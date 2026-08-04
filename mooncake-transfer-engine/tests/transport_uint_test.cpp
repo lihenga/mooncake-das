@@ -73,6 +73,37 @@ class TransferEngineImplTestPeer {
     }
 };
 
+TEST(TransferEngineAutoDiscoverTest, SelectsEfaForEfaProtocol) {
+    TransferEngineImpl engine(false);
+    engine.setAutoDiscover({.enabled = true, .protocol = "efa"});
+
+    const auto config = TransferEngineImplTestPeer::autoDiscoverConfig(engine);
+    EXPECT_TRUE(config.enabled);
+    EXPECT_EQ(config.protocol, "efa");
+    EXPECT_EQ(TransferEngineImplTestPeer::autoDiscoverTransport(engine), "efa");
+}
+
+TEST(TransferEngineAutoDiscoverTest, BarexOverrideTakesPrecedence) {
+    TransferEngineImpl engine(false);
+    engine.setAutoDiscover({.enabled = true, .protocol = "efa"});
+    TransferEngineImplTestPeer::setUseBarex(engine, true);
+
+    EXPECT_EQ(TransferEngineImplTestPeer::autoDiscoverTransport(engine),
+              "barex");
+}
+
+TEST(TransferEngineAutoDiscoverTest, BoolSetterPreservesDefaultSelection) {
+    TransferEngineImpl engine(false);
+    engine.setAutoDiscover({.enabled = true, .protocol = "efa"});
+    engine.setAutoDiscover(true);
+
+    const auto config = TransferEngineImplTestPeer::autoDiscoverConfig(engine);
+    EXPECT_TRUE(config.enabled);
+    EXPECT_TRUE(config.protocol.empty());
+    EXPECT_EQ(TransferEngineImplTestPeer::autoDiscoverTransport(engine),
+              "rdma");
+}
+
 class BatchResultTransport : public Transport {
    public:
     explicit BatchResultTransport(int unregister_result = 0)
