@@ -29,7 +29,10 @@ class EnvironTest : public ::testing::Test {
     void clearTestEnvVars() {
         unsetenv("MC_TEST_INT");
         unsetenv("MC_TEST_INT64");
+        unsetenv("MC_TEST_UINT32");
+        unsetenv("MC_TEST_UINT64");
         unsetenv("MC_TEST_SIZET");
+        unsetenv("MC_TEST_DOUBLE");
         unsetenv("MC_TEST_BOOL");
         unsetenv("MC_TEST_STRING");
         // Make sure AWS vars don't leak in from the test runner's env.
@@ -44,6 +47,7 @@ class EnvironTest : public ::testing::Test {
         unsetenv("MOONCAKE_AWS_RESPONSE_CHECKSUM_VALIDATION");
         unsetenv("MOONCAKE_AWS_CONNECT_TIMEOUT_MS");
         unsetenv("MOONCAKE_AWS_REQUEST_TIMEOUT_MS");
+        unsetenv("MOONCAKE_STORE_CHECKSUM");
     }
 };
 
@@ -98,6 +102,11 @@ TEST_F(EnvironTest, GetIntMinValue) {
     EXPECT_EQ(Environ::GetInt("MC_TEST_INT", 0), INT_MIN);
 }
 
+TEST_F(EnvironTest, GetIntSupportsTrimmedLeadingPlus) {
+    setenv("MC_TEST_INT", " \t+42\r\n", 1);
+    EXPECT_EQ(Environ::GetInt("MC_TEST_INT", 0), 42);
+}
+
 // --- GetInt64 ---
 
 TEST_F(EnvironTest, GetInt64ValidValue) {
@@ -124,6 +133,28 @@ TEST_F(EnvironTest, GetInt64Overflow) {
     EXPECT_EQ(Environ::GetInt64("MC_TEST_INT64", 555), 555);
 }
 
+TEST_F(EnvironTest, UnsignedGettersUseRequestedDefaultForInvalidValues) {
+    setenv("MC_TEST_UINT32", "4294967296", 1);
+    setenv("MC_TEST_UINT64", "-1", 1);
+    EXPECT_EQ(Environ::GetUInt32("MC_TEST_UINT32", 17), 17U);
+    EXPECT_EQ(Environ::GetUInt64("MC_TEST_UINT64", 23), 23U);
+}
+
+// --- GetDouble ---
+
+TEST_F(EnvironTest, GetDoubleValidValue) {
+    setenv("MC_TEST_DOUBLE", " 0.75 ", 1);
+    EXPECT_DOUBLE_EQ(Environ::GetDouble("MC_TEST_DOUBLE", 0.5), 0.75);
+}
+
+TEST_F(EnvironTest, GetDoubleMissingOrInvalidUsesRequestedDefault) {
+    EXPECT_DOUBLE_EQ(Environ::GetDouble("MC_TEST_DOUBLE", 0.5), 0.5);
+    setenv("MC_TEST_DOUBLE", "0.75garbage", 1);
+    EXPECT_DOUBLE_EQ(Environ::GetDouble("MC_TEST_DOUBLE", 0.5), 0.5);
+    setenv("MC_TEST_DOUBLE", "nan", 1);
+    EXPECT_DOUBLE_EQ(Environ::GetDouble("MC_TEST_DOUBLE", 0.5), 0.5);
+}
+
 // --- AWS / S3 fields ---
 //
 // NOTE: Environ is a singleton whose constructor caches every value the
@@ -147,6 +178,7 @@ TEST_F(EnvironTest, AwsFieldsPopulateFromEnv) {
     setenv("MOONCAKE_AWS_CONNECT_TIMEOUT_MS", "5000", 1);
     // Bogus request timeout should fall back to the registered default.
     setenv("MOONCAKE_AWS_REQUEST_TIMEOUT_MS", "bogus", 1);
+    setenv("MOONCAKE_STORE_CHECKSUM", "1", 1);
 
     const auto& e = Environ::Get();
     EXPECT_EQ(e.GetAwsRegion(), "us-east-1");
@@ -160,6 +192,7 @@ TEST_F(EnvironTest, AwsFieldsPopulateFromEnv) {
     EXPECT_EQ(e.GetAwsResponseChecksumValidation(), "when_supported");
     EXPECT_EQ(e.GetAwsConnectTimeoutMs(), 5000);
     EXPECT_EQ(e.GetAwsRequestTimeoutMs(), 30000);
+    EXPECT_TRUE(e.GetStoreChecksumEnabled());
 }
 
 // --- GetSizeT ---
@@ -211,18 +244,25 @@ TEST_F(EnvironTest, GetSizeTOverflow) {
 // --- GetBool ---
 
 TEST_F(EnvironTest, GetBoolTrue) {
-    for (const char* v :
-         {"1", "true", "TRUE", "True", "on", "ON", "yes", "YES"}) {
+    for (const char* v : {"1", "true", "TRUE", "True", "on", "ON", "yes", "YES",
+                          "enable", "EnAbLe", " true "}) {
         setenv("MC_TEST_BOOL", v, 1);
         EXPECT_TRUE(Environ::GetBool("MC_TEST_BOOL", false)) << "for: " << v;
     }
 }
 
 TEST_F(EnvironTest, GetBoolFalse) {
-    for (const char* v : {"0", "false", "FALSE", "off", "no", "whatever"}) {
+    for (const char* v :
+         {"0", "false", "FALSE", "off", "no", "disable", "DiSaBlE"}) {
         setenv("MC_TEST_BOOL", v, 1);
         EXPECT_FALSE(Environ::GetBool("MC_TEST_BOOL", false)) << "for: " << v;
     }
+}
+
+TEST_F(EnvironTest, GetBoolInvalidUsesRequestedDefault) {
+    setenv("MC_TEST_BOOL", "whatever", 1);
+    EXPECT_TRUE(Environ::GetBool("MC_TEST_BOOL", true));
+    EXPECT_FALSE(Environ::GetBool("MC_TEST_BOOL", false));
 }
 
 TEST_F(EnvironTest, GetBoolMissing) {
@@ -232,7 +272,8 @@ TEST_F(EnvironTest, GetBoolMissing) {
 
 TEST_F(EnvironTest, GetBoolEmpty) {
     setenv("MC_TEST_BOOL", "", 1);
-    EXPECT_FALSE(Environ::GetBool("MC_TEST_BOOL", true));
+    EXPECT_TRUE(Environ::GetBool("MC_TEST_BOOL", true));
+    EXPECT_FALSE(Environ::GetBool("MC_TEST_BOOL", false));
 }
 
 // --- GetString ---
