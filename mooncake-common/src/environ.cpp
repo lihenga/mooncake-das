@@ -8,10 +8,10 @@
 #include <cstring>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <iostream>
 
 namespace mooncake {
-
 Environ& Environ::Get() {
     static Environ instance;
     return instance;
@@ -50,6 +50,72 @@ int64_t Environ::GetInt64(const char* name, int64_t default_value) {
         return static_cast<int64_t>(result);
     }
     return default_value;
+}
+
+uint32_t Environ::GetUInt32(const char* name, uint32_t default_value) {
+    const char* val = std::getenv(name);
+    if (val) {
+        char* endptr = nullptr;
+        errno = 0;
+        // Reject negative inputs explicitly: strtoull silently wraps them.
+        const char* scan = val;
+        while (*scan != '\0' && std::isspace(static_cast<unsigned char>(*scan)))
+            ++scan;
+        unsigned long long result = std::strtoull(val, &endptr, 10);
+        if (endptr == val || *endptr != '\0' || errno == ERANGE ||
+            *scan == '-' || result > UINT32_MAX) {
+            std::cerr << "[Mooncake] Warning: invalid value '" << val
+                      << "' for env " << name << ", using default "
+                      << default_value << std::endl;
+            return default_value;
+        }
+        return static_cast<uint32_t>(result);
+    }
+    return default_value;
+}
+
+uint64_t Environ::GetUInt64(const char* name, uint64_t default_value) {
+    const char* val = std::getenv(name);
+    if (val) {
+        char* endptr = nullptr;
+        errno = 0;
+        const char* scan = val;
+        while (*scan != '\0' && std::isspace(static_cast<unsigned char>(*scan)))
+            ++scan;
+        unsigned long long result = std::strtoull(val, &endptr, 10);
+        if (endptr == val || *endptr != '\0' || errno == ERANGE ||
+            *scan == '-') {
+            std::cerr << "[Mooncake] Warning: invalid value '" << val
+                      << "' for env " << name << ", using default "
+                      << default_value << std::endl;
+            return default_value;
+        }
+        return static_cast<uint64_t>(result);
+    }
+    return default_value;
+}
+
+double Environ::GetDouble(const char* name, double default_value) {
+    const char* val = std::getenv(name);
+    if (val == nullptr || val[0] == '\0') {
+        return default_value;
+    }
+    char* endptr = nullptr;
+    errno = 0;
+    const double result = std::strtod(val, &endptr);
+    // Tolerate trailing whitespace, reject any other trailing garbage.
+    while (endptr != nullptr && *endptr != '\0' &&
+           std::isspace(static_cast<unsigned char>(*endptr))) {
+        ++endptr;
+    }
+    if (endptr == val || endptr == nullptr || *endptr != '\0' ||
+        errno == ERANGE || !std::isfinite(result)) {
+        std::cerr << "[Mooncake] Warning: invalid value '" << val
+                  << "' for env " << name << ", using default " << default_value
+                  << std::endl;
+        return default_value;
+    }
+    return result;
 }
 
 size_t Environ::GetSizeT(const char* name, size_t default_value) {
