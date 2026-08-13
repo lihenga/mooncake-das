@@ -30,6 +30,7 @@ class EnvironTest : public ::testing::Test {
         unsetenv("MC_TEST_INT");
         unsetenv("MC_TEST_INT64");
         unsetenv("MC_TEST_SIZET");
+        unsetenv("MC_TEST_DOUBLE");
         unsetenv("MC_TEST_BOOL");
         unsetenv("MC_TEST_STRING");
         // Make sure AWS vars don't leak in from the test runner's env.
@@ -122,6 +123,28 @@ TEST_F(EnvironTest, GetInt64NonNumeric) {
 TEST_F(EnvironTest, GetInt64Overflow) {
     setenv("MC_TEST_INT64", "99999999999999999999999999", 1);
     EXPECT_EQ(Environ::GetInt64("MC_TEST_INT64", 555), 555);
+}
+
+TEST_F(EnvironTest, UnsignedGettersUseRequestedDefaultForInvalidValues) {
+    setenv("MC_TEST_UINT32", "4294967296", 1);
+    setenv("MC_TEST_UINT64", "-1", 1);
+    EXPECT_EQ(Environ::GetUInt32("MC_TEST_UINT32", 17), 17U);
+    EXPECT_EQ(Environ::GetUInt64("MC_TEST_UINT64", 23), 23U);
+}
+
+// --- GetDouble ---
+
+TEST_F(EnvironTest, GetDoubleValidValue) {
+    setenv("MC_TEST_DOUBLE", " 0.75 ", 1);
+    EXPECT_DOUBLE_EQ(Environ::GetDouble("MC_TEST_DOUBLE", 0.5), 0.75);
+}
+
+TEST_F(EnvironTest, GetDoubleMissingOrInvalidUsesRequestedDefault) {
+    EXPECT_DOUBLE_EQ(Environ::GetDouble("MC_TEST_DOUBLE", 0.5), 0.5);
+    setenv("MC_TEST_DOUBLE", "0.75garbage", 1);
+    EXPECT_DOUBLE_EQ(Environ::GetDouble("MC_TEST_DOUBLE", 0.5), 0.5);
+    setenv("MC_TEST_DOUBLE", "nan", 1);
+    EXPECT_DOUBLE_EQ(Environ::GetDouble("MC_TEST_DOUBLE", 0.5), 0.5);
 }
 
 // --- AWS / S3 fields ---

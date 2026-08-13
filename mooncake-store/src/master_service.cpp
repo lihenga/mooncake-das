@@ -10,9 +10,11 @@
 #include <cstring>
 #include <limits>
 #include <random>
+#include <set>
 #include <shared_mutex>
 #include <sstream>
 #include <thread>
+#include <tuple>
 #include <regex>
 #include <unordered_set>
 #include <unistd.h>
@@ -24,6 +26,7 @@
 #include "http_metadata_server.h"
 #include "master_metric_manager.h"
 #include "common.h"
+#include "environ.h"
 #include "segment.h"
 #ifdef USE_HTTP
 #include "transfer_metadata_plugin.h"
@@ -44,6 +47,8 @@
 #include "ha/snapshot/snapshot_logger.h"
 #include "utils/zstd_util.h"
 #include "utils/file_util.h"
+#include "storage/distributed/dfs_global_allocator.h"
+#include "storage/distributed/distributed_storage_backend.h"
 #include "utils.h"
 #include "kv_event/kv_event_config.h"
 #include "master_snapshot_manager.h"
@@ -103,7 +108,7 @@ uint64_t SaturatingMultiply(uint64_t lhs, uint64_t rhs) {
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   size_t allocated_memory_replicas,
                                   size_t allocated_nof_replicas) {
-    if (config.nof_replica_num == 0) {
+    if (config.nof_replica_num == 0 && config.dfs_replica_num == 0) {
         return allocated_memory_replicas > 0;
     }
     if (DetermineReplicaWriteMode(config) ==
@@ -371,6 +376,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
                   << ")";
     }
 
+    InitDfsAllocatorFromEnvironment(config);
     kv_event_publisher_ =
         std::make_unique<KvEventPublisher>(BuildKvEventConfig(config));
 
@@ -451,6 +457,43 @@ MasterService::MasterService(const MasterServiceConfig& config)
         segment_manager_.initializeCxlAllocator(cxl_path_, cxl_size_);
         VLOG(1) << "action=start_cxl_global_allocator";
     }
+}
+
+void MasterService::InitDfsAllocatorFromEnvironment(
+    const MasterServiceConfig& config) {
+    enable_dfs_ = Environ::GetBool(
+        "MOONCAKE_ENABLE_DFS", Environ::GetBool("MOONCAKE_DFS_ENABLED", false));
+    if (!enable_dfs_) return;
+
+    // DAS has no oplog recovery path, so only the snapshot guards apply here.
+    if (config.enable_snapshot || config.enable_snapshot_restore) {
+        LOG(ERROR) << "DFS cannot be enabled with snapshot recovery "
+                      "until DFS allocator state restoration is supported";
+        throw std::invalid_argument("DFS is incompatible with snapshot "
+                                    "recovery");
+    }
+
+    const auto dfs_config = DistributedStorageConfig::FromEnvironment();
+    if (!dfs_config.single_tenant) {
+        LOG(ERROR) << "Currently, DFS backend is not supported in "
+                      "multi-tenant mode";
+        enable_dfs_ = false;
+        return;
+    }
+
+    dfs_allocator_ = std::make_unique<DfsGlobalAllocator>();
+    auto init_result = dfs_allocator_->Init(dfs_config);
+    if (!init_result) {
+        LOG(ERROR) << "Failed to initialize DFS allocator, error="
+                   << init_result.error() << ", config={"
+                   << dfs_config.FormatStr() << "}";
+        dfs_allocator_.reset();
+        enable_dfs_ = false;
+        return;
+    }
+
+    LOG(INFO) << "DFS allocator initialized, config={" << dfs_config.FormatStr()
+              << "}";
 }
 
 std::unique_ptr<ha::SnapshotCatalogStore>
@@ -538,6 +581,18 @@ MasterService::~MasterService() {
         snapshot_manager_.reset();
     }
 }
+
+void MasterService::RunBatchEvictForTesting(double evict_ratio_target,
+                                            double evict_ratio_lowerbound) {
+    BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
+}
+
+void MasterService::RunNoFBatchEvictForTesting(double evict_ratio_target,
+                                               double evict_ratio_lowerbound) {
+    NoFBatchEvict(evict_ratio_target, evict_ratio_lowerbound);
+}
+
+void MasterService::RunDfsEvictionForTesting() { RunDfsEviction(); }
 
 void MasterService::SetNoFProbeFnForTesting(NoFProbeFn fn) {
 #ifdef USE_NOF
@@ -1306,6 +1361,7 @@ size_t MasterService::EraseReplicasWithCacheTotalAccounting(
     // Release SSD/local-disk usage for any local-disk replicas being removed.
     // No-op for memory/noF replicas, so it is safe to call unconditionally.
     ReleaseLocalDiskUsage(erased_replicas);
+    FreeDfsReplicas(metadata.user_key, erased_replicas);
     return erased_replicas.size();
 }
 
@@ -1359,6 +1415,7 @@ MasterService::EraseMetadata(
     ErasePromotionTaskIfPresent(tenant_state, key, tenant_id);
 
     ReleaseLocalDiskUsage(metadata.GetAllReplicas());
+    FreeDfsReplicas(key, metadata.GetAllReplicas());
     AccountCacheTotalRemoval(metadata);
     switch (quota_mode) {
         case QuotaEraseMode::kFull:
@@ -2126,8 +2183,14 @@ auto MasterService::GetReplicaList(const std::string& key,
 
         std::vector<Replica::Descriptor> replica_list;
         metadata.VisitReplicas(
-            &Replica::fn_is_completed, [&replica_list](const Replica& replica) {
+            &Replica::fn_is_completed,
+            [this, &key, &replica_list](const Replica& replica) {
                 replica_list.emplace_back(replica.get_descriptor());
+                if (replica.is_dfs_replica() && dfs_allocator_) {
+                    const auto& desc = replica.get_dfs_descriptor();
+                    dfs_allocator_->UpdateAccess(key, desc.shard_idx,
+                                                 desc.offset);
+                }
             });
 
         if (replica_list.empty()) {
@@ -2595,6 +2658,23 @@ auto MasterService::AllocateAndInsertMetadata(
                               ReplicaStatus::PROCESSING);
     }
 
+    if (config.dfs_replica_num > 0) {
+        if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
+            LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
+                       << ", error=dfs_allocator_not_initialized";
+            abort_reserved_quota();
+            return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+        }
+        auto alloc = dfs_allocator_->Allocate(key, value_length);
+        if (!alloc) {
+            LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
+                       << ", error=" << alloc.error();
+            abort_reserved_quota();
+            return tl::make_unexpected(alloc.error());
+        }
+        replicas.emplace_back(std::move(*alloc), ReplicaStatus::PROCESSING);
+    }
+
     std::vector<Replica::Descriptor> replica_list;
     replica_list.reserve(replicas.size());
     int i = 0;
@@ -2616,6 +2696,11 @@ auto MasterService::AllocateAndInsertMetadata(
                     << nof_desc.buffer_descriptor.buffer_address_
                     << ", transport_endpoint="
                     << nof_desc.buffer_descriptor.transport_endpoint_;
+        } else if (replica.is_dfs_replica()) {
+            const auto& dfs_desc = desc.get_dfs_descriptor();
+            VLOG(1) << "Replica #" << ++i << ": dfs_file=" << dfs_desc.file_path
+                    << ", offset=" << dfs_desc.offset
+                    << ", shard_idx=" << dfs_desc.shard_idx;
         }
     }
 
@@ -2625,6 +2710,7 @@ auto MasterService::AllocateAndInsertMetadata(
                               config.with_soft_pin, config.with_hard_pin,
                               config.data_type, group_id, tenant_id, key));
     if (!inserted) {
+        FreeDfsReplicas(key, replicas);
         LOG(INFO) << "key=" << key << ", info=object_already_exists";
         abort_reserved_quota();
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
@@ -2648,13 +2734,32 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     }
     const ObjectIdentity object_id{std::move(normalized_tenant_result.value()),
                                    key};
-    if ((config.replica_num == 0 && config.nof_replica_num == 0) ||
+    if ((config.replica_num == 0 && config.nof_replica_num == 0 &&
+         config.dfs_replica_num == 0) ||
         key.empty() || slice_length == 0) {
         LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
                    << ", nof_replica_num=" << config.nof_replica_num
+                   << ", dfs_replica_num=" << config.dfs_replica_num
                    << ", slice_length=" << slice_length
                    << ", key_size=" << key.size() << ", error=invalid_params";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (config.dfs_replica_num > 1 ||
+        (config.dfs_replica_num > 0 && config.replica_num == 0)) {
+        LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
+                   << ", dfs_replica_num=" << config.dfs_replica_num
+                   << ", error=invalid_dfs_replica_config";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (config.dfs_replica_num > 0 && !object_id.tenant_id.IsDefault()) {
+        LOG(ERROR) << "key=" << key << ", tenant_id=" << tenant_id
+                   << ", error=dfs_currently_requires_default_tenant";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (config.dfs_replica_num > 0 &&
+        (!enable_dfs_ || !dfs_allocator_ || !dfs_allocator_->IsInitialized())) {
+        LOG(ERROR) << "key=" << key << ", error=dfs_allocator_not_initialized";
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
     if (config.prefer_alloc_in_same_node && config.nof_replica_num > 0) {
         LOG(ERROR) << "key=" << key
@@ -2743,6 +2848,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     auto replicas =
                         metadata.PopReplicas(&Replica::fn_is_processing);
                     if (!replicas.empty()) {
+                        FreeDfsReplicas(key, replicas);
                         std::lock_guard lock(discarded_replicas_mutex_);
                         discarded_replicas_.emplace_back(
                             std::move(replicas),
@@ -2831,7 +2937,8 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
                 return (replica.is_memory_replica() &&
                         !replica.has_invalid_mem_handle()) ||
                        (replica.is_nof_replica() &&
-                        !replica.has_invalid_nof_handle());
+                        !replica.has_invalid_nof_handle()) ||
+                       replica.is_dfs_replica();
             }
             if (replica_type == ReplicaType::MEMORY) {
                 return replica.is_memory_replica() &&
@@ -2843,7 +2950,13 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
             }
             return replica.type() == replica_type;
         },
-        [](Replica& replica) { replica.mark_complete(); });
+        [this, &key](Replica& replica) {
+            replica.mark_complete();
+            if (replica.is_dfs_replica() && dfs_allocator_) {
+                const auto& desc = replica.get_dfs_descriptor();
+                dfs_allocator_->UpdateAccess(key, desc.shard_idx, desc.offset);
+            }
+        });
 
     const bool has_memory_replica = metadata.HasMemReplica();
     const bool should_settle_quota =
@@ -2869,7 +2982,10 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
         metadata.pending_replaced_quota_charge_bytes = 0;
     }
 
-    if (enable_offload_ && !offload_on_evict_) {
+    if (replica_type != ReplicaType::DFS && enable_offload_ &&
+        !offload_on_evict_ && !metadata.HasReplica([](const Replica& replica) {
+            return replica.is_dfs_replica() && replica.is_processing();
+        })) {
         auto& tenant_state = accessor.GetTenantState();
         bool task_created = false;
         metadata.VisitReplicas(
@@ -2988,14 +3104,15 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
-    auto processing_rep = metadata.GetFirstReplica([replica_type](
-                                                       const Replica& replica) {
-        if (replica_type == ReplicaType::ALL) {
-            return (replica.is_memory_replica() || replica.is_nof_replica()) &&
-                   !replica.is_processing();
-        }
-        return replica.type() == replica_type && !replica.is_processing();
-    });
+    auto processing_rep =
+        metadata.GetFirstReplica([replica_type](const Replica& replica) {
+            if (replica_type == ReplicaType::ALL) {
+                return (replica.is_memory_replica() ||
+                        replica.is_nof_replica() || replica.is_dfs_replica()) &&
+                       !replica.is_processing();
+            }
+            return replica.type() == replica_type && !replica.is_processing();
+        });
     if (processing_rep != nullptr) {
         LOG(ERROR) << "key=" << key << ", status=" << processing_rep->status()
                    << ", error=invalid_replica_status";
@@ -3006,7 +3123,8 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     EraseReplicasWithCacheTotalAccounting(
         metadata, [replica_type](const Replica& replica) {
             if (replica_type == ReplicaType::ALL) {
-                return replica.is_memory_replica() || replica.is_nof_replica();
+                return replica.is_memory_replica() ||
+                       replica.is_nof_replica() || replica.is_dfs_replica();
             }
             return replica.type() == replica_type;
         });
@@ -3083,13 +3201,35 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     const ObjectIdentity object_id{std::move(normalized_tenant_result.value()),
                                    key};
     // --- Parameter validation (same as PutStart) ---
-    if ((config.replica_num == 0 && config.nof_replica_num == 0) ||
+    if ((config.replica_num == 0 && config.nof_replica_num == 0 &&
+         config.dfs_replica_num == 0) ||
         key.empty() || slice_length == 0) {
         LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
                    << ", nof_replica_num=" << config.nof_replica_num
+                   << ", dfs_replica_num=" << config.dfs_replica_num
                    << ", slice_length=" << slice_length
                    << ", key_size=" << key.size() << ", error=invalid_params";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (config.dfs_replica_num > 1 ||
+        (config.dfs_replica_num > 0 && config.replica_num == 0)) {
+        LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
+                   << ", dfs_replica_num=" << config.dfs_replica_num
+                   << ", error=invalid_dfs_replica_config";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (config.dfs_replica_num > 0 && !object_id.tenant_id.IsDefault()) {
+        LOG(ERROR) << "key=" << key << ", tenant_id=" << tenant_id
+                   << ", error=dfs_currently_requires_default_tenant";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (config.dfs_replica_num > 0 &&
+        (!enable_dfs_ || dfs_allocator_ == nullptr ||
+         !dfs_allocator_->IsInitialized())) {
+        LOG(ERROR) << "key=" << key
+                   << ", dfs_replica_num=" << config.dfs_replica_num
+                   << ", error=dfs_service_unavailable";
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
     if (config.prefer_alloc_in_same_node && config.nof_replica_num > 0) {
         LOG(ERROR) << "key=" << key
@@ -3212,6 +3352,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     auto processing_replicas =
                         metadata.PopReplicas(&Replica::fn_is_processing);
                     if (!processing_replicas.empty()) {
+                        FreeDfsReplicas(key, processing_replicas);
                         std::lock_guard lock(discarded_replicas_mutex_);
                         discarded_replicas_.emplace_back(
                             std::move(processing_replicas),
@@ -3270,6 +3411,33 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     // hard_pinned is const and preserved automatically — upsert
                     // does not change the eviction protection level of an
                     // existing object.
+                    const size_t existing_dfs_replicas =
+                        metadata.CountReplicas(&Replica::fn_is_dfs_replica);
+                    if (config.dfs_replica_num > 0 ||
+                        existing_dfs_replicas > 0) {
+                        const size_t existing_memory_replicas =
+                            metadata.CountReplicas(
+                                &Replica::fn_is_memory_replica);
+                        const size_t existing_nof_replicas =
+                            metadata.CountReplicas(&Replica::fn_is_nof_replica);
+                        if (existing_memory_replicas != config.replica_num ||
+                            existing_nof_replicas != config.nof_replica_num ||
+                            existing_dfs_replicas != config.dfs_replica_num) {
+                            LOG(ERROR)
+                                << "key=" << key
+                                << ", error=dfs_upsert_topology_mismatch"
+                                << ", existing_memory="
+                                << existing_memory_replicas
+                                << ", requested_memory=" << config.replica_num
+                                << ", existing_nof=" << existing_nof_replicas
+                                << ", requested_nof=" << config.nof_replica_num
+                                << ", existing_dfs=" << existing_dfs_replicas
+                                << ", requested_dfs=" << config.dfs_replica_num;
+                            return tl::make_unexpected(
+                                ErrorCode::INVALID_PARAMS);
+                        }
+                    }
+
                     metadata.client_id = client_id;
                     metadata.put_start_time = now;
 
@@ -3337,6 +3505,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 auto old_replicas =
                     PopReplicasWithCacheTotalAccounting(metadata);
                 if (!old_replicas.empty()) {
+                    FreeDfsReplicas(key, old_replicas);
                     std::lock_guard lock(discarded_replicas_mutex_);
                     discarded_replicas_.emplace_back(
                         std::move(old_replicas),
@@ -4015,6 +4184,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
             return replica.id() == source_id;
         });
     if (!source_replica.empty()) {
+        FreeDfsReplicas(key, source_replica);
         std::lock_guard lock(discarded_replicas_mutex_);
         discarded_replicas_.emplace_back(
             std::move(source_replica),
@@ -4461,6 +4631,153 @@ bool MasterService::CleanupStaleHandles(
 
     // Return true if no valid replicas remain after cleanup
     return !metadata.IsValid();
+}
+
+void MasterService::FreeDfsReplicas(const std::string& key,
+                                    const std::vector<Replica>& replicas) {
+    if (!dfs_allocator_) return;
+    for (const auto& replica : replicas) {
+        if (!replica.is_dfs_replica()) continue;
+        const auto& desc = replica.get_dfs_descriptor();
+        dfs_allocator_->Free(desc.offset, desc.aligned_size, desc.shard_idx,
+                             key);
+    }
+}
+
+void MasterService::RunDfsEviction() {
+    if (!dfs_allocator_) return;
+
+    const TenantId tenant_id = TenantId::Default();
+    using CandidateIdentity = std::tuple<std::string, int, uint64_t>;
+    std::set<CandidateIdentity> attempted;
+
+    while (true) {
+        auto pending = dfs_allocator_->PrepareEviction();
+        if (pending.Empty()) return;
+
+        const auto candidates = pending.Candidates();
+        std::vector<bool> accepted(candidates.size(), false);
+        std::vector<bool> considered(candidates.size(), false);
+        bool saw_repeated_candidate = false;
+
+        // Group prepared candidates by metadata shard, then validate and
+        // remove each group while holding only that shard. Prepared allocator
+        // extents remain unavailable until ResolvePreparedEviction(), so
+        // different metadata shards do not need one cross-shard transaction.
+        std::array<std::vector<size_t>, kNumShards> indexes_by_shard;
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            const auto& candidate = candidates[i];
+            if (!attempted
+                     .emplace(candidate.key, candidate.shard_idx,
+                              candidate.offset)
+                     .second) {
+                saw_repeated_candidate = true;
+                continue;
+            }
+            considered[i] = true;
+            indexes_by_shard[getMetadataShardIndex(tenant_id, candidate.key)]
+                .push_back(i);
+        }
+
+        auto matches_candidate = [](const Replica& replica,
+                                    const auto& candidate) {
+            return replica.is_dfs_replica() &&
+                   replica.get_dfs_descriptor().shard_idx ==
+                       candidate.shard_idx &&
+                   replica.get_dfs_descriptor().offset == candidate.offset;
+        };
+
+        auto now = std::chrono::system_clock::now();
+        for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
+            if (indexes_by_shard[shard_idx].empty()) continue;
+
+            std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+            SharedMutexLocker shard_lock(&metadata_shards_[shard_idx].mutex);
+
+            // Validate and remove candidates under the same shard lock. Once a
+            // candidate has been seen in this cycle, it is excluded above;
+            // encountering it again means the LRU scan has wrapped.
+            for (const size_t i : indexes_by_shard[shard_idx]) {
+                const auto& candidate = candidates[i];
+                auto tenant_it =
+                    metadata_shards_[shard_idx].tenants.find(tenant_id);
+                if (tenant_it == metadata_shards_[shard_idx].tenants.end()) {
+                    accepted[i] = true;
+                    continue;
+                }
+                auto& tenant_state = tenant_it->second;
+                auto metadata_it = tenant_state.metadata.find(candidate.key);
+                if (metadata_it == tenant_state.metadata.end()) {
+                    accepted[i] = true;
+                    continue;
+                }
+
+                auto& metadata = metadata_it->second;
+                const bool has_candidate =
+                    metadata.HasReplica([&](const Replica& replica) {
+                        return matches_candidate(replica, candidate);
+                    });
+                if (!has_candidate) {
+                    accepted[i] = true;
+                    continue;
+                }
+
+                const bool candidate_is_processing =
+                    metadata.HasReplica([&](const Replica& replica) {
+                        return matches_candidate(replica, candidate) &&
+                               replica.is_processing();
+                    });
+                accepted[i] =
+                    !candidate_is_processing &&
+                    !tenant_state.processing_keys.contains(candidate.key) &&
+                    !metadata.IsHardPinned() && metadata.IsLeaseExpired(now) &&
+                    (!metadata.IsSoftPinned(now) ||
+                     allow_evict_soft_pinned_objects_);
+                if (!accepted[i]) continue;
+
+                // A missing descriptor was accepted above and is already
+                // evicted from the master's point of view. Otherwise remove
+                // the accepted descriptor before its allocator extent can be
+                // committed and reused.
+                const size_t erased =
+                    metadata.EraseReplicas([&](const Replica& replica) {
+                        return matches_candidate(replica, candidate) &&
+                               !replica.is_processing();
+                    });
+                if (erased > 0 && !metadata.IsValid()) {
+                    PublishKvRemovedAfterEvict(candidate.key,
+                                               metadata.size * erased, "disk",
+                                               metadata, tenant_id);
+                    EraseMetadata(tenant_state, metadata_it, tenant_id,
+                                  QuotaEraseMode::kFull);
+                }
+            }
+
+            auto tenant_it =
+                metadata_shards_[shard_idx].tenants.find(tenant_id);
+            if (tenant_it != metadata_shards_[shard_idx].tenants.end() &&
+                tenant_it->second.Empty()) {
+                metadata_shards_[shard_idx].tenants.erase(tenant_it);
+            }
+        }
+
+        dfs_allocator_->ResolvePreparedEviction(std::move(pending), accepted);
+
+        // A protected allocation stays live, but moving it to the MRU side
+        // lets this cycle inspect colder candidates behind it. The attempted
+        // set bounds the scan when every remaining allocation is protected.
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            if (considered[i] && !accepted[i]) {
+                dfs_allocator_->UpdateAccess(candidates[i].key,
+                                             candidates[i].shard_idx,
+                                             candidates[i].offset);
+            }
+        }
+
+        if (saw_repeated_candidate) {
+            return;
+        }
+    }
 }
 
 size_t MasterService::GetKeyCount() const {
@@ -5657,6 +5974,7 @@ void MasterService::EvictionThreadFunc() {
     VLOG(1) << "action=eviction_thread_started";
 
     auto last_discard_time = std::chrono::system_clock::now();
+    auto next_dfs_eviction_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
         double used_ratio =
@@ -5706,6 +6024,16 @@ void MasterService::EvictionThreadFunc() {
             NoFBatchEvict(nof_evict_ratio_target, nof_evict_ratio_lowerbound);
         }
 #endif
+
+        if (dfs_allocator_ && dfs_allocator_->IsEvictionEnabled()) {
+            const auto steady_now = std::chrono::steady_clock::now();
+            if (steady_now >= next_dfs_eviction_time) {
+                RunDfsEviction();
+                next_dfs_eviction_time =
+                    std::chrono::steady_clock::now() +
+                    dfs_allocator_->GetEvictionCheckInterval();
+            }
+        }
 
         if (promotion_candidate_count_.load(std::memory_order_relaxed) > 0) {
             RunPromotionCandidateRetry();
@@ -5757,6 +6085,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 auto replicas =
                     metadata.PopReplicas(&Replica::fn_is_processing);
                 if (!replicas.empty()) {
+                    FreeDfsReplicas(*key_it, replicas);
                     discarded_replicas.emplace_back(std::move(replicas), ttl);
                 }
                 if (!metadata.IsValid()) {
@@ -5805,6 +6134,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                     return it != replica_ids.end();
                 });
             if (!replicas.empty()) {
+                FreeDfsReplicas(task_it->first, replicas);
                 discarded_replicas.emplace_back(std::move(replicas), ttl);
             }
             if (!metadata.IsValid()) {
