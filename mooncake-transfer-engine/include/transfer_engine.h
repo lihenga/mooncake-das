@@ -150,6 +150,8 @@ class TransferEngine {
         ScatterTransferOperation& operator=(const ScatterTransferOperation&) =
             delete;
 
+        // Single-consumer operation: do not wait concurrently or from a
+        // fragment completion callback.
         Status wait();
 
         // A wait timeout does not cancel the transfer. Keep this operation and
@@ -262,6 +264,7 @@ class TransferEngine {
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
     std::shared_ptr<ShutdownToken> shutdown_token_;
     bool use_tent_{false};
+    friend class TransferEngineImplTestPeer;
 };
 }  // namespace mooncake
 
