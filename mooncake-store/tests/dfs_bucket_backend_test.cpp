@@ -64,6 +64,7 @@ class FaultyPosixFsAdapter : public PosixFsAdapter {
    public:
     void FailWriteCall(int call) { fail_write_call_.store(call); }
     void FailReadCall(int call) { fail_read_call_.store(call); }
+    void FailWriteOffset(int64_t offset) { fail_write_offset_.store(offset); }
     // Truncates the Nth write to `bytes`, simulating a short pwritev.
     void ShortWriteCall(int call, size_t bytes) {
         short_write_call_.store(call);
@@ -76,7 +77,8 @@ class FaultyPosixFsAdapter : public PosixFsAdapter {
                                             int iovcnt,
                                             int64_t offset) override {
         const int call = ++write_calls_;
-        if (call == fail_write_call_.load()) {
+        if (call == fail_write_call_.load() ||
+            offset == fail_write_offset_.load()) {
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
         if (call == short_write_call_.load()) {
@@ -110,6 +112,7 @@ class FaultyPosixFsAdapter : public PosixFsAdapter {
     std::atomic<int> write_calls_{0};
     std::atomic<int> read_calls_{0};
     std::atomic<int> fail_write_call_{-1};
+    std::atomic<int64_t> fail_write_offset_{-1};
     std::atomic<int> fail_read_call_{-1};
     std::atomic<int> short_write_call_{-1};
     std::atomic<size_t> short_write_bytes_{0};
@@ -201,18 +204,16 @@ TEST_F(DfsBucketBackendTest, WriteThenReadRoundTrip) {
     EXPECT_EQ(ReadObject(key, desc), value);
 }
 
-TEST_F(DfsBucketBackendTest, WrittenEntryContainsHeaderAndKey) {
+TEST_F(DfsBucketBackendTest, WrittenEntryContainsHeaderKeyValueAndPadding) {
     const std::string key = "header_key";
     const std::string value(64, 'Z');
     auto desc = WriteObject(key, value);
 
-    // The bucket entry must be self-describing: [key_size][key][value].
     const uint64_t entry_start =
         desc.offset - BucketEntryLayout::kHeaderSize - key.size();
     const int fd = ::open(desc.file_path.c_str(), O_RDONLY);
     ASSERT_GE(fd, 0);
-    std::vector<char> buffer(BucketEntryLayout::kHeaderSize + key.size() +
-                             value.size());
+    std::vector<char> buffer(desc.aligned_size, '\0');
     ASSERT_EQ(::pread(fd, buffer.data(), buffer.size(),
                       static_cast<off_t>(entry_start)),
               static_cast<ssize_t>(buffer.size()));
@@ -232,6 +233,10 @@ TEST_F(DfsBucketBackendTest, WrittenEntryContainsHeaderAndKey) {
                               key.size(),
                           value.size()),
               value);
+    const size_t entry_size = BucketEntryLayout::kHeaderSize + key.size() +
+                              value.size();
+    EXPECT_TRUE(std::all_of(buffer.begin() + entry_size, buffer.end(),
+                            [](char byte) { return byte == 0; }));
 }
 
 TEST_F(DfsBucketBackendTest, MultiSliceValueWriteAndRead) {
@@ -458,20 +463,24 @@ TEST_F(DfsBucketBackendTest, PerKeyErrorsDoNotAffectOtherKeys) {
     ASSERT_TRUE(allocations[0].success);
     ASSERT_TRUE(allocations[1].success);
 
-    // Fail the second write only.
-    adapter_->FailWriteCall(adapter_->WriteCalls() + 2);
+    // Make only the second request invalid before I/O; the first request must
+    // still be written successfully.
+    auto failed_descriptor = allocations[1].descriptor;
+    failed_descriptor.shard_idx = -1;
 
     std::vector<std::vector<Slice>> slices(2);
     std::vector<DfsWriteRequest> writes;
     for (size_t i = 0; i < keys.size(); ++i) {
         slices[i] = {{values[i].data(), values[i].size()}};
-        writes.push_back({keys[i], allocations[i].descriptor, slices[i]});
+        writes.push_back({keys[i], i == 1 ? failed_descriptor
+                                           : allocations[i].descriptor,
+                          slices[i]});
     }
     auto results = backend_->BatchWrite(writes);
     ASSERT_EQ(results.size(), 2u);
     EXPECT_TRUE(results[0].has_value());
     ASSERT_FALSE(results[1].has_value());
-    EXPECT_EQ(results[1].error(), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_EQ(results[1].error(), ErrorCode::INVALID_PARAMS);
 
     // The successful key is intact and readable.
     EXPECT_EQ(ReadObject(keys[0], allocations[0].descriptor), values[0]);
