@@ -358,22 +358,22 @@ TEST_F(DfsBucketClientTest, FailedAsyncWriteRevokesOnlyTheDfsReplica) {
     }
 }
 
-TEST_F(DfsBucketClientTest, PartialBatchFailureRevokesOnlyAffectedKeys) {
+TEST_F(DfsBucketClientTest, BatchIoFailureRevokesAllKeysInMergedRun) {
     std::vector<std::string> keys{"bucket_mixed_ok", "bucket_mixed_fail"};
     std::vector<std::string> values{std::string(4096, 'G'),
                                     std::string(4096, 'H')};
     auto slices = MakeSlices(values);
 
-    // Fail the second entry's write only.
-    adapter_->FailWriteCall(adapter_->WriteCalls() + 2);
+    // A merged contiguous run is one filesystem operation. If that operation
+    // fails, none of its entries is known durable, so every DFS replica in the
+    // run must be revoked.
+    adapter_->FailWriteCall(adapter_->WriteCalls() + 1);
     auto results = writer_->BatchPut(keys, slices, DfsConfig());
     ASSERT_EQ(results.size(), keys.size());
     ASSERT_TRUE(results[0].has_value());
     ASSERT_TRUE(results[1].has_value());
 
-    ASSERT_TRUE(WaitForDfsReplica(keys[0]));
-    ExpectDfsValue(keys[0], values[0]);
-    // The failed key's DFS replica is revoked; its neighbour is unaffected.
+    ASSERT_TRUE(WaitForKeyGone(keys[0]));
     ASSERT_TRUE(WaitForKeyGone(keys[1]));
 }
 
