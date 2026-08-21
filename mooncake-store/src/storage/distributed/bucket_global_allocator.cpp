@@ -61,6 +61,30 @@ uint32_t ComputeMetadataChecksum(PersistedBucketMetadata snapshot) {
     return Crc32cValue(payload.data(), payload.size());
 }
 
+uint32_t ComputeLegacyMetadataChecksum(LegacyPersistedBucketMetadata snapshot) {
+    snapshot.checksum = 0;
+    std::string payload;
+    struct_pb::to_pb(snapshot, payload);
+    return Crc32cValue(payload.data(), payload.size());
+}
+
+PersistedBucketMetadata UpgradeLegacyMetadata(
+    const LegacyPersistedBucketMetadata& legacy) {
+    PersistedBucketMetadata snapshot;
+    snapshot.version = kBucketMetadataVersion;
+    snapshot.bucket_id = legacy.bucket_id;
+    snapshot.bucket_generation = legacy.bucket_generation;
+    snapshot.capacity = legacy.capacity;
+    snapshot.alignment = legacy.alignment;
+    snapshot.append_offset = legacy.append_offset;
+    snapshot.log_seq = legacy.log_seq;
+    snapshot.snapshot_epoch = 0;
+    snapshot.evicting = legacy.evicting;
+    snapshot.entries = legacy.entries;
+    snapshot.checksum = ComputeMetadataChecksum(snapshot);
+    return snapshot;
+}
+
 // --- little-endian fixed-width encode/decode for the metadata log ---
 
 void PutU32(std::string& out, uint32_t value) {
@@ -332,6 +356,11 @@ std::string BucketGlobalAllocator::BucketMetaPath(int64_t bucket_id) const {
            kBucketMetaSuffix;
 }
 
+std::string BucketGlobalAllocator::BucketMetaSlotPath(int64_t bucket_id,
+                                                       int slot) const {
+    return BucketMetaPath(bucket_id) + "." + std::to_string(slot);
+}
+
 std::string BucketGlobalAllocator::BucketMetaLogPath(int64_t bucket_id) const {
     return fsdir_ + "/" + kBucketFilePrefix + FormatBucketId(bucket_id) +
            kBucketMetaLogSuffix;
@@ -403,8 +432,7 @@ tl::expected<void, ErrorCode> BucketGlobalAllocator::Init(
     initialized_.store(true, std::memory_order_release);
 
     // Recovery folded each log into memory; publish that as a snapshot right
-    // away so a second restart starts from a clean `.meta` and an empty log
-    // instead of replaying the same records again.
+    // away so a second restart starts from a clean snapshot slot and empty log.
     const size_t compacted = CompactAllBuckets();
 
     LOG(INFO) << "DFS bucket allocator initialized, fsdir=" << fsdir_
@@ -419,7 +447,7 @@ tl::expected<void, ErrorCode> BucketGlobalAllocator::Init(
 }
 
 PersistedBucketMetadata BucketGlobalAllocator::SnapshotLocked(
-    const BucketState& bucket, bool evicting) const {
+    BucketState& bucket, bool evicting) {
     PersistedBucketMetadata snapshot;
     snapshot.version = kBucketMetadataVersion;
     snapshot.bucket_id = bucket.bucket_id;
@@ -433,6 +461,9 @@ PersistedBucketMetadata BucketGlobalAllocator::SnapshotLocked(
     // this bucket's last queued seq) is what lets compaction clear the log
     // without inspecting its contents.
     snapshot.log_seq = next_log_seq_ - 1;
+    snapshot.snapshot_epoch =
+        bucket.snapshot_epoch + 1;
+    bucket.snapshot_epoch = snapshot.snapshot_epoch;
     snapshot.evicting = evicting;
     snapshot.entries.reserve(bucket.entries.size());
     for (const auto& [key, entry] : bucket.entries) {
@@ -499,57 +530,46 @@ tl::expected<void, ErrorCode> BucketGlobalAllocator::PersistMetadata(
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
-    const std::string final_path = BucketMetaPath(snapshot.bucket_id);
-    // The temp name must be unique per writer. Several threads can persist the
-    // same bucket concurrently (a compaction racing an eviction marker), and a
-    // shared "<meta>.tmp" path makes them overwrite each other's partial
-    // payload and delete a file another thread is about to rename - which
-    // surfaces as spurious FILE_NOT_FOUND failures under concurrency.
-    static std::atomic<uint64_t> temp_sequence{0};
-    const std::string temp_path =
-        final_path + ".tmp." +
-        std::to_string(temp_sequence.fetch_add(1, std::memory_order_relaxed));
+    const int slot = static_cast<int>(snapshot.snapshot_epoch & 1u);
+    const std::string slot_path =
+        BucketMetaSlotPath(snapshot.bucket_id, slot);
+    bool slot_existed = false;
+    auto slot_exists_result = fs_adapter_->FileExists(slot_path);
+    if (slot_exists_result) slot_existed = *slot_exists_result;
 
-    // Write the full payload to a temp file, make it durable, then swap it in
-    // atomically. Truncating the live `.meta` in place would leave a window in
-    // which a crash loses the whole bucket index.
+    // Rewrite only the inactive stable slot. The other slot remains a complete,
+    // checksummed recovery point until this write and sync finish, so atomic
+    // namespace replacement is unnecessary.
     auto write_result = fs_adapter_->WriteFile(
-        temp_path, std::span<const char>(payload.data(), payload.size()));
+        slot_path, std::span<const char>(payload.data(), payload.size()));
     if (!write_result) {
-        LOG(ERROR) << "Failed to write bucket metadata temp file " << temp_path
+        LOG(ERROR) << "Failed to write bucket metadata slot " << slot_path
                    << ", error=" << write_result.error();
-        (void)fs_adapter_->DeleteFile(temp_path);
         return tl::make_unexpected(write_result.error());
     }
     if (*write_result != payload.size()) {
-        LOG(ERROR) << "Short write of bucket metadata temp file " << temp_path
+        LOG(ERROR) << "Short write of bucket metadata slot " << slot_path
                    << ", expected=" << payload.size()
                    << ", actual=" << *write_result;
-        (void)fs_adapter_->DeleteFile(temp_path);
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
 
-    auto sync_file = fs_adapter_->SyncFile(temp_path);
+    auto sync_file = fs_adapter_->SyncFile(slot_path);
     if (!sync_file) {
-        LOG(ERROR) << "Failed to fsync bucket metadata temp file " << temp_path
+        LOG(ERROR) << "Failed to fsync bucket metadata slot " << slot_path
                    << ", error=" << sync_file.error();
-        (void)fs_adapter_->DeleteFile(temp_path);
         return tl::make_unexpected(sync_file.error());
     }
 
-    auto renamed = fs_adapter_->RenameFile(temp_path, final_path);
-    if (!renamed) {
-        LOG(ERROR) << "Failed to publish bucket metadata " << final_path
-                   << ", error=" << renamed.error();
-        (void)fs_adapter_->DeleteFile(temp_path);
-        return tl::make_unexpected(renamed.error());
-    }
-
-    auto sync_dir = fs_adapter_->SyncDirectory(fsdir_);
-    if (!sync_dir) {
-        LOG(ERROR) << "Failed to fsync DFS bucket directory " << fsdir_
-                   << ", error=" << sync_dir.error();
-        return tl::make_unexpected(sync_dir.error());
+    // Creating a directory entry needs one directory sync. Rewriting an existing
+    // slot changes no namespace metadata and deliberately avoids that DFS lock.
+    if (!slot_existed) {
+        auto sync_dir = fs_adapter_->SyncDirectory(fsdir_);
+        if (!sync_dir) {
+            LOG(ERROR) << "Failed to fsync DFS bucket directory " << fsdir_
+                       << ", error=" << sync_dir.error();
+            return tl::make_unexpected(sync_dir.error());
+        }
     }
     return {};
 }
@@ -562,8 +582,17 @@ void BucketGlobalAllocator::DeleteBucketFiles(int64_t bucket_id) {
     }
     auto meta_result = fs_adapter_->DeleteFile(BucketMetaPath(bucket_id));
     if (!meta_result && meta_result.error() != ErrorCode::FILE_NOT_FOUND) {
-        LOG(ERROR) << "Failed to delete bucket metadata file for bucket_id="
+        LOG(ERROR) << "Failed to delete legacy bucket metadata file for bucket_id="
                    << bucket_id << ", error=" << meta_result.error();
+    }
+    for (int slot = 0; slot < 2; ++slot) {
+        auto slot_result =
+            fs_adapter_->DeleteFile(BucketMetaSlotPath(bucket_id, slot));
+        if (!slot_result && slot_result.error() != ErrorCode::FILE_NOT_FOUND) {
+            LOG(ERROR) << "Failed to delete bucket metadata slot " << slot
+                       << " for bucket_id=" << bucket_id
+                       << ", error=" << slot_result.error();
+        }
     }
     auto log_result = fs_adapter_->DeleteFile(BucketMetaLogPath(bucket_id));
     if (!log_result && log_result.error() != ErrorCode::FILE_NOT_FOUND) {
@@ -575,9 +604,8 @@ void BucketGlobalAllocator::DeleteBucketFiles(int64_t bucket_id) {
         LOG(ERROR) << "Failed to delete bucket data file for bucket_id="
                    << bucket_id << ", error=" << data_result.error();
     }
-    // Sweep any leftover temp files for this bucket. Their names carry a
-    // per-writer suffix (".meta.tmp.<n>"), so enumerate rather than guessing a
-    // single fixed name. Whatever remains is unpublished by definition.
+    // Sweep obsolete temp files left by the version-2 rename publication
+    // protocol. Version 3 uses stable slots and never creates new temp files.
     const std::string temp_prefix =
         std::string(kBucketFilePrefix) + FormatBucketId(bucket_id) +
         kBucketMetaSuffix + ".tmp.";
@@ -1349,7 +1377,9 @@ std::vector<BatchAllocateResult> BucketGlobalAllocator::BatchAllocate(
         return results;
     }
 
-    MaybeCompact(bucket_id);
+    // Compaction is maintenance work. Keeping it off this path guarantees that
+    // allocation latency is one log append and data sync even when a threshold
+    // is crossed.
     return results;
 }
 
@@ -1403,7 +1433,8 @@ bool BucketGlobalAllocator::MarkCommitted(
         return false;
     }
 
-    MaybeCompact(bucket_id);
+    // The maintenance thread observes the log size and compacts later; PutEnd
+    // must never inherit a full-snapshot rewrite or DFS namespace operation.
     return true;
 }
 
@@ -1452,17 +1483,19 @@ size_t BucketGlobalAllocator::FlushDirtyMetadata() {
     // Which buckets still have records that are queued but not durable. Read
     // before the flush, since the flush is what clears the gap.
     std::vector<std::pair<int64_t, uint64_t>> wanted;
+    std::vector<int64_t> bucket_ids;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        bucket_ids.reserve(buckets_.size());
         for (const auto& [bucket_id, bucket] : buckets_) {
+            bucket_ids.push_back(bucket_id);
             if (bucket->last_queued_seq == 0) continue;
             wanted.emplace_back(bucket_id, bucket->last_queued_seq);
         }
     }
-    if (wanted.empty()) return 0;
 
     std::vector<std::pair<int64_t, uint64_t>> dirty;
-    {
+    if (!wanted.empty()) {
         std::lock_guard<std::mutex> log_lock(log_mutex_);
         for (const auto& [bucket_id, queued_seq] : wanted) {
             auto it = log_synced_seq_.find(bucket_id);
@@ -1471,11 +1504,12 @@ size_t BucketGlobalAllocator::FlushDirtyMetadata() {
             }
             dirty.emplace_back(bucket_id, queued_seq);
         }
-        if (dirty.empty()) return 0;
-        auto drained = DrainPendingLogLogLocked();
-        if (!drained) {
-            LOG(ERROR) << "Failed to flush DFS bucket metadata log, error="
-                       << drained.error();
+        if (!dirty.empty()) {
+            auto drained = DrainPendingLogLogLocked();
+            if (!drained) {
+                LOG(ERROR) << "Failed to flush DFS bucket metadata log, error="
+                           << drained.error();
+            }
         }
     }
 
@@ -1490,11 +1524,10 @@ size_t BucketGlobalAllocator::FlushDirtyMetadata() {
         }
     }
 
-    // Tombstones are exactly what makes a snapshot stale, so this is the right
-    // moment to check whether any bucket has accumulated enough of them (or
-    // enough log bytes) to be worth folding.
-    for (const auto& [bucket_id, queued_seq] : dirty) {
-        (void)queued_seq;
+    // Hot paths may have already synced a log that crossed the threshold. Scan
+    // every bucket here so compaction remains maintenance work rather than being
+    // charged to the Put/Allocate request that happened to cross the limit.
+    for (const int64_t bucket_id : bucket_ids) {
         MaybeCompact(bucket_id);
     }
     return flushed;
@@ -1923,25 +1956,32 @@ tl::expected<void, ErrorCode> BucketGlobalAllocator::RecoverFromDisk() {
     std::vector<int64_t> meta_ids;
     std::vector<int64_t> data_ids;
     std::vector<int64_t> log_ids;
+    std::unordered_map<int64_t, std::vector<std::string>> snapshot_paths;
     for (const auto& name : *files) {
-        // Order matters: ".meta.log" also ends in a valid ".log" and starts
-        // with the ".meta" stem, so it has to be tested before ".meta".
+        // Order matters: slot and log suffixes include the legacy `.meta`
+        // stem, so recognize them before the single-file version-2 snapshot.
         if (auto log_id = ParseBucketFileName(name, kBucketMetaLogSuffix)) {
             log_ids.push_back(*log_id);
+        } else if (name.size() > 2 &&
+                   (name.ends_with(".meta.0") || name.ends_with(".meta.1"))) {
+            const std::string base = name.substr(0, name.size() - 2);
+            if (auto slot_id = ParseBucketFileName(base, kBucketMetaSuffix)) {
+                meta_ids.push_back(*slot_id);
+                snapshot_paths[*slot_id].push_back(fsdir_ + "/" + name);
+            }
         } else if (auto id = ParseBucketFileName(name, kBucketMetaSuffix)) {
             meta_ids.push_back(*id);
+            snapshot_paths[*id].push_back(fsdir_ + "/" + name);
         } else if (auto data_id =
                        ParseBucketFileName(name, kBucketDataSuffix)) {
             data_ids.push_back(*data_id);
         } else if (name.find(".tmp.") != std::string::npos) {
-            // A temp file means a `.meta` publish was interrupted; the live
-            // `.meta` is still the last durable state, so drop the leftover.
-            // Temp names carry a per-writer suffix (".meta.tmp.<n>"), so match
-            // on the marker rather than a fixed trailing extension.
+            // Remove leftovers from the old rename-based publication protocol.
             (void)fs_adapter_->DeleteFile(fsdir_ + "/" + name);
         }
     }
     std::sort(meta_ids.begin(), meta_ids.end());
+    meta_ids.erase(std::unique(meta_ids.begin(), meta_ids.end()), meta_ids.end());
     std::sort(log_ids.begin(), log_ids.end());
 
     int64_t max_seen_id = -1;
@@ -1953,53 +1993,67 @@ tl::expected<void, ErrorCode> BucketGlobalAllocator::RecoverFromDisk() {
 
     for (const int64_t bucket_id : meta_ids) {
         max_seen_id = std::max(max_seen_id, bucket_id);
-        const std::string meta_path = BucketMetaPath(bucket_id);
 
-        auto file_size = fs_adapter_->GetFileSize(meta_path);
-        if (!file_size) {
-            LOG(ERROR) << "Skipping DFS bucket " << bucket_id
-                       << ": cannot stat metadata, error=" << file_size.error();
-            continue;
-        }
-        std::string payload(*file_size, '\0');
-        if (*file_size > 0) {
-            auto read =
-                fs_adapter_->ReadFile(meta_path, payload.data(), payload.size());
-            if (!read || *read != payload.size()) {
-                LOG(ERROR) << "Quarantining DFS bucket " << bucket_id
-                           << ": truncated metadata read";
-                continue;
+        // Select the newest complete, checksummed slot. The legacy single
+        // `.meta` snapshot has epoch zero and is considered only when no newer
+        // version-3 slot is valid.
+        std::optional<PersistedBucketMetadata> selected;
+        const auto paths_it = snapshot_paths.find(bucket_id);
+        if (paths_it != snapshot_paths.end()) {
+            for (const auto& meta_path : paths_it->second) {
+                auto file_size = fs_adapter_->GetFileSize(meta_path);
+                if (!file_size) continue;
+                std::string payload(*file_size, '\0');
+                if (*file_size > 0) {
+                    auto read = fs_adapter_->ReadFile(meta_path, payload.data(),
+                                                      payload.size());
+                    if (!read || *read != payload.size()) continue;
+                }
+
+                PersistedBucketMetadata candidate;
+                bool valid = false;
+                try {
+                    struct_pb::from_pb(candidate, payload);
+                    valid = candidate.version == kBucketMetadataVersion &&
+                            ComputeMetadataChecksum(candidate) ==
+                                candidate.checksum;
+                } catch (...) {
+                    valid = false;
+                }
+
+                if (!valid && meta_path == BucketMetaPath(bucket_id)) {
+                    LegacyPersistedBucketMetadata legacy;
+                    try {
+                        struct_pb::from_pb(legacy, payload);
+                        if (legacy.version == kLegacyBucketMetadataVersion &&
+                            ComputeLegacyMetadataChecksum(legacy) ==
+                                legacy.checksum) {
+                            candidate = UpgradeLegacyMetadata(legacy);
+                            valid = true;
+                        }
+                    } catch (...) {
+                        valid = false;
+                    }
+                }
+
+                if (!valid || candidate.bucket_id != bucket_id) {
+                    LOG(WARNING) << "Ignoring invalid DFS bucket snapshot "
+                                 << meta_path;
+                    continue;
+                }
+                if (!selected || candidate.snapshot_epoch >
+                                     selected->snapshot_epoch) {
+                    selected = std::move(candidate);
+                }
             }
         }
+        if (!selected) {
+            LOG(ERROR) << "Quarantining DFS bucket " << bucket_id
+                       << ": no valid metadata snapshot";
+            continue;
+        }
+        PersistedBucketMetadata snapshot = std::move(*selected);
 
-        PersistedBucketMetadata snapshot;
-        try {
-            struct_pb::from_pb(snapshot, payload);
-        } catch (const std::exception& e) {
-            LOG(ERROR) << "Quarantining DFS bucket " << bucket_id
-                       << ": metadata parse failed, error=" << e.what();
-            continue;
-        } catch (...) {
-            LOG(ERROR) << "Quarantining DFS bucket " << bucket_id
-                       << ": metadata parse failed";
-            continue;
-        }
-
-        if (snapshot.version != kBucketMetadataVersion) {
-            LOG(ERROR) << "Quarantining DFS bucket " << bucket_id
-                       << ": unsupported metadata version " << snapshot.version;
-            continue;
-        }
-        if (ComputeMetadataChecksum(snapshot) != snapshot.checksum) {
-            LOG(ERROR) << "Quarantining DFS bucket " << bucket_id
-                       << ": metadata checksum mismatch";
-            continue;
-        }
-        if (snapshot.bucket_id != bucket_id) {
-            LOG(ERROR) << "Quarantining DFS bucket " << bucket_id
-                       << ": metadata records bucket_id " << snapshot.bucket_id;
-            continue;
-        }
         if (snapshot.alignment != alignment_) {
             LOG(ERROR) << "Quarantining DFS bucket " << bucket_id
                        << ": metadata alignment " << snapshot.alignment
@@ -2193,8 +2247,8 @@ tl::expected<void, ErrorCode> BucketGlobalAllocator::RecoverFromDisk() {
         max_seen_id = std::max(max_seen_id, data_id);
     }
 
-    // A log without a live bucket is unreadable for the same reason: nothing
-    // will ever replay it, since replay is driven by the snapshot.
+    // Snapshot-less logs are unreadable: a snapshot establishes the bucket
+    // capacity/generation on which deltas are replayed.
     for (const int64_t log_id : log_ids) {
         if (buckets_.count(log_id) > 0) continue;
         LOG(WARNING) << "Removing orphaned DFS bucket metadata log for "
