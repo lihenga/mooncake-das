@@ -67,18 +67,40 @@ struct PersistedBucketMetadata {
     uint64_t append_offset = 0;
     // Highest metadata-log sequence number already reflected here.
     uint64_t log_seq = 0;
+    // Monotonically increasing snapshot publication generation. Compaction
+    // writes the inactive `.meta.0`/`.meta.1` slot and recovery chooses the
+    // valid slot with the greatest epoch, so publication never needs rename.
+    uint64_t snapshot_epoch = 0;
     // Set when the bucket has been chosen for eviction and its data file is
     // being deleted. Recovery treats such a bucket as gone rather than live.
     bool evicting = false;
     std::vector<PersistedBucketEntry> entries;
     YLT_REFL(PersistedBucketMetadata, version, checksum, bucket_id,
              bucket_generation, capacity, alignment, append_offset, log_seq,
+             snapshot_epoch, evicting, entries);
+};
+
+struct LegacyPersistedBucketMetadata {
+    uint32_t version = 0;
+    uint32_t checksum = 0;
+    int64_t bucket_id = 0;
+    uint64_t bucket_generation = 0;
+    uint64_t capacity = 0;
+    uint64_t alignment = 0;
+    uint64_t append_offset = 0;
+    uint64_t log_seq = 0;
+    bool evicting = false;
+    std::vector<PersistedBucketEntry> entries;
+    YLT_REFL(LegacyPersistedBucketMetadata, version, checksum, bucket_id,
+             bucket_generation, capacity, alignment, append_offset, log_seq,
              evicting, entries);
 };
 
 // Bump when the layout of PersistedBucketMetadata changes incompatibly.
-// Version 2 pairs the snapshot with an append-only metadata log (`log_seq`).
-inline constexpr uint32_t kBucketMetadataVersion = 2;
+// Version 3 publishes snapshots through alternating stable slots and therefore
+// never needs a metadata rename.
+inline constexpr uint32_t kBucketMetadataVersion = 3;
+inline constexpr uint32_t kLegacyBucketMetadataVersion = 2;
 
 enum class BucketEntryState : int32_t {
     PENDING = 0,
@@ -183,9 +205,13 @@ std::optional<MetaLogRecord> DeserializeMetaLogRecord(std::string_view payload,
  * -------------------
  * Each bucket owns two metadata files:
  *
- *   bucket_NNNNNN.meta      full snapshot, published atomically by compaction
- *                           (write `.meta.tmp.<n>`, fsync, rename, fsync dir)
+ *   bucket_NNNNNN.meta.0    alternating full snapshot slots
+ *   bucket_NNNNNN.meta.1    (the valid slot with the greatest epoch wins)
  *   bucket_NNNNNN.meta.log  append-only deltas produced since that snapshot
+ *
+ * Compaction rewrites the inactive snapshot slot and syncs it before clearing
+ * the log. A torn rewrite leaves the other slot valid, so neither hot paths nor
+ * compaction need rename or temporary metadata files.
  *
  * The hot path - Allocate, BatchAllocate, MarkCommitted, Free - appends one
  * fixed-shape record and fdatasyncs the log. It never rewrites the snapshot and
@@ -365,8 +391,8 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
     /**
      * @brief Fold `bucket_id`'s log back into a fresh `.meta` snapshot.
      *
-     * Publishes the snapshot atomically, then clears the log. `log_mutex_` is
-     * held throughout, so no record can be appended between the snapshot and
+     * Rewrites the inactive stable snapshot slot, then clears the log.
+     * `log_mutex_` is held throughout, so no record can be appended between
      * the truncation; combined with a snapshot `log_seq` of "every sequence
      * number issued so far", everything the truncation discards is covered.
      */
@@ -437,6 +463,9 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
         // bucket is dirty exactly while this exceeds the durable sequence
         // number tracked in `log_synced_seq_`.
         uint64_t last_queued_seq = 0;
+        // Epoch of the newest durable snapshot slot. The next publication uses
+        // epoch + 1 and alternates slots by parity.
+        uint64_t snapshot_epoch = 0;
         // Tombstoned entries, used by the tombstone-ratio compaction trigger.
         uint64_t tombstones = 0;
         std::unordered_map<std::string, BucketEntry> entries;
@@ -448,13 +477,14 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
 
     std::string BucketDataPath(int64_t bucket_id) const;
     std::string BucketMetaPath(int64_t bucket_id) const;
+    std::string BucketMetaSlotPath(int64_t bucket_id, int slot) const;
     std::string BucketMetaLogPath(int64_t bucket_id) const;
 
     // Serializes `bucket` into a PersistedBucketMetadata snapshot covering
     // every sequence number issued so far. Taken under `mutex_`; the file write
     // happens outside it.
-    PersistedBucketMetadata SnapshotLocked(const BucketState& bucket,
-                                           bool evicting) const;
+    PersistedBucketMetadata SnapshotLocked(BucketState& bucket,
+                                           bool evicting);
 
     // Queues one metadata delta for `bucket`, assigning it the next sequence
     // number and returning it. The record reaches disk when the log is flushed.
@@ -462,9 +492,8 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
                                   const std::string& key,
                                   const BucketEntry& entry);
 
-    // Durably replaces the `.meta` file of `snapshot.bucket_id`: writes a
-    // uniquely named temp file, fsyncs it, atomically renames it into place and
-    // fsyncs the directory. Never called with `mutex_` held.
+    // Writes a complete snapshot to one of two stable metadata slots and syncs
+    // it. The previous slot remains the recovery fallback; no rename is used.
     tl::expected<void, ErrorCode> PersistMetadata(
         const PersistedBucketMetadata& snapshot);
 
