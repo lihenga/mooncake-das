@@ -541,12 +541,16 @@ TEST(BucketGlobalAllocatorTest, MetadataIsPersistedOnAllocate) {
     auto desc = alloc.Allocate("persisted", 100);
     ASSERT_TRUE(desc.has_value());
 
-    const std::string meta_path =
+    const std::string meta_base =
         tmp.file("bucket_" + BucketGlobalAllocator::FormatBucketId(0) + ".meta");
-    ASSERT_TRUE(std::filesystem::exists(meta_path));
+    const bool slot0 = std::filesystem::exists(meta_base + ".0");
+    const bool slot1 = std::filesystem::exists(meta_base + ".1");
+    ASSERT_NE(slot0, slot1);
+    const std::string meta_path = meta_base + (slot0 ? ".0" : ".1");
     EXPECT_GT(std::filesystem::file_size(meta_path), 0u);
-    // No temp file may be left behind by the atomic publish.
-    EXPECT_FALSE(std::filesystem::exists(meta_path + ".tmp"));
+    // Stable slots replace the old temp-plus-rename publication protocol.
+    EXPECT_FALSE(std::filesystem::exists(meta_base));
+    EXPECT_FALSE(std::filesystem::exists(meta_base + ".tmp"));
 }
 
 TEST(BucketGlobalAllocatorTest, RecoveryRestoresOnlyCommittedEntries) {
@@ -668,8 +672,9 @@ TEST(BucketGlobalAllocatorTest, RecoveryRejectsCorruptAndTruncatedMetadata) {
             auto desc = alloc.Allocate("k", 100);
             ASSERT_TRUE(desc.has_value());
             ASSERT_TRUE(alloc.MarkCommitted("k", *desc));
-            meta_path = tmp.file(
+            const std::string base = tmp.file(
                 "bucket_" + BucketGlobalAllocator::FormatBucketId(0) + ".meta");
+            meta_path = base + ".0";
         }
         // Flip bytes in the middle of the payload.
         {
@@ -684,6 +689,15 @@ TEST(BucketGlobalAllocatorTest, RecoveryRejectsCorruptAndTruncatedMetadata) {
             }
             ASSERT_EQ(::pwrite(fd, buffer.data(), size, 0),
                       static_cast<ssize_t>(size));
+            ::close(fd);
+        }
+        // Corrupt the other slot as well; this test verifies quarantine when no
+        // valid snapshot remains.
+        {
+            const std::string other = meta_path.substr(0, meta_path.size() - 1) + "1";
+            const int fd = ::open(other.c_str(), O_RDWR);
+            ASSERT_GE(fd, 0);
+            ASSERT_EQ(::ftruncate(fd, 3), 0);
             ::close(fd);
         }
 
@@ -705,10 +719,15 @@ TEST(BucketGlobalAllocatorTest, RecoveryRejectsCorruptAndTruncatedMetadata) {
             auto desc = alloc.Allocate("k", 100);
             ASSERT_TRUE(desc.has_value());
             ASSERT_TRUE(alloc.MarkCommitted("k", *desc));
-            meta_path = tmp.file(
+            const std::string base = tmp.file(
                 "bucket_" + BucketGlobalAllocator::FormatBucketId(0) + ".meta");
+            meta_path = base + (std::filesystem::exists(base + ".0") ? ".0" : ".1");
         }
+        const std::string other =
+            meta_path.substr(0, meta_path.size() - 1) +
+            (meta_path.back() == '0' ? "1" : "0");
         ASSERT_EQ(::truncate(meta_path.c_str(), 3), 0);
+        ASSERT_EQ(::truncate(other.c_str(), 3), 0);
 
         BucketGlobalAllocator recovered;
         ASSERT_TRUE(
@@ -775,31 +794,39 @@ TEST(BucketGlobalAllocatorTest, RecoveryContinuesInterruptedEviction) {
         ASSERT_TRUE(desc.has_value());
         ASSERT_TRUE(alloc.MarkCommitted("k", *desc));
         data_path = desc->file_path;
-        meta_path = tmp.file("bucket_" +
-                             BucketGlobalAllocator::FormatBucketId(0) + ".meta");
+        const std::string base = tmp.file(
+            "bucket_" + BucketGlobalAllocator::FormatBucketId(0) + ".meta");
+        meta_path = base + ".1";
     }
 
     {
-        // Load, set evicting, recompute the checksum, and write it back.
-        const auto size = std::filesystem::file_size(meta_path);
-        std::string payload(size, '\0');
-        const int fd = ::open(meta_path.c_str(), O_RDWR);
-        ASSERT_GE(fd, 0);
-        ASSERT_EQ(::pread(fd, payload.data(), size, 0),
-                  static_cast<ssize_t>(size));
-        PersistedBucketMetadata snapshot;
-        struct_pb::from_pb(snapshot, payload);
-        snapshot.evicting = true;
-        snapshot.checksum = 0;
-        std::string rechecked;
-        struct_pb::to_pb(snapshot, rechecked);
-        snapshot.checksum = Crc32cValue(rechecked.data(), rechecked.size());
-        std::string final_payload;
-        struct_pb::to_pb(snapshot, final_payload);
-        ASSERT_EQ(::ftruncate(fd, 0), 0);
-        ASSERT_EQ(::pwrite(fd, final_payload.data(), final_payload.size(), 0),
-                  static_cast<ssize_t>(final_payload.size()));
-        ::close(fd);
+        // Load, set evicting, recompute the checksum, and write the marker to
+        // both slots. This models a marker publication that has completed a
+        // durable slot write while making either slot independently decisive.
+        for (int slot = 0; slot < 2; ++slot) {
+            const std::string slot_path =
+                tmp.file("bucket_" + BucketGlobalAllocator::FormatBucketId(0) +
+                         ".meta." + std::to_string(slot));
+            const auto size = std::filesystem::file_size(slot_path);
+            std::string payload(size, '\0');
+            const int fd = ::open(slot_path.c_str(), O_RDWR);
+            ASSERT_GE(fd, 0);
+            ASSERT_EQ(::pread(fd, payload.data(), size, 0),
+                      static_cast<ssize_t>(size));
+            PersistedBucketMetadata snapshot;
+            struct_pb::from_pb(snapshot, payload);
+            snapshot.evicting = true;
+            snapshot.checksum = 0;
+            std::string rechecked;
+            struct_pb::to_pb(snapshot, rechecked);
+            snapshot.checksum = Crc32cValue(rechecked.data(), rechecked.size());
+            std::string final_payload;
+            struct_pb::to_pb(snapshot, final_payload);
+            ASSERT_EQ(::ftruncate(fd, 0), 0);
+            ASSERT_EQ(::pwrite(fd, final_payload.data(), final_payload.size(), 0),
+                      static_cast<ssize_t>(final_payload.size()));
+            ::close(fd);
+        }
     }
 
     BucketGlobalAllocator recovered;
@@ -809,6 +836,8 @@ TEST(BucketGlobalAllocatorTest, RecoveryContinuesInterruptedEviction) {
     EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
     EXPECT_FALSE(std::filesystem::exists(data_path));
     EXPECT_FALSE(std::filesystem::exists(meta_path));
+    EXPECT_FALSE(std::filesystem::exists(meta_path.substr(0, meta_path.size() - 1) +
+                                         (meta_path.back() == '0' ? "1" : "0")));
 }
 
 TEST(BucketGlobalAllocatorTest, RecoveryPreservesBucketIdSequence) {
@@ -1409,6 +1438,37 @@ TEST(BucketEntryLayoutTest, DescriptorConstructionIsCentralized) {
 // ---------------------------------------------------------------------------
 // Append-only metadata log: crash replay and concurrent compaction
 // ---------------------------------------------------------------------------
+
+TEST(BucketMetadataLogTest, ThresholdCompactionStaysOffPutHotPath) {
+    TempDir tmp("bucket_log_deferred_compaction");
+    auto config = MakeBucketConfig(tmp.path(), 4 * 1024 * 1024, 8);
+    config.bucket_meta_log_threshold = 1 << 20;
+
+    BucketGlobalAllocator alloc;
+    ASSERT_TRUE(alloc.Init(config));
+
+    // Two records for a large key cross the 1 MiB minimum threshold. Neither
+    // Allocate nor MarkCommitted may compact synchronously: PutEnd must remain
+    // one append plus fdatasync and perform no snapshot namespace operation.
+    const std::string key(600 * 1024, 'k');
+    auto desc = alloc.Allocate(key, 100);
+    ASSERT_TRUE(desc.has_value());
+    ASSERT_TRUE(alloc.MarkCommitted(key, *desc));
+    EXPECT_GE(alloc.GetLogBytes(0), config.bucket_meta_log_threshold);
+
+    const std::string base =
+        tmp.file("bucket_" + BucketGlobalAllocator::FormatBucketId(0) + ".meta");
+    EXPECT_FALSE(std::filesystem::exists(base));
+    EXPECT_NE(std::filesystem::exists(base + ".0"),
+              std::filesystem::exists(base + ".1"));
+
+    // The maintenance call notices an already-durable oversized log, writes the
+    // inactive stable slot, and clears the log without rename.
+    alloc.FlushDirtyMetadata();
+    EXPECT_EQ(alloc.GetLogBytes(0), 0u);
+    EXPECT_TRUE(std::filesystem::exists(base + ".0"));
+    EXPECT_TRUE(std::filesystem::exists(base + ".1"));
+}
 
 TEST(BucketMetadataLogTest, AbruptRestartReplaysCommittedLog) {
     TempDir tmp("bucket_log_replay");
