@@ -2935,9 +2935,19 @@ auto MasterService::PutStartInternal(
                                          now, preallocated_dfs);
     };
 
+    bool retried_dfs_allocation = false;
     for (int attempt = 0; attempt <= kMaxTenantQuotaEvictionRetries;
          ++attempt) {
         auto result = attempt_once();
+        if (!result && result.error() == ErrorCode::NO_AVAILABLE_HANDLE &&
+            config.dfs_replica_num > 0 && bucket_allocator_ != nullptr &&
+            !retried_dfs_allocation) {
+            retried_dfs_allocation = true;
+            if (TryRecoverDfsSpaceAfterAllocationFailure()) {
+                --attempt;
+                continue;
+            }
+        }
         if (result.has_value() ||
             result.error() != ErrorCode::TENANT_QUOTA_EXCEEDED) {
             return result;
@@ -2975,6 +2985,23 @@ MasterService::ReserveDfsSpaceForBatch(
     if (requests.empty()) return reservations;
 
     auto results = dfs_allocator_->BatchAllocate(requests);
+    bool allocation_exhausted = false;
+    for (const auto& result : results) {
+        allocation_exhausted = allocation_exhausted ||
+                               result.error == ErrorCode::NO_AVAILABLE_HANDLE;
+    }
+    if (allocation_exhausted && bucket_allocator_ != nullptr) {
+        bool released_any = false;
+        for (const auto& result : results) {
+            if (!result.success) continue;
+            dfs_allocator_->Free(result.key, result.descriptor);
+            released_any = true;
+        }
+        if (released_any) bucket_allocator_->FlushDirtyMetadata();
+        if (TryRecoverDfsSpaceAfterAllocationFailure()) {
+            results = dfs_allocator_->BatchAllocate(requests);
+        }
+    }
     if (results.size() != requests.size()) {
         LOG(ERROR) << "DFS BatchAllocate returned " << results.size()
                    << " results for " << requests.size() << " requests";
@@ -4893,7 +4920,27 @@ void MasterService::RunDfsEviction() {
 }
 
 void MasterService::RunBucketDfsEviction() {
-    if (bucket_allocator_ == nullptr) return;
+    (void)RunBucketDfsEvictionInternal(/*force_one=*/false);
+}
+
+bool MasterService::TryRecoverDfsSpaceAfterAllocationFailure() {
+    if (bucket_allocator_ == nullptr || !bucket_allocator_->IsEvictionEnabled()) {
+        return false;
+    }
+    const uint64_t used = bucket_allocator_->GetUsedBytes();
+    const uint64_t capacity = bucket_allocator_->GetTotalCapacity();
+    LOG(WARNING) << "DFS bucket allocation exhausted; forcing one validated "
+                    "eviction below the byte watermark, bucket_count="
+                 << bucket_allocator_->GetBucketCount() << ", used_bytes=" << used
+                 << ", total_capacity=" << capacity << ", usage_ratio="
+                 << (capacity == 0 ? 0.0
+                                   : static_cast<double>(used) /
+                                         static_cast<double>(capacity));
+    return RunBucketDfsEvictionInternal(/*force_one=*/true);
+}
+
+bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
+    if (bucket_allocator_ == nullptr) return false;
 
     // Free() defers its metadata write so it never fsyncs under a metadata
     // shard lock. This tick holds no master lock, so it is the right place to
@@ -4904,16 +4951,19 @@ void MasterService::RunBucketDfsEviction() {
     // Buckets already inspected in this cycle. Bounds the scan when every
     // remaining bucket keeps getting rejected.
     std::set<int64_t> attempted;
+    bool evicted = false;
 
     while (true) {
-        auto pending = bucket_allocator_->PrepareEviction();
+        auto pending = force_one
+                           ? bucket_allocator_->PrepareEvictionForAllocationFailure()
+                           : bucket_allocator_->PrepareEviction();
         // Nothing is evictable right now (below watermark, or every bucket is
         // active/frozen).
-        if (pending.bucket_id() < 0) return;
+        if (pending.bucket_id() < 0) return evicted;
         if (!attempted.insert(pending.bucket_id()).second) {
             // The scan wrapped around without making progress.
             bucket_allocator_->AbortEviction(std::move(pending));
-            return;
+            return evicted;
         }
 
         const auto& candidates = pending.Candidates();
@@ -4921,6 +4971,8 @@ void MasterService::RunBucketDfsEviction() {
             // A bucket whose entries are all tombstoned has no replicas for the
             // master to validate, so it can be reclaimed immediately.
             bucket_allocator_->CommitEviction(std::move(pending));
+            evicted = true;
+            if (force_one) return true;
             continue;
         }
 
@@ -5039,7 +5091,10 @@ void MasterService::RunBucketDfsEviction() {
         // Phase 3 (commit storage): the master no longer returns any descriptor
         // into this bucket, so it is now safe to drop the files.
         bucket_allocator_->CommitEviction(std::move(pending));
+        evicted = true;
+        if (force_one) return true;
     }
+    return evicted;
 }
 
 void MasterService::RunShardDfsEviction() {

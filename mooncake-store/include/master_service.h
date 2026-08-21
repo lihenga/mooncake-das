@@ -1567,6 +1567,8 @@ class MasterService {
     // are accepted, so a bucket file is never deleted while the master still
     // hands out a descriptor into it.
     void RunBucketDfsEviction();
+    bool RunBucketDfsEvictionInternal(bool force_one);
+    bool TryRecoverDfsSpaceAfterAllocationFailure();
     // Shard-mode per-key eviction (unchanged behaviour).
     void RunShardDfsEviction();
     // Re-registers DFS replicas recovered from bucket metadata as COMPLETE so
