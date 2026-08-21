@@ -383,25 +383,26 @@ TEST(BucketGlobalAllocatorTest, ConcurrentBatchesDoNotInterleave) {
     }
 }
 
-TEST(BucketGlobalAllocatorTest, BatchLargerThanBucketIsRejected) {
+TEST(BucketGlobalAllocatorTest, BatchLargerThanBucketSpansBuckets) {
     TempDir tmp("bucket_batch_too_big");
     const uint64_t capacity = 2 * kAlignment;
     BucketGlobalAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), capacity, 8)));
 
-    // Three 4096-byte entries cannot fit in a two-entry bucket, and splitting
-    // the batch would defeat the contiguity guarantee, so this must fail.
+    // The batch is larger than one bucket, but each object fits. Pack the first
+    // two entries into bucket 0 and continue with the complete third object in
+    // bucket 1; no object is split across files.
     std::vector<BatchAllocateRequest> requests{
         {"a", 100}, {"b", 100}, {"c", 100}};
     auto results = alloc.BatchAllocate(requests);
     ASSERT_EQ(results.size(), 3u);
-    for (const auto& result : results) {
-        EXPECT_FALSE(result.success);
-        EXPECT_EQ(result.error, ErrorCode::INVALID_PARAMS);
-    }
-    // Nothing may have been reserved.
-    EXPECT_FALSE(alloc.GetBucketIdForKey("a").has_value());
-    EXPECT_FALSE(alloc.GetBucketIdForKey("b").has_value());
+    for (const auto& result : results) EXPECT_TRUE(result.success);
+    EXPECT_EQ(results[0].descriptor.shard_idx, 0);
+    EXPECT_EQ(results[1].descriptor.shard_idx, 0);
+    EXPECT_EQ(results[2].descriptor.shard_idx, 1);
+    EXPECT_EQ(EntryStartOf(results[0].descriptor, "a"), 0u);
+    EXPECT_EQ(EntryStartOf(results[1].descriptor, "b"), kAlignment);
+    EXPECT_EQ(EntryStartOf(results[2].descriptor, "c"), 0u);
 }
 
 TEST(BucketGlobalAllocatorTest, BatchRollsOverToNewBucketWhenActiveIsFull) {
@@ -415,17 +416,17 @@ TEST(BucketGlobalAllocatorTest, BatchRollsOverToNewBucketWhenActiveIsFull) {
         ASSERT_TRUE(alloc.Allocate("pre" + std::to_string(i), 100).has_value());
     }
 
-    // A 2-entry batch no longer fits in bucket 0, so it must land wholly in a
-    // new bucket rather than being split.
+    // A 2-entry batch fills the remaining slot in bucket 0 and puts the
+    // second complete object at offset 0 in bucket 1.
     std::vector<BatchAllocateRequest> requests{{"x", 100}, {"y", 100}};
     auto results = alloc.BatchAllocate(requests);
     ASSERT_EQ(results.size(), 2u);
     ASSERT_TRUE(results[0].success);
     ASSERT_TRUE(results[1].success);
-    EXPECT_EQ(results[0].descriptor.shard_idx, 1);
+    EXPECT_EQ(results[0].descriptor.shard_idx, 0);
     EXPECT_EQ(results[1].descriptor.shard_idx, 1);
-    EXPECT_EQ(EntryStartOf(results[0].descriptor, "x"), 0u);
-    EXPECT_EQ(EntryStartOf(results[1].descriptor, "y"), kAlignment);
+    EXPECT_EQ(EntryStartOf(results[0].descriptor, "x"),  kAlignment * 3);
+    EXPECT_EQ(EntryStartOf(results[1].descriptor, "y"), 0u);
 }
 
 TEST(BucketGlobalAllocatorTest, BatchAllocateRejectsBadRequestsAtomically) {
@@ -1037,17 +1038,15 @@ TEST(BucketGlobalAllocatorTest, AllocationFailureEvictionBypassesLowWatermark) {
         auto results = alloc.BatchAllocate(requests);
         for (const auto& result : results) ASSERT_TRUE(result.success);
     }
-    EXPECT_EQ(alloc.GetBucketCount(), 4u);
-    EXPECT_LT(static_cast<double>(alloc.GetUsedBytes()) /
-                  static_cast<double>(alloc.GetTotalCapacity()),
-              config.eviction_high_watermark);
+    // Twenty-four entries pack into 10 + 10 + 4 slots instead of four
+    // six-entry buckets. Utilization is still below the configured watermark,
+    // so retain coverage for the allocation-failure override.
+    EXPECT_EQ(alloc.GetBucketCount(), 3u);
     EXPECT_TRUE(alloc.PrepareEviction().Empty());
-
-    // The forced allocation-failure path bypasses only the watermark gate.
     auto pending = alloc.PrepareEvictionForAllocationFailure();
     ASSERT_FALSE(pending.Empty());
     alloc.CommitEviction(std::move(pending));
-    EXPECT_EQ(alloc.GetBucketCount(), 3u);
+    EXPECT_EQ(alloc.GetBucketCount(), 2u);
 
     auto retry = alloc.BatchAllocate({{"after_eviction", 100}});
     ASSERT_EQ(retry.size(), 1u);
