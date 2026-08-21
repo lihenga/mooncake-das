@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <set>
 #include <sstream>
 #include <utility>
@@ -1223,15 +1224,15 @@ std::vector<BatchAllocateResult> BucketGlobalAllocator::BatchAllocate(
             result.descriptor = DistributedFSDescriptor{};
         }
     };
-
     if (!initialized_.load(std::memory_order_acquire)) {
         fail_all(ErrorCode::DFS_SERVICE_UNAVAILABLE);
         return results;
     }
 
-    // Validate the whole batch before touching allocator state so a bad
-    // request never leaves a partial reservation behind.
-    uint64_t total_required = 0;
+    // Validate request shape before changing allocator state. A batch may span
+    // buckets, but one object must always fit in one bucket.
+    std::vector<size_t> allocatable;
+    allocatable.reserve(requests.size());
     for (size_t i = 0; i < requests.size(); ++i) {
         const auto& request = requests[i];
         if (request.key.empty() || request.size == 0) {
@@ -1246,140 +1247,143 @@ std::vector<BatchAllocateResult> BucketGlobalAllocator::BatchAllocate(
                 return results;
             }
         }
-        auto layout = ComputeBucketEntryLayout(
-            total_required, request.key.size(), request.size, alignment_);
-        if (!layout) {
+        auto layout = ComputeBucketEntryLayout(0, request.key.size(),
+                                               request.size, alignment_);
+        if (!layout || layout->reserved_size > bucket_capacity_) {
+            LOG(ERROR) << "DFS object for key " << request.key
+                       << " exceeds bucket capacity, object_size="
+                       << request.size << ", reserved_size="
+                       << (layout ? layout->reserved_size : 0)
+                       << ", bucket_capacity=" << bucket_capacity_;
             fail_all(ErrorCode::INVALID_PARAMS);
             return results;
         }
-        total_required = layout->entry_end();
-    }
-
-    if (total_required > bucket_capacity_) {
-        // Keeping a batch contiguous is the point of this API; splitting it
-        // across buckets would silently defeat that, so report the limit.
-        LOG(ERROR) << "DFS batch allocate needs " << total_required
-                   << " bytes which exceeds bucket_capacity="
-                   << bucket_capacity_;
-        fail_all(ErrorCode::INVALID_PARAMS);
-        return results;
+        allocatable.push_back(i);
     }
 
     std::unique_lock<std::mutex> lock(mutex_);
-
-    // A key that already holds a live allocation is rejected individually, not
-    // by failing the batch: BatchPutStart legitimately mixes fresh keys with
-    // ones that already exist, and the caller expects the fresh keys to
-    // succeed while the duplicates come back as OBJECT_ALREADY_EXISTS.
-    std::vector<size_t> allocatable;
-    allocatable.reserve(requests.size());
-    uint64_t cursor = 0;
+    // Existing live keys retain their per-key OBJECT_ALREADY_EXISTS outcome;
+    // the remaining requests are packed in their original order.
+    allocatable.clear();
     for (size_t i = 0; i < requests.size(); ++i) {
-        if (key_index_.count(requests[i].key) > 0) {
+        if (key_index_.count(requests[i].key) != 0) {
             LOG(WARNING) << "DFS batch allocate skipped key " << requests[i].key
                          << ": it already has a live allocation";
-            results[i].success = false;
             results[i].error = ErrorCode::OBJECT_ALREADY_EXISTS;
             continue;
         }
-        auto layout = ComputeBucketEntryLayout(cursor, requests[i].key.size(),
-                                               requests[i].size, alignment_);
-        if (!layout) {
-            results[i].success = false;
-            results[i].error = ErrorCode::INVALID_PARAMS;
-            continue;
-        }
-        cursor = layout->entry_end();
         allocatable.push_back(i);
     }
     if (allocatable.empty()) return results;
-    // Only the surviving keys need contiguous space.
-    total_required = cursor;
 
-    // Fails only the keys we actually tried to reserve, leaving the per-key
-    // rejections recorded above (e.g. OBJECT_ALREADY_EXISTS) intact.
-    auto fail_allocatable = [&results, &allocatable](ErrorCode error) {
+    struct Reservation {
+        size_t request_index = 0;
+        int64_t bucket_id = -1;
+        uint64_t generation = 0;
+        uint64_t seq = 0;
+    };
+    std::vector<Reservation> reserved;
+    reserved.reserve(allocatable.size());
+
+    auto fail_allocatable = [&]() {
         for (const size_t index : allocatable) {
             results[index].success = false;
-            results[index].error = error;
             results[index].descriptor = DistributedFSDescriptor{};
+            if (results[index].error == ErrorCode::OK) {
+                results[index].error = ErrorCode::NO_AVAILABLE_HANDLE;
+            }
         }
     };
 
-    auto bucket_result = EnsureActiveBucket(lock, total_required);
-    if (!bucket_result) {
-        fail_allocatable(bucket_result.error());
-        return results;
-    }
-    auto bucket = bucket_result.value();
-
-    // Re-check under the (possibly re-acquired) lock: EnsureActiveBucket may
-    // have released it to create a bucket, letting another batch in first.
-    auto entry_start = CheckedAlignUp(bucket->append_offset, alignment_);
-    if (bucket->frozen || !entry_start || *entry_start > bucket->capacity ||
-        total_required > bucket->capacity - *entry_start) {
-        fail_allocatable(ErrorCode::NO_AVAILABLE_HANDLE);
-        return results;
-    }
-
-    std::vector<size_t> reserved_indexes;
-    reserved_indexes.reserve(allocatable.size());
-    uint64_t highest_seq = 0;
-    for (const size_t i : allocatable) {
-        uint64_t seq = 0;
-        auto descriptor = ReserveInBucketLocked(*bucket, requests[i].key,
-                                                requests[i].size, &seq);
-        if (!descriptor) {
-            // Unwind in reverse so each rollback releases the tail of the
-            // append region and the bucket returns to its prior offset.
-            for (auto it = reserved_indexes.rbegin();
-                 it != reserved_indexes.rend(); ++it) {
-                UnreserveInBucketLocked(*bucket, requests[*it].key,
-                                        results[*it].descriptor);
-                results[*it].descriptor = DistributedFSDescriptor{};
-                results[*it].success = false;
-            }
-            fail_allocatable(descriptor.error());
-            return results;
+    // Append-pack in request order. EnsureActiveBucket receives only the
+    // current object's reserved size, so a partially filled active bucket is
+    // used before a new bucket is created. A bucket boundary can therefore
+    // occur only between two objects, never inside one object.
+    for (const size_t index : allocatable) {
+        const auto& request = requests[index];
+        auto object_layout = ComputeBucketEntryLayout(
+            0, request.key.size(), request.size, alignment_);
+        if (!object_layout) {
+            fail_allocatable();
+            break;
         }
-        results[i].descriptor = std::move(descriptor.value());
-        results[i].success = true;
-        results[i].error = ErrorCode::OK;
-        reserved_indexes.push_back(i);
-        highest_seq = std::max(highest_seq, seq);
+        auto bucket_result = EnsureActiveBucket(lock,
+                                                object_layout->reserved_size);
+        if (!bucket_result) {
+            fail_allocatable();
+            results[index].error = bucket_result.error();
+            break;
+        }
+        auto bucket = bucket_result.value();
+        uint64_t seq = 0;
+        auto descriptor = ReserveInBucketLocked(*bucket, request.key,
+                                                 request.size, &seq);
+        if (!descriptor) {
+            fail_allocatable();
+            results[index].error = descriptor.error();
+            break;
+        }
+        results[index].descriptor = std::move(descriptor.value());
+        results[index].success = true;
+        results[index].error = ErrorCode::OK;
+        reserved.push_back({index, bucket->bucket_id, bucket->generation, seq});
+        TouchLruLocked(bucket->bucket_id, NowNs());
     }
 
-    const int64_t bucket_id = bucket->bucket_id;
-    const uint64_t generation = bucket->generation;
-    TouchLruLocked(bucket_id, NowNs());
-    lock.unlock();
-
-    // Make the reservations durable as PENDING with one append plus one
-    // fdatasync - no snapshot rewrite, no rename. A crash here loses at most
-    // PENDING entries, which recovery discards; committed data is unaffected.
-    auto synced = SyncLogUpTo(bucket_id, highest_seq);
-    if (!synced) {
-        LOG(ERROR) << "Failed to persist DFS bucket metadata log after batch "
-                      "allocate, bucket_id="
-                   << bucket_id << ", error=" << synced.error();
-        lock.lock();
-        auto bucket_it = buckets_.find(bucket_id);
-        if (bucket_it != buckets_.end() &&
-            bucket_it->second->generation == generation) {
-            for (auto it = reserved_indexes.rbegin();
-                 it != reserved_indexes.rend(); ++it) {
-                UnreserveInBucketLocked(*bucket_it->second, requests[*it].key,
-                                        results[*it].descriptor);
+    if (reserved.size() != allocatable.size()) {
+        // Roll back in reverse reservation order, across every bucket touched
+        // by this batch. Tombstone records make already-durable ADD_PENDING
+        // records safe to replay on restart.
+        for (auto it = reserved.rbegin(); it != reserved.rend(); ++it) {
+            auto bucket_it = buckets_.find(it->bucket_id);
+            if (bucket_it != buckets_.end() &&
+                bucket_it->second->generation == it->generation) {
+                UnreserveInBucketLocked(*bucket_it->second,
+                                        requests[it->request_index].key,
+                                        results[it->request_index].descriptor);
             }
         }
         lock.unlock();
-        fail_allocatable(synced.error());
+        fail_allocatable();
         return results;
     }
 
-    // Compaction is maintenance work. Keeping it off this path guarantees that
-    // allocation latency is one log append and data sync even when a threshold
-    // is crossed.
+    // The batch may touch multiple metadata logs. Every ADD_PENDING record in
+    // every touched bucket must be fdatasync'd before the reservation is
+    // exposed to the master.
+    std::map<int64_t, std::pair<uint64_t, uint64_t>> bucket_sequences;
+    for (const auto& item : reserved) {
+        auto& state = bucket_sequences[item.bucket_id];
+        state.first = item.generation;
+        state.second = std::max(state.second, item.seq);
+    }
+    lock.unlock();
+
+    for (const auto& [bucket_id, sequence] : bucket_sequences) {
+        auto synced = SyncLogUpTo(bucket_id, sequence.second);
+        if (synced) continue;
+
+        LOG(ERROR) << "Failed to persist DFS metadata for multi-bucket batch, "
+                   << "bucket_id=" << bucket_id << ", error=" << synced.error();
+        lock.lock();
+        for (auto it = reserved.rbegin(); it != reserved.rend(); ++it) {
+            auto bucket_it = buckets_.find(it->bucket_id);
+            if (bucket_it != buckets_.end() &&
+                bucket_it->second->generation == it->generation) {
+                UnreserveInBucketLocked(*bucket_it->second,
+                                        requests[it->request_index].key,
+                                        results[it->request_index].descriptor);
+            }
+        }
+        lock.unlock();
+        // Flush the compensating tombstones. If this second flush fails, the
+        // tombstones remain queued and maintenance will retry them; recovery
+        // still never exposes PENDING entries as committed objects.
+        (void)FlushLog();
+        fail_allocatable();
+        return results;
+    }
+
     return results;
 }
 
