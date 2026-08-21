@@ -91,6 +91,11 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     shm_helper.cpp
     file_storage.cpp
     config/file_storage_config.cpp
+    serialize/serializer.cpp
+    storage/distributed/dfs_global_allocator.cpp
+    storage/distributed/bucket_global_allocator.cpp
+    storage/distributed/distributed_storage_backend.cpp
+    storage/distributed/posix_fs_adapter.cpp
     device/accelerator_device.cpp
     device/accelerator_registry.cpp
     device/runtime_accelerator.cpp

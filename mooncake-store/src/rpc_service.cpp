@@ -488,12 +488,11 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
             }
         }
     } else {
-        for (size_t i = 0; i < keys.size(); ++i) {
-            auto key_config = config.ForSingleKey(i);
-            results.emplace_back(master_service_.PutStart(
-                client_id, keys[i], resolved_tenant_id.value(),
-                slice_lengths[i], key_config));
-        }
+        // Go through MasterService::BatchPutStart so DFS space for the whole
+        // batch is reserved in one allocator call, keeping the batch's entries
+        // contiguous instead of interleaved with other clients' batches.
+        results = master_service_.BatchPutStart(
+            client_id, keys, resolved_tenant_id.value(), slice_lengths, config);
     }
 
     size_t failure_count = 0;
