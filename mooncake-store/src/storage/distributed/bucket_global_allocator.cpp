@@ -1597,6 +1597,16 @@ BucketGlobalAllocator::TakeRecoveredReplicas() {
 
 BucketGlobalAllocator::PendingEviction
 BucketGlobalAllocator::PrepareEviction() {
+    return PrepareEvictionInternal(/*force_one=*/false);
+}
+
+BucketGlobalAllocator::PendingEviction
+BucketGlobalAllocator::PrepareEvictionForAllocationFailure() {
+    return PrepareEvictionInternal(/*force_one=*/true);
+}
+
+BucketGlobalAllocator::PendingEviction
+BucketGlobalAllocator::PrepareEvictionInternal(bool force_one) {
     PendingEviction pending;
     if (!initialized_.load(std::memory_order_acquire)) return pending;
 
@@ -1611,13 +1621,15 @@ BucketGlobalAllocator::PrepareEviction() {
 
         const double usage = static_cast<double>(UsedBytesLocked()) /
                              static_cast<double>(capacity);
-        if (usage >= eviction_high_watermark_) {
-            eviction_active_ = true;
-        }
-        if (!eviction_active_) return pending;
-        if (usage < eviction_low_watermark_) {
-            eviction_active_ = false;
-            return pending;
+        if (!force_one) {
+            if (usage >= eviction_high_watermark_) {
+                eviction_active_ = true;
+            }
+            if (!eviction_active_) return pending;
+            if (usage < eviction_low_watermark_) {
+                eviction_active_ = false;
+                return pending;
+            }
         }
 
         // Walk the LRU from the cold end and take the first bucket that is

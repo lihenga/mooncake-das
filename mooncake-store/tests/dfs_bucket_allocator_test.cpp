@@ -1016,6 +1016,44 @@ TEST(BucketGlobalAllocatorTest, CommitAndAbortEvictionAreIdempotent) {
     EXPECT_EQ(alloc.GetBucketCount(), 2u);
 }
 
+TEST(BucketGlobalAllocatorTest, AllocationFailureEvictionBypassesLowWatermark) {
+    TempDir tmp("bucket_evict_allocation_failure");
+    constexpr uint64_t capacity = 10 * kAlignment;
+    BucketGlobalAllocator alloc;
+    auto config = MakeEvictionConfig(tmp.path(), capacity, 4);
+    config.eviction_high_watermark = 0.9;
+    config.eviction_low_watermark = 0.7;
+    ASSERT_TRUE(alloc.Init(config));
+
+    // Each batch consumes six aligned entries, so four buckets fill only 60%
+    // of the fixed denominator and the ordinary watermark scan is empty.
+    for (int batch = 0; batch < 4; ++batch) {
+        std::vector<BatchAllocateRequest> requests;
+        for (int i = 0; i < 6; ++i) {
+            requests.push_back({"key_" + std::to_string(batch) + "_" +
+                                    std::to_string(i),
+                                100});
+        }
+        auto results = alloc.BatchAllocate(requests);
+        for (const auto& result : results) ASSERT_TRUE(result.success);
+    }
+    EXPECT_EQ(alloc.GetBucketCount(), 4u);
+    EXPECT_LT(static_cast<double>(alloc.GetUsedBytes()) /
+                  static_cast<double>(alloc.GetTotalCapacity()),
+              config.eviction_high_watermark);
+    EXPECT_TRUE(alloc.PrepareEviction().Empty());
+
+    // The forced allocation-failure path bypasses only the watermark gate.
+    auto pending = alloc.PrepareEvictionForAllocationFailure();
+    ASSERT_FALSE(pending.Empty());
+    alloc.CommitEviction(std::move(pending));
+    EXPECT_EQ(alloc.GetBucketCount(), 3u);
+
+    auto retry = alloc.BatchAllocate({{"after_eviction", 100}});
+    ASSERT_EQ(retry.size(), 1u);
+    EXPECT_TRUE(retry[0].success);
+}
+
 TEST(BucketGlobalAllocatorTest, EvictionCandidatesExcludeFreedKeys) {
     TempDir tmp("bucket_evict_freed");
     const uint64_t capacity = 2 * kAlignment;

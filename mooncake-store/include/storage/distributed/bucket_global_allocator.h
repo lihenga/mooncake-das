@@ -351,6 +351,15 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
     PendingEviction PrepareEviction();
 
     /**
+     * @brief Prepare one cold bucket regardless of byte watermarks.
+     *
+     * Used only after allocation reports that the bucket-count limit has been
+     * reached. It allows the master to reclaim one bucket and retry without
+     * turning low-utilization bucket tails into a permanent allocation deadlock.
+     */
+    PendingEviction PrepareEvictionForAllocationFailure();
+
+    /**
      * @brief Accept the eviction: drop the bucket and delete its files.
      * Must only be called once the master has removed every candidate replica.
      */
@@ -429,6 +438,11 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
 
    private:
     friend class PendingEviction;
+
+    // Shared implementation for watermark-driven and allocation-failure-driven
+    // eviction. The latter bypasses only the watermark gate and still observes
+    // active/frozen state plus the master's full validation protocol.
+    PendingEviction PrepareEvictionInternal(bool force_one);
 
     // Shared implementation of AbortEviction. `demote` distinguishes an
     // explicit master rejection (return the bucket at the warm end so the scan
