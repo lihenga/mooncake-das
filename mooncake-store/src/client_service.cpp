@@ -3299,7 +3299,12 @@ Client::StartBatchPutForSizes(const std::vector<std::string>& keys,
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchPutEnd(
     const std::vector<ObjectMeta>& object_metas, ReplicaType replica_type) {
-    return master_client_.BatchPutEnd(object_metas, replica_type);
+    std::vector<std::string> keys;
+    keys.reserve(object_metas.size());
+    for (const auto& object_meta : object_metas) {
+        keys.push_back(object_meta.key);
+    }
+    return master_client_.BatchPutEnd(keys, replica_type);
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchPutRevoke(
