@@ -3644,7 +3644,7 @@ RealClient::get_into_ranges_internal(
 
                 range_results[k] = execute_ranged_read(
                     keys[j], buffers[i], dst_offset, src_offsets[k], sizes[k],
-                    metadata, false, false);
+                    metadata, false);
             }
         }
     }
