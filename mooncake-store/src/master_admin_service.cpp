@@ -959,6 +959,16 @@ struct HttpLocalDiskReplicaInfo {
              transport_endpoint);
 };
 
+struct HttpDfsReplicaInfo {
+    std::string file_path;
+    uint64_t offset = 0;
+    uint64_t object_size = 0;
+    uint64_t aligned_size = 0;
+    int shard_idx = 0;
+    YLT_REFL(HttpDfsReplicaInfo, file_path, offset, object_size, aligned_size,
+             shard_idx);
+};
+
 struct HttpBatchQueryKeyResult {
     bool ok{false};
     std::optional<std::string> error;
@@ -966,9 +976,10 @@ struct HttpBatchQueryKeyResult {
     std::optional<std::vector<HttpDiskReplicaInfo>> disk_values;
     std::optional<std::vector<HttpLocalDiskReplicaInfo>> local_disk_values;
     std::optional<std::vector<AllocatedBuffer::Descriptor>> nof_values;
+    std::optional<std::vector<HttpDfsReplicaInfo>> dfs_values;
 };
 YLT_REFL(HttpBatchQueryKeyResult, ok, error, values, disk_values,
-         local_disk_values, nof_values);
+         local_disk_values, nof_values, dfs_values);
 
 struct HttpBatchQueryKeysResponse {
     bool success{false};
@@ -1042,6 +1053,17 @@ void MasterAdminServer::HandleBatchQueryKeys(
                     }
                     item.nof_values->emplace_back(
                         replica.get_nof_descriptor().buffer_descriptor);
+                } else if (replica.is_dfs_replica()) {
+                    if (!item.dfs_values.has_value()) {
+                        item.dfs_values = std::vector<HttpDfsReplicaInfo>{};
+                    }
+                    auto& d = replica.get_dfs_descriptor();
+                    item.dfs_values->emplace_back(
+                        HttpDfsReplicaInfo{d.file_path,
+                                           d.offset,
+                                           d.object_size,
+                                           d.aligned_size,
+                                           d.shard_idx});
                 }
             }
             payload.data.emplace(keys[i], std::move(item));
