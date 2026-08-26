@@ -5000,9 +5000,9 @@ std::vector<int> RealClient::batch_get_session_start(
         }
 
         const auto *replica =
-            SelectCompleteMemoryReplica(query_result.replicas, local_endpoints);
+            SelectBestReplica(query_result.replicas, local_endpoints);
         if (!replica) {
-            LOG(ERROR) << "No complete memory replica for key: " << keys[i];
+            LOG(ERROR) << "No usable replica for key: " << keys[i];
             results[i] = static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
             get_sessions_.erase(keys[i]);
             continue;
@@ -5016,6 +5016,54 @@ std::vector<int> RealClient::batch_get_session_start(
     }
     return results;
 }
+
+namespace {
+
+struct NonMemReadEntry {
+    std::string key;
+    size_t original_idx;
+    Replica::Descriptor replica;
+    QueryResult query_result;
+    std::vector<void *> buffers;
+    std::vector<size_t> sizes;
+    std::vector<size_t> src_offsets;
+    std::chrono::steady_clock::time_point lease_deadline;
+};
+
+inline void scatter_non_mem_result(
+    const NonMemReadEntry &entry,
+    const void *tmp_base,
+    std::vector<int> &results,
+    std::mutex &session_mutex,
+    std::unordered_map<std::string, QueryResult> &sessions) {
+    for (size_t j = 0; j < entry.buffers.size(); ++j) {
+        const void *src =
+            static_cast<const char *>(tmp_base) + entry.src_offsets[j];
+        if (auto r = scatter_host_to_maybe_device(
+                entry.buffers[j], src, entry.sizes[j],
+                "session non-mem range read, key: " + entry.key);
+            !r) {
+            results[entry.original_idx] =
+                static_cast<int>(toInt(r.error()));
+            return;
+        }
+    }
+    auto now = std::chrono::steady_clock::now();
+    if (now >= entry.lease_deadline) {
+        results[entry.original_idx] =
+            static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+        std::lock_guard<std::mutex> lock(session_mutex);
+        sessions.erase(entry.key);
+    } else {
+        size_t transferred = 0;
+        for (size_t j = 0; j < entry.sizes.size(); ++j) {
+            transferred += entry.sizes[j];
+        }
+        results[entry.original_idx] = static_cast<int>(transferred);
+    }
+}
+
+}  // anonymous namespace
 
 std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     const std::vector<std::string> &keys,
@@ -5040,6 +5088,9 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     std::vector<size_t> idx_map;  // batch entry -> original key index
     std::vector<std::chrono::steady_clock::time_point> lease_deadlines;
 
+    // Non-memory replicas: handled via temp buffer + scatter fallback.
+    std::vector<NonMemReadEntry> non_mem_entries;
+
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
         auto now = std::chrono::steady_clock::now();
@@ -5060,66 +5111,122 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
                 results[i] = static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
                 continue;
             }
-            // start cached a single complete memory replica via
-            // FilterQueryResult.
+            // start cached a single replica via FilterQueryResult.
             const auto &replica = it->second.replicas.front();
-            const size_t replica_limit =
-                replica.is_memory_replica()
-                    ? replica.get_memory_descriptor().buffer_descriptor.size_
-                    : 0;
-            bool overflow = false;
-            std::vector<Slice> entry_slices;
-            std::vector<uint64_t> entry_offsets;
-            entry_slices.reserve(buffers.size());
-            entry_offsets.reserve(buffers.size());
-            for (size_t j = 0; j < buffers.size(); ++j) {
-                if (replica_limit == 0 ||
-                    is_object_range_overflow(offsets[j], sizes[j],
-                                             replica_limit)) {
-                    overflow = true;
-                    break;
+
+            // Reset initial INVALID_PARAMS; will be set to actual
+            // transferred bytes or error during read/scatter phase.
+            results[i] = 0;
+            if (replica.is_memory_replica()) {
+                // Fast path: memory replicas use BatchTransferReadRanges.
+                const size_t replica_limit =
+                    replica.get_memory_descriptor().buffer_descriptor.size_;
+                bool overflow = false;
+                std::vector<Slice> entry_slices;
+                std::vector<uint64_t> entry_offsets;
+                entry_slices.reserve(buffers.size());
+                entry_offsets.reserve(buffers.size());
+                for (size_t j = 0; j < buffers.size(); ++j) {
+                    if (is_object_range_overflow(offsets[j], sizes[j],
+                                                 replica_limit)) {
+                        overflow = true;
+                        break;
+                    }
+                    entry_slices.emplace_back(Slice{buffers[j], sizes[j]});
+                    entry_offsets.push_back(
+                        static_cast<uint64_t>(offsets[j]));
                 }
-                entry_slices.emplace_back(Slice{buffers[j], sizes[j]});
-                entry_offsets.push_back(static_cast<uint64_t>(offsets[j]));
-            }
-            if (overflow) {
-                results[i] = static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
-                continue;
-            }
-            replicas.push_back(replica);
-            slices.push_back(std::move(entry_slices));
-            src_offsets.push_back(std::move(entry_offsets));
-            idx_map.push_back(i);
-            lease_deadlines.push_back(it->second.lease_timeout);
-        }
-    }
-
-    if (replicas.empty()) {
-        return results;
-    }
-
-    auto transfer =
-        client_->BatchTransferReadRanges(replicas, slices, src_offsets);
-
-    // Merge results; drop sessions whose lease expired during the wait.
-    {
-        std::lock_guard<std::mutex> lock(session_mutex_);
-        const auto now = std::chrono::steady_clock::now();
-        for (size_t k = 0; k < transfer.size(); ++k) {
-            const size_t i = idx_map[k];
-            if (transfer[k]) {
-                if (now >= lease_deadlines[k]) {
+                if (overflow) {
                     results[i] =
-                        static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
-                    get_sessions_.erase(keys[i]);
-                } else {
-                    results[i] = static_cast<int>(transfer[k].value());
+                        static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+                    continue;
                 }
+                replicas.push_back(replica);
+                slices.push_back(std::move(entry_slices));
+                src_offsets.push_back(std::move(entry_offsets));
+                idx_map.push_back(i);
+                lease_deadlines.push_back(it->second.lease_timeout);
             } else {
-                results[i] = static_cast<int>(toInt(transfer[k].error()));
+                // Non-memory replica: validate ranges, collect for fallback.
+                const uint64_t total_size =
+                    calculate_total_size(replica);
+                bool overflow = false;
+                for (size_t j = 0; j < buffers.size(); ++j) {
+                    if (is_object_range_overflow(offsets[j], sizes[j],
+                                                 total_size)) {
+                        overflow = true;
+                        break;
+                    }
+                }
+                if (overflow) {
+                    results[i] =
+                        static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+                    continue;
+                }
+                non_mem_entries.push_back(NonMemReadEntry{
+                    keys[i], i, replica, it->second,
+                    std::vector<void *>(buffers.begin(), buffers.end()),
+                    std::vector<size_t>(sizes.begin(), sizes.end()),
+                    std::vector<size_t>(offsets.begin(), offsets.end()),
+                    it->second.lease_timeout});
             }
         }
     }
+
+    // 1. Memory replicas: fast scatter path via BatchTransferReadRanges.
+    if (!replicas.empty()) {
+        auto transfer =
+            client_->BatchTransferReadRanges(replicas, slices, src_offsets);
+
+        // Merge results; drop sessions whose lease expired during the wait.
+        {
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            const auto now = std::chrono::steady_clock::now();
+            for (size_t k = 0; k < transfer.size(); ++k) {
+                const size_t i = idx_map[k];
+                if (transfer[k]) {
+                    if (now >= lease_deadlines[k]) {
+                        results[i] =
+                            static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+                        get_sessions_.erase(keys[i]);
+                    } else {
+                        results[i] =
+                            static_cast<int>(transfer[k].value());
+                    }
+                } else {
+                    results[i] =
+                        static_cast<int>(toInt(transfer[k].error()));
+                }
+            }
+        }
+    }
+
+    // 2. Non-memory replicas: batch by endpoint/type, temp buffer + scatter.
+    // Group LOCAL_DISK entries by endpoint for batch RPC.
+    std::unordered_map<std::string,
+        std::vector<NonMemReadEntry *>> local_disk_by_endpoint;
+    std::vector<NonMemReadEntry *> disk_dfs_entries;
+
+    for (auto &entry : non_mem_entries) {
+        const auto &replica = entry.replica;
+        if (replica.is_local_disk_replica()) {
+            const auto &endpoint =
+                replica.get_local_disk_descriptor().transport_endpoint;
+            local_disk_by_endpoint[endpoint].push_back(&entry);
+        } else {
+            // DISK or DFS
+            disk_dfs_entries.push_back(&entry);
+        }
+    }
+
+    process_session_local_disk_reads(
+        local_disk_by_endpoint, results);
+
+    // DISK/DFS: batch via client_->BatchGet.
+    if (!disk_dfs_entries.empty()) {
+        process_session_disk_dfs_reads(disk_dfs_entries, results);
+    }
+
     return results;
 }
 
@@ -5129,6 +5236,150 @@ int RealClient::batch_get_session_end(const std::vector<std::string> &keys) {
         get_sessions_.erase(key);
     }
     return 0;
+}
+
+void RealClient::process_session_local_disk_reads(
+    const std::unordered_map<std::string,
+        std::vector<NonMemReadEntry *>> &local_disk_by_endpoint,
+    std::vector<int> &results) {
+    for (auto &[endpoint, ep_entries] : local_disk_by_endpoint) {
+        std::unordered_map<std::string, std::vector<Slice>> objects;
+        std::unordered_map<std::string,
+            std::unique_ptr<BufferHandle>> temp_handles;
+
+        for (auto *entry_ptr : ep_entries) {
+            auto &entry = *entry_ptr;
+            const uint64_t total_size =
+                calculate_total_size(entry.replica);
+
+            if (!client_buffer_allocator_) {
+                LOG(ERROR) << "Client buffer allocator not provided, "
+                           << "key: " << entry.key;
+                results[entry.original_idx] =
+                    static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+                continue;
+            }
+            auto alloc_result =
+                client_buffer_allocator_->allocate(total_size);
+            if (!alloc_result) {
+                LOG(ERROR)
+                    << "Failed to allocate temp buffer for LOCAL_DISK"
+                    << " read, key: " << entry.key
+                    << ", size: " << total_size;
+                results[entry.original_idx] =
+                    static_cast<int>(
+                        toInt(ErrorCode::NO_AVAILABLE_HANDLE));
+                continue;
+            }
+            auto handle =
+                std::make_unique<BufferHandle>(
+                    std::move(*alloc_result));
+            std::vector<Slice> tmp_slices;
+            tmp_slices.emplace_back(
+                Slice{handle->ptr(), total_size});
+            objects.emplace(entry.key, std::move(tmp_slices));
+            temp_handles.emplace(entry.key, std::move(handle));
+        }
+
+        if (objects.empty()) continue;
+
+        auto read_result =
+            batch_get_into_offload_object_internal(
+                endpoint, objects);
+
+        for (auto *entry_ptr : ep_entries) {
+            auto &entry = *entry_ptr;
+            if (results[entry.original_idx] != 0) continue;
+            if (!read_result) {
+                LOG(ERROR) << "LOCAL_DISK read failed for key: "
+                           << entry.key << " error: "
+                           << toString(read_result.error());
+                results[entry.original_idx] =
+                    static_cast<int>(
+                        toInt(read_result.error()));
+                continue;
+            }
+            auto handle_it =
+                temp_handles.find(entry.key);
+            if (handle_it == temp_handles.end()) continue;
+
+            scatter_non_mem_result(
+                *entry, handle_it->second->ptr(),
+                results, session_mutex_, get_sessions_);
+        }
+    }
+}
+
+void RealClient::process_session_disk_dfs_reads(
+    const std::vector<NonMemReadEntry *> &entries,
+    std::vector<int> &results) {
+    std::vector<std::string> disk_batch_keys;
+    std::vector<QueryResult> disk_batch_qrs;
+    std::unordered_map<std::string,
+        std::vector<Slice>> disk_batch_slices;
+    std::unordered_map<std::string,
+        std::unique_ptr<BufferHandle>> disk_temp_handles;
+    std::vector<NonMemReadEntry *> disk_batch_entry_ptrs;
+
+    for (auto *entry_ptr : entries) {
+        auto &entry = *entry_ptr;
+        const uint64_t total_size =
+            calculate_total_size(entry.replica);
+
+        if (!client_buffer_allocator_) {
+            LOG(ERROR) << "Client buffer allocator not provided, "
+                       << "key: " << entry.key;
+            results[entry.original_idx] =
+                static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+        auto alloc_result =
+            client_buffer_allocator_->allocate(total_size);
+        if (!alloc_result) {
+            LOG(ERROR) << "Failed to allocate temp buffer for DISK/DFS"
+                       << " read, key: " << entry.key
+                       << ", size: " << total_size;
+            results[entry.original_idx] =
+                static_cast<int>(
+                    toInt(ErrorCode::NO_AVAILABLE_HANDLE));
+            continue;
+        }
+        auto handle =
+            std::make_unique<BufferHandle>(std::move(*alloc_result));
+        std::vector<Slice> disk_slices;
+        allocateSlices(disk_slices, entry.replica, handle->ptr());
+
+        disk_batch_keys.push_back(entry.key);
+        disk_batch_qrs.push_back(
+            FilterQueryResult(entry.query_result, entry.replica));
+        disk_batch_slices[entry.key] = std::move(disk_slices);
+        disk_temp_handles.emplace(entry.key, std::move(handle));
+        disk_batch_entry_ptrs.push_back(entry_ptr);
+    }
+
+    if (!disk_batch_keys.empty()) {
+        auto disk_results = client_->BatchGet(
+            disk_batch_keys, disk_batch_qrs, disk_batch_slices);
+
+        for (size_t di = 0;
+             di < disk_batch_entry_ptrs.size(); ++di) {
+            auto &entry = *disk_batch_entry_ptrs[di];
+            if (results[entry.original_idx] != 0) continue;
+            if (!disk_results[di]) {
+                results[entry.original_idx] =
+                    static_cast<int>(
+                        toInt(disk_results[di].error()));
+                continue;
+            }
+            auto handle_it =
+                disk_temp_handles.find(entry.key);
+            if (handle_it == disk_temp_handles.end()) continue;
+
+            scatter_non_mem_result(
+                entry, handle_it->second->ptr(),
+                results, session_mutex_, get_sessions_);
+        }
+    }
 }
 
 std::vector<int> RealClient::batch_put_session_start(

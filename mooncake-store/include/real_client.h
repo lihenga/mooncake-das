@@ -75,6 +75,7 @@ class ResourceTracker {
 
 class RealClient : public PyClient {
    public:
+   public:
     RealClient();
     ~RealClient();
 
@@ -255,6 +256,15 @@ class RealClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_src_offsets) override;
 
     int batch_get_session_end(const std::vector<std::string> &keys) override;
+
+    void process_session_local_disk_reads(
+        const std::unordered_map<std::string,
+            std::vector<NonMemReadEntry *>> &local_disk_by_endpoint,
+        std::vector<int> &results);
+
+    void process_session_disk_dfs_reads(
+        const std::vector<NonMemReadEntry *> &entries,
+        std::vector<int> &results);
 
     std::vector<int> batch_put_session_start(
         const std::vector<std::string> &keys, const std::vector<size_t> &sizes,
