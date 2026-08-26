@@ -224,6 +224,18 @@ struct HttpTenantQuotaPolicyRequest {
 };
 YLT_REFL(HttpTenantQuotaPolicyRequest, requested_quota_bytes);
 
+struct HttpDfsMaxBucketCountRequest {
+    int64_t max_bucket_count{0};
+};
+YLT_REFL(HttpDfsMaxBucketCountRequest, max_bucket_count);
+
+struct HttpDfsMaxBucketCountResponse {
+    bool success{true};
+    int64_t old_value{0};
+    int64_t new_value{0};
+};
+YLT_REFL(HttpDfsMaxBucketCountResponse, success, old_value, new_value);
+
 tl::expected<std::string, ErrorCode> ParseAdminTenantId(
     coro_http::coro_http_request& req) {
     auto tenant_id_view = req.get_decode_query_value("tenant_id");
@@ -245,6 +257,22 @@ tl::expected<HttpTenantQuotaPolicyRequest, std::string> ParseQuotaPolicyBody(
     } catch (const std::exception& e) {
         return tl::make_unexpected(std::string("Invalid JSON body: ") +
                                    e.what());
+    }
+    return request;
+}
+
+tl::expected<HttpDfsMaxBucketCountRequest, std::string>
+ParseDfsMaxBucketCountBody(coro_http::coro_http_request& req) {
+    HttpDfsMaxBucketCountRequest request;
+    try {
+        struct_json::from_json(request, req.get_body());
+    } catch (const std::exception& e) {
+        return tl::make_unexpected(std::string("Invalid JSON body: ") +
+                                   e.what());
+    }
+    if (request.max_bucket_count < 0) {
+        return tl::make_unexpected(
+            "max_bucket_count must be non-negative");
     }
     return request;
 }
@@ -1206,6 +1234,31 @@ void MasterAdminServer::HandleRemoveAll(coro_http::coro_http_request& req,
     });
 }
 
+void MasterAdminServer::HandleSetDfsMaxBucketCount(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    auto body_result = ParseDfsMaxBucketCountBody(req);
+    if (!body_result.has_value()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS, body_result.error());
+        return;
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        auto result =
+            service->SetDfsMaxBucketCount(body_result->max_bucket_count);
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+        HttpDfsMaxBucketCountResponse response;
+        response.success = true;
+        response.old_value = result.value();
+        response.new_value = body_result->max_bucket_count;
+        WriteJsonResponse(resp, coro_http::status_type::ok, response);
+    });
+}
+
 void MasterAdminServer::RegisterHandler() {
     using namespace coro_http;
 
@@ -1308,6 +1361,11 @@ void MasterAdminServer::RegisterHandler() {
         "/api/v1/remove_all",
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleRemoveAll(req, resp);
+        });
+    http_server_.set_http_handler<PUT>(
+        "/api/v1/dfs/max_bucket_count",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleSetDfsMaxBucketCount(req, resp);
         });
 }
 }  // namespace mooncake

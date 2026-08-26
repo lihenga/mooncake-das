@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "real_client.h"
+#include "scatter_utils.h"
 #include "registered_pinned_memory.h"
 #include "client_buffer.h"
 #include "replica_selection.h"
@@ -211,32 +212,6 @@ size_t sum_buffer_handle_sizes(
 ErrorCode scatter_transfer_error(const Status &status) {
     return status.IsInvalidArgument() ? ErrorCode::INVALID_PARAMS
                                       : ErrorCode::TRANSFER_FAIL;
-}
-
-// Scatter host (CPU) memory to a destination that may be GPU or host.
-// Returns tl::expected<void, ErrorCode> for use in functions returning
-// tl::expected<int64_t, ErrorCode>.
-inline tl::expected<void, ErrorCode> scatter_host_to_maybe_device(
-    void *dst, const void *src, size_t size, const std::string &context) {
-    auto runtime_accelerator =
-        device::GetAcceleratorRegistry().RuntimeAccelerators();
-    if (!runtime_accelerator.CopyFromHost(dst, src, size)) {
-        LOG(ERROR) << "H2D copy failed: " << context;
-        return tl::unexpected(ErrorCode::TRANSFER_FAIL);
-    }
-    return {};
-}
-
-// Gather memory that may be GPU or host into a host destination.
-inline tl::expected<void, ErrorCode> gather_maybe_device_to_host(
-    void *dst, const void *src, size_t size, const std::string &context) {
-    auto runtime_accelerator =
-        device::GetAcceleratorRegistry().RuntimeAccelerators();
-    if (!runtime_accelerator.CopyToHost(dst, src, size)) {
-        LOG(ERROR) << "D2H copy failed: " << context;
-        return tl::unexpected(ErrorCode::TRANSFER_FAIL);
-    }
-    return {};
 }
 
 // SelectBestReplica and the replica-scoring helpers live in
@@ -5019,50 +4994,6 @@ std::vector<int> RealClient::batch_get_session_start(
 
 namespace {
 
-struct NonMemReadEntry {
-    std::string key;
-    size_t original_idx;
-    Replica::Descriptor replica;
-    QueryResult query_result;
-    std::vector<void *> buffers;
-    std::vector<size_t> sizes;
-    std::vector<size_t> src_offsets;
-    std::chrono::steady_clock::time_point lease_deadline;
-};
-
-inline void scatter_non_mem_result(
-    const NonMemReadEntry &entry,
-    const void *tmp_base,
-    std::vector<int> &results,
-    std::mutex &session_mutex,
-    std::unordered_map<std::string, QueryResult> &sessions) {
-    for (size_t j = 0; j < entry.buffers.size(); ++j) {
-        const void *src =
-            static_cast<const char *>(tmp_base) + entry.src_offsets[j];
-        if (auto r = scatter_host_to_maybe_device(
-                entry.buffers[j], src, entry.sizes[j],
-                "session non-mem range read, key: " + entry.key);
-            !r) {
-            results[entry.original_idx] =
-                static_cast<int>(toInt(r.error()));
-            return;
-        }
-    }
-    auto now = std::chrono::steady_clock::now();
-    if (now >= entry.lease_deadline) {
-        results[entry.original_idx] =
-            static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
-        std::lock_guard<std::mutex> lock(session_mutex);
-        sessions.erase(entry.key);
-    } else {
-        size_t transferred = 0;
-        for (size_t j = 0; j < entry.sizes.size(); ++j) {
-            transferred += entry.sizes[j];
-        }
-        results[entry.original_idx] = static_cast<int>(transferred);
-    }
-}
-
 }  // anonymous namespace
 
 std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
@@ -5239,7 +5170,7 @@ int RealClient::batch_get_session_end(const std::vector<std::string> &keys) {
 }
 
 void RealClient::process_session_local_disk_reads(
-    const std::unordered_map<std::string,
+    std::unordered_map<std::string,
         std::vector<NonMemReadEntry *>> &local_disk_by_endpoint,
     std::vector<int> &results) {
     for (auto &[endpoint, ep_entries] : local_disk_by_endpoint) {
@@ -5304,14 +5235,14 @@ void RealClient::process_session_local_disk_reads(
             if (handle_it == temp_handles.end()) continue;
 
             scatter_non_mem_result(
-                *entry, handle_it->second->ptr(),
+                entry, handle_it->second->ptr(),
                 results, session_mutex_, get_sessions_);
         }
     }
 }
 
 void RealClient::process_session_disk_dfs_reads(
-    const std::vector<NonMemReadEntry *> &entries,
+    std::vector<NonMemReadEntry *> &entries,
     std::vector<int> &results) {
     std::vector<std::string> disk_batch_keys;
     std::vector<QueryResult> disk_batch_qrs;

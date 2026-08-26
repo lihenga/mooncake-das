@@ -1453,6 +1453,11 @@ WrappedMasterService::GetTenantQuotaAllocatableCapacityBytes() {
     return master_service_.GetTenantQuotaAllocatableCapacityBytes();
 }
 
+tl::expected<int64_t, ErrorCode>
+WrappedMasterService::SetDfsMaxBucketCount(int64_t new_max_bucket_count) {
+    return master_service_.SetDfsMaxBucketCount(new_max_bucket_count);
+}
+
 tl::expected<std::vector<std::string>, ErrorCode>
 WrappedMasterService::GetAllKeysForAdmin() {
     // Compatibility endpoint: /get_all_keys historically listed only the

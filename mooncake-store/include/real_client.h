@@ -28,7 +28,53 @@
 #include <ylt/coro_io/coro_io.hpp>
 #include <async_simple/coro/Lazy.h>
 
+#include "scatter_utils.h"
+
 namespace mooncake {
+
+struct NonMemReadEntry {
+    std::string key;
+    size_t original_idx;
+    Replica::Descriptor replica;
+    QueryResult query_result;
+    std::vector<void *> buffers;
+    std::vector<size_t> sizes;
+    std::vector<size_t> src_offsets;
+    std::chrono::steady_clock::time_point lease_deadline;
+};
+
+inline void scatter_non_mem_result(
+    const NonMemReadEntry &entry,
+    const void *tmp_base,
+    std::vector<int> &results,
+    std::mutex &session_mutex,
+    std::unordered_map<std::string, QueryResult> &sessions) {
+    for (size_t j = 0; j < entry.buffers.size(); ++j) {
+        const void *src =
+            static_cast<const char *>(tmp_base) + entry.src_offsets[j];
+        if (auto r = scatter_host_to_maybe_device(
+                entry.buffers[j], src, entry.sizes[j],
+                "session non-mem range read, key: " + entry.key);
+            !r) {
+            results[entry.original_idx] =
+                static_cast<int>(toInt(r.error()));
+            return;
+        }
+    }
+    auto now = std::chrono::steady_clock::now();
+    if (now >= entry.lease_deadline) {
+        results[entry.original_idx] =
+            static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+        std::lock_guard<std::mutex> lock(session_mutex);
+        sessions.erase(entry.key);
+    } else {
+        size_t transferred = 0;
+        for (size_t j = 0; j < entry.sizes.size(); ++j) {
+            transferred += entry.sizes[j];
+        }
+        results[entry.original_idx] = static_cast<int>(transferred);
+    }
+}
 
 class RealClient;
 class RegisteredPinnedRegion;
@@ -258,12 +304,12 @@ class RealClient : public PyClient {
     int batch_get_session_end(const std::vector<std::string> &keys) override;
 
     void process_session_local_disk_reads(
-        const std::unordered_map<std::string,
+        std::unordered_map<std::string,
             std::vector<NonMemReadEntry *>> &local_disk_by_endpoint,
         std::vector<int> &results);
 
     void process_session_disk_dfs_reads(
-        const std::vector<NonMemReadEntry *> &entries,
+        std::vector<NonMemReadEntry *> &entries,
         std::vector<int> &results);
 
     std::vector<int> batch_put_session_start(

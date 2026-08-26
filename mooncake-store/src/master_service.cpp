@@ -1093,6 +1093,14 @@ uint64_t MasterService::GetTenantQuotaAllocatableCapacityBytes() {
     return capacity;
 }
 
+tl::expected<int64_t, ErrorCode> MasterService::SetDfsMaxBucketCount(
+    int64_t new_max_bucket_count) {
+    if (!bucket_allocator_) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    return bucket_allocator_->SetMaxBucketCount(new_max_bucket_count);
+}
+
 void MasterService::RecomputeTenantEffectiveQuotas() {
     if (!enable_multi_tenants_) {
         return;
