@@ -283,6 +283,18 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
     uint64_t GetUsedBytes() const override;
 
     /**
+     * @brief Dynamically change the maximum number of buckets at runtime.
+     *
+     * A value of 0 means unlimited. The new limit takes effect on the next
+     * allocation: no new bucket is created once the count is reached. It does
+     * not force eviction of already-existing buckets, so it can be set below
+     * the current bucket count without immediate effect.
+     *
+     * @return the previous value of max_bucket_count_.
+     */
+    int64_t SetMaxBucketCount(int64_t new_max_bucket_count);
+
+    /**
      * @brief Mark a reservation as durable so restart recovery may revive it.
      *
      * Called by the master once the client reports the DFS data write finished

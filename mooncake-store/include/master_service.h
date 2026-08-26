@@ -200,6 +200,15 @@ class MasterService {
     void SetBatchOpLogWriterFactoryForTesting(BatchOpLogWriterFactory factory);
 
     /**
+     * @brief Dynamically set the max_bucket_count of the DFS bucket allocator.
+     *
+     * Only valid in BUCKET mode; returns UNAVAILABLE_IN_CURRENT_MODE otherwise.
+     * @return the previous max_bucket_count on success.
+     */
+    tl::expected<int64_t, ErrorCode> SetDfsMaxBucketCount(
+        int64_t new_max_bucket_count);
+
+    /**
      * @brief Test-only wrapper around BatchEvict / NoFBatchEvict so that
      *        unit tests can drive a single eviction cycle synchronously
      *        without standing up the periodic eviction thread.
