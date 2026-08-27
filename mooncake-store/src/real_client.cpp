@@ -4992,10 +4992,6 @@ std::vector<int> RealClient::batch_get_session_start(
     return results;
 }
 
-namespace {
-
-}  // anonymous namespace
-
 std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
@@ -5024,6 +5020,19 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
 
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
+        // GC: remove cache entries whose session has been erased
+        if (session_cache_enabled()) {
+            for (auto it = get_session_object_cache_.begin();
+                 it != get_session_object_cache_.end(); ) {
+                if (get_sessions_.find(it->first) ==
+                    get_sessions_.end()) {
+                    it = get_session_object_cache_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
         auto now = std::chrono::steady_clock::now();
         for (size_t i = 0; i < keys.size(); ++i) {
             const auto &buffers = all_buffers[i];
@@ -5165,8 +5174,49 @@ int RealClient::batch_get_session_end(const std::vector<std::string> &keys) {
     std::lock_guard<std::mutex> lock(session_mutex_);
     for (const auto &key : keys) {
         get_sessions_.erase(key);
+        get_session_object_cache_.erase(key);
     }
     return 0;
+}
+
+void RealClient::scatter_cached_entries(
+    std::vector<NonMemReadEntry *> &entries,
+    std::vector<int> &results) {
+    if (!session_cache_enabled()) {
+        return;  // all entries remain as miss
+    }
+    std::vector<NonMemReadEntry *> miss_entries;
+    for (auto *entry_ptr : entries) {
+        auto &entry = *entry_ptr;
+        auto cache_it = get_session_object_cache_.find(entry.key);
+        if (cache_it != get_session_object_cache_.end()) {
+            if (results[entry.original_idx] != 0) continue;
+            scatter_non_mem_result(
+                entry,
+                cache_it->second.buffer_handle->ptr(),
+                results, session_mutex_, get_sessions_);
+            continue;
+        }
+        miss_entries.push_back(entry_ptr);
+    }
+    entries = std::move(miss_entries);
+}
+
+void RealClient::store_in_cache_and_scatter(
+    NonMemReadEntry &entry,
+    std::unique_ptr<BufferHandle> handle,
+    std::vector<int> &results) {
+    uint64_t total_size = calculate_total_size(entry.replica);
+    auto shared_handle = std::shared_ptr<BufferHandle>(
+        std::move(handle));
+    if (session_cache_enabled()) {
+        get_session_object_cache_.emplace(
+            entry.key,
+            SessionCachedObject{shared_handle, total_size});
+    }
+    scatter_non_mem_result(
+        entry, shared_handle->ptr(),
+        results, session_mutex_, get_sessions_);
 }
 
 void RealClient::process_session_local_disk_reads(
@@ -5174,9 +5224,14 @@ void RealClient::process_session_local_disk_reads(
         std::vector<NonMemReadEntry *>> &local_disk_by_endpoint,
     std::vector<int> &results) {
     for (auto &[endpoint, ep_entries] : local_disk_by_endpoint) {
-        std::unordered_map<std::string, std::vector<Slice>> objects;
+        // 1. Cache hit: scatter directly from cached buffer
+        scatter_cached_entries(ep_entries, results);
+
+        // 2. Cache miss: allocate + I/O + cache + scatter
         std::unordered_map<std::string,
-            std::unique_ptr<BufferHandle>> temp_handles;
+            std::vector<Slice>> miss_objects;
+        std::unordered_map<std::string,
+            std::unique_ptr<BufferHandle>> miss_handles;
 
         for (auto *entry_ptr : ep_entries) {
             auto &entry = *entry_ptr;
@@ -5187,40 +5242,49 @@ void RealClient::process_session_local_disk_reads(
                 LOG(ERROR) << "Client buffer allocator not provided, "
                            << "key: " << entry.key;
                 results[entry.original_idx] =
-                    static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+                    static_cast<int>(
+                        toInt(ErrorCode::INVALID_PARAMS));
                 continue;
             }
+
             auto alloc_result =
                 client_buffer_allocator_->allocate(total_size);
             if (!alloc_result) {
-                LOG(ERROR)
-                    << "Failed to allocate temp buffer for LOCAL_DISK"
-                    << " read, key: " << entry.key
-                    << ", size: " << total_size;
+                LOG(WARNING)
+                    << "Cache allocation failed for key: "
+                    << entry.key
+                    << ", falling back to non-cached I/O";
                 results[entry.original_idx] =
                     static_cast<int>(
                         toInt(ErrorCode::NO_AVAILABLE_HANDLE));
                 continue;
             }
-            auto handle =
-                std::make_unique<BufferHandle>(
-                    std::move(*alloc_result));
+
+            auto handle = std::make_unique<BufferHandle>(
+                std::move(*alloc_result));
             std::vector<Slice> tmp_slices;
             tmp_slices.emplace_back(
                 Slice{handle->ptr(), total_size});
-            objects.emplace(entry.key, std::move(tmp_slices));
-            temp_handles.emplace(entry.key, std::move(handle));
+            miss_objects.emplace(
+                entry.key, std::move(tmp_slices));
+            miss_handles.emplace(
+                entry.key, std::move(handle));
         }
 
-        if (objects.empty()) continue;
+        if (miss_objects.empty()) continue;
 
         auto read_result =
             batch_get_into_offload_object_internal(
-                endpoint, objects);
+                endpoint, miss_objects);
 
         for (auto *entry_ptr : ep_entries) {
             auto &entry = *entry_ptr;
             if (results[entry.original_idx] != 0) continue;
+
+            auto handle_it =
+                miss_handles.find(entry.key);
+            if (handle_it == miss_handles.end()) continue;
+
             if (!read_result) {
                 LOG(ERROR) << "LOCAL_DISK read failed for key: "
                            << entry.key << " error: "
@@ -5230,13 +5294,10 @@ void RealClient::process_session_local_disk_reads(
                         toInt(read_result.error()));
                 continue;
             }
-            auto handle_it =
-                temp_handles.find(entry.key);
-            if (handle_it == temp_handles.end()) continue;
 
-            scatter_non_mem_result(
-                entry, handle_it->second->ptr(),
-                results, session_mutex_, get_sessions_);
+            // Store in cache + scatter
+            store_in_cache_and_scatter(
+                entry, std::move(handle_it->second), results);
         }
     }
 }
@@ -5244,13 +5305,16 @@ void RealClient::process_session_local_disk_reads(
 void RealClient::process_session_disk_dfs_reads(
     std::vector<NonMemReadEntry *> &entries,
     std::vector<int> &results) {
+    // 1. Cache hit: scatter directly from cached buffer
+    scatter_cached_entries(entries, results);
+
+    // 2. Cache miss: allocate + BatchGet
     std::vector<std::string> disk_batch_keys;
     std::vector<QueryResult> disk_batch_qrs;
     std::unordered_map<std::string,
         std::vector<Slice>> disk_batch_slices;
     std::unordered_map<std::string,
         std::unique_ptr<BufferHandle>> disk_temp_handles;
-    std::vector<NonMemReadEntry *> disk_batch_entry_ptrs;
 
     for (auto *entry_ptr : entries) {
         auto &entry = *entry_ptr;
@@ -5261,54 +5325,78 @@ void RealClient::process_session_disk_dfs_reads(
             LOG(ERROR) << "Client buffer allocator not provided, "
                        << "key: " << entry.key;
             results[entry.original_idx] =
-                static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+                static_cast<int>(
+                    toInt(ErrorCode::INVALID_PARAMS));
             continue;
         }
+
         auto alloc_result =
             client_buffer_allocator_->allocate(total_size);
         if (!alloc_result) {
-            LOG(ERROR) << "Failed to allocate temp buffer for DISK/DFS"
-                       << " read, key: " << entry.key
-                       << ", size: " << total_size;
+            LOG(WARNING) << "Cache allocation failed for key: "
+                         << entry.key
+                         << ", falling back to non-cached I/O";
             results[entry.original_idx] =
                 static_cast<int>(
                     toInt(ErrorCode::NO_AVAILABLE_HANDLE));
             continue;
         }
-        auto handle =
-            std::make_unique<BufferHandle>(std::move(*alloc_result));
+
+        auto handle = std::make_unique<BufferHandle>(
+            std::move(*alloc_result));
         std::vector<Slice> disk_slices;
-        allocateSlices(disk_slices, entry.replica, handle->ptr());
+        allocateSlices(
+            disk_slices, entry.replica, handle->ptr());
 
         disk_batch_keys.push_back(entry.key);
         disk_batch_qrs.push_back(
-            FilterQueryResult(entry.query_result, entry.replica));
-        disk_batch_slices[entry.key] = std::move(disk_slices);
-        disk_temp_handles.emplace(entry.key, std::move(handle));
-        disk_batch_entry_ptrs.push_back(entry_ptr);
+            FilterQueryResult(
+                entry.query_result, entry.replica));
+        disk_batch_slices[entry.key] =
+            std::move(disk_slices);
+        disk_temp_handles.emplace(
+            entry.key, std::move(handle));
     }
 
     if (!disk_batch_keys.empty()) {
         auto disk_results = client_->BatchGet(
-            disk_batch_keys, disk_batch_qrs, disk_batch_slices);
+            disk_batch_keys, disk_batch_qrs,
+            disk_batch_slices);
+
+        // Build key -> entry map for O(1) lookup
+        std::unordered_map<std::string,
+            NonMemReadEntry *> entry_map;
+        for (auto *entry_ptr : entries) {
+            entry_map[entry_ptr->key] = entry_ptr;
+        }
 
         for (size_t di = 0;
-             di < disk_batch_entry_ptrs.size(); ++di) {
-            auto &entry = *disk_batch_entry_ptrs[di];
-            if (results[entry.original_idx] != 0) continue;
-            if (!disk_results[di]) {
-                results[entry.original_idx] =
-                    static_cast<int>(
-                        toInt(disk_results[di].error()));
+             di < disk_batch_keys.size(); ++di) {
+            const auto &key = disk_batch_keys[di];
+            auto handle_it =
+                disk_temp_handles.find(key);
+            if (handle_it == disk_temp_handles.end()) {
                 continue;
             }
-            auto handle_it =
-                disk_temp_handles.find(entry.key);
-            if (handle_it == disk_temp_handles.end()) continue;
 
-            scatter_non_mem_result(
-                entry, handle_it->second->ptr(),
-                results, session_mutex_, get_sessions_);
+            if (!disk_results[di]) {
+                auto map_it = entry_map.find(key);
+                if (map_it != entry_map.end()) {
+                    results[map_it->second->original_idx] =
+                        static_cast<int>(
+                            toInt(disk_results[di].error()));
+                }
+                continue;
+            }
+
+            // Find corresponding entry and store in cache
+            auto map_it = entry_map.find(key);
+            if (map_it != entry_map.end()) {
+                store_in_cache_and_scatter(
+                    *map_it->second,
+                    std::move(handle_it->second),
+                    results);
+            }
         }
     }
 }
