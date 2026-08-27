@@ -689,4 +689,361 @@ TEST_F(DfsBucketBackendTest, ReadAfterAllocatorRecoveryReturnsSameBytes) {
     }
 }
 
+TEST_F(DfsBucketBackendTest, ParallelBatchReadAcrossBuckets) {
+    // Test parallel reads across different buckets
+    constexpr size_t kNumBuckets = 4;
+    constexpr size_t kEntriesPerBucket = 5;
+
+    std::vector<std::string> keys;
+    std::vector<std::string> values;
+    std::vector<DistributedFSDescriptor> descriptors;
+
+    // Create multiple objects in each bucket
+    for (size_t bucket = 0; bucket < kNumBuckets; ++bucket) {
+        for (size_t i = 0; i < kEntriesPerBucket; ++i) {
+            std::string key =
+                "parallel_bucket_" + std::to_string(bucket) + "_key_" +
+                std::to_string(i);
+            std::string value(100 + i * 10, static_cast<char>('A' + bucket));
+
+            auto desc = allocator_->Allocate(key, value.size());
+            ASSERT_TRUE(desc.has_value()) << "Allocate failed for " << key;
+
+            std::vector<Slice> slices{{const_cast<char*>(value.data()),
+                                       value.size()}};
+            auto results = backend_->BatchWrite({{key, *desc, slices}});
+            ASSERT_EQ(results.size(), 1u);
+            ASSERT_TRUE(results[0].has_value()) << "Write failed for " << key;
+            ASSERT_TRUE(allocator_->MarkCommitted(key, *desc));
+
+            keys.push_back(key);
+            values.push_back(value);
+            descriptors.push_back(*desc);
+        }
+    }
+
+    // Batch read all objects
+    std::vector<std::string> outputs;
+    std::vector<std::vector<Slice>> read_slices;
+    std::vector<DfsReadRequest> reads;
+    outputs.reserve(keys.size());
+    read_slices.resize(keys.size());
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        outputs.emplace_back(values[i].size(), '\0');
+    }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        read_slices[i] = {{outputs[i].data(), outputs[i].size()}};
+        reads.push_back({keys[i], descriptors[i], read_slices[i]});
+    }
+
+    auto read_results = backend_->BatchRead(reads);
+    ASSERT_EQ(read_results.size(), reads.size());
+    for (size_t i = 0; i < read_results.size(); ++i) {
+        ASSERT_TRUE(read_results[i].has_value())
+            << "Read failed for " << keys[i];
+        EXPECT_EQ(outputs[i], values[i]) << "Mismatch for " << keys[i];
+    }
+}
+
+TEST_F(DfsBucketBackendTest, NonContiguousEntriesInSameBucket) {
+    // Test non-contiguous entries within the same bucket
+    // Create multiple objects with gaps between them
+    std::vector<std::string> keys{"key1", "key2", "key3"};
+    std::vector<std::string> values{
+        std::string(100, '1'),
+        std::string(200, '2'),
+        std::string(300, '3')};
+
+    std::vector<DistributedFSDescriptor> descriptors;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto desc = allocator_->Allocate(keys[i], values[i].size());
+        ASSERT_TRUE(desc.has_value());
+
+        std::vector<Slice> slices{{const_cast<char*>(values[i].data()),
+                                   values[i].size()}};
+        auto results = backend_->BatchWrite({{keys[i], *desc, slices}});
+        ASSERT_TRUE(results[0].has_value());
+        ASSERT_TRUE(allocator_->MarkCommitted(keys[i], *desc));
+        descriptors.push_back(*desc);
+    }
+
+    // Shuffle read order
+    std::vector<size_t> indices{2, 0, 1};
+    std::vector<std::string> outputs;
+    std::vector<std::vector<Slice>> read_slices;
+    std::vector<DfsReadRequest> reads;
+    read_slices.resize(keys.size());
+
+    for (size_t i : indices) {
+        outputs.emplace_back(values[i].size(), '\0');
+    }
+    size_t out_idx = 0;
+    for (size_t i : indices) {
+        read_slices[out_idx] = {{outputs[out_idx].data(),
+                                 outputs[out_idx].size()}};
+        reads.push_back({keys[i], descriptors[i], read_slices[out_idx]});
+        ++out_idx;
+    }
+
+    auto read_results = backend_->BatchRead(reads);
+    ASSERT_EQ(read_results.size(), reads.size());
+    for (size_t i = 0; i < read_results.size(); ++i) {
+        ASSERT_TRUE(read_results[i].has_value());
+        EXPECT_EQ(outputs[i], values[indices[i]]);
+    }
+}
+
+TEST_F(DfsBucketBackendTest, SingleBucketPathFallsBackToSequential) {
+    // Test single bucket path falls back to sequential execution
+    constexpr size_t kNumEntries = 10;
+    std::vector<std::string> keys;
+    std::vector<std::string> values;
+    std::vector<DistributedFSDescriptor> descriptors;
+
+    // Create multiple objects in the same bucket
+    for (size_t i = 0; i < kNumEntries; ++i) {
+        std::string key = "single_bucket_key_" + std::to_string(i);
+        std::string value(100 + i * 50, static_cast<char>('A' + i));
+
+        auto desc = allocator_->Allocate(key, value.size());
+        ASSERT_TRUE(desc.has_value());
+
+        std::vector<Slice> slices{{const_cast<char*>(value.data()),
+                                   value.size()}};
+        auto results = backend_->BatchWrite({{key, *desc, slices}});
+        ASSERT_TRUE(results[0].has_value());
+        ASSERT_TRUE(allocator_->MarkCommitted(key, *desc));
+
+        keys.push_back(key);
+        values.push_back(value);
+        descriptors.push_back(*desc);
+    }
+
+    // Batch read
+    std::vector<std::string> outputs;
+    std::vector<std::vector<Slice>> read_slices;
+    std::vector<DfsReadRequest> reads;
+    outputs.reserve(keys.size());
+    read_slices.resize(keys.size());
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        outputs.emplace_back(values[i].size(), '\0');
+    }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        read_slices[i] = {{outputs[i].data(), outputs[i].size()}};
+        reads.push_back({keys[i], descriptors[i], read_slices[i]});
+    }
+
+    auto read_results = backend_->BatchRead(reads);
+    ASSERT_EQ(read_results.size(), reads.size());
+    for (size_t i = 0; i < read_results.size(); ++i) {
+        ASSERT_TRUE(read_results[i].has_value());
+        EXPECT_EQ(outputs[i], values[i]);
+    }
+}
+
+TEST_F(DfsBucketBackendTest, ContiguousEntriesAreMerged) {
+    // Test contiguous entries are merged for optimal IO
+    constexpr size_t kNumEntries = 5;
+    std::vector<std::string> keys;
+    std::vector<std::string> values;
+    std::vector<DistributedFSDescriptor> descriptors;
+
+    // Create contiguous objects (same size to ensure alignment)
+    for (size_t i = 0; i < kNumEntries; ++i) {
+        std::string key = "contiguous_key_" + std::to_string(i);
+        std::string value(kAlignment / 2, static_cast<char>('X' + i));
+
+        auto desc = allocator_->Allocate(key, value.size());
+        ASSERT_TRUE(desc.has_value());
+
+        std::vector<Slice> slices{{const_cast<char*>(value.data()),
+                                   value.size()}};
+        auto results = backend_->BatchWrite({{key, *desc, slices}});
+        ASSERT_TRUE(results[0].has_value());
+        ASSERT_TRUE(allocator_->MarkCommitted(key, *desc));
+
+        keys.push_back(key);
+        values.push_back(value);
+        descriptors.push_back(*desc);
+    }
+
+    // Batch read
+    std::vector<std::string> outputs;
+    std::vector<std::vector<Slice>> read_slices;
+    std::vector<DfsReadRequest> reads;
+    outputs.reserve(keys.size());
+    read_slices.resize(keys.size());
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        outputs.emplace_back(values[i].size(), '\0');
+    }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        read_slices[i] = {{outputs[i].data(), outputs[i].size()}};
+        reads.push_back({keys[i], descriptors[i], read_slices[i]});
+    }
+
+    // Use default parallel read threads
+    auto read_results = backend_->BatchRead(reads);
+    ASSERT_EQ(read_results.size(), reads.size());
+    for (size_t i = 0; i < read_results.size(); ++i) {
+        ASSERT_TRUE(read_results[i].has_value());
+        EXPECT_EQ(outputs[i], values[i]);
+    }
+}
+
+TEST_F(DfsBucketBackendTest, BatchReadWithDifferentThreadCounts) {
+    // Test BatchRead behavior with different thread count configurations
+    constexpr size_t kNumEntries = 20;
+    std::vector<std::string> keys;
+    std::vector<std::string> values;
+    std::vector<DistributedFSDescriptor> descriptors;
+
+    // Create objects across multiple buckets
+    for (size_t i = 0; i < kNumEntries; ++i) {
+        std::string key = "thread_count_key_" + std::to_string(i);
+        std::string value(100 + i * 25, static_cast<char>('A' + i % 26));
+
+        auto desc = allocator_->Allocate(key, value.size());
+        ASSERT_TRUE(desc.has_value());
+
+        std::vector<Slice> slices{{const_cast<char*>(value.data()),
+                                   value.size()}};
+        auto results = backend_->BatchWrite({{key, *desc, slices}});
+        ASSERT_TRUE(results[0].has_value());
+        ASSERT_TRUE(allocator_->MarkCommitted(key, *desc));
+
+        keys.push_back(key);
+        values.push_back(value);
+        descriptors.push_back(*desc);
+    }
+
+    // Test different batch_read_threads configurations
+    std::vector<int> thread_counts{1, 2, 4, 8};
+    for (int threads : thread_counts) {
+        config_.batch_read_threads = threads;
+
+        // Recreate backend to apply new configuration
+        FileStorageConfig file_config;
+        file_config.storage_backend_type = StorageBackendType::kDistributed;
+        file_config.storage_filepath = tmp_->path();
+        backend_ = std::make_shared<DistributedStorageBackend>(
+            file_config, config_, std::make_unique<FaultyPosixFsAdapter>());
+        ASSERT_TRUE(backend_->Init().has_value());
+
+        // Batch read
+        std::vector<std::string> outputs;
+        std::vector<std::vector<Slice>> read_slices;
+        std::vector<DfsReadRequest> reads;
+        outputs.reserve(keys.size());
+        read_slices.resize(keys.size());
+
+        for (size_t i = 0; i < keys.size(); ++i) {
+            outputs.emplace_back(values[i].size(), '\0');
+        }
+        for (size_t i = 0; i < keys.size(); ++i) {
+            read_slices[i] = {{outputs[i].data(), outputs[i].size()}};
+            reads.push_back({keys[i], descriptors[i], read_slices[i]});
+        }
+
+        auto read_results = backend_->BatchRead(reads);
+        ASSERT_EQ(read_results.size(), reads.size());
+        for (size_t i = 0; i < read_results.size(); ++i) {
+            ASSERT_TRUE(read_results[i].has_value())
+                << "Failed with " << threads << " threads, entry " << i;
+            EXPECT_EQ(outputs[i], values[i])
+                << "Mismatch with " << threads << " threads, entry " << i;
+        }
+    }
+}
+
+TEST_F(DfsBucketBackendTest, BatchReadMixedContiguousAndNonContiguous) {
+    // Test mixed contiguous and non-contiguous entries
+    // Create some contiguous objects and some scattered objects
+    std::vector<std::string> keys;
+    std::vector<std::string> values;
+    std::vector<DistributedFSDescriptor> descriptors;
+
+    // Create 3 contiguous objects
+    for (size_t i = 0; i < 3; ++i) {
+        std::string key = "mixed_contiguous_" + std::to_string(i);
+        std::string value(200, static_cast<char>('A' + i));
+        keys.push_back(key);
+        values.push_back(value);
+    }
+
+    // Create 2 scattered objects (different sizes to break alignment)
+    std::string key4 = "mixed_scattered_0";
+    std::string value4(150, 'D');
+    keys.push_back(key4);
+    values.push_back(value4);
+
+    std::string key5 = "mixed_scattered_1";
+    std::string value5(250, 'E');
+    keys.push_back(key5);
+    values.push_back(value5);
+
+    // Create 2 more contiguous objects
+    std::string key6 = "mixed_contiguous_3";
+    std::string value6(200, 'F');
+    keys.push_back(key6);
+    values.push_back(value6);
+
+    std::string key7 = "mixed_contiguous_4";
+    std::string value7(200, 'G');
+    keys.push_back(key7);
+    values.push_back(value7);
+
+    // Write all objects
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto desc = allocator_->Allocate(keys[i], values[i].size());
+        ASSERT_TRUE(desc.has_value()) << "Allocate failed for " << keys[i];
+
+        std::vector<Slice> slices{{const_cast<char*>(values[i].data()),
+                                   values[i].size()}};
+        auto results = backend_->BatchWrite({{keys[i], *desc, slices}});
+        ASSERT_TRUE(results[0].has_value()) << "Write failed for " << keys[i];
+        ASSERT_TRUE(allocator_->MarkCommitted(keys[i], *desc));
+        descriptors.push_back(*desc);
+    }
+
+    // Random order read
+    std::vector<size_t> indices{6, 0, 4, 2, 5, 1, 3};
+    std::vector<std::string> outputs;
+    std::vector<std::vector<Slice>> read_slices;
+    std::vector<DfsReadRequest> reads;
+    read_slices.resize(keys.size());
+
+    for (size_t i : indices) {
+        outputs.emplace_back(values[i].size(), '\0');
+    }
+
+    size_t out_idx = 0;
+    for (size_t i : indices) {
+        read_slices[out_idx] = {{outputs[out_idx].data(),
+                                 outputs[out_idx].size()}};
+        reads.push_back({keys[i], descriptors[i], read_slices[out_idx]});
+        ++out_idx;
+    }
+
+    // Use parallel reads
+    config_.batch_read_threads = 4;
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp_->path();
+    backend_ = std::make_shared<DistributedStorageBackend>(
+        file_config, config_, std::make_unique<FaultyPosixFsAdapter>());
+    ASSERT_TRUE(backend_->Init().has_value());
+
+    auto read_results = backend_->BatchRead(reads);
+    ASSERT_EQ(read_results.size(), reads.size());
+    for (size_t i = 0; i < read_results.size(); ++i) {
+        ASSERT_TRUE(read_results[i].has_value())
+            << "Read failed for index " << indices[i];
+        EXPECT_EQ(outputs[i], values[indices[i]])
+            << "Mismatch for index " << indices[i];
+    }
+}
+
 }  // namespace mooncake::test
