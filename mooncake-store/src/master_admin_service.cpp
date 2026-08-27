@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 #include <exception>
+#include <limits>
 #include <map>
 #include <sstream>
 #include <string_view>
@@ -261,6 +262,12 @@ tl::expected<HttpTenantQuotaPolicyRequest, std::string> ParseQuotaPolicyBody(
     return request;
 }
 
+// Buckets are addressed through DistributedFSDescriptor::shard_idx, an int
+// serialized as int32, so the count must stay within int32 range. Keep in
+// sync with kMaxBucketId in storage/distributed/bucket_entry_layout.h.
+constexpr int64_t kDfsMaxBucketCountLimit =
+    static_cast<int64_t>(std::numeric_limits<int32_t>::max());
+
 tl::expected<HttpDfsMaxBucketCountRequest, std::string>
 ParseDfsMaxBucketCountBody(coro_http::coro_http_request& req) {
     HttpDfsMaxBucketCountRequest request;
@@ -270,9 +277,14 @@ ParseDfsMaxBucketCountBody(coro_http::coro_http_request& req) {
         return tl::make_unexpected(std::string("Invalid JSON body: ") +
                                    e.what());
     }
-    if (request.max_bucket_count < 0) {
+    if (request.max_bucket_count <= 0) {
         return tl::make_unexpected(
-            "max_bucket_count must be non-negative");
+            "max_bucket_count must be positive (>0)");
+    }
+    if (request.max_bucket_count > kDfsMaxBucketCountLimit) {
+        return tl::make_unexpected(
+            "max_bucket_count exceeds maximum addressable bucket id (" +
+            std::to_string(kDfsMaxBucketCountLimit) + ")");
     }
     return request;
 }
