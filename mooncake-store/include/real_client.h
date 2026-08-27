@@ -38,22 +38,7 @@ namespace mooncake {
 // Enabled by default; set MC_STORE_DISABLE_SESSION_CACHE to
 // "0", "false", or "off" to disable; any other value or
 // unset enables the cache.
-inline bool session_cache_enabled() {
-    static const bool enabled = [] {
-        const char *val =
-            std::getenv("MC_STORE_DISABLE_SESSION_CACHE");
-        if (!val || val[0] == '\0') {
-            return true;  // unset: enabled
-        }
-        std::string s(val);
-        // case-insensitive compare
-        for (auto &c : s) {
-            c = std::tolower(c);
-        }
-        return s != "0" && s != "false" && s != "off";
-    }();
-    return enabled;
-}
+bool session_cache_enabled();
 
 struct NonMemReadEntry {
     std::string key;

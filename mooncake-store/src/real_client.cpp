@@ -54,6 +54,40 @@ DEFINE_int32(http_port, 9300,
              "(only effective when --enable_http_server=true).");
 
 namespace mooncake {
+
+bool session_cache_enabled() {
+    static const bool enabled = [] {
+        const char *val =
+            std::getenv("MC_STORE_DISABLE_SESSION_CACHE");
+        bool result = true;
+        if (!val || val[0] == '\0') {
+            result = true;  // unset: enabled
+        } else {
+            std::string s(val);
+            // case-insensitive compare
+            for (auto &c : s) {
+                c = std::tolower(c);
+            }
+            result = s != "0" && s != "false" && s != "off";
+        }
+        std::string raw_value = "<unset>";
+        if (val != nullptr) {
+            raw_value = val;
+        }
+        if (result) {
+            LOG(INFO) << "Session cache enabled"
+                      << " (MC_STORE_DISABLE_SESSION_CACHE="
+                      << raw_value << ")";
+        } else {
+            LOG(INFO) << "Session cache disabled"
+                      << " (MC_STORE_DISABLE_SESSION_CACHE="
+                      << raw_value << ")";
+        }
+        return result;
+    }();
+    return enabled;
+}
+
 namespace {
 constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
 
@@ -5018,6 +5052,8 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     // Non-memory replicas: handled via temp buffer + scatter fallback.
     std::vector<NonMemReadEntry> non_mem_entries;
 
+    size_t cache_evicted_count = 0;
+
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
         // GC: remove cache entries whose session has been erased
@@ -5026,6 +5062,7 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
                  it != get_session_object_cache_.end(); ) {
                 if (get_sessions_.find(it->first) ==
                     get_sessions_.end()) {
+                    ++cache_evicted_count;
                     it = get_session_object_cache_.erase(it);
                 } else {
                     ++it;
@@ -5113,6 +5150,10 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         }
     }
 
+    size_t mem_count = replicas.size();
+    size_t local_disk_count = 0;
+    size_t dfs_count = 0;
+
     // 1. Memory replicas: fast scatter path via BatchTransferReadRanges.
     if (!replicas.empty()) {
         auto transfer =
@@ -5153,9 +5194,11 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
             const auto &endpoint =
                 replica.get_local_disk_descriptor().transport_endpoint;
             local_disk_by_endpoint[endpoint].push_back(&entry);
+            ++local_disk_count;
         } else {
             // DISK or DFS
             disk_dfs_entries.push_back(&entry);
+            ++dfs_count;
         }
     }
 
@@ -5166,6 +5209,12 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     if (!disk_dfs_entries.empty()) {
         process_session_disk_dfs_reads(disk_dfs_entries, results);
     }
+
+    LOG(INFO) << "batch_get_into_multi_buffer_ranges: keys=" << keys.size()
+              << ", mem_reads=" << mem_count
+              << ", cache_evicted=" << cache_evicted_count
+              << ", local_disk_reads=" << local_disk_count
+              << ", disk_dfs_reads=" << dfs_count;
 
     return results;
 }
