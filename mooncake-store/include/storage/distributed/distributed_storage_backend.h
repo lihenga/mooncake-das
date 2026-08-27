@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -14,6 +15,8 @@
 #include "storage_backend.h"
 
 namespace mooncake {
+
+class ThreadPool;
 
 struct DistributedStorageConfig {
     std::string fsdir = "/mnt/3fs/mooncake";
@@ -37,6 +40,10 @@ struct DistributedStorageConfig {
     // BUCKET mode only: upper bound on live buckets. Also the fixed
     // denominator for eviction watermarks, so it must be > 0.
     int64_t max_bucket_count = 256;
+    // BUCKET mode only: number of threads for parallel batch reads across
+    // buckets. Set to 1 to disable parallelism. Must be in
+    // [1, kMaxBatchReadThreads].
+    int batch_read_threads = 4;
     // Cleared by FromEnvironment() when MOONCAKE_DFS_ALLOCATOR_TYPE names an
     // unknown allocator, so the master can reject the configuration instead of
     // silently defaulting to SHARD.
@@ -169,6 +176,74 @@ class DistributedStorageBackend : public StorageBackendInterface {
     tl::expected<std::shared_ptr<OpenFileHandle>, ErrorCode> GetOrOpenBucket(
         const std::string& path);
 
+    /**
+     * @brief One validated BUCKET-mode read, resolved but not yet issued.
+     */
+    struct PreparedRead {
+        size_t request_index = 0;
+        ResolvedTarget target;
+        uint64_t entry_start = 0;
+        uint64_t reserved_size = 0;
+    };
+
+    /**
+     * @brief Every read of one batch that targets the same bucket data file.
+     *
+     * Keyed on the handle's mutex rather than its fd: an fd number can be
+     * reused once a handle is closed, while the mutex address uniquely
+     * identifies the open handle for as long as a PreparedRead in the group
+     * keeps it alive through `ResolvedTarget::keepalive`.
+     */
+    struct BucketReadGroup {
+        std::mutex* mutex = nullptr;
+        std::vector<PreparedRead> reads;
+    };
+
+    /**
+     * @brief A run of contiguous entries collapsed into a single read.
+     */
+    struct MergedIo {
+        uint64_t entry_start = 0;
+        uint64_t total_size = 0;
+        std::vector<const PreparedRead*> reads;
+    };
+
+    static ErrorCode ReadFully(FileSystemAdapter* fs_adapter,
+                               const ResolvedTarget& target, uint64_t offset,
+                               std::span<char> output);
+
+    /// Scatter `value` (object_size bytes) across the request's slices.
+    static void CopyToSlices(const DfsReadRequest& request, const char* value);
+
+    /// Consumes `prepared`, bucketing its entries by open file handle.
+    static std::unordered_map<std::mutex*, BucketReadGroup> GroupReadsByBucket(
+        std::vector<PreparedRead>&& prepared);
+
+    static void SortGroupByOffset(BucketReadGroup& group);
+
+    static std::vector<MergedIo> BuildMergedIos(const BucketReadGroup& group);
+
+    static void ExecuteMergedRead(
+        const MergedIo& io, const std::vector<DfsReadRequest>& requests,
+        std::vector<tl::expected<void, ErrorCode>>& results,
+        const ResolvedTarget& target, std::mutex* mutex,
+        FileSystemAdapter* fs_adapter, std::vector<char>& staging);
+
+    static void FailGroupReads(
+        const BucketReadGroup& group,
+        std::vector<tl::expected<void, ErrorCode>>& results, ErrorCode error);
+
+    static void ProcessBucketGroup(
+        BucketReadGroup& group, const std::vector<DfsReadRequest>& requests,
+        std::vector<tl::expected<void, ErrorCode>>& results,
+        FileSystemAdapter* fs_adapter);
+
+    static void DispatchParallelReads(
+        std::unordered_map<std::mutex*, BucketReadGroup>& groups,
+        const std::vector<DfsReadRequest>& requests,
+        std::vector<tl::expected<void, ErrorCode>>& results, ThreadPool& pool,
+        FileSystemAdapter* fs_adapter);
+
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
     DistributedStorageConfig distributed_config_;
     std::string root_dir_;
@@ -180,6 +255,7 @@ class DistributedStorageBackend : public StorageBackendInterface {
     mutable std::mutex bucket_cache_mutex_;
     std::unordered_map<std::string, std::shared_ptr<OpenFileHandle>>
         bucket_cache_;
+    std::unique_ptr<ThreadPool> batch_read_pool_;
 
     bool initialized_ = false;
 };
