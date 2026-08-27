@@ -1578,6 +1578,16 @@ uint64_t BucketGlobalAllocator::GetUsedBytes() const {
     return UsedBytesLocked();
 }
 
+int64_t BucketGlobalAllocator::SetMaxBucketCount(
+    int64_t new_max_bucket_count) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    int64_t old = max_bucket_count_;
+    max_bucket_count_ = new_max_bucket_count;
+    LOG(INFO) << "Dynamic max_bucket_count changed from "
+              << old << " to " << new_max_bucket_count;
+    return old;
+}
+
 size_t BucketGlobalAllocator::GetBucketCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return buckets_.size();

@@ -197,6 +197,15 @@ class WrappedMasterService {
     DeleteTenantQuotaPolicy(const std::string& tenant_id);
     tl::expected<uint64_t, ErrorCode> GetTenantQuotaAllocatableCapacityBytes();
 
+    /**
+     * @brief Dynamically set the max_bucket_count of the DFS bucket allocator.
+     *
+     * Only valid in BUCKET mode; returns UNAVAILABLE_IN_CURRENT_MODE otherwise.
+     * @return the previous max_bucket_count on success.
+     */
+    tl::expected<int64_t, ErrorCode> SetDfsMaxBucketCount(
+        int64_t new_max_bucket_count);
+
     tl::expected<std::vector<std::string>, ErrorCode> GetAllKeysForAdmin();
 
     tl::expected<std::vector<std::string>, ErrorCode> GetAllSegmentsForAdmin();
