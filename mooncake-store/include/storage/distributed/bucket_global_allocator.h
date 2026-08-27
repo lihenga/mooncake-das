@@ -52,10 +52,10 @@ struct PersistedBucketEntry {
  * A CRC-32C over the serialized payload (with `checksum` zeroed) detects torn
  * or corrupt metadata; `version` rejects formats this build cannot parse.
  *
- * The snapshot is only rewritten by compaction, never once per key. `log_seq`
- * is the highest metadata-log sequence number this snapshot already accounts
- * for, so recovery can replay `bucket_NNNNNN.meta.log` on top of it while
- * discarding records the snapshot covers.
+ * There is exactly one `.meta` file per bucket, holding the bucket's full state
+ * at the moment it was written. It is written when the bucket stops being the
+ * active one (it is sealed) and rewritten only when the sealed bucket's state
+ * changed afterwards, never once per key.
  */
 struct PersistedBucketMetadata {
     uint32_t version = 0;
@@ -65,19 +65,13 @@ struct PersistedBucketMetadata {
     uint64_t capacity = 0;
     uint64_t alignment = 0;
     uint64_t append_offset = 0;
-    // Highest metadata-log sequence number already reflected here.
-    uint64_t log_seq = 0;
-    // Monotonically increasing snapshot publication generation. Compaction
-    // writes the inactive `.meta.0`/`.meta.1` slot and recovery chooses the
-    // valid slot with the greatest epoch, so publication never needs rename.
-    uint64_t snapshot_epoch = 0;
     // Set when the bucket has been chosen for eviction and its data file is
     // being deleted. Recovery treats such a bucket as gone rather than live.
     bool evicting = false;
     std::vector<PersistedBucketEntry> entries;
     YLT_REFL(PersistedBucketMetadata, version, checksum, bucket_id,
-             bucket_generation, capacity, alignment, append_offset, log_seq,
-             snapshot_epoch, evicting, entries);
+             bucket_generation, capacity, alignment, append_offset, evicting,
+             entries);
 };
 
 struct LegacyPersistedBucketMetadata {
@@ -97,9 +91,9 @@ struct LegacyPersistedBucketMetadata {
 };
 
 // Bump when the layout of PersistedBucketMetadata changes incompatibly.
-// Version 3 publishes snapshots through alternating stable slots and therefore
-// never needs a metadata rename.
-inline constexpr uint32_t kBucketMetadataVersion = 3;
+// Version 4 stores one full `.meta` snapshot per bucket and has no metadata
+// log, so it carries neither a log sequence number nor a snapshot epoch.
+inline constexpr uint32_t kBucketMetadataVersion = 4;
 inline constexpr uint32_t kLegacyBucketMetadataVersion = 2;
 
 enum class BucketEntryState : int32_t {
@@ -107,90 +101,6 @@ enum class BucketEntryState : int32_t {
     COMMITTED = 1,
     TOMBSTONE = 2,
 };
-
-/**
- * @brief Kind of metadata delta recorded in `bucket_NNNNNN.meta.log`.
- *
- * All three are idempotent, last-writer-wins updates of one (key, entry_offset)
- * slot, which is what lets recovery replay a log that partially overlaps the
- * snapshot it is replayed onto.
- */
-enum class MetaLogOp : uint32_t {
-    ADD_PENDING = 0,     // space reserved, data not yet known durable
-    MARK_COMMITTED = 1,  // client reported the data write finished
-    TOMBSTONE = 2,       // entry freed; must not be revived on restart
-};
-
-const char* ToString(MetaLogOp op);
-
-/**
- * @brief In-memory form of one metadata-log record.
- *
- * Records are produced under the allocator lock, which assigns `seq`, and are
- * written to disk outside it. `seq` is globally monotonic, so it - not file
- * order - is what defines how recovery orders the replay.
- */
-struct MetaLogRecord {
-    MetaLogOp op = MetaLogOp::ADD_PENDING;
-    uint64_t seq = 0;
-    int64_t bucket_id = -1;
-    uint64_t bucket_generation = 0;
-    int64_t timestamp_ns = 0;
-    uint64_t entry_offset = 0;
-    uint64_t key_size = 0;
-    uint64_t value_size = 0;
-    uint64_t reserved_size = 0;
-    uint64_t entry_generation = 0;
-    // The bucket's append offset right after this operation was applied in
-    // memory. Recovery takes the maximum over all replayed records, so the
-    // append cursor can never end up inside data an earlier record reserved.
-    uint64_t append_offset = 0;
-    std::string key;
-};
-
-/**
- * @brief Serialized metadata-log record framing.
- *
- * Layout (little-endian, byte offsets), a fixed header followed by the key:
- *   0  magic             u32  kMetaLogMagic, also the resynchronization anchor
- *   4  crc               u32  CRC-32C over bytes [8, record_size)
- *   8  record_size       u32  total record length, header included
- *   12 op                u32
- *   16 seq               u64
- *   24 bucket_id         i64
- *   32 bucket_generation u64
- *   40 timestamp_ns      i64
- *   48 entry_offset      u64
- *   56 key_size          u64
- *   64 value_size        u64
- *   72 reserved_size     u64
- *   80 entry_generation  u64
- *   88 append_offset     u64
- *   96 key bytes         key_size bytes
- *
- * The CRC is per record rather than over the whole log, so one damaged record
- * costs exactly that record: replay drops it and resynchronizes on the next
- * magic.
- */
-inline constexpr uint32_t kMetaLogMagic = 0x474C424Du;  // "MBLG"
-inline constexpr uint32_t kMetaLogHeaderSize = 96;
-// Refuse absurd lengths outright so a corrupt size field cannot make recovery
-// allocate wildly. Keys are bounded far below this in practice.
-inline constexpr uint32_t kMetaLogMaxRecordSize = 1u << 20;
-
-void SerializeMetaLogRecord(const MetaLogRecord& record, std::string& out);
-
-/**
- * @brief Parse one record from `payload` starting at `pos`.
- *
- * On success `consumed` receives the record length. Returns std::nullopt when
- * the record is unusable; `consumed` then holds the number of bytes to skip,
- * which is 0 when even the framing cannot be trusted and the caller must
- * resynchronize by scanning for the next magic.
- */
-std::optional<MetaLogRecord> DeserializeMetaLogRecord(std::string_view payload,
-                                                      size_t pos,
-                                                      size_t& consumed);
 
 /**
  * @brief Append-only, bucket-based DFS space allocator.
@@ -203,45 +113,39 @@ std::optional<MetaLogRecord> DeserializeMetaLogRecord(std::string_view payload,
  *
  * Metadata durability
  * -------------------
- * Each bucket owns two metadata files:
+ * Each bucket owns exactly two files:
  *
- *   bucket_NNNNNN.meta.0    alternating full snapshot slots
- *   bucket_NNNNNN.meta.1    (the valid slot with the greatest epoch wins)
- *   bucket_NNNNNN.meta.log  append-only deltas produced since that snapshot
+ *   bucket_NNNNNN.data     preallocated data file
+ *   bucket_NNNNNN.meta     the bucket's single full metadata snapshot
  *
- * Compaction rewrites the inactive snapshot slot and syncs it before clearing
- * the log. A torn rewrite leaves the other slot valid, so neither hot paths nor
- * compaction need rename or temporary metadata files.
+ * The active bucket keeps its metadata in memory only. The `.meta` file is
+ * written when the bucket is sealed, i.e. when allocation moves on to a new
+ * bucket, and rewritten afterwards only if the sealed bucket's state changed
+ * (a tail reservation committing, or an entry being freed). Rewrites happen in
+ * place: the hot path never writes metadata, never renames and never appends to
+ * a log, so storing a key costs no metadata I/O at all.
  *
- * The hot path - Allocate, BatchAllocate, MarkCommitted, Free - appends one
- * fixed-shape record and fdatasyncs the log. It never rewrites the snapshot and
- * never renames, so the cost of storing a key is constant instead of
- * proportional to the number of keys already in the bucket.
+ * `FlushDirtyMetadata()` performs the deferred writes for every bucket marked
+ * dirty. It runs on the master's DFS maintenance tick and at shutdown.
  *
- * Compaction folds the log back into a fresh snapshot when the log grows past
- * `log_compaction_threshold_`, when more than half the bucket's entries are
- * tombstones, on the master's DFS maintenance tick (which also drives eviction)
- * and at shutdown. Recovery loads the snapshot, replays the log records the
- * snapshot does not already cover, and compacts immediately so the next start
- * begins from a clean snapshot.
+ * The accepted failure mode: if the master dies before a bucket is sealed, that
+ * bucket has no `.meta` file and recovery deletes its `.data` file, so at most
+ * the newest bucket's contents are lost. Because an in-place rewrite that is
+ * torn destroys both the old and the new content, a crash during a rewrite has
+ * the same effect for that one bucket.
  *
  * Lock ownership
  * --------------
  * `mutex_` guards every mutable allocator member: `buckets_`, `key_index_`,
- * `active_bucket_id_`, `next_bucket_id_`, `next_log_seq_`, `pending_log_`,
- * `lru_list_`/`lru_index_` and the eviction bookkeeping. Bucket state lives
- * behind shared_ptr and is only mutated while `mutex_` is held, so no
- * per-bucket mutex is needed.
+ * `active_bucket_id_`, `next_bucket_id_`, `lru_list_`/`lru_index_` and the
+ * eviction bookkeeping. Bucket state lives behind shared_ptr and is only
+ * mutated while `mutex_` is held, so no per-bucket mutex is needed.
  *
- * `log_mutex_` guards the log descriptors and their counters and serializes log
- * I/O. It is always acquired *before* `mutex_`; no path takes them in the
- * opposite order, and no path takes `log_mutex_` while holding `mutex_`.
- *
- * Slow DFS I/O (preallocation, snapshot publication, log appends, deletes) is
- * always performed with `mutex_` released: the caller snapshots the state it
- * needs under the lock, does the I/O, then reacquires the lock and re-validates
- * the bucket generation before publishing the result. No RPC, callback or
- * filesystem call ever happens while `mutex_` is held.
+ * Slow DFS I/O (preallocation, metadata writes, deletes) is always performed
+ * with `mutex_` released: the caller snapshots the state it needs under the
+ * lock, does the I/O, then reacquires the lock and re-validates the bucket
+ * generation before publishing the result. No RPC, callback or filesystem call
+ * ever happens while `mutex_` is held.
  */
 class BucketGlobalAllocator final : public GlobalAllocatorInterface {
    public:
@@ -387,59 +291,23 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
     void AbortEviction(PendingEviction&& pending);
 
     /**
-     * @brief Make every deferred metadata delta durable and compact as needed.
+     * @brief Write the `.meta` file of every bucket whose state is dirty.
      *
-     * `Free()` only updates in-memory state and queues a tombstone record,
-     * because the master calls it while holding a metadata shard lock and DFS
-     * I/O must never happen under that lock. This method performs the deferred
-     * append and then compacts any bucket that has crossed a compaction
-     * trigger, so it must be called with no master lock held: the master's DFS
-     * maintenance tick drives it, and the destructor runs it once more so a
-     * clean shutdown leaves no unflushed tombstones.
+     * The hot paths - BatchAllocate, MarkCommitted, Free - only update memory
+     * and mark the bucket dirty, because the master calls `Free()` while holding
+     * a metadata shard lock and DFS I/O must never happen under that lock. This
+     * method performs the deferred writes, so it must be called with no master
+     * lock held: the master's DFS maintenance tick drives it, and the destructor
+     * runs it once more so a clean shutdown leaves no unwritten metadata.
      *
-     * @return the number of buckets whose pending metadata was made durable.
+     * @return the number of buckets whose metadata was made durable.
      */
     size_t FlushDirtyMetadata();
-
-    /**
-     * @brief Append every queued metadata record and fdatasync the logs.
-     *
-     * The hot-path durability primitive: one append plus one data sync per
-     * touched log, no snapshot rewrite and no rename.
-     */
-    tl::expected<void, ErrorCode> FlushLog();
-
-    /**
-     * @brief Fold `bucket_id`'s log back into a fresh `.meta` snapshot.
-     *
-     * Rewrites the inactive stable snapshot slot, then clears the log.
-     * `log_mutex_` is held throughout, so no record can be appended between
-     * the truncation; combined with a snapshot `log_seq` of "every sequence
-     * number issued so far", everything the truncation discards is covered.
-     */
-    tl::expected<void, ErrorCode> CompactBucket(int64_t bucket_id);
-
-    /**
-     * @brief Compact every bucket. Returns how many were compacted.
-     */
-    size_t CompactAllBuckets();
 
     /**
      * @brief Number of buckets currently tracked (test/metrics helper).
      */
     size_t GetBucketCount() const;
-
-    /**
-     * @brief Bytes currently held in `bucket_id`'s metadata log.
-     */
-    uint64_t GetLogBytes(int64_t bucket_id) const;
-
-    /**
-     * @brief Log size at which a bucket becomes eligible for compaction.
-     */
-    uint64_t GetLogCompactionThreshold() const {
-        return log_compaction_threshold_;
-    }
 
     /**
      * @brief Bucket id an existing key currently lives in, if any.
@@ -485,14 +353,14 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
         // Set between PrepareEviction and Commit/Abort. A frozen bucket
         // accepts no new allocations and cannot be selected again.
         bool frozen = false;
-        // Highest metadata-log sequence number queued for this bucket. The
-        // bucket is dirty exactly while this exceeds the durable sequence
-        // number tracked in `log_synced_seq_`.
-        uint64_t last_queued_seq = 0;
-        // Epoch of the newest durable snapshot slot. The next publication uses
-        // epoch + 1 and alternates slots by parity.
-        uint64_t snapshot_epoch = 0;
-        // Tombstoned entries, used by the tombstone-ratio compaction trigger.
+        // True once the bucket has been sealed (it is no longer the active
+        // bucket), which is when its `.meta` file starts to exist.
+        bool sealed = false;
+        // Set when the in-memory state differs from what the `.meta` file holds,
+        // cleared once the file has been rewritten. Only meaningful for a sealed
+        // bucket: an unsealed one is deliberately not persisted at all.
+        bool meta_dirty = false;
+        // Tombstoned entries, kept for eviction bookkeeping.
         uint64_t tombstones = 0;
         std::unordered_map<std::string, BucketEntry> entries;
     };
@@ -503,53 +371,28 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
 
     std::string BucketDataPath(int64_t bucket_id) const;
     std::string BucketMetaPath(int64_t bucket_id) const;
-    std::string BucketMetaSlotPath(int64_t bucket_id, int slot) const;
-    std::string BucketMetaLogPath(int64_t bucket_id) const;
 
-    // Serializes `bucket` into a PersistedBucketMetadata snapshot covering
-    // every sequence number issued so far. Taken under `mutex_`; the file write
-    // happens outside it.
+    // Serializes `bucket` into a PersistedBucketMetadata snapshot. Taken under
+    // `mutex_`; the file write happens outside it.
     PersistedBucketMetadata SnapshotLocked(BucketState& bucket,
                                            bool evicting);
 
-    // Queues one metadata delta for `bucket`, assigning it the next sequence
-    // number and returning it. The record reaches disk when the log is flushed.
-    uint64_t QueueLogRecordLocked(BucketState& bucket, MetaLogOp op,
-                                  const std::string& key,
-                                  const BucketEntry& entry);
-
-    // Writes a complete snapshot to one of two stable metadata slots and syncs
-    // it. The previous slot remains the recovery fallback; no rename is used.
+    // Overwrites `bucket_id`'s single `.meta` file in place and syncs it.
     tl::expected<void, ErrorCode> PersistMetadata(
         const PersistedBucketMetadata& snapshot);
 
-    // Ensures `seq` is durable for `bucket_id`, appending and syncing whatever
-    // is still queued if it is not. Call with no lock held.
-    tl::expected<void, ErrorCode> SyncLogUpTo(int64_t bucket_id, uint64_t seq);
+    // Marks `bucket` as needing its `.meta` file (re)written. A bucket that is
+    // still active is never persisted, so the flag is only set once sealed.
+    static void MarkMetaDirtyLocked(BucketState& bucket);
 
-    // Appends everything queued and syncs each touched log. Requires
-    // `log_mutex_`; must not be called with `mutex_` held.
-    tl::expected<void, ErrorCode> DrainPendingLogLogLocked();
-
-    // Opens (and caches) the append fd of `bucket_id`'s log. Requires
-    // `log_mutex_`.
-    tl::expected<int, ErrorCode> GetOrOpenLogLogLocked(int64_t bucket_id);
-
-    // Closes and forgets `bucket_id`'s log fd. Requires `log_mutex_`.
-    void CloseLogLogLocked(int64_t bucket_id);
-
-    // True when `bucket_id` has crossed a compaction trigger. Takes both locks
-    // internally; call with neither held.
-    bool ShouldCompact(int64_t bucket_id) const;
-
-    // Compacts `bucket_id` when a trigger fired, and logs but does not
-    // propagate a compaction failure: the log is still authoritative, so the
-    // only cost is that it stays large a little longer.
-    void MaybeCompact(int64_t bucket_id);
+    // Seals the currently active bucket - it stops accepting allocations - and
+    // marks it for persistence. Requires `mutex_`.
+    void SealActiveBucketLocked();
 
     // Creates a fresh bucket: allocates the id under the lock, preallocates
-    // the data file and writes the initial `.meta` outside the lock, then
-    // publishes the bucket. Rolls back id/state/files on any failure.
+    // the data file outside the lock, then publishes the bucket. Rolls back
+    // id/state/files on any failure. The new bucket's `.meta` is written only
+    // when it is later sealed.
     tl::expected<BucketPtr, ErrorCode> CreateBucketUnlocked(
         std::unique_lock<std::mutex>& lock);
 
@@ -561,11 +404,9 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
     void TouchLruLocked(int64_t bucket_id, int64_t now_ns);
     void RemoveFromLruLocked(int64_t bucket_id);
 
-    // Applies one reservation to `bucket`, queues its ADD_PENDING record and
-    // returns the descriptor. `out_seq` receives the record's sequence number.
+    // Applies one reservation to `bucket` and returns the descriptor.
     tl::expected<DistributedFSDescriptor, ErrorCode> ReserveInBucketLocked(
-        BucketState& bucket, const std::string& key, uint64_t size,
-        uint64_t* out_seq);
+        BucketState& bucket, const std::string& key, uint64_t size);
 
     // Rolls a reservation back out of `bucket` (used when a later entry of the
     // same batch fails). Only valid while the reservation is the most recent
@@ -581,11 +422,6 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
 
     tl::expected<void, ErrorCode> RecoverFromDisk();
 
-    // Replays `bucket_NNNNNN.meta.log` on top of an already-loaded snapshot.
-    // Single-threaded recovery context only.
-    void ReplayLogForRecovery(BucketState& bucket, uint64_t snapshot_log_seq,
-                              uint64_t& max_seq, uint64_t& max_generation);
-
     void DeleteBucketFiles(int64_t bucket_id);
 
     uint64_t UsedBytesLocked() const;
@@ -597,7 +433,6 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
     uint64_t bucket_capacity_ = 0;
     uint64_t alignment_ = 4096;
     int64_t max_bucket_count_ = 0;
-    uint64_t log_compaction_threshold_ = 0;
 
     bool eviction_enabled_ = true;
     double eviction_high_watermark_ = 0.9;
@@ -616,10 +451,6 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
     int64_t next_bucket_id_ = 0;
     int64_t active_bucket_id_ = -1;
     uint64_t next_generation_ = 1;
-    // Metadata deltas produced but not yet appended, in sequence order, and
-    // the globally monotonic counter that orders them.
-    std::vector<MetaLogRecord> pending_log_;
-    uint64_t next_log_seq_ = 1;
     // Once the high watermark is crossed, keep evicting until usage falls
     // below the low watermark; protected buckets may make that span several
     // prepare/resolve rounds.
@@ -629,15 +460,6 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
     std::unordered_map<int64_t, std::list<int64_t>::iterator> lru_index_;
 
     std::vector<RecoveredReplica> recovered_replicas_;
-
-    // Guards the log descriptors and counters below and serializes log I/O.
-    // Always acquired before `mutex_`, never while holding it.
-    mutable std::mutex log_mutex_;
-    std::unordered_map<int64_t, int> log_fds_;
-    std::unordered_map<int64_t, uint64_t> log_bytes_;
-    // Highest sequence number that is durable for each bucket, either because
-    // it reached the log or because a published snapshot covers it.
-    std::unordered_map<int64_t, uint64_t> log_synced_seq_;
 
     std::atomic<bool> initialized_{false};
 };

@@ -37,10 +37,6 @@ struct DistributedStorageConfig {
     // BUCKET mode only: upper bound on live buckets. Also the fixed
     // denominator for eviction watermarks, so it must be > 0.
     int64_t max_bucket_count = 256;
-    // BUCKET mode only: how large a bucket's metadata log may grow before it is
-    // folded into a fresh snapshot. 0 selects the default derived from
-    // `bucket_capacity` (see ResolveBucketMetaLogThreshold).
-    uint64_t bucket_meta_log_threshold = 0;
     // Cleared by FromEnvironment() when MOONCAKE_DFS_ALLOCATOR_TYPE names an
     // unknown allocator, so the master can reject the configuration instead of
     // silently defaulting to SHARD.
@@ -51,16 +47,6 @@ struct DistributedStorageConfig {
     bool ValidateForBucketAllocator() const;
     static DistributedStorageConfig FromEnvironment();
     std::string FormatStr() const;
-
-    /**
-     * @brief Effective metadata-log compaction threshold in bytes.
-     *
-     * Returns `bucket_meta_log_threshold` when set explicitly, otherwise a
-     * fraction of the bucket capacity capped at a few megabytes: large enough
-     * that compaction is rare, small enough that replay after a crash stays
-     * cheap.
-     */
-    uint64_t ResolveBucketMetaLogThreshold() const;
 };
 
 struct DfsWriteRequest {

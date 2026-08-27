@@ -236,30 +236,7 @@ bool DistributedStorageConfig::ValidateForBucketAllocator() const {
                       "bucket_capacity overflows";
         return false;
     }
-    // A log must be able to hold at least one maximum-size record, otherwise
-    // compaction would trigger on every single append.
-    if (bucket_meta_log_threshold != 0 &&
-        bucket_meta_log_threshold < kMetaLogMaxRecordSize) {
-        LOG(ERROR) << "DistributedStorageConfig: bucket_meta_log_threshold ("
-                   << bucket_meta_log_threshold
-                   << ") must be at least the maximum log record size ("
-                   << kMetaLogMaxRecordSize << ")";
-        return false;
-    }
     return true;
-}
-
-uint64_t DistributedStorageConfig::ResolveBucketMetaLogThreshold() const {
-    if (bucket_meta_log_threshold != 0) return bucket_meta_log_threshold;
-
-    // A 64th of the bucket capacity keeps the log small relative to the data it
-    // describes, and the 4 MiB ceiling bounds crash-recovery replay cost for
-    // large buckets. The floor keeps the threshold above one maximum-size
-    // record so a single append can never force a compaction.
-    constexpr uint64_t kMaxDefaultThreshold = 4ULL * 1024 * 1024;
-    const uint64_t derived = bucket_capacity / 64;
-    return std::max<uint64_t>(kMetaLogMaxRecordSize,
-                              std::min(derived, kMaxDefaultThreshold));
 }
 
 DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
@@ -313,9 +290,6 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     config.max_bucket_count = static_cast<int64_t>(
         Environ::GetInt("MOONCAKE_DFS_MAX_BUCKET_COUNT",
                         static_cast<int>(config.max_bucket_count)));
-    config.bucket_meta_log_threshold =
-        Environ::GetUInt64("MOONCAKE_DFS_BUCKET_META_LOG_THRESHOLD",
-                           config.bucket_meta_log_threshold);
     return config;
 }
 
@@ -334,8 +308,7 @@ std::string DistributedStorageConfig::FormatStr() const {
         << eviction_check_interval.count()
         << ", allocator_type=" << ToString(allocator_type)
         << ", bucket_capacity=" << bucket_capacity
-        << ", max_bucket_count=" << max_bucket_count
-        << ", bucket_meta_log_threshold=" << ResolveBucketMetaLogThreshold();
+        << ", max_bucket_count=" << max_bucket_count;
     return oss.str();
 }
 
