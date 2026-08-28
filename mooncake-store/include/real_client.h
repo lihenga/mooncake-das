@@ -35,9 +35,9 @@ namespace mooncake {
 
 // Session-level object cache for non-memory reads to avoid
 // repeated I/O on the same key within a session.
-// Enabled by default; set MC_STORE_DISABLE_SESSION_CACHE to
-// "0", "false", or "off" to disable; any other value or
-// unset enables the cache.
+// Enabled by default; set MC_STORE_ENABLE_SESSION_CACHE to
+// "0", "false", or "off" to disable; unset or any other value
+// enables the cache.
 bool session_cache_enabled();
 
 struct NonMemReadEntry {
@@ -63,7 +63,9 @@ inline void scatter_non_mem_result(
     const void *tmp_base,
     std::vector<int> &results,
     std::mutex &session_mutex,
-    std::unordered_map<std::string, QueryResult> &sessions) {
+    std::unordered_map<std::string, QueryResult> &sessions,
+    std::unordered_map<std::string, SessionCachedObject>
+        &session_cache) {
     for (size_t j = 0; j < entry.buffers.size(); ++j) {
         const void *src =
             static_cast<const char *>(tmp_base) + entry.src_offsets[j];
@@ -82,6 +84,7 @@ inline void scatter_non_mem_result(
             static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
         std::lock_guard<std::mutex> lock(session_mutex);
         sessions.erase(entry.key);
+        session_cache.erase(entry.key);
     } else {
         size_t transferred = 0;
         for (size_t j = 0; j < entry.sizes.size(); ++j) {

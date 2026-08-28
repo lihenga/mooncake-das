@@ -58,7 +58,7 @@ namespace mooncake {
 bool session_cache_enabled() {
     static const bool enabled = [] {
         const char *val =
-            std::getenv("MC_STORE_DISABLE_SESSION_CACHE");
+            std::getenv("MC_STORE_ENABLE_SESSION_CACHE");
         bool result = true;
         if (!val || val[0] == '\0') {
             result = true;  // unset: enabled
@@ -76,11 +76,11 @@ bool session_cache_enabled() {
         }
         if (result) {
             LOG(INFO) << "Session cache enabled"
-                      << " (MC_STORE_DISABLE_SESSION_CACHE="
+                      << " (MC_STORE_ENABLE_SESSION_CACHE="
                       << raw_value << ")";
         } else {
             LOG(INFO) << "Session cache disabled"
-                      << " (MC_STORE_DISABLE_SESSION_CACHE="
+                      << " (MC_STORE_ENABLE_SESSION_CACHE="
                       << raw_value << ")";
         }
         return result;
@@ -5237,13 +5237,20 @@ void RealClient::scatter_cached_entries(
     std::vector<NonMemReadEntry *> miss_entries;
     for (auto *entry_ptr : entries) {
         auto &entry = *entry_ptr;
-        auto cache_it = get_session_object_cache_.find(entry.key);
-        if (cache_it != get_session_object_cache_.end()) {
+        std::shared_ptr<BufferHandle> cached_handle;
+        {
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            auto cache_it = get_session_object_cache_.find(entry.key);
+            if (cache_it != get_session_object_cache_.end()) {
+                cached_handle = cache_it->second.buffer_handle;
+            }
+        }
+        if (cached_handle) {
             if (results[entry.original_idx] != 0) continue;
             scatter_non_mem_result(
-                entry,
-                cache_it->second.buffer_handle->ptr(),
-                results, session_mutex_, get_sessions_);
+                entry, cached_handle->ptr(),
+                results, session_mutex_, get_sessions_,
+                get_session_object_cache_);
             continue;
         }
         miss_entries.push_back(entry_ptr);
@@ -5255,17 +5262,21 @@ void RealClient::store_in_cache_and_scatter(
     NonMemReadEntry &entry,
     std::unique_ptr<BufferHandle> handle,
     std::vector<int> &results) {
-    uint64_t total_size = calculate_total_size(entry.replica);
+    const uint64_t total_size = calculate_total_size(entry.replica);
     auto shared_handle = std::shared_ptr<BufferHandle>(
         std::move(handle));
     if (session_cache_enabled()) {
-        get_session_object_cache_.emplace(
-            entry.key,
-            SessionCachedObject{shared_handle, total_size});
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        if (get_sessions_.find(entry.key) != get_sessions_.end()) {
+            get_session_object_cache_.insert_or_assign(
+                entry.key,
+                SessionCachedObject{shared_handle, total_size});
+        }
     }
     scatter_non_mem_result(
         entry, shared_handle->ptr(),
-        results, session_mutex_, get_sessions_);
+        results, session_mutex_, get_sessions_,
+        get_session_object_cache_);
 }
 
 void RealClient::process_session_local_disk_reads(
