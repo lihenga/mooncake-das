@@ -5278,8 +5278,15 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
             if (!inserted && record.source != source) {
                 record.success = false;
             }
-            record.success = record.success && results[i] >= 0;
-            if (results[i] >= 0) {
+            uint64_t expected_bytes = 0;
+            for (size_t size : all_sizes[i]) {
+                expected_bytes += size;
+            }
+            const bool range_success =
+                results[i] >= 0 &&
+                static_cast<uint64_t>(results[i]) == expected_bytes;
+            record.success = record.success && range_success;
+            if (range_success) {
                 for (size_t j = 0; j < all_sizes[i].size(); ++j) {
                     const auto range = std::make_pair(
                         static_cast<uint64_t>(all_src_offsets[i][j]),
