@@ -194,6 +194,7 @@ class MasterService {
     tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
     DeleteTenantQuotaPolicy(const TenantId& tenant_id);
     uint64_t GetTenantQuotaAllocatableCapacityBytes();
+    void RefreshDfsMetrics() const;
 
     ErrorCode SetBatchOpLogBackendForTesting(
         std::shared_ptr<HaKvBackend> backend);
