@@ -127,7 +127,9 @@ std::string DirectSourceForReplica(const Replica::Descriptor &replica) {
         return "local_disk";
     }
     if (replica.is_disk_replica() || replica.is_dfs_replica()) {
-        return "disk_dfs";
+        // Legacy DISK and descriptor-based DFS both represent the shared
+        // distributed filesystem tier for direct-storage metrics.
+        return "dfs";
     }
     return "unknown";
 }
@@ -5709,7 +5711,7 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     // Group LOCAL_DISK entries by endpoint for batch RPC.
     std::unordered_map<std::string,
         std::vector<NonMemReadEntry *>> local_disk_by_endpoint;
-    std::vector<NonMemReadEntry *> disk_dfs_entries;
+    std::vector<NonMemReadEntry *> dfs_entries;
 
     for (auto &entry : non_mem_entries) {
         const auto &replica = entry.replica;
@@ -5720,7 +5722,7 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
             ++local_disk_count;
         } else {
             // DISK or DFS
-            disk_dfs_entries.push_back(&entry);
+            dfs_entries.push_back(&entry);
             ++dfs_count;
         }
     }
@@ -5729,8 +5731,8 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         local_disk_by_endpoint, results);
 
     // DISK/DFS: batch via client_->BatchGet.
-    if (!disk_dfs_entries.empty()) {
-        process_session_disk_dfs_reads(disk_dfs_entries, results);
+    if (!dfs_entries.empty()) {
+        process_session_disk_dfs_reads(dfs_entries, results);
     }
 
     // Select and mark each key once while holding the session lock, then emit
@@ -5782,7 +5784,7 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
               << ", mem_reads=" << mem_count
               << ", cache_evicted=" << cache_evicted_count
               << ", local_disk_reads=" << local_disk_count
-              << ", disk_dfs_reads=" << dfs_count;
+              << ", dfs_reads=" << dfs_count;
 
     return results;
 }
@@ -6018,7 +6020,7 @@ void RealClient::process_session_disk_dfs_reads(
                 }
             }
         }
-        client_->ObserveDirectIo("read", "disk_dfs", io_success, io_bytes,
+        client_->ObserveDirectIo("read", "dfs", io_success, io_bytes,
                                  io_duration);
 
         // Build key -> entry map for O(1) lookup
