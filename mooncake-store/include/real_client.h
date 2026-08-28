@@ -992,7 +992,15 @@ class RealClient : public PyClient {
     mutable std::mutex session_mutex_;
     std::condition_variable session_cv_;
     std::unordered_map<std::string, QueryResult> get_sessions_;
-    std::unordered_set<std::string> get_session_access_recorded_;
+    struct GetSessionAccessRecord {
+        std::string source;
+        bool success{true};
+        uint64_t bytes{0};
+    };
+    // One record per key/session. Bytes are accumulated across all range
+    // calls (including every layer) and emitted when the session ends.
+    std::unordered_map<std::string, GetSessionAccessRecord>
+        get_session_access_records_;
     std::unordered_map<std::string, PutSessionEntry> put_sessions_;
 
     // Per-key object cache for non-memory reads within a get session.

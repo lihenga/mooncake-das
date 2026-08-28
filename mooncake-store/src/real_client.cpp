@@ -5021,7 +5021,7 @@ std::vector<int> RealClient::batch_get_session_start(
 
     std::lock_guard<std::mutex> lock(session_mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {
-        get_session_access_recorded_.erase(keys[i]);
+        get_session_access_records_.erase(keys[i]);
         if (!query_results[i]) {
             results[i] = static_cast<int>(toInt(query_results[i].error()));
             get_sessions_.erase(keys[i]);
@@ -5252,23 +5252,18 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         process_session_disk_dfs_reads(dfs_entries, results);
     }
 
-    // Select and mark each key once while holding the session lock, then emit
-    // metrics after releasing it.  This keeps the per-key accounting
-    // thread-safe without reacquiring session_mutex_ for every key.
-    struct DirectAccessObservation {
-        std::string source;
-        bool success;
-        uint64_t bytes;
-    };
-    std::vector<DirectAccessObservation> access_observations;
-    access_observations.reserve(keys.size());
+    // Accumulate one logical access per key across all layer/range calls.
+    // Bytes are emitted at session end so layer-wise loading reports the full
+    // request payload instead of only the first layer's ranges.
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
+        std::unordered_set<std::string> touched_keys;
+        touched_keys.reserve(keys.size());
         for (size_t i = 0; i < keys.size(); ++i) {
             auto session_it = get_sessions_.find(keys[i]);
             if (session_it == get_sessions_.end() ||
                 session_it->second.replicas.empty() ||
-                !get_session_access_recorded_.insert(keys[i]).second) {
+                !touched_keys.insert(keys[i]).second) {
                 continue;
             }
 
@@ -5278,23 +5273,22 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
                 continue;
             }
 
-            // Count only the first range touch for a key in this session;
-            // subsequent layer/range calls are deliberately de-duplicated.
-            uint64_t bytes = 0;
+            auto [record_it, inserted] = get_session_access_records_.try_emplace(
+                keys[i], GetSessionAccessRecord{source, true, 0});
+            auto &record = record_it->second;
+            if (!inserted && record.source != source) {
+                record.success = false;
+            }
+            record.success = record.success && results[i] >= 0;
             if (all_buffers[i].size() == all_sizes[i].size() &&
                 all_buffers[i].size() == all_src_offsets[i].size()) {
                 for (size_t size : all_sizes[i]) {
-                    bytes += size;
+                    if (results[i] >= 0) {
+                        record.bytes += size;
+                    }
                 }
             }
-            access_observations.push_back({source, results[i] >= 0,
-                                           results[i] >= 0 ? bytes : 0});
         }
-    }
-    for (const auto &observation : access_observations) {
-        client_->ObserveDirectAccess(observation.source,
-                                     observation.success,
-                                     observation.bytes);
     }
 
     LOG(INFO) << "batch_get_into_multi_buffer_ranges: keys=" << keys.size()
@@ -5307,11 +5301,35 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
 }
 
 int RealClient::batch_get_session_end(const std::vector<std::string> &keys) {
-    std::lock_guard<std::mutex> lock(session_mutex_);
-    for (const auto &key : keys) {
-        get_sessions_.erase(key);
-        get_session_access_recorded_.erase(key);
-        get_session_object_cache_.erase(key);
+    struct DirectAccessObservation {
+        std::string source;
+        bool success;
+        uint64_t bytes;
+    };
+    std::vector<DirectAccessObservation> access_observations;
+    access_observations.reserve(keys.size());
+    {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        std::unordered_set<std::string> ended_keys;
+        ended_keys.reserve(keys.size());
+        for (const auto &key : keys) {
+            if (!ended_keys.insert(key).second) continue;
+            auto access_it = get_session_access_records_.find(key);
+            if (access_it != get_session_access_records_.end()) {
+                const auto &record = access_it->second;
+                access_observations.push_back(
+                    {record.source, record.success,
+                     record.success ? record.bytes : 0});
+                get_session_access_records_.erase(access_it);
+            }
+            get_sessions_.erase(key);
+            get_session_object_cache_.erase(key);
+        }
+    }
+    for (const auto &observation : access_observations) {
+        client_->ObserveDirectAccess(observation.source,
+                                     observation.success,
+                                     observation.bytes);
     }
     return 0;
 }
