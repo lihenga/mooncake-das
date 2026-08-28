@@ -2467,7 +2467,7 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
             }
         }
     }
-    ObserveDirectIo("write", "disk_dfs", all_succeeded, successful_bytes,
+    ObserveDirectIo("write", "dfs", all_succeeded, successful_bytes,
                     write_duration_seconds);
 
     for (auto& buffer : staging_buffers) {
@@ -2589,7 +2589,7 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
             }
         }
     }
-    ObserveDirectIo("write", "disk_dfs", all_succeeded, successful_bytes,
+    ObserveDirectIo("write", "dfs", all_succeeded, successful_bytes,
                     write_duration_seconds);
 
     // Report each key individually so one failure cannot revoke its neighbours.
@@ -4195,7 +4195,7 @@ void Client::PutToLocalFile(const std::string& key,
                 .count();
         // PutToLocalFile writes the client-local file backend, not the DFS
         // allocator. Keep this separate from DISK/DFS metrics, where the
-        // legacy DISK replica type is grouped with DFS as disk_dfs.
+        // legacy DISK replica type is grouped with DFS as the shared dfs tier.
         ObserveDirectIo("write", "local_disk", store_result.has_value(),
                         store_result ? value.size() : 0, io_duration_seconds);
 
