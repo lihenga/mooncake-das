@@ -4193,7 +4193,10 @@ void Client::PutToLocalFile(const std::string& key,
             std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                           io_started)
                 .count();
-        ObserveDirectIo("write", "disk_dfs", store_result.has_value(),
+        // PutToLocalFile writes the client-local file backend, not the DFS
+        // allocator. Keep this separate from DISK/DFS metrics, where the
+        // legacy DISK replica type is grouped with DFS as disk_dfs.
+        ObserveDirectIo("write", "local_disk", store_result.has_value(),
                         store_result ? value.size() : 0, io_duration_seconds);
 
         if (!store_result) {

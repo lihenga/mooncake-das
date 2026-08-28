@@ -5250,25 +5250,49 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         process_session_disk_dfs_reads(disk_dfs_entries, results);
     }
 
-    for (size_t i = 0; i < keys.size(); ++i) {
+    // Select and mark each key once while holding the session lock, then emit
+    // metrics after releasing it.  This keeps the per-key accounting
+    // thread-safe without reacquiring session_mutex_ for every key.
+    struct DirectAccessObservation {
         std::string source;
-        bool should_record = false;
-        {
-            std::lock_guard<std::mutex> lock(session_mutex_);
+        bool success;
+        uint64_t bytes;
+    };
+    std::vector<DirectAccessObservation> access_observations;
+    access_observations.reserve(keys.size());
+    {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        for (size_t i = 0; i < keys.size(); ++i) {
             auto session_it = get_sessions_.find(keys[i]);
-            if (session_it != get_sessions_.end() &&
-                !session_it->second.replicas.empty() &&
-                get_session_access_recorded_.insert(keys[i]).second) {
-                source = DirectSourceForReplica(
-                    session_it->second.replicas.front());
-                should_record = source != "unknown";
+            if (session_it == get_sessions_.end() ||
+                session_it->second.replicas.empty() ||
+                !get_session_access_recorded_.insert(keys[i]).second) {
+                continue;
             }
+
+            const std::string source = DirectSourceForReplica(
+                session_it->second.replicas.front());
+            if (source == "unknown") {
+                continue;
+            }
+
+            // Count only the first range touch for a key in this session;
+            // subsequent layer/range calls are deliberately de-duplicated.
+            uint64_t bytes = 0;
+            if (all_buffers[i].size() == all_sizes[i].size() &&
+                all_buffers[i].size() == all_src_offsets[i].size()) {
+                for (size_t size : all_sizes[i]) {
+                    bytes += size;
+                }
+            }
+            access_observations.push_back({source, results[i] >= 0,
+                                           results[i] >= 0 ? bytes : 0});
         }
-        if (!should_record) continue;
-        uint64_t bytes = 0;
-        for (size_t size : all_sizes[i]) bytes += size;
-        const bool success = results[i] >= 0;
-        client_->ObserveDirectAccess(source, success, success ? bytes : 0);
+    }
+    for (const auto &observation : access_observations) {
+        client_->ObserveDirectAccess(observation.source,
+                                     observation.success,
+                                     observation.bytes);
     }
 
     LOG(INFO) << "batch_get_into_multi_buffer_ranges: keys=" << keys.size()
