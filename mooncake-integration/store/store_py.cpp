@@ -2984,20 +2984,6 @@ PYBIND11_MODULE(store, m) {
             py::arg("keys"),
             "End a get session and drop cached replica metadata")
         .def(
-            "record_hicache_tokens",
-            [](MooncakeStorePyWrapper &self, const std::string &operation,
-               const std::string &source, uint64_t tokens) {
-                if (!self.is_client_initialized()) {
-                    LOG(ERROR) << "Client is not initialized";
-                    return -1;
-                }
-                py::gil_scoped_release release;
-                return self.store_->record_hicache_tokens(operation, source,
-                                                          tokens);
-            },
-            py::arg("operation"), py::arg("source"), py::arg("tokens"),
-            "Record successful direct-linker prefetch or backup tokens")
-        .def(
             "batch_put_session_start",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys,

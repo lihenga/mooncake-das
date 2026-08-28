@@ -619,13 +619,6 @@ class Client {
         }
     }
 
-    void ObserveHicacheTokens(const std::string& operation,
-                              const std::string& source, uint64_t tokens) {
-        if (metrics_ != nullptr) {
-            metrics_->ObserveHicacheTokens(operation, source, tokens);
-        }
-    }
-
     // For Prometheus-style metrics
     tl::expected<std::string, ErrorCode> SerializeMetrics() {
         if (metrics_ == nullptr) {

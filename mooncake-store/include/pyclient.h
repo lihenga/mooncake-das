@@ -320,12 +320,6 @@ class PyClient {
         return static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
     }
 
-    virtual int record_hicache_tokens(const std::string & /*operation*/,
-                                      const std::string & /*source*/,
-                                      uint64_t /*tokens*/) {
-        return static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
-    }
-
     virtual std::vector<int> batch_put_session_start(
         const std::vector<std::string> &keys,
         const std::vector<size_t> & /*sizes*/,

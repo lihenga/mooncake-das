@@ -2445,7 +2445,8 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
                                       write_started)
             .count();
     uint64_t successful_bytes = 0;
-    bool all_succeeded = !requests.empty() &&
+    bool all_succeeded = requests.size() == keys.size() &&
+                         !requests.empty() &&
                          write_results.size() == requests.size();
     if (write_results.size() != requests.size()) {
         LOG(ERROR) << "DFS BatchWrite response size mismatch: expected "

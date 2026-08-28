@@ -5290,17 +5290,6 @@ int RealClient::batch_get_session_end(const std::vector<std::string> &keys) {
     return 0;
 }
 
-int RealClient::record_hicache_tokens(const std::string &operation,
-                                      const std::string &source,
-                                      uint64_t tokens) {
-    if (!client_ || (operation != "prefetch" && operation != "backup") ||
-        (source != "local_disk" && source != "disk_dfs")) {
-        return static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
-    }
-    client_->ObserveHicacheTokens(operation, source, tokens);
-    return 0;
-}
-
 void RealClient::scatter_cached_entries(
     std::vector<NonMemReadEntry *> &entries,
     std::vector<int> &results) {

@@ -324,10 +324,6 @@ class RealClient : public PyClient {
 
     int batch_get_session_end(const std::vector<std::string> &keys) override;
 
-    int record_hicache_tokens(const std::string &operation,
-                              const std::string &source,
-                              uint64_t tokens) override;
-
     void process_session_local_disk_reads(
         std::unordered_map<std::string,
             std::vector<NonMemReadEntry *>> &local_disk_by_endpoint,

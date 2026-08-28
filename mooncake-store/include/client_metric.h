@@ -35,10 +35,6 @@ const std::vector<double> kStorageLatencySecondsBucket = {
     0.025,  0.05,    0.1,    0.25,  0.5,    1,     2.5,
     5,      10,      20};
 
-const std::vector<double> kTokenCountBucket = {
-    1,    16,    64,    256,   512,    1024,   2048,
-    4096, 8192,  16384, 32768, 65536,  131072, 262144};
-
 static inline std::string get_env_or_default(
     const char* env_var, const std::string& default_val = "") {
     const char* val = getenv(env_var);
@@ -512,8 +508,6 @@ struct DirectStorageMetric {
     std::array<std::string, 1> cache_labels = {"result"};
     std::array<std::string, 1> eviction_labels = {"reason"};
     std::array<std::string, 3> io_labels = {"operation", "source", "result"};
-    std::array<std::string, 1> token_labels = {"source"};
-
     explicit DirectStorageMetric(
         std::map<std::string, std::string> labels = {})
         : access_total("mooncake_direct_access_total",
@@ -538,23 +532,7 @@ struct DirectStorageMetric {
           io_duration_seconds(
               "mooncake_direct_io_duration_seconds",
               "Direct storage I/O wall-clock duration in seconds",
-              kStorageLatencySecondsBucket, labels, io_labels),
-          prefetched_tokens_total(
-              "mooncake_hicache_prefetched_tokens_total",
-              "Tokens successfully prefetched through the direct linker",
-              labels, token_labels),
-          backuped_tokens_total(
-              "mooncake_hicache_backuped_tokens_total",
-              "Tokens successfully backed up through the direct linker",
-              labels, token_labels),
-          prefetched_tokens_per_request(
-              "mooncake_hicache_prefetched_tokens_per_request",
-              "Successfully prefetched tokens per request", kTokenCountBucket,
-              labels, token_labels),
-          backuped_tokens_per_operation(
-              "mooncake_hicache_backuped_tokens_per_operation",
-              "Successfully backed up tokens per offload operation",
-              kTokenCountBucket, labels, token_labels) {}
+              kStorageLatencySecondsBucket, labels, io_labels) {}
 
     ylt::metric::hybrid_counter_2t access_total;
     ylt::metric::hybrid_counter_2t access_bytes_total;
@@ -563,11 +541,6 @@ struct DirectStorageMetric {
     ylt::metric::hybrid_counter_3t io_operations_total;
     ylt::metric::hybrid_counter_3t io_bytes_total;
     ylt::metric::hybrid_histogram_3d io_duration_seconds;
-    ylt::metric::hybrid_counter_1t prefetched_tokens_total;
-    ylt::metric::hybrid_counter_1t backuped_tokens_total;
-    ylt::metric::hybrid_histogram_1d prefetched_tokens_per_request;
-    ylt::metric::hybrid_histogram_1d backuped_tokens_per_operation;
-
     void ObserveAccess(const std::string& source, bool success,
                        uint64_t bytes) {
         const std::array<std::string, 2> label = {
@@ -593,18 +566,6 @@ struct DirectStorageMetric {
         io_duration_seconds.observe(label, duration_seconds);
     }
 
-    void ObserveHicacheTokens(const std::string& operation,
-                              const std::string& source, uint64_t tokens) {
-        const std::array<std::string, 1> label = {source};
-        if (operation == "prefetch") {
-            prefetched_tokens_total.inc(label, tokens);
-            prefetched_tokens_per_request.observe(label, tokens);
-        } else if (operation == "backup") {
-            backuped_tokens_total.inc(label, tokens);
-            backuped_tokens_per_operation.observe(label, tokens);
-        }
-    }
-
     void serialize(std::string& str) {
         access_total.serialize(str);
         access_bytes_total.serialize(str);
@@ -613,10 +574,6 @@ struct DirectStorageMetric {
         io_operations_total.serialize(str);
         io_bytes_total.serialize(str);
         io_duration_seconds.serialize(str);
-        prefetched_tokens_total.serialize(str);
-        backuped_tokens_total.serialize(str);
-        prefetched_tokens_per_request.serialize(str);
-        backuped_tokens_per_operation.serialize(str);
     }
 };
 
@@ -826,11 +783,6 @@ struct ClientMetric {
                          uint64_t bytes, double duration_seconds) {
         direct_storage_metric.ObserveIo(operation, source, success, bytes,
                                         duration_seconds);
-    }
-
-    void ObserveHicacheTokens(const std::string& operation,
-                              const std::string& source, uint64_t tokens) {
-        direct_storage_metric.ObserveHicacheTokens(operation, source, tokens);
     }
 
     void serialize(std::string& str);
