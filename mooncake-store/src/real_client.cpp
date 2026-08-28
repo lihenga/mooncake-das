@@ -5259,8 +5259,18 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         std::lock_guard<std::mutex> lock(session_mutex_);
         for (size_t i = 0; i < keys.size(); ++i) {
             auto session_it = get_sessions_.find(keys[i]);
-            if (session_it == get_sessions_.end() ||
-                session_it->second.replicas.empty() ||
+            if (session_it == get_sessions_.end()) {
+                // A prior range may have succeeded before this call caused
+                // lease expiry or another failure to remove the session.
+                // Preserve that logical access as failed instead of silently
+                // emitting it as a success at session end.
+                auto record_it = get_session_access_records_.find(keys[i]);
+                if (record_it != get_session_access_records_.end()) {
+                    record_it->second.success = false;
+                }
+                continue;
+            }
+            if (session_it->second.replicas.empty() ||
                 all_buffers[i].size() != all_sizes[i].size() ||
                 all_buffers[i].size() != all_src_offsets[i].size()) {
                 continue;
