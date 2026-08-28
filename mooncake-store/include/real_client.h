@@ -13,6 +13,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <set>
 #include <vector>
 
 #include "pyclient.h"
@@ -996,6 +997,7 @@ class RealClient : public PyClient {
         std::string source;
         bool success{true};
         uint64_t bytes{0};
+        std::set<std::pair<uint64_t, uint64_t>> ranges;
     };
     // One record per key/session. Bytes are accumulated across all range
     // calls (including every layer) and emitted when the session ends.

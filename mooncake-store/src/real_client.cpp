@@ -5274,7 +5274,7 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
             }
 
             auto [record_it, inserted] = get_session_access_records_.try_emplace(
-                keys[i], GetSessionAccessRecord{source, true, 0});
+                keys[i], GetSessionAccessRecord{source, true, 0, {}});
             auto &record = record_it->second;
             if (!inserted && record.source != source) {
                 record.success = false;
@@ -5282,9 +5282,14 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
             record.success = record.success && results[i] >= 0;
             if (all_buffers[i].size() == all_sizes[i].size() &&
                 all_buffers[i].size() == all_src_offsets[i].size()) {
-                for (size_t size : all_sizes[i]) {
-                    if (results[i] >= 0) {
-                        record.bytes += size;
+                if (results[i] >= 0) {
+                    for (size_t j = 0; j < all_sizes[i].size(); ++j) {
+                        const auto range = std::make_pair(
+                            static_cast<uint64_t>(all_src_offsets[i][j]),
+                            static_cast<uint64_t>(all_sizes[i][j]));
+                        if (record.ranges.insert(range).second) {
+                            record.bytes += all_sizes[i][j];
+                        }
                     }
                 }
             }
