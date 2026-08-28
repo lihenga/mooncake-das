@@ -40,6 +40,8 @@ class WrappedMasterService {
     tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
     CalcCacheStats();
 
+    void RefreshDfsMetrics() const;
+
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& keys,
         const std::string& tenant_id = "default");

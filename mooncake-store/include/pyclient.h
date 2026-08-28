@@ -301,6 +301,11 @@ class PyClient {
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }
 
+    virtual std::vector<std::string> batch_get_session_sources(
+        const std::vector<std::string> &keys) {
+        return std::vector<std::string>(keys.size(), "unknown");
+    }
+
     virtual std::vector<int> batch_get_into_multi_buffer_ranges(
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> & /*all_buffers*/,
@@ -312,6 +317,12 @@ class PyClient {
 
     virtual int batch_get_session_end(
         const std::vector<std::string> & /*keys*/) {
+        return static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+    }
+
+    virtual int record_hicache_tokens(const std::string & /*operation*/,
+                                      const std::string & /*source*/,
+                                      uint64_t /*tokens*/) {
         return static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
     }
 

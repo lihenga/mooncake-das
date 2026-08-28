@@ -591,6 +591,41 @@ class Client {
         }
     }
 
+    void ObserveDirectAccess(const std::string& source, bool success,
+                             uint64_t bytes) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveDirectAccess(source, success, bytes);
+        }
+    }
+
+    void ObserveDirectSessionCache(bool hit) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveDirectSessionCache(hit);
+        }
+    }
+
+    void ObserveDirectSessionCacheEviction() {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveDirectSessionCacheEviction();
+        }
+    }
+
+    void ObserveDirectIo(const std::string& operation,
+                         const std::string& source, bool success,
+                         uint64_t bytes, double duration_seconds) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveDirectIo(operation, source, success, bytes,
+                                      duration_seconds);
+        }
+    }
+
+    void ObserveHicacheTokens(const std::string& operation,
+                              const std::string& source, uint64_t tokens) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveHicacheTokens(operation, source, tokens);
+        }
+    }
+
     // For Prometheus-style metrics
     tl::expected<std::string, ErrorCode> SerializeMetrics() {
         if (metrics_ == nullptr) {

@@ -30,6 +30,15 @@ const std::vector<double> kLatencyBucket = {
     50000, 100000, 200000, 500000, 1000000, 2000000, 5000000, 10000000,
     20000000};
 
+const std::vector<double> kStorageLatencySecondsBucket = {
+    0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01,
+    0.025,  0.05,    0.1,    0.25,  0.5,    1,     2.5,
+    5,      10,      20};
+
+const std::vector<double> kTokenCountBucket = {
+    1,    16,    64,    256,   512,    1024,   2048,
+    4096, 8192,  16384, 32768, 65536,  131072, 262144};
+
 static inline std::string get_env_or_default(
     const char* env_var, const std::string& default_val = "") {
     const char* val = getenv(env_var);
@@ -498,6 +507,119 @@ struct TransferOperationMetric {
     }
 };
 
+struct DirectStorageMetric {
+    std::array<std::string, 2> access_labels = {"source", "result"};
+    std::array<std::string, 1> cache_labels = {"result"};
+    std::array<std::string, 1> eviction_labels = {"reason"};
+    std::array<std::string, 3> io_labels = {"operation", "source", "result"};
+    std::array<std::string, 1> token_labels = {"source"};
+
+    explicit DirectStorageMetric(
+        std::map<std::string, std::string> labels = {})
+        : access_total("mooncake_direct_access_total",
+                       "Direct logical object accesses by selected source",
+                       labels, access_labels),
+          access_bytes_total(
+              "mooncake_direct_access_bytes_total",
+              "Direct logical object access payload bytes by selected source",
+              labels, access_labels),
+          session_cache_access_total(
+              "mooncake_direct_session_cache_access_total",
+              "Get-session object cache lookups", labels, cache_labels),
+          session_cache_evictions_total(
+              "mooncake_direct_session_cache_evictions_total",
+              "Get-session object cache evictions", labels, eviction_labels),
+          io_operations_total("mooncake_direct_io_operations_total",
+                              "Direct storage I/O operations", labels,
+                              io_labels),
+          io_bytes_total("mooncake_direct_io_bytes_total",
+                         "Direct storage I/O payload bytes", labels,
+                         io_labels),
+          io_duration_seconds(
+              "mooncake_direct_io_duration_seconds",
+              "Direct storage I/O wall-clock duration in seconds",
+              kStorageLatencySecondsBucket, labels, io_labels),
+          prefetched_tokens_total(
+              "mooncake_hicache_prefetched_tokens_total",
+              "Tokens successfully prefetched through the direct linker",
+              labels, token_labels),
+          backuped_tokens_total(
+              "mooncake_hicache_backuped_tokens_total",
+              "Tokens successfully backed up through the direct linker",
+              labels, token_labels),
+          prefetched_tokens_per_request(
+              "mooncake_hicache_prefetched_tokens_per_request",
+              "Successfully prefetched tokens per request", kTokenCountBucket,
+              labels, token_labels),
+          backuped_tokens_per_operation(
+              "mooncake_hicache_backuped_tokens_per_operation",
+              "Successfully backed up tokens per offload operation",
+              kTokenCountBucket, labels, token_labels) {}
+
+    ylt::metric::hybrid_counter_2t access_total;
+    ylt::metric::hybrid_counter_2t access_bytes_total;
+    ylt::metric::hybrid_counter_1t session_cache_access_total;
+    ylt::metric::hybrid_counter_1t session_cache_evictions_total;
+    ylt::metric::hybrid_counter_3t io_operations_total;
+    ylt::metric::hybrid_counter_3t io_bytes_total;
+    ylt::metric::hybrid_histogram_3d io_duration_seconds;
+    ylt::metric::hybrid_counter_1t prefetched_tokens_total;
+    ylt::metric::hybrid_counter_1t backuped_tokens_total;
+    ylt::metric::hybrid_histogram_1d prefetched_tokens_per_request;
+    ylt::metric::hybrid_histogram_1d backuped_tokens_per_operation;
+
+    void ObserveAccess(const std::string& source, bool success,
+                       uint64_t bytes) {
+        const std::array<std::string, 2> label = {
+            source, success ? "success" : "failure"};
+        access_total.inc(label);
+        access_bytes_total.inc(label, bytes);
+    }
+
+    void ObserveSessionCache(bool hit) {
+        session_cache_access_total.inc({hit ? "hit" : "miss"});
+    }
+
+    void ObserveSessionCacheEviction() {
+        session_cache_evictions_total.inc({"session_missing"});
+    }
+
+    void ObserveIo(const std::string& operation, const std::string& source,
+                   bool success, uint64_t bytes, double duration_seconds) {
+        const std::array<std::string, 3> label = {
+            operation, source, success ? "success" : "failure"};
+        io_operations_total.inc(label);
+        io_bytes_total.inc(label, bytes);
+        io_duration_seconds.observe(label, duration_seconds);
+    }
+
+    void ObserveHicacheTokens(const std::string& operation,
+                              const std::string& source, uint64_t tokens) {
+        const std::array<std::string, 1> label = {source};
+        if (operation == "prefetch") {
+            prefetched_tokens_total.inc(label, tokens);
+            prefetched_tokens_per_request.observe(label, tokens);
+        } else if (operation == "backup") {
+            backuped_tokens_total.inc(label, tokens);
+            backuped_tokens_per_operation.observe(label, tokens);
+        }
+    }
+
+    void serialize(std::string& str) {
+        access_total.serialize(str);
+        access_bytes_total.serialize(str);
+        session_cache_access_total.serialize(str);
+        session_cache_evictions_total.serialize(str);
+        io_operations_total.serialize(str);
+        io_bytes_total.serialize(str);
+        io_duration_seconds.serialize(str);
+        prefetched_tokens_total.serialize(str);
+        backuped_tokens_total.serialize(str);
+        prefetched_tokens_per_request.serialize(str);
+        backuped_tokens_per_operation.serialize(str);
+    }
+};
+
 // SSD latency bucket: microseconds, tuned for SSD/network storage
 // Range: 50us (high-end NVMe) to 30s (3fs/nfs large object batch writes)
 inline const std::vector<double> kSsdLatencyBucket = {
@@ -662,6 +784,7 @@ struct ClientMetric {
     TransferMetric transfer_metric;
     MasterClientMetric master_client_metric;
     TransferOperationMetric transfer_operation_metric;
+    DirectStorageMetric direct_storage_metric;
     SsdMetric ssd_metric;
 
     /**
@@ -683,6 +806,31 @@ struct ClientMetric {
                                   const std::string& op_name, uint64_t bytes,
                                   uint64_t latency_us) {
         transfer_operation_metric.Observe(kind, op_name, bytes, latency_us);
+    }
+
+    void ObserveDirectAccess(const std::string& source, bool success,
+                             uint64_t bytes) {
+        direct_storage_metric.ObserveAccess(source, success, bytes);
+    }
+
+    void ObserveDirectSessionCache(bool hit) {
+        direct_storage_metric.ObserveSessionCache(hit);
+    }
+
+    void ObserveDirectSessionCacheEviction() {
+        direct_storage_metric.ObserveSessionCacheEviction();
+    }
+
+    void ObserveDirectIo(const std::string& operation,
+                         const std::string& source, bool success,
+                         uint64_t bytes, double duration_seconds) {
+        direct_storage_metric.ObserveIo(operation, source, success, bytes,
+                                        duration_seconds);
+    }
+
+    void ObserveHicacheTokens(const std::string& operation,
+                              const std::string& source, uint64_t tokens) {
+        direct_storage_metric.ObserveHicacheTokens(operation, source, tokens);
     }
 
     void serialize(std::string& str);

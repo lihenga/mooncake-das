@@ -2939,6 +2939,19 @@ PYBIND11_MODULE(store, m) {
             py::arg("keys"),
             "Start a get session: query replicas once and cache them")
         .def(
+            "batch_get_session_sources",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<std::string>{};
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_get_session_sources(keys);
+            },
+            py::arg("keys"),
+            "Return the selected source for each active get session")
+        .def(
             "batch_get_into_multi_buffer_ranges",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys,
@@ -2970,6 +2983,20 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("keys"),
             "End a get session and drop cached replica metadata")
+        .def(
+            "record_hicache_tokens",
+            [](MooncakeStorePyWrapper &self, const std::string &operation,
+               const std::string &source, uint64_t tokens) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return -1;
+                }
+                py::gil_scoped_release release;
+                return self.store_->record_hicache_tokens(operation, source,
+                                                          tokens);
+            },
+            py::arg("operation"), py::arg("source"), py::arg("tokens"),
+            "Record successful direct-linker prefetch or backup tokens")
         .def(
             "batch_put_session_start",
             [](MooncakeStorePyWrapper &self,

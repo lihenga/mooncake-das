@@ -399,6 +399,10 @@ MasterAdminServer::RuntimeSnapshot MasterAdminServer::SnapshotState() const {
 }
 
 std::string MasterAdminServer::BuildMetricsText() const {
+    auto snapshot = SnapshotState();
+    if (snapshot.service) {
+        snapshot.service->RefreshDfsMetrics();
+    }
     std::string metrics = AppendMetricSections(
         MasterMetricManager::instance().serialize_metrics(),
         HAMetricManager::instance().serialize_metrics());

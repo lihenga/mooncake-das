@@ -313,6 +313,9 @@ class RealClient : public PyClient {
     std::vector<int> batch_get_session_start(
         const std::vector<std::string> &keys) override;
 
+    std::vector<std::string> batch_get_session_sources(
+        const std::vector<std::string> &keys) override;
+
     std::vector<int> batch_get_into_multi_buffer_ranges(
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
@@ -320,6 +323,10 @@ class RealClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_src_offsets) override;
 
     int batch_get_session_end(const std::vector<std::string> &keys) override;
+
+    int record_hicache_tokens(const std::string &operation,
+                              const std::string &source,
+                              uint64_t tokens) override;
 
     void process_session_local_disk_reads(
         std::unordered_map<std::string,
@@ -989,6 +996,7 @@ class RealClient : public PyClient {
     mutable std::mutex session_mutex_;
     std::condition_variable session_cv_;
     std::unordered_map<std::string, QueryResult> get_sessions_;
+    std::unordered_set<std::string> get_session_access_recorded_;
     std::unordered_map<std::string, PutSessionEntry> put_sessions_;
 
     // Per-key object cache for non-memory reads within a get session.

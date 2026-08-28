@@ -98,6 +98,10 @@ WrappedMasterService::CalcCacheStats() {
     return MasterMetricManager::instance().calculate_cache_stats();
 }
 
+void WrappedMasterService::RefreshDfsMetrics() const {
+    master_service_.RefreshDfsMetrics();
+}
+
 tl::expected<bool, ErrorCode> WrappedMasterService::ExistKey(
     const std::string& key, const std::string& tenant_id) {
     return execute_rpc(
