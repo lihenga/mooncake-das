@@ -11,6 +11,7 @@
 #include <shared_mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <unordered_map>
 #include <unordered_set>
 #include <set>
@@ -60,13 +61,10 @@ struct SessionCachedObject {
 };
 
 inline void scatter_non_mem_result(
-    const NonMemReadEntry &entry,
-    const void *tmp_base,
-    std::vector<int> &results,
-    std::mutex &session_mutex,
+    const NonMemReadEntry &entry, const void *tmp_base,
+    std::vector<int> &results, std::mutex &session_mutex,
     std::unordered_map<std::string, QueryResult> &sessions,
-    std::unordered_map<std::string, SessionCachedObject>
-        &session_cache) {
+    std::unordered_map<std::string, SessionCachedObject> &session_cache) {
     for (size_t j = 0; j < entry.buffers.size(); ++j) {
         const void *src =
             static_cast<const char *>(tmp_base) + entry.src_offsets[j];
@@ -74,8 +72,7 @@ inline void scatter_non_mem_result(
                 entry.buffers[j], src, entry.sizes[j],
                 "session non-mem range read, key: " + entry.key);
             !r) {
-            results[entry.original_idx] =
-                static_cast<int>(toInt(r.error()));
+            results[entry.original_idx] = static_cast<int>(toInt(r.error()));
             return;
         }
     }
@@ -314,10 +311,11 @@ class RealClient : public PyClient {
     std::vector<int> batch_get_session_start(
         const std::vector<std::string> &keys) override;
 
-    void record_prefetched_tokens(uint64_t tokens) override;
-
-    std::vector<std::string> batch_get_session_sources(
+    std::pair<std::vector<int>, std::vector<std::string>>
+    batch_get_session_start_with_sources(
         const std::vector<std::string> &keys) override;
+
+    void record_prefetched_tokens(uint64_t tokens) override;
 
     std::vector<int> batch_get_into_multi_buffer_ranges(
         const std::vector<std::string> &keys,
@@ -328,25 +326,22 @@ class RealClient : public PyClient {
     int batch_get_session_end(const std::vector<std::string> &keys) override;
 
     void process_session_local_disk_reads(
-        std::unordered_map<std::string,
-            std::vector<NonMemReadEntry *>> &local_disk_by_endpoint,
+        std::unordered_map<std::string, std::vector<NonMemReadEntry *>>
+            &local_disk_by_endpoint,
         std::vector<int> &results);
 
-    void process_session_disk_dfs_reads(
-        std::vector<NonMemReadEntry *> &entries,
-        std::vector<int> &results);
+    void process_session_disk_dfs_reads(std::vector<NonMemReadEntry *> &entries,
+                                        std::vector<int> &results);
 
     // Helper: scatter cached entries, return miss entries via
     // move-out parameter
-    void scatter_cached_entries(
-        std::vector<NonMemReadEntry *> &entries,
-        std::vector<int> &results);
+    void scatter_cached_entries(std::vector<NonMemReadEntry *> &entries,
+                                std::vector<int> &results);
 
     // Helper: store buffer in cache and scatter to target
-    void store_in_cache_and_scatter(
-        NonMemReadEntry &entry,
-        std::unique_ptr<BufferHandle> handle,
-        std::vector<int> &results);
+    void store_in_cache_and_scatter(NonMemReadEntry &entry,
+                                    std::unique_ptr<BufferHandle> handle,
+                                    std::vector<int> &results);
 
     std::vector<int> batch_put_session_start(
         const std::vector<std::string> &keys, const std::vector<size_t> &sizes,

@@ -598,6 +598,8 @@ class Client {
         }
     }
 
+    [[nodiscard]] bool MetricsEnabled() const { return metrics_ != nullptr; }
+
     void ObservePrefetchedTokens(uint64_t tokens) {
         if (metrics_ != nullptr) {
             metrics_->ObservePrefetchedTokens(tokens);

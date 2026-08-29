@@ -5,6 +5,7 @@
 #include <csignal>
 #include <map>
 #include <memory>
+#include <utility>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -301,12 +302,13 @@ class PyClient {
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }
 
-    virtual void record_prefetched_tokens(uint64_t /*tokens*/) {}
-
-    virtual std::vector<std::string> batch_get_session_sources(
-        const std::vector<std::string> &keys) {
-        return std::vector<std::string>(keys.size(), "unknown");
+    virtual std::pair<std::vector<int>, std::vector<std::string>>
+    batch_get_session_start_with_sources(const std::vector<std::string> &keys) {
+        return {batch_get_session_start(keys),
+                std::vector<std::string>(keys.size(), "unknown")};
     }
+
+    virtual void record_prefetched_tokens(uint64_t /*tokens*/) {}
 
     virtual std::vector<int> batch_get_into_multi_buffer_ranges(
         const std::vector<std::string> &keys,

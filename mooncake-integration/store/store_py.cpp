@@ -2939,18 +2939,20 @@ PYBIND11_MODULE(store, m) {
             py::arg("keys"),
             "Start a get session: query replicas once and cache them")
         .def(
-            "batch_get_session_sources",
+            "batch_get_session_start_with_sources",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys) {
                 if (!self.is_client_initialized()) {
                     LOG(ERROR) << "Client is not initialized";
-                    return std::vector<std::string>{};
+                    return std::pair<std::vector<int>,
+                                     std::vector<std::string>>{};
                 }
                 py::gil_scoped_release release;
-                return self.store_->batch_get_session_sources(keys);
+                return self.store_->batch_get_session_start_with_sources(keys);
             },
             py::arg("keys"),
-            "Return the selected source for each active get session")
+            "Start get sessions and return each result with its selected "
+            "source")
         .def(
             "record_prefetched_tokens",
             [](MooncakeStorePyWrapper &self, uint64_t tokens) {

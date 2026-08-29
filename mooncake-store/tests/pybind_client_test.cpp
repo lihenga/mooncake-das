@@ -5,10 +5,12 @@
 #include <barrier>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <thread>
@@ -34,6 +36,27 @@ class GLogMuter {
 
    private:
     int original_log_level_;
+};
+
+class ScopedEnv {
+   public:
+    explicit ScopedEnv(const char* name) : name_(name) {
+        if (const char* value = std::getenv(name)) {
+            old_value_ = value;
+        }
+    }
+
+    ~ScopedEnv() {
+        if (old_value_) {
+            setenv(name_.c_str(), old_value_->c_str(), 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+
+   private:
+    std::string name_;
+    std::optional<std::string> old_value_;
 };
 
 class RealClientTest : public ::testing::Test {
@@ -1227,6 +1250,8 @@ TEST_F(RealClientTest, TestPutSessionEndCompletesMemoryReplica) {
 
 // Lease expire on get ranges must drop the cached get session.
 TEST_F(RealClientTest, TestGetSessionLeaseExpiredDropsSession) {
+    ScopedEnv metrics_env("MC_STORE_CLIENT_METRIC");
+    setenv("MC_STORE_CLIENT_METRIC", "1", 1);
     constexpr uint64_t kLeaseTtlMs = 50;
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
                                   .set_default_kv_lease_ttl(kLeaseTtlMs)
@@ -1281,6 +1306,42 @@ TEST_F(RealClientTest, TestGetSessionLeaseExpiredDropsSession) {
     // get_end is still safe (idempotent erase).
     EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
 
+    auto metrics = py_client_->client_->SerializeMetrics();
+    ASSERT_TRUE(metrics.has_value());
+    EXPECT_NE(metrics.value().find("mooncake_direct_access_total{source="
+                                   "\"memory\",result=\"failure\"}"),
+              std::string::npos)
+        << "the first range lease expiry must be counted as a direct access "
+           "failure";
+
+    ASSERT_EQ(py_client_->unregister_buffer(src.data()), 0);
+    ASSERT_EQ(py_client_->unregister_buffer(dst.data()), 0);
+}
+
+TEST_F(RealClientTest, TestGetSessionDoesNotRecordWhenMetricsDisabled) {
+    ScopedEnv metrics_env("MC_STORE_CLIENT_METRIC");
+    setenv("MC_STORE_CLIENT_METRIC", "0", 1);
+    StartMasterAndSetupClient();
+    ASSERT_FALSE(py_client_->client_->MetricsEnabled());
+
+    constexpr size_t kSize = 64;
+    std::string src(kSize, 'S');
+    std::string dst(kSize, 'D');
+    const std::vector<std::string> keys = {"disabled_direct_metrics"};
+    ASSERT_EQ(py_client_->register_buffer(src.data(), src.size()), 0);
+    ASSERT_EQ(py_client_->register_buffer(dst.data(), dst.size()), 0);
+    ASSERT_EQ(py_client_->batch_put_session_start(keys, {kSize})[0], 0);
+    ASSERT_EQ(py_client_->batch_put_from_multi_buffer_ranges(
+                  keys, {{src.data()}}, {{kSize}}, {{0}})[0],
+              static_cast<int>(kSize));
+    ASSERT_EQ(py_client_->batch_put_session_end(keys)[0], 0);
+    ASSERT_EQ(py_client_->batch_get_session_start(keys)[0], 0);
+    ASSERT_EQ(py_client_->batch_get_into_multi_buffer_ranges(
+                  keys, {{dst.data()}}, {{kSize}}, {{0}})[0],
+              static_cast<int>(kSize));
+    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+    EXPECT_FALSE(py_client_->client_->SerializeMetrics().has_value());
+    EXPECT_EQ(dst, src);
     ASSERT_EQ(py_client_->unregister_buffer(src.data()), 0);
     ASSERT_EQ(py_client_->unregister_buffer(dst.data()), 0);
 }
