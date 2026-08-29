@@ -630,6 +630,12 @@ class Client {
         }
     }
 
+    void ObservePrefetchedTokens(uint64_t tokens) {
+        if (metrics_ != nullptr) {
+            metrics_->ObservePrefetchedTokens(tokens);
+        }
+    }
+
     void ObserveDirectSessionCache(bool hit) {
         if (metrics_ != nullptr) {
             metrics_->ObserveDirectSessionCache(hit);
