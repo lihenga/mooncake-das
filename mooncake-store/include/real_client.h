@@ -314,6 +314,8 @@ class RealClient : public PyClient {
     std::vector<int> batch_get_session_start(
         const std::vector<std::string> &keys) override;
 
+    void record_prefetched_tokens(uint64_t tokens) override;
+
     std::vector<std::string> batch_get_session_sources(
         const std::vector<std::string> &keys) override;
 

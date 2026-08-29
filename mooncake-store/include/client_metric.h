@@ -532,7 +532,11 @@ struct DirectStorageMetric {
           io_duration_seconds(
               "mooncake_direct_io_duration_seconds",
               "Direct storage I/O wall-clock duration in seconds",
-              kStorageLatencySecondsBucket, labels, io_labels) {}
+              kStorageLatencySecondsBucket, labels, io_labels),
+          prefetched_tokens_total(
+              "mooncake_prefetched_tokens_total",
+              "Total prompt tokens successfully prefetched by the direct linker",
+              labels) {}
 
     ylt::metric::hybrid_counter_2t access_total;
     ylt::metric::hybrid_counter_2t access_bytes_total;
@@ -541,12 +545,17 @@ struct DirectStorageMetric {
     ylt::metric::hybrid_counter_3t io_operations_total;
     ylt::metric::hybrid_counter_3t io_bytes_total;
     ylt::metric::hybrid_histogram_3d io_duration_seconds;
+    ylt::metric::counter_t prefetched_tokens_total;
     void ObserveAccess(const std::string& source, bool success,
                        uint64_t bytes) {
         const std::array<std::string, 2> label = {
             source, success ? "success" : "failure"};
         access_total.inc(label);
         access_bytes_total.inc(label, bytes);
+    }
+
+    void ObservePrefetchedTokens(uint64_t tokens) {
+        prefetched_tokens_total.inc(tokens);
     }
 
     void ObserveSessionCache(bool hit) {
@@ -567,6 +576,7 @@ struct DirectStorageMetric {
     }
 
     void serialize(std::string& str) {
+        prefetched_tokens_total.serialize(str);
         access_total.serialize(str);
         access_bytes_total.serialize(str);
         session_cache_access_total.serialize(str);
@@ -768,6 +778,10 @@ struct ClientMetric {
     void ObserveDirectAccess(const std::string& source, bool success,
                              uint64_t bytes) {
         direct_storage_metric.ObserveAccess(source, success, bytes);
+    }
+
+    void ObservePrefetchedTokens(uint64_t tokens) {
+        direct_storage_metric.ObservePrefetchedTokens(tokens);
     }
 
     void ObserveDirectSessionCache(bool hit) {

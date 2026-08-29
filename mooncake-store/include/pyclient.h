@@ -301,6 +301,8 @@ class PyClient {
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }
 
+    virtual void record_prefetched_tokens(uint64_t /*tokens*/) {}
+
     virtual std::vector<std::string> batch_get_session_sources(
         const std::vector<std::string> &keys) {
         return std::vector<std::string>(keys.size(), "unknown");

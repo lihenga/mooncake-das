@@ -5053,6 +5053,12 @@ std::vector<int> RealClient::batch_get_session_start(
     return results;
 }
 
+void RealClient::record_prefetched_tokens(uint64_t tokens) {
+    if (client_ != nullptr) {
+        client_->ObservePrefetchedTokens(tokens);
+    }
+}
+
 std::vector<std::string> RealClient::batch_get_session_sources(
     const std::vector<std::string> &keys) {
     std::vector<std::string> sources(keys.size(), "unknown");

@@ -2952,6 +2952,15 @@ PYBIND11_MODULE(store, m) {
             py::arg("keys"),
             "Return the selected source for each active get session")
         .def(
+            "record_prefetched_tokens",
+            [](MooncakeStorePyWrapper &self, uint64_t tokens) {
+                if (!self.is_client_initialized()) return;
+                py::gil_scoped_release release;
+                self.store_->record_prefetched_tokens(tokens);
+            },
+            py::arg("tokens"),
+            "Record prompt tokens successfully prefetched by the direct linker")
+        .def(
             "batch_get_into_multi_buffer_ranges",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys,
