@@ -530,7 +530,8 @@ void MasterService::RefreshDfsMetrics() const {
         used = dfs_allocator_->GetUsedBytes();
     }
     MasterMetricManager::instance().set_dfs_storage_usage(
-        capacity, used, /*unlimited=*/false);
+        capacity, used,
+        MasterMetricManager::instance().is_dfs_capacity_unlimited());
 }
 
 std::unique_ptr<ha::SnapshotCatalogStore>
