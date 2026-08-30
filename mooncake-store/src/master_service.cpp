@@ -529,9 +529,11 @@ void MasterService::RefreshDfsMetrics() const {
         capacity = dfs_allocator_->GetTotalCapacity();
         used = dfs_allocator_->GetUsedBytes();
     }
-    MasterMetricManager::instance().set_dfs_storage_usage(
-        capacity, used,
-        MasterMetricManager::instance().is_dfs_capacity_unlimited());
+    // The new DFS allocators are always finite: SHARD uses the configured
+    // shard_count * shard_capacity and BUCKET uses max_bucket_count *
+    // bucket_capacity.  Do not reuse the legacy root-fs/global-file flag.
+    MasterMetricManager::instance().set_dfs_storage_usage(capacity, used,
+                                                           false);
 }
 
 std::unique_ptr<ha::SnapshotCatalogStore>
