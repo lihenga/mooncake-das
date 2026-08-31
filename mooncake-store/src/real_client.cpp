@@ -118,15 +118,15 @@ size_t GetNextSegmentSize(size_t remaining,
 
 std::string DirectSourceForReplica(const Replica::Descriptor &replica) {
     if (replica.is_memory_replica() || replica.is_nof_replica()) {
-        return "memory";
+        return DirectStorageMetricSource(ReplicaType::MEMORY);
     }
     if (replica.is_local_disk_replica()) {
-        return "local_disk";
+        return DirectStorageMetricSource(ReplicaType::LOCAL_DISK);
     }
     if (replica.is_disk_replica() || replica.is_dfs_replica()) {
         // Legacy DISK and descriptor-based DFS both represent the shared
         // distributed filesystem tier for direct-storage metrics.
-        return "dfs";
+        return DirectStorageMetricSource(ReplicaType::DFS);
     }
     return "unknown";
 }
@@ -5962,9 +5962,10 @@ void RealClient::process_session_local_disk_reads(
             std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                           io_start)
                 .count();
-        client_->ObserveDirectIo("read", "local_disk", read_result.has_value(),
-                                 read_result ? SumSliceBytes(miss_objects) : 0,
-                                 io_duration);
+        client_->ObserveDirectIo(
+            "read", DirectStorageMetricSource(ReplicaType::LOCAL_DISK),
+            read_result.has_value(),
+            read_result ? SumSliceBytes(miss_objects) : 0, io_duration);
 
         for (auto *entry_ptr : ep_entries) {
             auto &entry = *entry_ptr;
@@ -6055,8 +6056,9 @@ void RealClient::process_session_disk_dfs_reads(
                 }
             }
         }
-        client_->ObserveDirectIo("read", "dfs", io_success, io_bytes,
-                                 io_duration);
+        client_->ObserveDirectIo(
+            "read", DirectStorageMetricSource(ReplicaType::DFS), io_success,
+            io_bytes, io_duration);
 
         // Build key -> entry map for O(1) lookup
         std::unordered_map<std::string, NonMemReadEntry *> entry_map;

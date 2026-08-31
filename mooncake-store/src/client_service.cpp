@@ -2740,7 +2740,8 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
             }
         }
     }
-    ObserveDirectIo("write", "dfs", all_succeeded, successful_bytes,
+    ObserveDirectIo("write", DirectStorageMetricSource(ReplicaType::DFS),
+                    all_succeeded, successful_bytes,
                     write_duration_seconds);
 
     for (auto& buffer : staging_buffers) {
@@ -2862,7 +2863,8 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
             }
         }
     }
-    ObserveDirectIo("write", "dfs", all_succeeded, successful_bytes,
+    ObserveDirectIo("write", DirectStorageMetricSource(ReplicaType::DFS),
+                    all_succeeded, successful_bytes,
                     write_duration_seconds);
 
     // Report each key individually so one failure cannot revoke its neighbours.
@@ -4566,10 +4568,10 @@ void Client::PutToLocalFile(const std::string& key,
             std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                           io_started)
                 .count();
-        // PutToLocalFile writes the client-local file backend, not the DFS
-        // allocator. Keep this separate from DISK/DFS metrics, where the
-        // legacy DISK replica type is grouped with DFS as the shared dfs tier.
-        ObserveDirectIo("write", "local_disk", store_result.has_value(),
+        // Legacy DISK and DFS replicas share the same direct-storage metric
+        // source. LOCAL_DISK replicas are the separate local-disk source.
+        ObserveDirectIo("write", DirectStorageMetricSource(replica_type),
+                        store_result.has_value(),
                         store_result ? value.size() : 0, io_duration_seconds);
 
         if (!store_result) {

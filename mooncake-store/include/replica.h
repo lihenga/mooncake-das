@@ -27,6 +27,22 @@ namespace mooncake {
  */
 using ReplicaID = uint64_t;
 
+inline constexpr const char* DirectStorageMetricSource(
+    ReplicaType replica_type) noexcept {
+    switch (replica_type) {
+        case ReplicaType::MEMORY:
+        case ReplicaType::NOF_SSD:
+            return "memory";
+        case ReplicaType::LOCAL_DISK:
+            return "local_disk";
+        case ReplicaType::DISK:
+        case ReplicaType::DFS:
+            return "dfs";
+        default:
+            return "unknown";
+    }
+}
+
 /**
  * @brief Stream operator for ReplicaType
  */
