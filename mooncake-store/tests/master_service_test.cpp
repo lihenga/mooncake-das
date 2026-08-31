@@ -913,6 +913,34 @@ TEST_F(MasterServiceTest, DfsEvictionSplitsAcceptedAndRejectedCandidates) {
              {std::nullopt, std::nullopt, size_t{1}, size_t{1}}, true);
 }
 
+TEST_F(MasterServiceTest,
+       DfsCapacityUnlimitedMetricDoesNotReuseLegacyFileStorageFlag) {
+    const auto dfs_root = (std::filesystem::temp_directory_path() /
+                           ("master_dfs_metric_" +
+                            std::to_string(::getpid())))
+                              .string();
+    std::filesystem::create_directories(dfs_root);
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
+    ScopedEnvVar allocator_type("MOONCAKE_DFS_ALLOCATOR_TYPE", "shard");
+    ScopedEnvVar shard_count("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar shard_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "1048576");
+    ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+    ScopedEnvVar deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    MasterService service;
+    auto& metrics = MasterMetricManager::instance();
+    metrics.set_dfs_capacity_unlimited(true);  // Legacy root-fs state.
+    service.RefreshDfsMetrics();
+
+    EXPECT_NE(metrics.serialize_metrics().find("master_dfs_capacity_unlimited 0"),
+              std::string::npos);
+    metrics.set_dfs_capacity_unlimited(false);
+}
+
 // ---------------------------------------------------------------------------
 // DFS bucket allocator mode
 // ---------------------------------------------------------------------------

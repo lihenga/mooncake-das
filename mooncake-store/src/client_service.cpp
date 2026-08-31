@@ -2438,7 +2438,16 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
         request_indices.push_back(i);
     }
 
+    const auto write_started = std::chrono::steady_clock::now();
     auto write_results = dfs_storage_backend_->BatchWrite(requests);
+    const double write_duration_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      write_started)
+            .count();
+    uint64_t successful_bytes = 0;
+    bool all_succeeded = requests.size() == keys.size() &&
+                         !requests.empty() &&
+                         write_results.size() == requests.size();
     if (write_results.size() != requests.size()) {
         LOG(ERROR) << "DFS BatchWrite response size mismatch: expected "
                    << requests.size() << ", got " << write_results.size();
@@ -2449,8 +2458,18 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
         for (size_t i = 0; i < write_results.size(); ++i) {
             results[request_indices[i]] =
                 write_results[i] ? ErrorCode::OK : write_results[i].error();
+            if (write_results[i]) {
+                for (const auto& slice : requests[i].slices) {
+                    successful_bytes += slice.size;
+                }
+            } else {
+                all_succeeded = false;
+            }
         }
     }
+    ObserveDirectIo("write", DirectStorageMetricSource(ReplicaType::DFS),
+                    all_succeeded, successful_bytes,
+                    write_duration_seconds);
 
     for (auto& buffer : staging_buffers) {
         pinned_buffer_pool_->Release(std::move(buffer));
@@ -2548,15 +2567,32 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
     // Every request gets a definite outcome: a missing or short result vector is
     // treated as failure for the affected keys rather than silently ignored.
     std::vector<ErrorCode> outcomes(requests.size(), ErrorCode::INTERNAL_ERROR);
+    const auto write_started = std::chrono::steady_clock::now();
     auto results = context->backend->BatchWrite(requests);
+    const double write_duration_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      write_started)
+            .count();
+    uint64_t successful_bytes = 0;
+    bool all_succeeded = !requests.empty() && results.size() == requests.size();
     if (results.size() != requests.size()) {
         LOG(ERROR) << "Async DFS BatchWrite response size mismatch: expected "
                    << requests.size() << ", got " << results.size();
     } else {
         for (size_t i = 0; i < results.size(); ++i) {
             outcomes[i] = results[i] ? ErrorCode::OK : results[i].error();
+            if (results[i]) {
+                for (const auto& slice : requests[i].slices) {
+                    successful_bytes += slice.size;
+                }
+            } else {
+                all_succeeded = false;
+            }
         }
     }
+    ObserveDirectIo("write", DirectStorageMetricSource(ReplicaType::DFS),
+                    all_succeeded, successful_bytes,
+                    write_duration_seconds);
 
     // Report each key individually so one failure cannot revoke its neighbours.
     // The RPCs are idempotent on the master side, so a bounded retry is safe.
@@ -4128,6 +4164,7 @@ void Client::PutToLocalFile(const std::string& key,
                                 value = std::move(value), path] {
         ReplicaType replica_type = ReplicaType::DISK;
         // Store the object
+        const auto io_started = std::chrono::steady_clock::now();
         auto store_result = backend->StoreObject(
             path, value, key,
             [this, replica_type](const std::vector<std::string>& evicted_keys)
@@ -4154,6 +4191,15 @@ void Client::PutToLocalFile(const std::string& key,
                 }
                 return {};
             });
+        const double io_duration_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                          io_started)
+                .count();
+        // Legacy DISK and DFS replicas share the same direct-storage metric
+        // source. LOCAL_DISK replicas are the separate local-disk source.
+        ObserveDirectIo("write", DirectStorageMetricSource(replica_type),
+                        store_result.has_value(),
+                        store_result ? value.size() : 0, io_duration_seconds);
 
         if (!store_result) {
             // If storage failed, revoke the put operation

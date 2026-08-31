@@ -132,6 +132,7 @@ class MasterService {
     tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
     DeleteTenantQuotaPolicy(const TenantId& tenant_id);
     uint64_t GetTenantQuotaAllocatableCapacityBytes();
+    void RefreshDfsMetrics() const;
 
     /**
      * @brief Dynamically set the max_bucket_count of the DFS bucket allocator.

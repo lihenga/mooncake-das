@@ -519,6 +519,21 @@ void MasterService::InitDfsAllocatorFromEnvironment(
     LOG(INFO) << "DFS allocator initialized, type="
               << ToString(dfs_config.allocator_type) << ", config={"
               << dfs_config.FormatStr() << "}";
+    RefreshDfsMetrics();
+}
+
+void MasterService::RefreshDfsMetrics() const {
+    uint64_t capacity = 0;
+    uint64_t used = 0;
+    if (dfs_allocator_ && dfs_allocator_->IsInitialized()) {
+        capacity = dfs_allocator_->GetTotalCapacity();
+        used = dfs_allocator_->GetUsedBytes();
+    }
+    // The new DFS allocators are always finite: SHARD uses the configured
+    // shard_count * shard_capacity and BUCKET uses max_bucket_count *
+    // bucket_capacity.  Do not reuse the legacy root-fs/global-file flag.
+    MasterMetricManager::instance().set_dfs_storage_usage(capacity, used,
+                                                           false);
 }
 
 std::unique_ptr<ha::SnapshotCatalogStore>
