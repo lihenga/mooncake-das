@@ -128,6 +128,33 @@ class FileSystemAdapter {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
 
+    /**
+     * @brief Open a file for direct (page-cache-bypassing) reads.
+     *
+     * Returns a read-only handle whose reads avoid polluting the kernel page
+     * cache (e.g. O_DIRECT on POSIX). Adapters whose I/O path already bypasses
+     * the page cache (e.g. 3FS USRBIO) may simply open a read-only handle.
+     * The default returns NOT_SUPPORTED, in which case callers fall back to
+     * OpenFile handles.
+     */
+    virtual tl::expected<int, ErrorCode> OpenFileDirect(
+        const std::string& /*path*/) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
+    /**
+     * @brief Scatter-read into `iov` from a handle opened by OpenFileDirect.
+     *
+     * Direct handles may impose alignment rules (offset, buffer, length), so
+     * implementations absorb unaligned requests internally (e.g. through an
+     * aligned bounce buffer) and always keep the zero-copy semantics of the
+     * caller's iovec. The default just forwards to ReadAt.
+     */
+    virtual tl::expected<size_t, ErrorCode> DirectReadAt(
+        int fd, iovec* iov, int iovcnt, int64_t offset) {
+        return ReadAt(fd, iov, iovcnt, offset);
+    }
+
     // === Durability primitives ===
     //
     // Used to publish metadata sidecars atomically: write a temp file, fsync
