@@ -76,20 +76,11 @@ inline void scatter_non_mem_result(
             return;
         }
     }
-    auto now = std::chrono::steady_clock::now();
-    if (now >= entry.lease_deadline) {
-        results[entry.original_idx] =
-            static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
-        std::lock_guard<std::mutex> lock(session_mutex);
-        sessions.erase(entry.key);
-        session_cache.erase(entry.key);
-    } else {
-        size_t transferred = 0;
-        for (size_t j = 0; j < entry.sizes.size(); ++j) {
-            transferred += entry.sizes[j];
-        }
-        results[entry.original_idx] = static_cast<int>(transferred);
+    size_t transferred = 0;
+    for (size_t j = 0; j < entry.sizes.size(); ++j) {
+        transferred += entry.sizes[j];
     }
+    results[entry.original_idx] = static_cast<int>(transferred);
 }
 
 class RealClient;
@@ -340,7 +331,7 @@ class RealClient : public PyClient {
 
     // Helper: store buffer in cache and scatter to target
     void store_in_cache_and_scatter(NonMemReadEntry &entry,
-                                    std::unique_ptr<BufferHandle> handle,
+                                    std::shared_ptr<BufferHandle> handle,
                                     std::vector<int> &results);
 
     std::vector<int> batch_put_session_start(

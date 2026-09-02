@@ -5080,6 +5080,7 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         LOG(ERROR) << "Invalid get ranges args";
         return results;
     }
+    const auto timing_start = std::chrono::steady_clock::now();
     const bool record_access = client_->MetricsEnabled();
 
     // No Master RPC here: use cached QueryResult from session start.
@@ -5099,6 +5100,7 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     std::vector<NonMemReadEntry> non_mem_entries;
 
     size_t cache_evicted_count = 0;
+    auto t_gc_done = timing_start;
 
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
@@ -5115,6 +5117,7 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
                 }
             }
         }
+        t_gc_done = std::chrono::steady_clock::now();
 
         auto now = std::chrono::steady_clock::now();
         for (size_t i = 0; i < keys.size(); ++i) {
@@ -5238,6 +5241,7 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
             }
         }
     }
+    const auto t_mem_done = std::chrono::steady_clock::now();
 
     // 2. Non-memory replicas: batch by endpoint/type, temp buffer + scatter.
     // Group LOCAL_DISK entries by endpoint for batch RPC.
@@ -5332,12 +5336,23 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
             }
         }
     }
+    const auto t_access_done = std::chrono::steady_clock::now();
 
-    LOG(INFO) << "batch_get_into_multi_buffer_ranges: keys=" << keys.size()
-              << ", mem_reads=" << mem_count
-              << ", cache_evicted=" << cache_evicted_count
-              << ", local_disk_reads=" << local_disk_count
-              << ", dfs_reads=" << dfs_count;
+    auto elapsed_us = [](const auto &a, const auto &b) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(b - a)
+            .count();
+    };
+    if (dfs_read_trace_enabled()) {
+        LOG(INFO) << "batch_get_into_multi_buffer_ranges: keys=" << keys.size()
+                  << ", mem_reads=" << mem_count
+                  << ", cache_evicted=" << cache_evicted_count
+                  << ", local_disk_reads=" << local_disk_count
+                  << ", dfs_reads=" << dfs_count
+                  << ", gc_us=" << elapsed_us(timing_start, t_gc_done)
+                  << ", session_mem_us=" << elapsed_us(t_gc_done, t_mem_done)
+                  << ", disk_access_us=" << elapsed_us(t_mem_done, t_access_done)
+                  << ", total_us=" << elapsed_us(timing_start, t_access_done);
+    }
 
     return results;
 }
@@ -5413,10 +5428,9 @@ void RealClient::scatter_cached_entries(std::vector<NonMemReadEntry *> &entries,
 }
 
 void RealClient::store_in_cache_and_scatter(
-    NonMemReadEntry &entry, std::unique_ptr<BufferHandle> handle,
+    NonMemReadEntry &entry, std::shared_ptr<BufferHandle> shared_handle,
     std::vector<int> &results) {
     const uint64_t total_size = calculate_total_size(entry.replica);
-    auto shared_handle = std::shared_ptr<BufferHandle>(std::move(handle));
     if (session_cache_enabled()) {
         std::lock_guard<std::mutex> lock(session_mutex_);
         if (get_sessions_.find(entry.key) != get_sessions_.end()) {
@@ -5499,17 +5513,21 @@ void RealClient::process_session_local_disk_reads(
                 continue;
             }
 
-            // Store in cache + scatter
-            store_in_cache_and_scatter(entry, std::move(handle_it->second),
-                                       results);
+            // Store in cache + scatter (unique_ptr converts to shared_ptr)
+            store_in_cache_and_scatter(
+                entry,
+                std::shared_ptr<BufferHandle>(std::move(handle_it->second)),
+                results);
         }
     }
 }
 
 void RealClient::process_session_disk_dfs_reads(
     std::vector<NonMemReadEntry *> &entries, std::vector<int> &results) {
+    const auto timing_start = std::chrono::steady_clock::now();
     // 1. Cache hit: scatter directly from cached buffer
     scatter_cached_entries(entries, results);
+    const auto t_cache_hit_done = std::chrono::steady_clock::now();
 
     // 2. Cache miss: allocate + BatchGet
     std::vector<std::string> disk_batch_keys;
@@ -5522,6 +5540,9 @@ void RealClient::process_session_disk_dfs_reads(
         auto &entry = *entry_ptr;
         const uint64_t total_size = calculate_total_size(entry.replica);
 
+        // DFS reads land in a pageable client-buffer; the H2D copy afterwards
+        // is issued to the scatter pool as one async task per key (see below),
+        // which is where the bandwidth win comes from, not pinned memory.
         if (!client_buffer_allocator_) {
             LOG(ERROR) << "Client buffer allocator not provided, "
                        << "key: " << entry.key;
@@ -5532,14 +5553,16 @@ void RealClient::process_session_disk_dfs_reads(
 
         auto alloc_result = client_buffer_allocator_->allocate(total_size);
         if (!alloc_result) {
-            LOG(WARNING) << "Cache allocation failed for key: " << entry.key
+            LOG(WARNING) << "Cache allocation failed for key: "
+                         << entry.key
                          << ", falling back to non-cached I/O";
             results[entry.original_idx] =
                 static_cast<int>(toInt(ErrorCode::NO_AVAILABLE_HANDLE));
             continue;
         }
+        std::unique_ptr<BufferHandle> handle =
+            std::make_unique<BufferHandle>(std::move(*alloc_result));
 
-        auto handle = std::make_unique<BufferHandle>(std::move(*alloc_result));
         std::vector<Slice> disk_slices;
         allocateSlices(disk_slices, entry.replica, handle->ptr());
 
@@ -5550,6 +5573,18 @@ void RealClient::process_session_disk_dfs_reads(
         disk_temp_handles.emplace(entry.key, std::move(handle));
     }
 
+    // Buffer allocation done here; what follows is the DFS read (BatchGet) and
+    // then the scatter. Splitting alloc from read tells a slow
+    // alloc_batch_get_us apart: allocation churn vs actual disk I/O.
+    const auto t_alloc_done = std::chrono::steady_clock::now();
+
+    // Scatter-side totals, reported in the closing trace log so a slow
+    // store_scatter_us can be told apart: bandwidth-bound (bytes/us near the
+    // H2D ceiling) vs overhead-bound (many tiny ranges, few bytes).
+    uint64_t scatter_ranges = 0;
+    uint64_t scatter_bytes = 0;
+
+    auto t_io_done = std::chrono::steady_clock::now();
     if (!disk_batch_keys.empty()) {
         const auto io_start = std::chrono::steady_clock::now();
         auto disk_results = client_->BatchGet(disk_batch_keys, disk_batch_qrs,
@@ -5573,6 +5608,7 @@ void RealClient::process_session_disk_dfs_reads(
                 }
             }
         }
+        t_io_done = std::chrono::steady_clock::now();
         client_->ObserveDirectIo(
             "read", DirectStorageMetricSource(ReplicaType::DFS), io_success,
             io_bytes, io_duration);
@@ -5583,6 +5619,12 @@ void RealClient::process_session_disk_dfs_reads(
             entry_map[entry_ptr->key] = entry_ptr;
         }
 
+        // Scatter every key's ranges to the device right here on the calling
+        // thread. The async MemcpyWorkerPool was tried and gave no speedup:
+        // the copies are synchronous cudaMemcpy that serialize on the device
+        // anyway, so the extra worker thread only added bookkeeping. The RAII
+        // handle frees the staging buffer at scope exit once the copy is done.
+        auto now = std::chrono::steady_clock::now();
         for (size_t di = 0; di < disk_batch_keys.size(); ++di) {
             const auto &key = disk_batch_keys[di];
             auto handle_it = disk_temp_handles.find(key);
@@ -5610,13 +5652,77 @@ void RealClient::process_session_disk_dfs_reads(
                 continue;
             }
 
-            // Find corresponding entry and store in cache
             auto map_it = entry_map.find(key);
-            if (map_it != entry_map.end()) {
-                store_in_cache_and_scatter(
-                    *map_it->second, std::move(handle_it->second), results);
+            if (map_it == entry_map.end()) {
+                continue;
             }
+            NonMemReadEntry *entry = map_it->second;
+            std::unique_ptr<BufferHandle> handle = std::move(handle_it->second);
+            // Keep a raw pointer for the scatter below regardless of how the
+            // session-cache handoff moves the owning handle.
+            void *staging_base = handle->ptr();
+
+            // Register into the session cache up front (unchanged semantics):
+            // the cached buffer must stay valid once visible to other readers.
+            const uint64_t total_size = calculate_total_size(entry->replica);
+            if (session_cache_enabled()) {
+                std::lock_guard<std::mutex> lock(session_mutex_);
+                if (get_sessions_.find(key) != get_sessions_.end()) {
+                    std::shared_ptr<BufferHandle> shared_handle(
+                        std::move(handle));
+                    get_session_object_cache_.insert_or_assign(
+                        key, SessionCachedObject{shared_handle, total_size});
+                }
+            }
+
+            // Lease check mirrors scatter_non_mem_result: an expired entry is
+            // evicted and reported without copying.
+            if (now >= entry->lease_deadline) {
+                results[entry->original_idx] =
+                    static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+                std::lock_guard<std::mutex> lock(session_mutex_);
+                get_sessions_.erase(key);
+                get_session_object_cache_.erase(key);
+                continue;
+            }
+
+            scatter_ranges += entry->buffers.size();
+            for (size_t j = 0; j < entry->sizes.size(); ++j) {
+                scatter_bytes += entry->sizes[j];
+            }
+            scatter_non_mem_result(*entry, staging_base, results,
+                                   session_mutex_, get_sessions_,
+                                   get_session_object_cache_);
         }
+    }
+
+    const auto t_end = std::chrono::steady_clock::now();
+    auto elapsed_us = [](const auto &a, const auto &b) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(b - a)
+            .count();
+    };
+    if (dfs_read_trace_enabled()) {
+        // One line per batch: alloc/dfs_read/scatter split plus scatter volume,
+        // so a slow stage can be attributed to bandwidth (bytes/us near the H2D
+        // ceiling) or to overhead (many tiny ranges, few bytes).
+        const uint64_t scatter_us = elapsed_us(t_io_done, t_end);
+        double scatter_gbps = 0.0;
+        if (scatter_us > 0) {
+            // bytes / us == MB/s; /1000 -> GB/s.
+            scatter_gbps =
+                static_cast<double>(scatter_bytes) / scatter_us / 1000.0;
+        }
+        LOG(INFO) << "process_session_disk_dfs_reads: entries=" << entries.size()
+                  << ", cache_hit_us="
+                  << elapsed_us(timing_start, t_cache_hit_done)
+                  << ", alloc_us="
+                  << elapsed_us(t_cache_hit_done, t_alloc_done)
+                  << ", dfs_read_us=" << elapsed_us(t_alloc_done, t_io_done)
+                  << ", scatter_us=" << scatter_us
+                  << ", total_us=" << elapsed_us(timing_start, t_end)
+                  << ", scatter_ranges=" << scatter_ranges
+                  << ", scatter_bytes=" << scatter_bytes
+                  << ", scatter_GBps=" << scatter_gbps;
     }
 }
 
