@@ -587,6 +587,61 @@ struct DirectStorageMetric {
     }
 };
 
+struct DfsPrefetchMetric {
+    std::array<std::string, 1> skip_labels = {"reason"};
+    std::array<std::string, 1> result_labels = {"result"};
+    std::array<std::string, 1> consume_labels = {"result"};
+
+    explicit DfsPrefetchMetric(std::map<std::string, std::string> labels = {})
+        : triggered_total("mooncake_dfs_prefetch_triggered_total",
+                          "Keys accepted into DFS prefetch after filtering",
+                          labels),
+          skipped_total("mooncake_dfs_prefetch_skipped_total",
+                        "Keys dropped from DFS prefetch by reason", labels,
+                        skip_labels),
+          query_rpc_total("mooncake_dfs_prefetch_query_rpc_total",
+                          "BatchQuery RPCs issued for DFS prefetch", labels,
+                          result_labels),
+          read_total("mooncake_dfs_prefetch_read_total",
+                     "DFS prefetch batch reads by result", labels,
+                     result_labels),
+          read_bytes("mooncake_dfs_prefetch_read_bytes_total",
+                     "Payload bytes prefetched from DFS", labels),
+          consume_total("mooncake_dfs_prefetch_consume_total",
+                        "Prefetch cache consume attempts by result", labels,
+                        consume_labels),
+          expired_total("mooncake_dfs_prefetch_expired_total",
+                        "READY entries expired before being consumed", labels),
+          inflight_bytes("mooncake_dfs_prefetch_inflight_bytes",
+                         "Bytes currently held by prefetch buffers", labels),
+          read_latency_seconds(
+              "mooncake_dfs_prefetch_read_latency_seconds",
+              "DFS prefetch batch read wall-clock duration in seconds",
+              kStorageLatencySecondsBucket, labels) {}
+
+    ylt::metric::counter_t triggered_total;
+    ylt::metric::hybrid_counter_1t skipped_total;
+    ylt::metric::hybrid_counter_1t query_rpc_total;
+    ylt::metric::hybrid_counter_1t read_total;
+    ylt::metric::counter_t read_bytes;
+    ylt::metric::hybrid_counter_1t consume_total;
+    ylt::metric::counter_t expired_total;
+    ylt::metric::gauge_t inflight_bytes;
+    ylt::metric::histogram_t read_latency_seconds;
+
+    void serialize(std::string& str) {
+        triggered_total.serialize(str);
+        skipped_total.serialize(str);
+        query_rpc_total.serialize(str);
+        read_total.serialize(str);
+        read_bytes.serialize(str);
+        consume_total.serialize(str);
+        expired_total.serialize(str);
+        inflight_bytes.serialize(str);
+        read_latency_seconds.serialize(str);
+    }
+};
+
 // SSD latency bucket: microseconds, tuned for SSD/network storage
 // Range: 50us (high-end NVMe) to 30s (3fs/nfs large object batch writes)
 inline const std::vector<double> kSsdLatencyBucket = {
@@ -753,6 +808,7 @@ struct ClientMetric {
     TransferOperationMetric transfer_operation_metric;
     DirectStorageMetric direct_storage_metric;
     SsdMetric ssd_metric;
+    DfsPrefetchMetric dfs_prefetch_metric;
 
     /**
      * @brief Creates a ClientMetric instance based on environment variables
