@@ -613,30 +613,40 @@ BucketGlobalAllocator::BucketEntry*
 BucketGlobalAllocator::FindMatchingEntryLocked(
     const std::string& key, const DistributedFSDescriptor& desc,
     BucketPtr* out_bucket) {
-    if (desc.shard_idx < 0) return nullptr;
+    auto fail = [&key, &desc](const char* reason) -> BucketEntry* {
+        LOG(ERROR) << "DFS entry match failed: reason=" << reason
+                   << ", key=" << key << ", bucket_id=" << desc.shard_idx
+                   << ", offset=" << desc.offset;
+        return nullptr;
+    };
+
+    if (desc.shard_idx < 0) return fail("invalid_bucket_id");
     const int64_t bucket_id = static_cast<int64_t>(desc.shard_idx);
 
     auto index_it = key_index_.find(key);
-    if (index_it == key_index_.end() || index_it->second != bucket_id) {
-        return nullptr;
-    }
+    if (index_it == key_index_.end()) return fail("key_not_indexed");
+    if (index_it->second != bucket_id)
+        return fail("key_index_bucket_mismatch");
     auto bucket_it = buckets_.find(bucket_id);
-    if (bucket_it == buckets_.end()) return nullptr;
+    if (bucket_it == buckets_.end()) return fail("bucket_not_found");
 
     auto entry_it = bucket_it->second->entries.find(key);
-    if (entry_it == bucket_it->second->entries.end()) return nullptr;
+    if (entry_it == bucket_it->second->entries.end())
+        return fail("bucket_entry_not_found");
 
     // Match on every layout-defining field so a descriptor from a superseded
     // allocation cannot address the current one.
     auto& entry = entry_it->second;
-    if (entry.value_size != desc.object_size ||
-        entry.reserved_size != desc.aligned_size ||
-        entry.key_size != key.size()) {
-        return nullptr;
-    }
+    if (entry.value_size != desc.object_size)
+        return fail("object_size_mismatch");
+    if (entry.reserved_size != desc.aligned_size)
+        return fail("aligned_size_mismatch");
+    if (entry.key_size != key.size()) return fail("key_size_mismatch");
     auto layout = RebuildBucketEntryLayout(entry.entry_offset, entry.key_size,
                                            entry.value_size, alignment_);
-    if (!layout || layout->value_offset != desc.offset) return nullptr;
+    if (!layout) return fail("invalid_entry_layout");
+    if (layout->value_offset != desc.offset)
+        return fail("value_offset_mismatch");
 
     if (out_bucket) *out_bucket = bucket_it->second;
     return &entry;
@@ -811,7 +821,12 @@ std::vector<BatchAllocateResult> BucketGlobalAllocator::BatchAllocate(
 
 bool BucketGlobalAllocator::MarkCommitted(
     const std::string& key, const DistributedFSDescriptor& descriptor) {
-    if (!initialized_.load(std::memory_order_acquire)) return false;
+    if (!initialized_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "DFS commit rejected: reason=allocator_not_initialized"
+                   << ", key=" << key
+                   << ", bucket_id=" << descriptor.shard_idx;
+        return false;
+    }
 
     std::lock_guard<std::mutex> lock(mutex_);
     BucketPtr bucket;
@@ -821,7 +836,13 @@ bool BucketGlobalAllocator::MarkCommitted(
         // Idempotent: a duplicate PutEnd for the same generation succeeds.
         return true;
     }
-    if (entry->state != BucketEntryState::PENDING) return false;
+    if (entry->state != BucketEntryState::PENDING) {
+        LOG(ERROR) << "DFS commit rejected: reason=invalid_entry_state"
+                   << ", key=" << key
+                   << ", bucket_id=" << descriptor.shard_idx
+                   << ", state=" << static_cast<int32_t>(entry->state);
+        return false;
+    }
     entry->state = BucketEntryState::COMMITTED;
     // PutEnd never touches a file. For the active bucket the transition is
     // simply part of the state that gets written when the bucket is sealed; for

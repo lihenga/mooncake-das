@@ -6,8 +6,8 @@
 // batch_get_session_start()/batch_get_into_multi_buffer_ranges(). DFS-resident
 // objects are otherwise read synchronously from the distributed filesystem on
 // every get. This component uses the exist->get window to asynchronously pull
-// DFS-only objects into client DRAM so the later get scatters from a local
-// buffer instead of hitting DFS.
+// DFS-only objects into pinned chunk arenas so the later get scatters from a
+// local buffer instead of hitting DFS.
 //
 // Only keys whose best replica (SelectBestReplica policy) is a DFS replica
 // are prefetched; keys with memory/NOF/local-disk replicas are left alone.
@@ -24,7 +24,6 @@
 #include <future>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -45,10 +44,12 @@ namespace mooncake {
 struct DfsPrefetchMetric;
 
 struct DfsPrefetchConfig {
-    // Total bytes reserved by pending/ready prefetch buffers. New prefetches
-    // are skipped (never queued) once exceeded, so the shared
-    // ClientBufferAllocator arena keeps headroom for on-demand reads.
-    uint64_t max_bytes = 4ull << 30;  // MC_STORE_DFS_PREFETCH_MAX_BYTES
+    // Logical object bytes being read or waiting to be consumed. New
+    // prefetches are skipped once this active-data limit would be exceeded.
+    uint64_t max_bytes = 1ull << 30;  // MC_STORE_DFS_PREFETCH_MAX_BYTES
+    // Maximum ordinary pinned arena chunk. Oversized objects receive one
+    // dedicated arena and are never split.
+    size_t chunk_bytes = 128ull << 20;  // MC_STORE_DFS_PREFETCH_CHUNK_BYTES
     // Time an unconsumed entry stays consumable before GC frees its buffer.
     uint64_t ttl_ms = 10000;  // MC_STORE_DFS_PREFETCH_TTL_MS
     // Driver threads issuing synchronous Client::BatchGet calls.
@@ -70,7 +71,9 @@ bool dfs_prefetch_enabled();
 enum class PrefetchState { READING, READY, FAILED, CONSUMED };
 
 struct PrefetchEntry {
-    std::unique_ptr<BufferHandle> buffer;
+    // View into a shared pinned chunk. Keeping the view alive also keeps the
+    // complete chunk alive until prefetch, session cache, and DMA users finish.
+    std::shared_ptr<BufferHandle> buffer;
     // Capacity charged against DfsPrefetchConfig::max_bytes while the entry
     // is tracked. Reset to 0 when the charge is released, so inflight
     // accounting never double-counts a release.
@@ -96,7 +99,9 @@ class DfsPrefetcher {
         std::unordered_map<std::string, std::vector<Slice>> &)>;
     using LocalEndpointsFn =
         std::function<std::unordered_set<std::string>()>;
-    using AllocateFn = std::function<std::optional<BufferHandle>(size_t)>;
+    // Allocates one pinned arena. A null result means pinned allocation failed
+    // and all objects assigned to that arena fall back to normal DFS reads.
+    using AllocateFn = std::function<std::shared_ptr<BufferHandle>(size_t)>;
 
     DfsPrefetcher(DfsPrefetchConfig config, BatchQueryFn query_fn,
                   BatchGetFn get_fn, LocalEndpointsFn endpoints_fn,
@@ -132,7 +137,8 @@ class DfsPrefetcher {
     EraseEntryLocked(
         std::unordered_map<std::string,
                            std::shared_ptr<PrefetchEntry>>::iterator it);
-    void TrackInflight(int64_t delta);
+    bool TryReserveInflight(uint64_t bytes);
+    void ReleaseInflight(uint64_t bytes);
 
     const DfsPrefetchConfig config_;
     BatchQueryFn query_fn_;

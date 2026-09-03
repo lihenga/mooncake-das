@@ -613,7 +613,9 @@ struct DfsPrefetchMetric {
           expired_total("mooncake_dfs_prefetch_expired_total",
                         "READY entries expired before being consumed", labels),
           inflight_bytes("mooncake_dfs_prefetch_inflight_bytes",
-                         "Bytes currently held by prefetch buffers", labels),
+                         "Logical object bytes currently reading or awaiting "
+                         "prefetch consumption",
+                         labels),
           read_latency_seconds(
               "mooncake_dfs_prefetch_read_latency_seconds",
               "DFS prefetch batch read wall-clock duration in seconds",

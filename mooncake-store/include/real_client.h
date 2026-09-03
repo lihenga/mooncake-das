@@ -21,6 +21,7 @@
 #include "client_service.h"
 #include "client_buffer.h"
 #include "dfs_prefetcher.h"
+#include "pinned_buffer_pool.h"
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
@@ -998,6 +999,12 @@ class RealClient : public PyClient {
     // Populated lazily on first range-get; released at session end.
     std::unordered_map<std::string, SessionCachedObject>
         get_session_object_cache_;
+    class DfsH2dStreamPool;
+    class DfsAsyncScatterContext;
+    mutable std::shared_mutex dfs_read_lifecycle_mutex_;
+    bool dfs_read_shutting_down_ = false;
+    std::shared_ptr<PinnedBufferPool> dfs_pinned_buffer_pool_;
+    std::unique_ptr<DfsH2dStreamPool> dfs_h2d_stream_pool_;
 
     // Asynchronous DFS-replica prefetcher fed by batchIsExist probes;
     // consumed by process_session_disk_dfs_reads. Null unless
