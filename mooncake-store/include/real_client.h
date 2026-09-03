@@ -21,6 +21,7 @@
 #include "client_service.h"
 #include "client_buffer.h"
 #include "device/cuda_ipc_buffer_handle.h"
+#include "dfs_prefetcher.h"
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
@@ -1085,6 +1086,11 @@ class RealClient : public PyClient {
     // Populated lazily on first range-get; released at session end.
     std::unordered_map<std::string, SessionCachedObject>
         get_session_object_cache_;
+
+    // Asynchronous DFS-replica prefetcher fed by batchIsExist probes;
+    // consumed by process_session_disk_dfs_reads. Null unless
+    // MC_STORE_ENABLE_DFS_PREFETCH is on.
+    std::unique_ptr<DfsPrefetcher> dfs_prefetcher_;
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,

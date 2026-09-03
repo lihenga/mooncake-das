@@ -1275,7 +1275,7 @@ DistributedStorageBackend::BatchReadDirect(
             }
             try {
                 batch_read_pool_->enqueue(
-                    [this, &read, &requests, &results, &mark_done]() {
+                    [this, read, &requests, &results, &mark_done]() {
                         try {
                             ExecuteKeyRead(read, requests, results);
                         } catch (const std::exception& e) {
