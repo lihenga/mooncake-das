@@ -5,6 +5,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <mutex>
 #include <sstream>
 
 #include "environ.h"
@@ -256,6 +257,16 @@ bool DistributedStorageConfig::ValidateForBucketAllocator() const {
         return false;
     }
     return true;
+}
+
+bool DistributedStorageConfig::IsReplicaEnabledFromEnvironment() {
+    const bool enabled = Environ::GetBool("MOONCAKE_DFS_FORCE_ONE_REPLICA", false);
+    static std::once_flag log_once;
+    std::call_once(log_once, [enabled] {
+        LOG(INFO) << "MOONCAKE_DFS_FORCE_ONE_REPLICA is "
+                  << (enabled ? "true" : "false");
+    });
+    return enabled;
 }
 
 DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
