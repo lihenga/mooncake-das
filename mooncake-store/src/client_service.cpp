@@ -512,10 +512,13 @@ Client::~Client() {
     hot_cache_.reset();
 }
 
-ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
+ReplicateConfig Client::AttachConfig(const ReplicateConfig& config) const {
     ReplicateConfig client_cfg = config;
     if (!host_id_.empty()) {
         client_cfg.host_id = host_id_;
+    }
+    if (DistributedStorageConfig::IsReplicaEnabledFromEnvironment()) {
+        client_cfg.dfs_replica_num = 1;
     }
     return client_cfg;
 }
@@ -1691,7 +1694,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         slice_lengths.emplace_back(slices[i].size);
     }
 
-    ReplicateConfig client_cfg = AttachHostId(config);
+    ReplicateConfig client_cfg = AttachConfig(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -1824,7 +1827,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         slice_lengths.emplace_back(slices[i].size);
     }
 
-    ReplicateConfig client_cfg = AttachHostId(config);
+    ReplicateConfig client_cfg = AttachConfig(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -1952,7 +1955,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
-    ReplicateConfig client_cfg = AttachHostId(config);
+    ReplicateConfig client_cfg = AttachConfig(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -3249,7 +3252,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
-    ReplicateConfig client_cfg = AttachHostId(config);
+    ReplicateConfig client_cfg = AttachConfig(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -3299,7 +3302,7 @@ Client::StartBatchPutForSizes(const std::vector<std::string>& keys,
         return results;
     }
 
-    ReplicateConfig client_cfg = AttachHostId(config);
+    ReplicateConfig client_cfg = AttachConfig(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
