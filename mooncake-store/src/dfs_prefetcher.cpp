@@ -3,14 +3,93 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cctype>
 #include <cstdlib>
+#include <limits>
+#include <type_traits>
 #include <utility>
 
 #include "client_metric.h"
 #include "utils.h"
 
 namespace mooncake {
+
+namespace {
+
+template <typename T>
+T GetUnsignedEnvOr(const char *name, T default_value) {
+    static_assert(std::is_unsigned_v<T>);
+    const char *value = std::getenv(name);
+    if (!value || value[0] == '\0') return default_value;
+
+    const std::string raw(value);
+    const bool digits_only =
+        std::all_of(raw.begin(), raw.end(), [](unsigned char c) {
+            return std::isdigit(c) != 0;
+        });
+    errno = 0;
+    char *end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (!digits_only || errno != 0 || end == value || *end != '\0' ||
+        parsed > std::numeric_limits<T>::max()) {
+        LOG(WARNING) << "Invalid " << name << "='" << value << "', using "
+                     << default_value;
+        return default_value;
+    }
+    return static_cast<T>(parsed);
+}
+
+bool AlignUpSize(size_t value, size_t alignment, size_t *aligned) {
+    const size_t remainder = value % alignment;
+    if (remainder == 0) {
+        *aligned = value;
+        return true;
+    }
+    const size_t padding = alignment - remainder;
+    if (value > std::numeric_limits<size_t>::max() - padding) return false;
+    *aligned = value + padding;
+    return true;
+}
+
+DfsPrefetchConfig NormalizeConfig(DfsPrefetchConfig config) {
+    constexpr size_t kDefaultChunkBytes = 128ull << 20;
+    const uint64_t max_accountable_bytes =
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+    if (config.max_bytes > max_accountable_bytes) {
+        LOG(WARNING) << "MC_STORE_DFS_PREFETCH_MAX_BYTES exceeds the "
+                        "accounting range; clamping to "
+                     << max_accountable_bytes;
+        config.max_bytes = max_accountable_bytes;
+    }
+    if (config.chunk_bytes == 0) {
+        LOG(WARNING) << "DFS prefetch chunk_bytes is zero; using "
+                     << kDefaultChunkBytes;
+        config.chunk_bytes = kDefaultChunkBytes;
+    }
+    const auto max_steady_ms = std::chrono::duration_cast<
+        std::chrono::milliseconds>(std::chrono::steady_clock::duration::max())
+                                   .count();
+    const uint64_t max_duration_ms =
+        max_steady_ms > 0 ? static_cast<uint64_t>(max_steady_ms) : 0;
+    auto clamp_duration = [max_duration_ms](uint64_t *value,
+                                             const char *name) {
+        if (*value <= max_duration_ms) return;
+        LOG(WARNING) << name << " exceeds the chrono duration range; "
+                     << "clamping to " << max_duration_ms;
+        *value = max_duration_ms;
+    };
+    clamp_duration(&config.ttl_ms, "MC_STORE_DFS_PREFETCH_TTL_MS");
+    clamp_duration(&config.wait_timeout_ms,
+                   "MC_STORE_DFS_PREFETCH_WAIT_TIMEOUT_MS");
+    clamp_duration(&config.retry_backoff_ms,
+                   "MC_STORE_DFS_PREFETCH_RETRY_BACKOFF_MS");
+    if (config.io_threads == 0) config.io_threads = 1;
+    if (config.max_batch_keys == 0) config.max_batch_keys = 1;
+    return config;
+}
+
+}  // namespace
 
 bool dfs_prefetch_enabled() {
     static const bool enabled = [] {
@@ -38,25 +117,21 @@ bool dfs_prefetch_enabled() {
 
 DfsPrefetchConfig DfsPrefetchConfig::FromEnv() {
     DfsPrefetchConfig config;
-    config.max_bytes =
-        GetEnvOr<uint64_t>("MC_STORE_DFS_PREFETCH_MAX_BYTES", config.max_bytes);
-    config.ttl_ms =
-        GetEnvOr<uint64_t>("MC_STORE_DFS_PREFETCH_TTL_MS", config.ttl_ms);
-    config.io_threads = GetEnvOr<uint32_t>("MC_STORE_DFS_PREFETCH_IO_THREADS",
-                                           config.io_threads);
-    config.wait_timeout_ms = GetEnvOr<uint64_t>(
+    config.max_bytes = GetUnsignedEnvOr<uint64_t>(
+        "MC_STORE_DFS_PREFETCH_MAX_BYTES", config.max_bytes);
+    config.chunk_bytes = GetUnsignedEnvOr<size_t>(
+        "MC_STORE_DFS_PREFETCH_CHUNK_BYTES", config.chunk_bytes);
+    config.ttl_ms = GetUnsignedEnvOr<uint64_t>(
+        "MC_STORE_DFS_PREFETCH_TTL_MS", config.ttl_ms);
+    config.io_threads = GetUnsignedEnvOr<uint32_t>(
+        "MC_STORE_DFS_PREFETCH_IO_THREADS", config.io_threads);
+    config.wait_timeout_ms = GetUnsignedEnvOr<uint64_t>(
         "MC_STORE_DFS_PREFETCH_WAIT_TIMEOUT_MS", config.wait_timeout_ms);
-    config.retry_backoff_ms = GetEnvOr<uint64_t>(
+    config.retry_backoff_ms = GetUnsignedEnvOr<uint64_t>(
         "MC_STORE_DFS_PREFETCH_RETRY_BACKOFF_MS", config.retry_backoff_ms);
-    config.max_batch_keys = GetEnvOr<size_t>(
+    config.max_batch_keys = GetUnsignedEnvOr<size_t>(
         "MC_STORE_DFS_PREFETCH_MAX_BATCH_KEYS", config.max_batch_keys);
-    if (config.io_threads == 0) {
-        config.io_threads = 1;
-    }
-    if (config.max_batch_keys == 0) {
-        config.max_batch_keys = 1;
-    }
-    return config;
+    return NormalizeConfig(config);
 }
 
 namespace {
@@ -79,7 +154,7 @@ inline void SetPromiseValue(const std::shared_ptr<std::promise<void>> &done) {
 DfsPrefetcher::DfsPrefetcher(DfsPrefetchConfig config, BatchQueryFn query_fn,
                              BatchGetFn get_fn, LocalEndpointsFn endpoints_fn,
                              AllocateFn alloc_fn, DfsPrefetchMetric *metric)
-    : config_(config),
+    : config_(NormalizeConfig(config)),
       query_fn_(std::move(query_fn)),
       get_fn_(std::move(get_fn)),
       endpoints_fn_(std::move(endpoints_fn)),
@@ -87,7 +162,9 @@ DfsPrefetcher::DfsPrefetcher(DfsPrefetchConfig config, BatchQueryFn query_fn,
       metric_(metric) {
     io_pool_ = std::make_unique<ThreadPool>(config_.io_threads);
     coordinator_thread_ = std::thread([this] { CoordinatorLoop(); });
-    LOG(INFO) << "DfsPrefetcher started: max_bytes=" << config_.max_bytes
+    LOG(INFO) << "DfsPrefetcher started: max_active_bytes="
+              << config_.max_bytes
+              << ", chunk_bytes=" << config_.chunk_bytes
               << ", ttl_ms=" << config_.ttl_ms
               << ", io_threads=" << config_.io_threads
               << ", wait_timeout_ms=" << config_.wait_timeout_ms;
@@ -159,8 +236,7 @@ std::shared_ptr<BufferHandle> DfsPrefetcher::TryConsume(
         out_found = true;
         const auto state = entry->state.load(std::memory_order_acquire);
         if (state == PrefetchState::READY) {
-            auto handle = std::shared_ptr<BufferHandle>(
-                std::move(entry->buffer));
+            auto handle = std::move(entry->buffer);
             EraseEntryLocked(it);
             if (metric_) {
                 metric_->consume_total.inc({"hit"});
@@ -213,7 +289,7 @@ std::shared_ptr<BufferHandle> DfsPrefetcher::TryConsume(
         }
         return nullptr;
     }
-    auto handle = std::shared_ptr<BufferHandle>(std::move(entry->buffer));
+    auto handle = std::move(entry->buffer);
     EraseEntryLocked(it);
     if (metric_) {
         metric_->consume_total.inc({"hit"});
@@ -247,6 +323,8 @@ void DfsPrefetcher::ProcessKeys(const std::vector<std::string> &keys) {
     // are still inside their retry backoff window.
     std::vector<std::string> query_keys;
     query_keys.reserve(keys.size());
+    std::unordered_set<std::string> query_key_set;
+    query_key_set.reserve(keys.size());
     const auto now = std::chrono::steady_clock::now();
     {
         std::lock_guard<std::mutex> lock(entries_mutex_);
@@ -271,8 +349,11 @@ void DfsPrefetcher::ProcessKeys(const std::vector<std::string> &keys) {
                     }
                 }
             }
-            if (entries_.find(key) == entries_.end()) {
+            if (entries_.find(key) == entries_.end() &&
+                query_key_set.insert(key).second) {
                 query_keys.push_back(key);
+            } else if (entries_.find(key) == entries_.end() && metric_) {
+                metric_->skipped_total.inc({"duplicate"});
             }
         }
     }
@@ -282,13 +363,20 @@ void DfsPrefetcher::ProcessKeys(const std::vector<std::string> &keys) {
 
     const auto local_endpoints = endpoints_fn_();
 
-    // 2. BatchQuery (chunked), keep only keys whose best replica is DFS.
-    std::vector<std::pair<std::string, std::shared_ptr<PrefetchEntry>>>
-        to_read;
+    // 2. BatchQuery (chunked), keep only keys whose best replica is DFS and
+    // reserve their logical bytes before allocating pinned chunks.
+    struct Candidate {
+        std::string key;
+        std::shared_ptr<PrefetchEntry> entry;
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve(query_keys.size());
     for (size_t base = 0; base < query_keys.size();
-         base += config_.max_batch_keys) {
-        const size_t end =
-            std::min(base + config_.max_batch_keys, query_keys.size());
+         base += std::min(config_.max_batch_keys,
+                          query_keys.size() - base)) {
+        const size_t count =
+            std::min(config_.max_batch_keys, query_keys.size() - base);
+        const size_t end = base + count;
         std::vector<std::string> chunk(query_keys.begin() + base,
                                        query_keys.begin() + end);
         std::vector<tl::expected<QueryResult, ErrorCode>> qrs;
@@ -326,69 +414,177 @@ void DfsPrefetcher::ProcessKeys(const std::vector<std::string> &keys) {
                 continue;
             }
 
+            const uint64_t total_size = calculate_total_size(*best);
+            if (total_size == 0 || total_size > config_.max_bytes ||
+                total_size > std::numeric_limits<size_t>::max()) {
+                if (metric_) {
+                    metric_->skipped_total.inc({"capacity"});
+                }
+                continue;
+            }
             auto entry = std::make_shared<PrefetchEntry>();
             entry->replica = *best;
             entry->lease_timeout = qrs[i]->lease_timeout;
-            entry->total_size = calculate_total_size(*best);
+            entry->total_size = total_size;
             entry->done = std::make_shared<std::promise<void>>();
             entry->done_future = entry->done->get_future().share();
             entry->created_at = std::chrono::steady_clock::now();
-
-            if (entry->total_size == 0 ||
-                entry->total_size > config_.max_bytes) {
+            if (!TryReserveInflight(total_size)) {
                 if (metric_) {
                     metric_->skipped_total.inc({"capacity"});
                 }
                 continue;
             }
-            const int64_t inflight =
-                inflight_bytes_.load(std::memory_order_relaxed);
-            if (inflight + static_cast<int64_t>(entry->total_size) >
-                static_cast<int64_t>(config_.max_bytes)) {
-                if (metric_) {
-                    metric_->skipped_total.inc({"capacity"});
+            candidates.push_back(Candidate{chunk[i], std::move(entry)});
+        }
+    }
+
+    // 3. Form each I/O batch first, then pack its objects in original order
+    // into shared pinned chunks. Ordinary chunks never exceed chunk_bytes;
+    // an oversized object gets one aligned dedicated arena.
+    constexpr size_t kObjectAlignment = 64;
+    for (size_t base = 0; base < candidates.size();
+         base += std::min(config_.max_batch_keys,
+                          candidates.size() - base)) {
+        const size_t count =
+            std::min(config_.max_batch_keys, candidates.size() - base);
+        const size_t end = base + count;
+
+        struct PlannedView {
+            Candidate *candidate;
+            size_t offset;
+            size_t size;
+        };
+        struct PlannedArena {
+            std::vector<PlannedView> views;
+            size_t used_bytes = 0;
+            bool oversized = false;
+        };
+        std::vector<PlannedArena> arenas;
+        arenas.reserve(count);
+
+        for (size_t i = base; i < end; ++i) {
+            Candidate &candidate = candidates[i];
+            const size_t object_size =
+                static_cast<size_t>(candidate.entry->total_size);
+            if (object_size > config_.chunk_bytes) {
+                size_t allocation_size = 0;
+                if (!AlignUpSize(object_size, kObjectAlignment,
+                                 &allocation_size)) {
+                    ReleaseInflight(candidate.entry->total_size);
+                    candidate.entry->total_size = 0;
+                    if (metric_) {
+                        metric_->skipped_total.inc({"capacity"});
+                    }
+                    continue;
+                }
+                PlannedArena arena;
+                arena.oversized = true;
+                arena.used_bytes = allocation_size;
+                arena.views.push_back(
+                    PlannedView{&candidate, 0, object_size});
+                arenas.push_back(std::move(arena));
+                continue;
+            }
+
+            size_t aligned_offset = 0;
+            bool needs_new_arena =
+                arenas.empty() || arenas.back().oversized ||
+                !AlignUpSize(arenas.back().used_bytes, kObjectAlignment,
+                             &aligned_offset) ||
+                aligned_offset > config_.chunk_bytes ||
+                object_size > config_.chunk_bytes - aligned_offset;
+            if (needs_new_arena) {
+                arenas.emplace_back();
+                aligned_offset = 0;
+            }
+            auto &arena = arenas.back();
+            arena.views.push_back(
+                PlannedView{&candidate, aligned_offset, object_size});
+            arena.used_bytes = aligned_offset + object_size;
+        }
+
+        std::vector<std::pair<std::string, std::shared_ptr<PrefetchEntry>>>
+            io_batch;
+        io_batch.reserve(count);
+        size_t allocated_chunks = 0;
+        uint64_t arena_requested_bytes = 0;
+        size_t failed_chunks = 0;
+        for (auto &arena : arenas) {
+            size_t allocation_size = 0;
+            if (!AlignUpSize(arena.used_bytes, kObjectAlignment,
+                             &allocation_size)) {
+                ++failed_chunks;
+                for (auto &view : arena.views) {
+                    ReleaseInflight(view.candidate->entry->total_size);
+                    view.candidate->entry->total_size = 0;
                 }
                 continue;
             }
 
-            auto alloc = alloc_fn_(entry->total_size);
-            if (!alloc) {
-                // Transient arena pressure: skip without marking FAILED so a
-                // later exist probe may retry.
-                if (metric_) {
-                    metric_->skipped_total.inc({"capacity"});
+            std::shared_ptr<BufferHandle> arena_handle;
+            try {
+                arena_handle = alloc_fn_(allocation_size);
+            } catch (const std::exception &e) {
+                LOG(WARNING) << "DFS prefetch pinned arena allocation threw: "
+                             << e.what();
+            }
+            if (!arena_handle || !arena_handle->ptr() ||
+                arena_handle->size() < allocation_size) {
+                ++failed_chunks;
+                for (auto &view : arena.views) {
+                    ReleaseInflight(view.candidate->entry->total_size);
+                    view.candidate->entry->total_size = 0;
+                    if (metric_) {
+                        metric_->skipped_total.inc({"pinned_allocation"});
+                    }
                 }
                 continue;
             }
-            entry->buffer = std::make_unique<BufferHandle>(std::move(*alloc));
 
-            {
-                std::lock_guard<std::mutex> lock(entries_mutex_);
-                if (entries_.find(chunk[i]) != entries_.end()) {
-                    // Lost a race with another insertion path; drop ours.
+            ++allocated_chunks;
+            if (allocation_size >
+                std::numeric_limits<uint64_t>::max() -
+                    arena_requested_bytes) {
+                arena_requested_bytes =
+                    std::numeric_limits<uint64_t>::max();
+            } else {
+                arena_requested_bytes += allocation_size;
+            }
+            for (auto &view : arena.views) {
+                auto &candidate = *view.candidate;
+                auto *view_ptr =
+                    static_cast<char *>(arena_handle->ptr()) + view.offset;
+                candidate.entry->buffer = std::make_shared<BufferHandle>(
+                    view_ptr, view.size,
+                    [arena_handle]() { (void)arena_handle; });
+
+                bool inserted = false;
+                {
+                    std::lock_guard<std::mutex> lock(entries_mutex_);
+                    inserted =
+                        entries_.emplace(candidate.key, candidate.entry).second;
+                }
+                if (!inserted) {
+                    candidate.entry->buffer.reset();
+                    ReleaseInflight(candidate.entry->total_size);
+                    candidate.entry->total_size = 0;
                     if (metric_) {
                         metric_->skipped_total.inc({"duplicate"});
                     }
                     continue;
                 }
-                entries_.emplace(chunk[i], entry);
+                if (metric_) metric_->triggered_total.inc();
+                io_batch.emplace_back(candidate.key, candidate.entry);
             }
-            TrackInflight(static_cast<int64_t>(entry->total_size));
-            if (metric_) {
-                metric_->triggered_total.inc();
-            }
-            to_read.emplace_back(chunk[i], std::move(entry));
         }
-    }
 
-    // 3. Submit IO batches (chunked) to the driver pool.
-    for (size_t base = 0; base < to_read.size();
-         base += config_.max_batch_keys) {
-        const size_t end =
-            std::min(base + config_.max_batch_keys, to_read.size());
-        std::vector<std::pair<std::string, std::shared_ptr<PrefetchEntry>>>
-            io_batch(std::make_move_iterator(to_read.begin() + base),
-                     std::make_move_iterator(to_read.begin() + end));
+        if (dfs_read_trace_enabled()) {
+            LOG(INFO) << "dfs_prefetch_arena_plan: candidates=" << count
+                      << ", chunks=" << allocated_chunks
+                      << ", arena_requested_bytes=" << arena_requested_bytes
+                      << ", failed_chunks=" << failed_chunks;
+        }
         if (io_batch.empty()) {
             continue;
         }
@@ -409,9 +605,9 @@ void DfsPrefetcher::ProcessKeys(const std::vector<std::string> &keys) {
                 // ProcessKeys acquire-read can observe a default time_point.
                 entry->failed_at = std::chrono::steady_clock::now();
                 entry->last_error = ErrorCode::INTERNAL_ERROR;
-                if (entry->buffer) {
-                    entry->buffer.reset();
-                    TrackInflight(-static_cast<int64_t>(entry->total_size));
+                entry->buffer.reset();
+                if (entry->total_size > 0) {
+                    ReleaseInflight(entry->total_size);
                     entry->total_size = 0;
                 }
                 entry->state.store(PrefetchState::FAILED,
@@ -500,10 +696,13 @@ void DfsPrefetcher::RunIoBatch(
                         i < results.size() && results[i].has_value() &&
                         !slices[keys[i]].empty();
         if (ok) {
-            entry->state.store(PrefetchState::READY,
-                               std::memory_order_release);
             ok_bytes += entry->total_size;
             ++ok_keys;
+            // Publish READY only after the producer's final reads from the
+            // entry; a consumer may immediately move the view and release the
+            // capacity charge after observing this state.
+            entry->state.store(PrefetchState::READY,
+                               std::memory_order_release);
         } else {
             if (i < results.size() && !results[i].has_value()) {
                 entry->last_error = results[i].error();
@@ -514,9 +713,9 @@ void DfsPrefetcher::RunIoBatch(
             // ProcessKeys reads failed_at under acquire for backoff.
             entry->failed_at = std::chrono::steady_clock::now();
             // The buffer cannot serve anyone; release its inflight share.
-            if (entry->buffer) {
-                entry->buffer.reset();
-                TrackInflight(-static_cast<int64_t>(entry->total_size));
+            entry->buffer.reset();
+            if (entry->total_size > 0) {
+                ReleaseInflight(entry->total_size);
                 entry->total_size = 0;
             }
             entry->state.store(PrefetchState::FAILED,
@@ -589,18 +788,49 @@ DfsPrefetcher::EraseEntryLocked(
         entry->buffer.reset();
     }
     if (entry->total_size > 0) {
-        TrackInflight(-static_cast<int64_t>(entry->total_size));
+        ReleaseInflight(entry->total_size);
         entry->total_size = 0;
     }
     return entries_.erase(it);
 }
 
-void DfsPrefetcher::TrackInflight(int64_t delta) {
-    const int64_t current =
-        inflight_bytes_.fetch_add(delta, std::memory_order_relaxed) + delta;
-    if (metric_) {
-        metric_->inflight_bytes.update(current);
+bool DfsPrefetcher::TryReserveInflight(uint64_t bytes) {
+    if (bytes == 0 || bytes > config_.max_bytes ||
+        bytes > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        return false;
     }
+    const int64_t amount = static_cast<int64_t>(bytes);
+    const int64_t limit = static_cast<int64_t>(config_.max_bytes);
+    int64_t current = inflight_bytes_.load(std::memory_order_relaxed);
+    while (true) {
+        if (current < 0 || current > limit - amount) return false;
+        if (inflight_bytes_.compare_exchange_weak(
+                current, current + amount, std::memory_order_relaxed,
+                std::memory_order_relaxed)) {
+            break;
+        }
+    }
+    if (metric_) {
+        metric_->inflight_bytes.update(current + amount);
+    }
+    return true;
+}
+
+void DfsPrefetcher::ReleaseInflight(uint64_t bytes) {
+    if (bytes == 0 ||
+        bytes > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        return;
+    }
+    const int64_t amount = static_cast<int64_t>(bytes);
+    const int64_t previous =
+        inflight_bytes_.fetch_sub(amount, std::memory_order_relaxed);
+    const int64_t current = previous >= amount ? previous - amount : 0;
+    if (previous < amount) {
+        LOG(ERROR) << "DFS prefetch inflight accounting underflow: current="
+                   << previous << ", release=" << amount;
+        inflight_bytes_.store(0, std::memory_order_relaxed);
+    }
+    if (metric_) metric_->inflight_bytes.update(current);
 }
 
 }  // namespace mooncake

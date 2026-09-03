@@ -1,7 +1,6 @@
 // Unit tests for DfsPrefetcher: replica filtering, dedup/backoff, capacity
 // accounting, TryConsume semantics, and TTL GC. Dependencies are injected as
-// std::function fakes; buffers are allocated from a real
-// ClientBufferAllocator.
+// std::function fakes; arena allocations use a real ClientBufferAllocator.
 
 #include "dfs_prefetcher.h"
 
@@ -73,6 +72,7 @@ class DfsPrefetcherTest : public ::testing::Test {
         config_.wait_timeout_ms = 2000;
         config_.retry_backoff_ms = 300;
         config_.max_batch_keys = 16;
+        config_.chunk_bytes = 4 * kObjSize;
     }
 
     DfsPrefetcher::BatchQueryFn QueryReturning(
@@ -110,7 +110,11 @@ class DfsPrefetcherTest : public ::testing::Test {
     }
 
     DfsPrefetcher::AllocateFn Alloc() {
-        return [this](size_t size) { return allocator_->allocate(size); };
+        return [this](size_t size) -> std::shared_ptr<BufferHandle> {
+            auto allocation = allocator_->allocate(size);
+            if (!allocation) return nullptr;
+            return std::make_shared<BufferHandle>(std::move(*allocation));
+        };
     }
 
     // Poll `cond` up to `timeout`, sleeping briefly between checks. Returns
@@ -293,6 +297,98 @@ TEST_F(DfsPrefetcherTest, CapacityLimitSkipsNewPrefetches) {
     EXPECT_LE(hits, 8);
     EXPECT_GT(misses, 0);
     EXPECT_EQ(hits + misses, 16);
+}
+
+TEST_F(DfsPrefetcherTest, PacksObjectsIntoSharedChunks) {
+    config_.max_bytes = 3 * kObjSize;
+    config_.chunk_bytes = 2 * kObjSize;
+    std::atomic<int> allocation_calls{0};
+    std::atomic<int> read_calls{0};
+    auto alloc = [this, &allocation_calls](
+                     size_t size) -> std::shared_ptr<BufferHandle> {
+        ++allocation_calls;
+        auto allocation = allocator_->allocate(size);
+        if (!allocation) return nullptr;
+        return std::make_shared<BufferHandle>(std::move(*allocation));
+    };
+    auto get_ok = GetOk();
+    auto get = [get_ok = std::move(get_ok), &read_calls](
+                   const std::vector<std::string> &keys,
+                   const std::vector<QueryResult> &qrs,
+                   std::unordered_map<std::string, std::vector<Slice>>
+                       &slices) mutable {
+        ++read_calls;
+        return get_ok(keys, qrs, slices);
+    };
+    DfsPrefetcher p(config_, QueryReturning({MakeDfs()}), get, NoLocal(),
+                    alloc);
+    p.NotifyExistTrue({"k1", "k2", "k3"});
+    ASSERT_TRUE(WaitFor([&read_calls] { return read_calls.load() > 0; }));
+
+    std::vector<std::shared_ptr<BufferHandle>> handles;
+    for (const auto *key : {"k1", "k2", "k3"}) {
+        bool found = false;
+        auto handle = p.TryConsume(key, found);
+        ASSERT_TRUE(found);
+        ASSERT_NE(handle, nullptr);
+        handles.push_back(std::move(handle));
+    }
+    EXPECT_EQ(allocation_calls.load(), 2);
+}
+
+TEST_F(DfsPrefetcherTest, OversizedObjectUsesOneDedicatedArena) {
+    constexpr uint64_t kOversized = 2 * kObjSize + 1;
+    config_.max_bytes = kOversized;
+    config_.chunk_bytes = kObjSize;
+    std::atomic<int> allocation_calls{0};
+    std::atomic<size_t> allocation_bytes{0};
+    std::atomic<int> read_calls{0};
+    auto alloc = [this, &allocation_calls, &allocation_bytes](
+                     size_t size) -> std::shared_ptr<BufferHandle> {
+        ++allocation_calls;
+        allocation_bytes.store(size);
+        auto allocation = allocator_->allocate(size);
+        if (!allocation) return nullptr;
+        return std::make_shared<BufferHandle>(std::move(*allocation));
+    };
+    auto get_ok = GetOk();
+    auto get = [get_ok = std::move(get_ok), &read_calls](
+                   const std::vector<std::string> &keys,
+                   const std::vector<QueryResult> &qrs,
+                   std::unordered_map<std::string, std::vector<Slice>>
+                       &slices) mutable {
+        ++read_calls;
+        return get_ok(keys, qrs, slices);
+    };
+    DfsPrefetcher p(config_, QueryReturning({MakeDfs(kOversized)}), get,
+                    NoLocal(), alloc);
+    p.NotifyExistTrue({"large"});
+    ASSERT_TRUE(WaitFor([&read_calls] { return read_calls.load() > 0; }));
+
+    bool found = false;
+    auto handle = p.TryConsume("large", found);
+    ASSERT_TRUE(found);
+    ASSERT_NE(handle, nullptr);
+    EXPECT_EQ(handle->size(), kOversized);
+    EXPECT_EQ(allocation_calls.load(), 1);
+    EXPECT_GE(allocation_bytes.load(), kOversized);
+}
+
+TEST_F(DfsPrefetcherTest, ArenaAllocationFailureFallsBackToNormalRead) {
+    std::atomic<int> allocation_calls{0};
+    auto alloc = [&allocation_calls](size_t) -> std::shared_ptr<BufferHandle> {
+        ++allocation_calls;
+        return nullptr;
+    };
+    DfsPrefetcher p(config_, QueryReturning({MakeDfs()}), GetOk(), NoLocal(),
+                    alloc);
+    p.NotifyExistTrue({"k1"});
+    ASSERT_TRUE(WaitFor(
+        [&allocation_calls] { return allocation_calls.load() > 0; }));
+
+    bool found = false;
+    EXPECT_EQ(p.TryConsume("k1", found), nullptr);
+    EXPECT_FALSE(found);
 }
 
 // --- TryConsume semantics --------------------------------------------------

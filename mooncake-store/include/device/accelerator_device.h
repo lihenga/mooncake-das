@@ -50,6 +50,22 @@ class AcceleratorDevice {
     virtual void SetContext(int32_t device_id) const = 0;
     virtual bool Copy(void* dst, const void* src, size_t size,
                       CopyDirection direction) const = 0;
+    // Asynchronous host-to-device copy. Backends without stream support use
+    // the synchronous implementation as a correctness-preserving fallback.
+    virtual bool CopyFromHostAsync(void* dst, const void* src, size_t size,
+                                   void* stream) const {
+        (void)stream;
+        return Copy(dst, src, size, CopyDirection::kHostToDevice);
+    }
+    virtual bool CreateStream(void** stream) const {
+        (void)stream;
+        return false;
+    }
+    virtual bool SynchronizeStream(void* stream) const {
+        (void)stream;
+        return true;
+    }
+    virtual void DestroyStream(void* stream) const { (void)stream; }
     virtual PinnedHostBuffer AllocatePinnedHost(size_t size) const = 0;
 };
 

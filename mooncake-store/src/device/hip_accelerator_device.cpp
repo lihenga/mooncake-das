@@ -63,6 +63,31 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
         return hipMemcpy(dst, src, size, kind) == hipSuccess;
     }
 
+    bool CopyFromHostAsync(void* dst, const void* src, size_t size,
+                           void* stream) const override {
+        return hipMemcpyAsync(dst, src, size, hipMemcpyHostToDevice,
+                              static_cast<hipStream_t>(stream)) == hipSuccess;
+    }
+
+    bool CreateStream(void** stream) const override {
+        hipStream_t hip_stream = nullptr;
+        if (hipStreamCreate(&hip_stream) != hipSuccess) {
+            hipGetLastError();
+            return false;
+        }
+        *stream = static_cast<void*>(hip_stream);
+        return true;
+    }
+
+    bool SynchronizeStream(void* stream) const override {
+        return hipStreamSynchronize(static_cast<hipStream_t>(stream)) ==
+               hipSuccess;
+    }
+
+    void DestroyStream(void* stream) const override {
+        hipStreamDestroy(static_cast<hipStream_t>(stream));
+    }
+
     PinnedHostBuffer AllocatePinnedHost(size_t size) const override {
         void* addr = nullptr;
         if (hipHostMalloc(&addr, size, 0) != hipSuccess) {
