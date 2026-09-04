@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -43,7 +44,15 @@ struct DistributedStorageConfig {
     // BUCKET mode only: number of threads for parallel batch reads across
     // buckets. Set to 1 to disable parallelism. Must be in
     // [1, kMaxBatchReadThreads].
-    int batch_read_threads = 4;
+    int batch_read_threads = 128;
+    // When true, BatchRead keeps the legacy flow that groups reads by bucket
+    // and merges contiguous entries. When false (default), every key is read
+    // directly on its own with batch_read_threads concurrency.
+    bool batch_read_merge_enabled = false;
+    // When true (default), BatchRead reads through dedicated direct handles
+    // (page-cache-bypassing where the adapter supports it, e.g. O_DIRECT on
+    // POSIX). When false, reads go through the regular cached handles.
+    bool direct_read_enabled = true;
     // Cleared by FromEnvironment() when MOONCAKE_DFS_ALLOCATOR_TYPE names an
     // unknown allocator, so the master can reject the configuration instead of
     // silently defaulting to SHARD.
@@ -125,6 +134,9 @@ class DistributedStorageBackend : public StorageBackendInterface {
     struct ShardFile {
         std::string path;
         int fd = -1;
+        // Optional direct (page-cache-bypassing) read handle for the same
+        // file; -1 when the adapter does not support direct reads.
+        int direct_fd = -1;
         std::mutex mutex;
     };
 
@@ -169,12 +181,23 @@ class DistributedStorageBackend : public StorageBackendInterface {
      * SHARD mode validates against the fixed shard table. BUCKET mode
      * canonicalizes the descriptor path, verifies it names the expected bucket
      * data file under the configured DFS root, and then opens/caches it.
+     * When `resolved_path` is non-null, BUCKET mode stores the canonical
+     * bucket data file path there.
      */
     tl::expected<ResolvedTarget, ErrorCode> ResolveTarget(
-        const DistributedFSDescriptor& descriptor, const std::string& key);
+        const DistributedFSDescriptor& descriptor, const std::string& key,
+        std::string* resolved_path = nullptr);
 
     tl::expected<std::shared_ptr<OpenFileHandle>, ErrorCode> GetOrOpenBucket(
         const std::string& path);
+
+    /**
+     * @brief Open/cache the direct (page-cache-bypassing) read handle for a
+     * bucket data file. Returns NOT_SUPPORTED when the adapter has no direct
+     * read path; callers then fall back to the regular handle.
+     */
+    tl::expected<std::shared_ptr<OpenFileHandle>, ErrorCode>
+    GetOrOpenBucketDirect(const std::string& path);
 
     /**
      * @brief One validated BUCKET-mode read, resolved but not yet issued.
@@ -208,6 +231,19 @@ class DistributedStorageBackend : public StorageBackendInterface {
         std::vector<const PreparedRead*> reads;
     };
 
+    /**
+     * @brief Cumulative counters for observing merge effectiveness.
+     *
+     * Only MergedIos that actually combined multiple reads are counted.
+     * Bucket groups may be processed concurrently on the batch read pool, so
+     * the counters are atomic.
+     */
+    struct MergeStats {
+        std::atomic<uint64_t> aggregated_reads{0};
+        std::atomic<uint64_t> merged_ios{0};
+        std::atomic<uint64_t> merged_bytes{0};
+    };
+
     static ErrorCode ReadFully(FileSystemAdapter* fs_adapter,
                                const ResolvedTarget& target, uint64_t offset,
                                std::span<char> output);
@@ -236,13 +272,37 @@ class DistributedStorageBackend : public StorageBackendInterface {
     static void ProcessBucketGroup(
         BucketReadGroup& group, const std::vector<DfsReadRequest>& requests,
         std::vector<tl::expected<void, ErrorCode>>& results,
-        FileSystemAdapter* fs_adapter);
+        FileSystemAdapter* fs_adapter, MergeStats& stats);
+
+    /**
+     * @brief One validated read for the per-key direct flow.
+     *
+     * `target` already points at the direct read handle when one is
+     * available; `mutex` is null for direct handles because read-only,
+     * offset-explicit I/O needs no serialization against other reads.
+     */
+    struct PreparedKeyRead {
+        size_t request_index = 0;
+        ResolvedTarget target;
+        uint64_t value_offset = 0;
+    };
+
+    std::vector<tl::expected<void, ErrorCode>> BatchReadDirect(
+        const std::vector<DfsReadRequest>& requests);
+
+    /**
+     * @brief Read one key's value (object_size bytes at value_offset) straight
+     * into the request's slices.
+     */
+    void ExecuteKeyRead(const PreparedKeyRead& read,
+                        const std::vector<DfsReadRequest>& requests,
+                        std::vector<tl::expected<void, ErrorCode>>& results);
 
     static void DispatchParallelReads(
         std::unordered_map<std::mutex*, BucketReadGroup>& groups,
         const std::vector<DfsReadRequest>& requests,
         std::vector<tl::expected<void, ErrorCode>>& results, ThreadPool& pool,
-        FileSystemAdapter* fs_adapter);
+        FileSystemAdapter* fs_adapter, MergeStats& stats);
 
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
     DistributedStorageConfig distributed_config_;
@@ -255,6 +315,10 @@ class DistributedStorageBackend : public StorageBackendInterface {
     mutable std::mutex bucket_cache_mutex_;
     std::unordered_map<std::string, std::shared_ptr<OpenFileHandle>>
         bucket_cache_;
+    // Direct read handles for bucket data files, keyed by canonical path.
+    // Guarded by bucket_cache_mutex_ alongside bucket_cache_.
+    std::unordered_map<std::string, std::shared_ptr<OpenFileHandle>>
+        bucket_direct_cache_;
     std::unique_ptr<ThreadPool> batch_read_pool_;
 
     bool initialized_ = false;

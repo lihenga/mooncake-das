@@ -20,6 +20,8 @@
 #include "pyclient.h"
 #include "client_service.h"
 #include "client_buffer.h"
+#include "dfs_prefetcher.h"
+#include "pinned_buffer_pool.h"
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
@@ -76,20 +78,11 @@ inline void scatter_non_mem_result(
             return;
         }
     }
-    auto now = std::chrono::steady_clock::now();
-    if (now >= entry.lease_deadline) {
-        results[entry.original_idx] =
-            static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
-        std::lock_guard<std::mutex> lock(session_mutex);
-        sessions.erase(entry.key);
-        session_cache.erase(entry.key);
-    } else {
-        size_t transferred = 0;
-        for (size_t j = 0; j < entry.sizes.size(); ++j) {
-            transferred += entry.sizes[j];
-        }
-        results[entry.original_idx] = static_cast<int>(transferred);
+    size_t transferred = 0;
+    for (size_t j = 0; j < entry.sizes.size(); ++j) {
+        transferred += entry.sizes[j];
     }
+    results[entry.original_idx] = static_cast<int>(transferred);
 }
 
 class RealClient;
@@ -340,7 +333,7 @@ class RealClient : public PyClient {
 
     // Helper: store buffer in cache and scatter to target
     void store_in_cache_and_scatter(NonMemReadEntry &entry,
-                                    std::unique_ptr<BufferHandle> handle,
+                                    std::shared_ptr<BufferHandle> handle,
                                     std::vector<int> &results);
 
     std::vector<int> batch_put_session_start(
@@ -1006,6 +999,17 @@ class RealClient : public PyClient {
     // Populated lazily on first range-get; released at session end.
     std::unordered_map<std::string, SessionCachedObject>
         get_session_object_cache_;
+    class DfsH2dStreamPool;
+    class DfsAsyncScatterContext;
+    mutable std::shared_mutex dfs_read_lifecycle_mutex_;
+    bool dfs_read_shutting_down_ = false;
+    std::shared_ptr<PinnedBufferPool> dfs_pinned_buffer_pool_;
+    std::unique_ptr<DfsH2dStreamPool> dfs_h2d_stream_pool_;
+
+    // Asynchronous DFS-replica prefetcher fed by batchIsExist probes;
+    // consumed by process_session_disk_dfs_reads. Null unless
+    // MC_STORE_ENABLE_DFS_PREFETCH is on.
+    std::unique_ptr<DfsPrefetcher> dfs_prefetcher_;
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,

@@ -15,8 +15,10 @@
 #include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
 #include <algorithm>
+#include <cerrno>
 #include <cctype>
 #include <charconv>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -317,7 +319,429 @@ inline bool HasMemoryReplica(const std::vector<Replica::Descriptor> &replicas) {
     return false;
 }
 
+size_t DfsPinnedPoolBytes() {
+    constexpr size_t kDefaultBytes = 512ULL * 1024 * 1024;
+    const char *value = std::getenv("MC_STORE_DFS_PINNED_POOL_BYTES");
+    if (!value || value[0] == '\0') return kDefaultBytes;
+
+    errno = 0;
+    char *end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    const bool digits_only =
+        std::all_of(value, value + std::strlen(value), [](unsigned char c) {
+            return std::isdigit(c) != 0;
+        });
+    if (!digits_only || errno != 0 || end == value || *end != '\0' ||
+        parsed > std::numeric_limits<size_t>::max()) {
+        LOG(WARNING) << "Invalid MC_STORE_DFS_PINNED_POOL_BYTES='" << value
+                     << "', using " << kDefaultBytes;
+        return kDefaultBytes;
+    }
+    return static_cast<size_t>(parsed);
+}
+
+size_t DfsH2dStreamCount() {
+    constexpr size_t kDefaultStreams = 4;
+    const char *value = std::getenv("MC_STORE_DFS_H2D_STREAMS");
+    if (!value || value[0] == '\0') return kDefaultStreams;
+
+    errno = 0;
+    char *end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    const bool digits_only =
+        std::all_of(value, value + std::strlen(value), [](unsigned char c) {
+            return std::isdigit(c) != 0;
+        });
+    if (!digits_only || errno != 0 || end == value || *end != '\0' ||
+        (parsed != 1 && parsed != 2 && parsed != 4)) {
+        LOG(WARNING) << "Invalid MC_STORE_DFS_H2D_STREAMS='" << value
+                     << "', using " << kDefaultStreams;
+        return kDefaultStreams;
+    }
+    return static_cast<size_t>(parsed);
+}
+
+bool AlignUp(size_t value, size_t alignment, size_t *aligned) {
+    const size_t remainder = value % alignment;
+    if (remainder == 0) {
+        *aligned = value;
+        return true;
+    }
+    const size_t padding = alignment - remainder;
+    if (value > std::numeric_limits<size_t>::max() - padding) return false;
+    *aligned = value + padding;
+    return true;
+}
+
+struct DfsPinnedArenaBacking {
+    std::shared_ptr<PinnedBufferPool> pool;
+    PinnedBufferPool::Buffer buffer;
+
+    ~DfsPinnedArenaBacking() {
+        if (pool) pool->Release(std::move(buffer));
+    }
+};
+
+std::shared_ptr<BufferHandle> AcquireDfsPinnedArena(
+    const std::shared_ptr<PinnedBufferPool> &pool, size_t size) {
+    if (!pool || size == 0) return nullptr;
+
+    auto backing = std::make_shared<DfsPinnedArenaBacking>();
+    backing->pool = pool;
+    backing->buffer = pool->AcquirePinned(size);
+    if (!backing->buffer.data || !backing->buffer.pinned_host.addr ||
+        backing->buffer.capacity < size) {
+        return nullptr;
+    }
+    return std::make_shared<BufferHandle>(
+        backing->buffer.data, size, [backing]() { (void)backing; });
+}
+
 }  // namespace
+
+class RealClient::DfsH2dStreamPool {
+   private:
+    struct DeviceKey {
+        const device::AcceleratorDevice *device = nullptr;
+        int32_t device_id = -1;
+
+        bool operator<(const DeviceKey &other) const {
+            if (device != other.device) {
+                return std::less<const device::AcceleratorDevice *>{}(
+                    device, other.device);
+            }
+            return device_id < other.device_id;
+        }
+    };
+
+    struct DeviceState {
+        DeviceState(const device::AcceleratorDevice *device, int32_t device_id)
+            : device(device), device_id(device_id) {}
+
+        const device::AcceleratorDevice *device;
+        int32_t device_id;
+        std::mutex mutex;
+        std::vector<void *> streams;
+        bool initialized = false;
+    };
+
+   public:
+    class Lease {
+       public:
+        Lease(std::shared_ptr<DeviceState> state,
+              std::unique_lock<std::mutex> lock)
+            : state_(std::move(state)), lock_(std::move(lock)) {}
+
+        const device::AcceleratorDevice *device() const {
+            return state_->device;
+        }
+        int32_t device_id() const { return state_->device_id; }
+        const std::vector<void *> &streams() const { return state_->streams; }
+
+       private:
+        std::shared_ptr<DeviceState> state_;
+        std::unique_lock<std::mutex> lock_;
+    };
+
+    explicit DfsH2dStreamPool(size_t streams_per_device)
+        : streams_per_device_(streams_per_device) {}
+
+    ~DfsH2dStreamPool() {
+        if (!Shutdown()) {
+            LOG(ERROR)
+                << "Failed to synchronize a DFS H2D stream during shutdown";
+        }
+    }
+
+    std::unique_ptr<Lease> Acquire(
+        const device::AcceleratorDevice *accelerator, int32_t device_id) {
+        std::shared_ptr<DeviceState> state;
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (shutting_down_) return nullptr;
+        DeviceKey key{accelerator, device_id};
+        auto [it, inserted] = states_.try_emplace(key);
+        if (inserted) {
+            it->second =
+                std::make_shared<DeviceState>(accelerator, device_id);
+        }
+        state = it->second;
+
+        // Keep the map lock until this lease owns the device state. Shutdown
+        // can then swap and destroy states only after every lease is returned.
+        std::unique_lock<std::mutex> state_lock(state->mutex);
+        lock.unlock();
+        state->device->SetContext(state->device_id);
+        if (!state->initialized) {
+            state->streams.reserve(streams_per_device_);
+            for (size_t i = 0; i < streams_per_device_; ++i) {
+                void *stream = nullptr;
+                if (!state->device->CreateStream(&stream)) break;
+                state->streams.push_back(stream);
+            }
+            state->initialized = true;
+        }
+        return std::make_unique<Lease>(state, std::move(state_lock));
+    }
+
+    bool Shutdown() {
+        std::map<DeviceKey, std::shared_ptr<DeviceState>> states;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            if (shutting_down_) {
+                shutdown_cv_.wait(lock,
+                                  [this] { return shutdown_complete_; });
+                return shutdown_succeeded_;
+            }
+            shutting_down_ = true;
+            states.swap(states_);
+        }
+
+        bool succeeded = true;
+        for (auto &[_, state] : states) {
+            std::lock_guard<std::mutex> state_lock(state->mutex);
+            state->device->SetContext(state->device_id);
+            for (void *stream : state->streams) {
+                succeeded &= state->device->SynchronizeStream(stream);
+                state->device->DestroyStream(stream);
+            }
+            state->streams.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            shutdown_succeeded_ = succeeded;
+            shutdown_complete_ = true;
+        }
+        shutdown_cv_.notify_all();
+        return succeeded;
+    }
+
+   private:
+    const size_t streams_per_device_;
+    std::mutex mutex_;
+    std::condition_variable shutdown_cv_;
+    std::map<DeviceKey, std::shared_ptr<DeviceState>> states_;
+    bool shutting_down_ = false;
+    bool shutdown_complete_ = false;
+    bool shutdown_succeeded_ = true;
+};
+
+class RealClient::DfsAsyncScatterContext {
+   private:
+    struct Target {
+        const device::AcceleratorDevice *device = nullptr;
+        int32_t device_id = -1;
+
+        bool operator==(const Target &other) const {
+            return device == other.device && device_id == other.device_id;
+        }
+        bool operator<(const Target &other) const {
+            if (device != other.device) {
+                return std::less<const device::AcceleratorDevice *>{}(
+                    device, other.device);
+            }
+            return device_id < other.device_id;
+        }
+    };
+
+    struct CopyOperation {
+        void *dst = nullptr;
+        const void *src = nullptr;
+        size_t size = 0;
+        Target target;
+        size_t first_range = 0;
+        size_t range_count = 0;
+    };
+
+    struct ActiveDevice {
+        std::unique_ptr<DfsH2dStreamPool::Lease> lease;
+        std::vector<std::vector<size_t>> operations_by_stream;
+        std::vector<uint8_t> used_streams;
+    };
+
+   public:
+    explicit DfsAsyncScatterContext(DfsH2dStreamPool &stream_pool)
+        : stream_pool_(stream_pool),
+          runtime_(device::GetAcceleratorRegistry().RuntimeAccelerators()) {}
+
+    ~DfsAsyncScatterContext() {
+        if (!submitted_ || synchronized_) return;
+        for (auto &active : active_devices_) {
+            active.lease->device()->SetContext(active.lease->device_id());
+            const auto &streams = active.lease->streams();
+            for (size_t i = 0; i < streams.size(); ++i) {
+                if (active.used_streams[i]) {
+                    active.lease->device()->SynchronizeStream(streams[i]);
+                }
+            }
+        }
+    }
+
+    void AddCopy(void *dst, const void *src, size_t size,
+                 size_t result_index) {
+        ++original_range_count_;
+        if (size == 0) return;
+
+        Target target;
+        auto target_it = target_cache_.find(dst);
+        if (target_it != target_cache_.end()) {
+            target = target_it->second;
+        } else {
+            device::PointerInfo info{};
+            target.device = runtime_.FindDeviceForPointer(dst, &info);
+            if (target.device) target.device_id = info.device_id;
+            target_cache_.emplace(dst, target);
+        }
+
+        const size_t range_index = range_results_.size();
+        range_results_.push_back(result_index);
+        // Keep merges within one result entry so all of that entry's writes
+        // retain their original order on a single stream.
+        if (!operations_.empty() &&
+            range_results_[operations_.back().first_range] == result_index &&
+            CanMerge(operations_.back(), dst, src, size, target)) {
+            operations_.back().size += size;
+            ++operations_.back().range_count;
+            return;
+        }
+        operations_.push_back(
+            CopyOperation{dst, src, size, target, range_index, 1});
+    }
+
+    bool Submit() {
+        if (submitted_) return failed_results_.empty();
+        submitted_ = true;
+
+        std::map<Target, std::vector<size_t>> device_operations;
+        for (size_t i = 0; i < operations_.size(); ++i) {
+            const auto &operation = operations_[i];
+            if (!operation.target.device) {
+                std::memcpy(operation.dst, operation.src, operation.size);
+                continue;
+            }
+            device_operations[operation.target].push_back(i);
+        }
+
+        active_devices_.reserve(device_operations.size());
+        for (const auto &[target, operation_indices] : device_operations) {
+            ActiveDevice active;
+            active.lease =
+                stream_pool_.Acquire(target.device, target.device_id);
+            if (!active.lease) {
+                for (size_t operation_index : operation_indices) {
+                    MarkFailed(operation_index);
+                }
+                continue;
+            }
+
+            const auto &streams = active.lease->streams();
+            if (streams.empty()) {
+                for (size_t operation_index : operation_indices) {
+                    const auto &operation = operations_[operation_index];
+                    if (!target.device->Copy(
+                            operation.dst, operation.src, operation.size,
+                            device::CopyDirection::kHostToDevice)) {
+                        MarkFailed(operation_index);
+                    }
+                }
+                continue;
+            }
+
+            active.operations_by_stream.resize(streams.size());
+            active.used_streams.resize(streams.size());
+            active_devices_.push_back(std::move(active));
+            auto &owned_active = active_devices_.back();
+            size_t next_stream = 0;
+            std::unordered_map<size_t, size_t> result_streams;
+            for (size_t operation_index : operation_indices) {
+                const auto &operation = operations_[operation_index];
+                const size_t result_index =
+                    range_results_[operation.first_range];
+                auto [stream_it, inserted] =
+                    result_streams.try_emplace(result_index);
+                if (inserted) {
+                    stream_it->second = next_stream++ % streams.size();
+                }
+                const size_t stream_index = stream_it->second;
+                owned_active.used_streams[stream_index] = true;
+                if (!target.device->CopyFromHostAsync(
+                        operation.dst, operation.src, operation.size,
+                        streams[stream_index])) {
+                    MarkFailed(operation_index);
+                    continue;
+                }
+                owned_active.operations_by_stream[stream_index].push_back(
+                    operation_index);
+            }
+        }
+        return failed_results_.empty();
+    }
+
+    bool Synchronize() {
+        if (synchronized_) return failed_results_.empty();
+        if (!submitted_) Submit();
+
+        for (auto &active : active_devices_) {
+            active.lease->device()->SetContext(active.lease->device_id());
+            const auto &streams = active.lease->streams();
+            for (size_t i = 0; i < streams.size(); ++i) {
+                if (!active.used_streams[i]) continue;
+                if (active.lease->device()->SynchronizeStream(streams[i])) {
+                    continue;
+                }
+                for (size_t operation_index :
+                     active.operations_by_stream[i]) {
+                    MarkFailed(operation_index);
+                }
+            }
+        }
+        active_devices_.clear();
+        synchronized_ = true;
+        return failed_results_.empty();
+    }
+
+    bool EntryFailed(size_t result_index) const {
+        return failed_results_.find(result_index) != failed_results_.end();
+    }
+
+    size_t original_range_count() const { return original_range_count_; }
+    size_t merged_range_count() const { return operations_.size(); }
+
+   private:
+    static bool AreContiguous(const void *begin, size_t size,
+                              const void *next) {
+        const uintptr_t address = reinterpret_cast<uintptr_t>(begin);
+        return address <= std::numeric_limits<uintptr_t>::max() - size &&
+               address + size == reinterpret_cast<uintptr_t>(next);
+    }
+
+    static bool CanMerge(const CopyOperation &previous, const void *dst,
+                         const void *src, size_t size, const Target &target) {
+        return previous.target == target &&
+               previous.size <=
+                   std::numeric_limits<size_t>::max() - size &&
+               AreContiguous(previous.src, previous.size, src) &&
+               AreContiguous(previous.dst, previous.size, dst);
+    }
+
+    void MarkFailed(size_t operation_index) {
+        const auto &operation = operations_[operation_index];
+        for (size_t i = 0; i < operation.range_count; ++i) {
+            failed_results_.insert(
+                range_results_[operation.first_range + i]);
+        }
+    }
+
+    DfsH2dStreamPool &stream_pool_;
+    device::RuntimeAccelerator runtime_;
+    std::unordered_map<void *, Target> target_cache_;
+    std::vector<size_t> range_results_;
+    std::vector<CopyOperation> operations_;
+    std::vector<ActiveDevice> active_devices_;
+    std::unordered_set<size_t> failed_results_;
+    size_t original_range_count_ = 0;
+    bool submitted_ = false;
+    bool synchronized_ = false;
+};
 
 PyClient::~PyClient() {}
 
@@ -595,6 +1019,16 @@ RealClient::RealClient() {
     mooncake::init_ylt_log_level();
     const char *hp = std::getenv("MC_STORE_USE_HUGEPAGE");
     use_hugepage_ = (hp != nullptr);
+    const size_t pinned_pool_cache_bytes = DfsPinnedPoolBytes();
+    const size_t h2d_streams_per_device = DfsH2dStreamCount();
+    dfs_pinned_buffer_pool_ =
+        std::make_shared<PinnedBufferPool>(pinned_pool_cache_bytes);
+    dfs_h2d_stream_pool_ =
+        std::make_unique<DfsH2dStreamPool>(h2d_streams_per_device);
+    LOG(INFO) << "DFS staging config: pinned_pool_max_idle_cache_bytes="
+              << pinned_pool_cache_bytes
+              << " (idle cache only, not an active pinned-memory limit)"
+              << ", h2d_streams_per_device=" << h2d_streams_per_device;
 }
 
 RealClient::~RealClient() {
@@ -754,6 +1188,27 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     client_buffer_allocator_ = ClientBufferAllocator::create(
         local_buffer_size, this->protocol, should_use_hugepage,
         use_spdk_dma_for_client_buffer);
+
+    // Optional DFS prefetcher: uses batchIsExist probes to pull DFS-only
+    // objects into chunked pinned arenas ahead of the session get.
+    if (dfs_prefetch_enabled()) {
+        dfs_prefetcher_ = std::make_unique<DfsPrefetcher>(
+            DfsPrefetchConfig::FromEnv(),
+            [client = client_.get()](const std::vector<std::string> &keys) {
+                return client->BatchQuery(keys);
+            },
+            [client = client_.get()](
+                const std::vector<std::string> &keys,
+                const std::vector<QueryResult> &qrs,
+                std::unordered_map<std::string, std::vector<Slice>> &slices) {
+                return client->BatchGet(keys, qrs, slices);
+            },
+            [client = client_.get()]() { return client->GetLocalEndpoints(); },
+            [pool = dfs_pinned_buffer_pool_](size_t size) {
+                return AcquireDfsPinnedArena(pool, size);
+            },
+            client_->GetDfsPrefetchMetricPtr());
+    }
     if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
                   << " bytes";
@@ -1205,6 +1660,29 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     stop_ipc_server();
     stop_dummy_client_monitor();
     stop_http_server();
+    // Stop and drain prefetch I/O while its pinned arena factory and Client
+    // callbacks are still valid. The object stays alive until existing DFS
+    // read and notification callers leave the shared lifecycle region.
+    if (dfs_prefetcher_) dfs_prefetcher_->Shutdown();
+
+    // New callers observe closed_ and return after entering this shared
+    // lifecycle region. Taking it exclusively drains existing DFS callers
+    // before streams and their pinned sources are released.
+    std::unique_lock<std::shared_mutex> dfs_read_lock(
+        dfs_read_lifecycle_mutex_);
+    dfs_read_shutting_down_ = true;
+    dfs_prefetcher_.reset();
+
+    dfs_h2d_stream_pool_.reset();
+
+    {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        get_session_object_cache_.clear();
+    }
+    if (dfs_pinned_buffer_pool_) {
+        dfs_pinned_buffer_pool_->Clear();
+        dfs_pinned_buffer_pool_.reset();
+    }
 
     if (!client_) {
         // Not initialized or already cleaned; treat as success for idempotence
@@ -4914,7 +5392,10 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
 
 std::vector<tl::expected<bool, ErrorCode>> RealClient::batchIsExist_internal(
     const std::vector<std::string> &keys) {
-    if (!client_) {
+    std::shared_lock<std::shared_mutex> dfs_read_lock(
+        dfs_read_lifecycle_mutex_);
+    if (closed_.load(std::memory_order_acquire) ||
+        dfs_read_shutting_down_ || !client_) {
         LOG(ERROR) << "Client is not initialized";
         return std::vector<tl::expected<bool, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
@@ -4926,7 +5407,21 @@ std::vector<tl::expected<bool, ErrorCode>> RealClient::batchIsExist_internal(
     }
 
     // Call client BatchIsExist and return the vector<expected> directly
-    return client_->BatchIsExist(keys);
+    auto results = client_->BatchIsExist(keys);
+
+    // Feed existing keys to the DFS prefetcher. The call is non-blocking;
+    // only keys whose best replica is a DFS replica get prefetched.
+    if (!closed_.load(std::memory_order_acquire) &&
+        !dfs_read_shutting_down_ && dfs_prefetcher_) {
+        std::vector<std::string> existing_keys;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (i < results.size() && results[i] && results[i].value()) {
+                existing_keys.push_back(keys[i]);
+            }
+        }
+        dfs_prefetcher_->NotifyExistTrue(std::move(existing_keys));
+    }
+    return results;
 }
 
 int RealClient::put_from_with_metadata(const std::string &key, void *buffer,
@@ -5080,6 +5575,7 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         LOG(ERROR) << "Invalid get ranges args";
         return results;
     }
+    const auto timing_start = std::chrono::steady_clock::now();
     const bool record_access = client_->MetricsEnabled();
 
     // No Master RPC here: use cached QueryResult from session start.
@@ -5099,6 +5595,7 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     std::vector<NonMemReadEntry> non_mem_entries;
 
     size_t cache_evicted_count = 0;
+    auto t_gc_done = timing_start;
 
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
@@ -5115,6 +5612,7 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
                 }
             }
         }
+        t_gc_done = std::chrono::steady_clock::now();
 
         auto now = std::chrono::steady_clock::now();
         for (size_t i = 0; i < keys.size(); ++i) {
@@ -5238,6 +5736,7 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
             }
         }
     }
+    const auto t_mem_done = std::chrono::steady_clock::now();
 
     // 2. Non-memory replicas: batch by endpoint/type, temp buffer + scatter.
     // Group LOCAL_DISK entries by endpoint for batch RPC.
@@ -5332,12 +5831,23 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
             }
         }
     }
+    const auto t_access_done = std::chrono::steady_clock::now();
 
-    LOG(INFO) << "batch_get_into_multi_buffer_ranges: keys=" << keys.size()
-              << ", mem_reads=" << mem_count
-              << ", cache_evicted=" << cache_evicted_count
-              << ", local_disk_reads=" << local_disk_count
-              << ", dfs_reads=" << dfs_count;
+    auto elapsed_us = [](const auto &a, const auto &b) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(b - a)
+            .count();
+    };
+    if (dfs_read_trace_enabled()) {
+        LOG(INFO) << "batch_get_into_multi_buffer_ranges: keys=" << keys.size()
+                  << ", mem_reads=" << mem_count
+                  << ", cache_evicted=" << cache_evicted_count
+                  << ", local_disk_reads=" << local_disk_count
+                  << ", dfs_reads=" << dfs_count
+                  << ", gc_us=" << elapsed_us(timing_start, t_gc_done)
+                  << ", session_mem_us=" << elapsed_us(t_gc_done, t_mem_done)
+                  << ", disk_access_us=" << elapsed_us(t_mem_done, t_access_done)
+                  << ", total_us=" << elapsed_us(timing_start, t_access_done);
+    }
 
     return results;
 }
@@ -5413,10 +5923,9 @@ void RealClient::scatter_cached_entries(std::vector<NonMemReadEntry *> &entries,
 }
 
 void RealClient::store_in_cache_and_scatter(
-    NonMemReadEntry &entry, std::unique_ptr<BufferHandle> handle,
+    NonMemReadEntry &entry, std::shared_ptr<BufferHandle> shared_handle,
     std::vector<int> &results) {
     const uint64_t total_size = calculate_total_size(entry.replica);
-    auto shared_handle = std::shared_ptr<BufferHandle>(std::move(handle));
     if (session_cache_enabled()) {
         std::lock_guard<std::mutex> lock(session_mutex_);
         if (get_sessions_.find(entry.key) != get_sessions_.end()) {
@@ -5499,57 +6008,238 @@ void RealClient::process_session_local_disk_reads(
                 continue;
             }
 
-            // Store in cache + scatter
-            store_in_cache_and_scatter(entry, std::move(handle_it->second),
-                                       results);
+            // Store in cache + scatter (unique_ptr converts to shared_ptr)
+            store_in_cache_and_scatter(
+                entry,
+                std::shared_ptr<BufferHandle>(std::move(handle_it->second)),
+                results);
         }
     }
 }
 
 void RealClient::process_session_disk_dfs_reads(
     std::vector<NonMemReadEntry *> &entries, std::vector<int> &results) {
-    // 1. Cache hit: scatter directly from cached buffer
-    scatter_cached_entries(entries, results);
+    std::shared_lock<std::shared_mutex> dfs_read_lock(
+        dfs_read_lifecycle_mutex_);
+    if (closed_.load(std::memory_order_acquire) ||
+        dfs_read_shutting_down_ || !dfs_h2d_stream_pool_ ||
+        !dfs_pinned_buffer_pool_) {
+        for (auto *entry : entries) {
+            results[entry->original_idx] =
+                static_cast<int>(toInt(ErrorCode::TRANSFER_FAIL));
+        }
+        return;
+    }
+
+    const auto timing_start = std::chrono::steady_clock::now();
+    struct PendingScatterResult {
+        NonMemReadEntry *entry;
+        size_t transferred;
+    };
+    std::vector<PendingScatterResult> pending_scatter_results;
+    pending_scatter_results.reserve(entries.size());
+    std::vector<std::shared_ptr<BufferHandle>> inflight_handles;
+    inflight_handles.reserve(entries.size());
+    uint64_t scatter_bytes = 0;
+    DfsAsyncScatterContext async_scatter(*dfs_h2d_stream_pool_);
+
+    auto valid_source_handle = [](const NonMemReadEntry *entry,
+                                  const std::shared_ptr<BufferHandle> &handle) {
+        const uint64_t total_size = calculate_total_size(entry->replica);
+        return handle && handle->ptr() &&
+               total_size <= std::numeric_limits<size_t>::max() &&
+               static_cast<size_t>(total_size) <= handle->size();
+    };
+
+    auto queue_scatter = [&](NonMemReadEntry *entry,
+                             const std::shared_ptr<BufferHandle> &handle) {
+        if (std::chrono::steady_clock::now() >= entry->lease_deadline) {
+            results[entry->original_idx] =
+                static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            get_sessions_.erase(entry->key);
+            get_session_object_cache_.erase(entry->key);
+            return;
+        }
+
+        size_t transferred = 0;
+        for (size_t j = 0; j < entry->sizes.size(); ++j) {
+            scatter_bytes += entry->sizes[j];
+            transferred += entry->sizes[j];
+            const void *src = static_cast<const char *>(handle->ptr()) +
+                              entry->src_offsets[j];
+            async_scatter.AddCopy(entry->buffers[j], src, entry->sizes[j],
+                                  entry->original_idx);
+        }
+        inflight_handles.push_back(handle);
+        pending_scatter_results.push_back(
+            PendingScatterResult{entry, transferred});
+    };
+
+    auto cache_and_queue_scatter =
+        [&](NonMemReadEntry *entry,
+            const std::shared_ptr<BufferHandle> &handle) {
+        const uint64_t total_size = calculate_total_size(entry->replica);
+        if (session_cache_enabled()) {
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            if (get_sessions_.find(entry->key) != get_sessions_.end()) {
+                get_session_object_cache_.insert_or_assign(
+                    entry->key, SessionCachedObject{handle, total_size});
+            }
+        }
+        queue_scatter(entry, handle);
+    };
+
+    // Cache hits participate in the same copy plan as newly read objects. A
+    // local shared handle pins the arena even if session end evicts the entry.
+    if (session_cache_enabled()) {
+        std::vector<NonMemReadEntry *> miss_entries;
+        miss_entries.reserve(entries.size());
+        for (auto *entry : entries) {
+            std::shared_ptr<BufferHandle> cached_handle;
+            {
+                std::lock_guard<std::mutex> lock(session_mutex_);
+                auto cache_it = get_session_object_cache_.find(entry->key);
+                if (cache_it != get_session_object_cache_.end()) {
+                    cached_handle = cache_it->second.buffer_handle;
+                }
+            }
+            if (!cached_handle) {
+                client_->ObserveDirectSessionCache(false);
+                miss_entries.push_back(entry);
+                continue;
+            }
+            client_->ObserveDirectSessionCache(true);
+            if (results[entry->original_idx] == 0) {
+                if (valid_source_handle(entry, cached_handle)) {
+                    queue_scatter(entry, cached_handle);
+                } else {
+                    LOG(ERROR) << "DFS session-cache buffer is smaller than "
+                                  "the replica, key: "
+                               << entry->key;
+                    {
+                        std::lock_guard<std::mutex> lock(session_mutex_);
+                        get_session_object_cache_.erase(entry->key);
+                    }
+                    miss_entries.push_back(entry);
+                }
+            }
+        }
+        entries = std::move(miss_entries);
+    }
+    const auto t_cache_hit_done = std::chrono::steady_clock::now();
+
+    // 1.5 Prefetch hit: serve DFS-only objects staged by batchIsExist from
+    // pinned chunks instead of re-reading DFS. Entries that miss or time out
+    // stay in the list and take the normal read path below.
+    size_t prefetch_hits = 0;
+    if (dfs_prefetcher_) {
+        std::vector<NonMemReadEntry *> miss_entries;
+        for (auto *entry_ptr : entries) {
+            auto &entry = *entry_ptr;
+            bool found = false;
+            auto handle = dfs_prefetcher_->TryConsume(entry.key, found);
+            if (!found) {
+                miss_entries.push_back(entry_ptr);
+                continue;
+            }
+            if (!handle) {
+                // Read failed or wait timed out: fall back to a direct read.
+                miss_entries.push_back(entry_ptr);
+                continue;
+            }
+            if (!valid_source_handle(&entry, handle)) {
+                LOG(ERROR) << "Prefetch buffer smaller than replica for key: "
+                           << entry.key;
+                miss_entries.push_back(entry_ptr);
+                continue;
+            }
+            cache_and_queue_scatter(&entry, handle);
+            ++prefetch_hits;
+        }
+        entries = std::move(miss_entries);
+    }
+    const auto t_prefetch_done = std::chrono::steady_clock::now();
 
     // 2. Cache miss: allocate + BatchGet
     std::vector<std::string> disk_batch_keys;
     std::vector<QueryResult> disk_batch_qrs;
     std::unordered_map<std::string, std::vector<Slice>> disk_batch_slices;
-    std::unordered_map<std::string, std::unique_ptr<BufferHandle>>
+    std::unordered_map<std::string, std::shared_ptr<BufferHandle>>
         disk_temp_handles;
+
+    struct ArenaView {
+        NonMemReadEntry *entry;
+        size_t offset;
+        size_t size;
+    };
+
+    constexpr size_t kArenaObjectAlignment = 64;
+    std::vector<ArenaView> arena_views;
+    arena_views.reserve(entries.size());
+    size_t arena_size = 0;
 
     for (auto *entry_ptr : entries) {
         auto &entry = *entry_ptr;
         const uint64_t total_size = calculate_total_size(entry.replica);
-
-        if (!client_buffer_allocator_) {
-            LOG(ERROR) << "Client buffer allocator not provided, "
-                       << "key: " << entry.key;
+        if (total_size > std::numeric_limits<size_t>::max()) {
+            LOG(ERROR) << "DFS object is too large for a host arena, key: "
+                       << entry.key << ", size: " << total_size;
             results[entry.original_idx] =
                 static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
             continue;
         }
 
-        auto alloc_result = client_buffer_allocator_->allocate(total_size);
-        if (!alloc_result) {
-            LOG(WARNING) << "Cache allocation failed for key: " << entry.key
-                         << ", falling back to non-cached I/O";
+        size_t aligned_offset = 0;
+        const size_t object_size = static_cast<size_t>(total_size);
+        if (!AlignUp(arena_size, kArenaObjectAlignment, &aligned_offset) ||
+            object_size >
+                std::numeric_limits<size_t>::max() - aligned_offset) {
+            LOG(ERROR) << "DFS pinned arena size overflow, key: " << entry.key;
             results[entry.original_idx] =
-                static_cast<int>(toInt(ErrorCode::NO_AVAILABLE_HANDLE));
+                static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
             continue;
         }
-
-        auto handle = std::make_unique<BufferHandle>(std::move(*alloc_result));
-        std::vector<Slice> disk_slices;
-        allocateSlices(disk_slices, entry.replica, handle->ptr());
-
-        disk_batch_keys.push_back(entry.key);
-        disk_batch_qrs.push_back(
-            FilterQueryResult(entry.query_result, entry.replica));
-        disk_batch_slices[entry.key] = std::move(disk_slices);
-        disk_temp_handles.emplace(entry.key, std::move(handle));
+        arena_views.push_back(ArenaView{entry_ptr, aligned_offset, object_size});
+        arena_size = aligned_offset + object_size;
     }
 
+    std::shared_ptr<BufferHandle> arena;
+    if (!arena_views.empty()) {
+        arena = AcquireDfsPinnedArena(dfs_pinned_buffer_pool_, arena_size);
+        if (!arena) {
+            LOG(ERROR) << "DFS pinned host arena allocation failed, size: "
+                       << arena_size;
+            for (const auto &view : arena_views) {
+                results[view.entry->original_idx] =
+                    static_cast<int>(toInt(ErrorCode::NO_AVAILABLE_HANDLE));
+            }
+            arena_views.clear();
+            arena.reset();
+        }
+    }
+
+    for (const auto &view : arena_views) {
+        auto *view_ptr = static_cast<char *>(arena->ptr()) + view.offset;
+        auto handle = std::make_shared<BufferHandle>(
+            view_ptr, view.size, [arena]() { (void)arena; });
+
+        std::vector<Slice> disk_slices;
+        allocateSlices(disk_slices, view.entry->replica, handle->ptr());
+
+        disk_batch_keys.push_back(view.entry->key);
+        disk_batch_qrs.push_back(
+            FilterQueryResult(view.entry->query_result, view.entry->replica));
+        disk_batch_slices[view.entry->key] = std::move(disk_slices);
+        disk_temp_handles.emplace(view.entry->key, std::move(handle));
+    }
+
+    // Buffer allocation done here; what follows is the DFS read (BatchGet) and
+    // then the scatter. Splitting alloc from read tells a slow
+    // alloc_batch_get_us apart: allocation churn vs actual disk I/O.
+    const auto t_alloc_done = std::chrono::steady_clock::now();
+
+    auto t_io_done = std::chrono::steady_clock::now();
     if (!disk_batch_keys.empty()) {
         const auto io_start = std::chrono::steady_clock::now();
         auto disk_results = client_->BatchGet(disk_batch_keys, disk_batch_qrs,
@@ -5573,6 +6263,7 @@ void RealClient::process_session_disk_dfs_reads(
                 }
             }
         }
+        t_io_done = std::chrono::steady_clock::now();
         client_->ObserveDirectIo(
             "read", DirectStorageMetricSource(ReplicaType::DFS), io_success,
             io_bytes, io_duration);
@@ -5583,6 +6274,9 @@ void RealClient::process_session_disk_dfs_reads(
             entry_map[entry_ptr->key] = entry_ptr;
         }
 
+        // Build a copy plan before submitting any DMA. Destination pointers are
+        // resolved once, adjacent compatible ranges are merged, and operations
+        // are grouped by accelerator and physical device.
         for (size_t di = 0; di < disk_batch_keys.size(); ++di) {
             const auto &key = disk_batch_keys[di];
             auto handle_it = disk_temp_handles.find(key);
@@ -5610,13 +6304,87 @@ void RealClient::process_session_disk_dfs_reads(
                 continue;
             }
 
-            // Find corresponding entry and store in cache
             auto map_it = entry_map.find(key);
-            if (map_it != entry_map.end()) {
-                store_in_cache_and_scatter(
-                    *map_it->second, std::move(handle_it->second), results);
+            if (map_it == entry_map.end()) {
+                continue;
             }
+            NonMemReadEntry *entry = map_it->second;
+            std::shared_ptr<BufferHandle> handle = std::move(handle_it->second);
+            if (!valid_source_handle(entry, handle)) {
+                LOG(ERROR) << "DFS read buffer is smaller than the replica, "
+                              "key: "
+                           << key;
+                results[entry->original_idx] =
+                    static_cast<int>(toInt(ErrorCode::INTERNAL_ERROR));
+                continue;
+            }
+            cache_and_queue_scatter(entry, handle);
         }
+    }
+
+    async_scatter.Submit();
+    const bool scatter_succeeded = async_scatter.Synchronize();
+    const uint64_t scatter_ranges = async_scatter.original_range_count();
+    const uint64_t scatter_merged_ranges = async_scatter.merged_range_count();
+
+    // Success is published only after all streams have synchronized. The
+    // inflight handles keep each source arena alive through the last DMA.
+    const auto scatter_done = std::chrono::steady_clock::now();
+    for (const auto &pending : pending_scatter_results) {
+        const size_t result_index = pending.entry->original_idx;
+        if (async_scatter.EntryFailed(result_index)) {
+            results[result_index] =
+                static_cast<int>(toInt(ErrorCode::TRANSFER_FAIL));
+            continue;
+        }
+        if (scatter_done >= pending.entry->lease_deadline) {
+            results[result_index] =
+                static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            get_sessions_.erase(pending.entry->key);
+            get_session_object_cache_.erase(pending.entry->key);
+            continue;
+        }
+        results[result_index] = static_cast<int>(pending.transferred);
+    }
+    if (!scatter_succeeded) {
+        LOG(ERROR) << "One or more DFS H2D stream operations failed";
+    }
+
+    // Inflight references are released only after explicit stream
+    // synchronization, preserving the synchronous batch-get API contract.
+    inflight_handles.clear();
+    const auto t_end = std::chrono::steady_clock::now();
+    auto elapsed_us = [](const auto &a, const auto &b) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(b - a)
+            .count();
+    };
+    if (dfs_read_trace_enabled()) {
+        // One line per batch: alloc/dfs_read/scatter split plus scatter volume,
+        // so a slow stage can be attributed to bandwidth (bytes/us near the H2D
+        // ceiling) or to overhead (many tiny ranges, few bytes).
+        const uint64_t scatter_us = elapsed_us(t_io_done, t_end);
+        double scatter_gbps = 0.0;
+        if (scatter_us > 0) {
+            // bytes / us == MB/s; /1000 -> GB/s.
+            scatter_gbps =
+                static_cast<double>(scatter_bytes) / scatter_us / 1000.0;
+        }
+        LOG(INFO) << "process_session_disk_dfs_reads: entries=" << entries.size()
+                  << ", prefetch_hits=" << prefetch_hits
+                  << ", cache_hit_us="
+                  << elapsed_us(timing_start, t_cache_hit_done)
+                  << ", prefetch_us="
+                  << elapsed_us(t_cache_hit_done, t_prefetch_done)
+                  << ", alloc_us="
+                  << elapsed_us(t_prefetch_done, t_alloc_done)
+                  << ", dfs_read_us=" << elapsed_us(t_alloc_done, t_io_done)
+                  << ", scatter_us=" << scatter_us
+                  << ", total_us=" << elapsed_us(timing_start, t_end)
+                  << ", scatter_ranges=" << scatter_ranges
+                  << ", scatter_merged_ranges=" << scatter_merged_ranges
+                  << ", scatter_bytes=" << scatter_bytes
+                  << ", scatter_GBps=" << scatter_gbps;
     }
 }
 
