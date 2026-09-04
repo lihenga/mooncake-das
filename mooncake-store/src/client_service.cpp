@@ -4276,13 +4276,13 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
     }
 
     size_t fragment_count = 0;
-    for (const auto& entry : slices) {
+    for (const auto& entry : slices) { // 记录到底几个slice
         fragment_count += entry.size();
     }
 
     // Every fragment of every entry goes into one scatter submit so the
     // transport sees the whole layer at once instead of one transfer per key.
-    ScatterRangeBuilder builder(fragment_count);
+    ScatterRangeBuilder builder(fragment_count); // 对每个slice
     std::vector<std::optional<ErrorCode>> entry_errors(replicas.size());
     for (size_t i = 0; i < replicas.size(); ++i) {
         if (slices[i].size() != src_offsets[i].size()) {
@@ -4296,22 +4296,22 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
             continue;
         }
 
-        const auto& handle =
+        const auto& handle = // 这个handle指的是预先申请好的一个固定大小的空间吗
             replicas[i].get_memory_descriptor().buffer_descriptor;
         int64_t transferred = 0;
         for (size_t j = 0; j < slices[i].size(); ++j) {
-            builder.Add(TransferRequest::READ, handle, slices[i][j],
-                        src_offsets[i][j], &entry_errors[i]);
+            builder.Add(TransferRequest::READ, handle, slices[i][j], // 目标buffer
+                        src_offsets[i][j], &entry_errors[i]); // 元数据buffer
             transferred += static_cast<int64_t>(slices[i][j].size);
         }
         results[i] = transferred;  // optimistic; corrected on await
     }
 
-    if (builder.empty()) {
+    if (builder.empty()) { // 相当于一个构造器
         return results;
     }
 
-    auto operation = SubmitScatter(builder.ranges());
+    auto operation = SubmitScatter(builder.ranges()); // submit
     if (!operation) {
         LOG(ERROR) << "Failed to submit batch range read";
         for (auto& result : results) {

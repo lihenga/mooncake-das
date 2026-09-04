@@ -90,13 +90,17 @@ class PinnedBufferPool {
 
     // Acquire only pinned storage; unlike Acquire(), this never falls back to
     // pageable memory and is intended for asynchronous DMA sources.
-    Buffer AcquirePinned(size_t size) {
+    Buffer AcquirePinned(size_t size, bool *from_cache = nullptr) {
+        if (from_cache) *from_cache = false;
         const size_t capacity = SizeClass(size);
         if (capacity == 0) return {};
         {
             std::lock_guard<std::mutex> lk(mutex_);
             Buffer buf = TakeCached(capacity, true);
-            if (buf.data) return buf;
+            if (buf.data) {
+                if (from_cache) *from_cache = true;
+                return buf;
+            }
         }
         return AllocPinnedOnly(capacity);
     }
