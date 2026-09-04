@@ -33,12 +33,16 @@ class PinnedBufferPool {
         std::unique_ptr<char[]> pageable_host;
         char* data = nullptr;
         size_t capacity = 0;
+        bool mapped = false;
+        void* device_data = nullptr;
 
         Buffer() = default;
         explicit Buffer(PinnedHostBuffer pinned_host)
             : pinned_host(std::move(pinned_host)),
               data(static_cast<char*>(this->pinned_host.addr)),
-              capacity(this->pinned_host.size) {}
+              capacity(this->pinned_host.size),
+              mapped(this->pinned_host.device_addr != nullptr),
+              device_data(this->pinned_host.device_addr) {}
 
         static Buffer Pageable(size_t size) {
             Buffer buf;
@@ -54,9 +58,13 @@ class PinnedBufferPool {
             : pinned_host(std::move(other.pinned_host)),
               pageable_host(std::move(other.pageable_host)),
               data(other.data),
-              capacity(other.capacity) {
+              capacity(other.capacity),
+              mapped(other.mapped),
+              device_data(other.device_data) {
             other.data = nullptr;
             other.capacity = 0;
+            other.mapped = false;
+            other.device_data = nullptr;
         }
         Buffer& operator=(Buffer&& other) noexcept {
             if (this != &other) {
@@ -64,8 +72,12 @@ class PinnedBufferPool {
                 pageable_host = std::move(other.pageable_host);
                 data = other.data;
                 capacity = other.capacity;
+                mapped = other.mapped;
+                device_data = other.device_data;
                 other.data = nullptr;
                 other.capacity = 0;
+                other.mapped = false;
+                other.device_data = nullptr;
             }
             return *this;
         }
@@ -90,19 +102,20 @@ class PinnedBufferPool {
 
     // Acquire only pinned storage; unlike Acquire(), this never falls back to
     // pageable memory and is intended for asynchronous DMA sources.
-    Buffer AcquirePinned(size_t size, bool *from_cache = nullptr) {
+    Buffer AcquirePinned(size_t size, bool *from_cache = nullptr,
+                         bool mapped = false) {
         if (from_cache) *from_cache = false;
         const size_t capacity = SizeClass(size);
         if (capacity == 0) return {};
         {
             std::lock_guard<std::mutex> lk(mutex_);
-            Buffer buf = TakeCached(capacity, true);
+            Buffer buf = TakeCached(capacity, true, mapped);
             if (buf.data) {
                 if (from_cache) *from_cache = true;
                 return buf;
             }
         }
-        return AllocPinnedOnly(capacity);
+        return AllocPinnedOnly(capacity, mapped);
     }
 
     void Release(Buffer buf) {
@@ -153,11 +166,13 @@ class PinnedBufferPool {
                kLargeAllocationAlignment;
     }
 
-    Buffer TakeCached(size_t capacity, bool pinned_only) {
+    Buffer TakeCached(size_t capacity, bool pinned_only, bool mapped = false) {
         for (auto it = pool_.lower_bound(capacity); it != pool_.end(); ++it) {
             auto& buffers = it->second;
             for (size_t i = 0; i < buffers.size(); ++i) {
                 if (pinned_only && !buffers[i].pinned_host.addr) continue;
+                if (mapped && (!buffers[i].mapped || !buffers[i].device_data))
+                    continue;
                 Buffer buf = std::move(buffers[i]);
                 if (i != buffers.size() - 1) {
                     buffers[i] = std::move(buffers.back());
@@ -171,12 +186,21 @@ class PinnedBufferPool {
         return {};
     }
 
-    static Buffer AllocPinnedOnly(size_t capacity) {
+    static Buffer AllocPinnedOnly(size_t capacity, bool mapped = false) {
         const auto& registry = device::GetAcceleratorRegistry();
         auto runtime_accelerator = registry.RuntimeAccelerators();
         for (auto* accelerator : runtime_accelerator.Devices()) {
-            auto host = accelerator->AllocatePinnedHost(capacity);
-            if (host.addr) return Buffer(std::move(host));
+            auto host = mapped ? accelerator->AllocateMappedPinnedHost(capacity)
+                               : accelerator->AllocatePinnedHost(capacity);
+            if (host.addr) {
+                Buffer buffer(std::move(host));
+                buffer.mapped = mapped && buffer.device_data != nullptr;
+                if (mapped && !buffer.mapped) {
+                    FreeBuffer(buffer);
+                    continue;
+                }
+                return buffer;
+            }
         }
         return {};
     }

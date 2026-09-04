@@ -354,6 +354,15 @@ size_t DfsPinnedPoolBytes() {
     return static_cast<size_t>(parsed);
 }
 
+bool DfsH2dKernelEnabled() {
+#if defined(USE_HYGON)
+    const char *value = std::getenv("MC_STORE_DFS_H2D_KERNEL");
+    return value && value[0] == '1' && value[1] == '\0';
+#else
+    return false;
+#endif
+}
+
 size_t DfsH2dStreamCount() {
     constexpr size_t kDefaultStreams = 4;
     const char *value = std::getenv("MC_STORE_DFS_H2D_STREAMS");
@@ -406,7 +415,15 @@ std::shared_ptr<BufferHandle> AcquireDfsPinnedArena(
     auto backing = std::make_shared<DfsPinnedArenaBacking>();
     backing->pool = pool;
     bool pool_hit = false;
-    backing->buffer = pool->AcquirePinned(size, &pool_hit);
+    const bool use_h2d_kernel = DfsH2dKernelEnabled();
+    backing->buffer =
+        pool->AcquirePinned(size, &pool_hit, use_h2d_kernel);
+    // Mapped host memory is optional. Keep the original pinned-DMA path if the
+    // platform cannot expose a device-visible alias.
+    if (use_h2d_kernel && !backing->buffer.data) {
+        pool_hit = false;
+        backing->buffer = pool->AcquirePinned(size, &pool_hit, false);
+    }
     if (!backing->buffer.data || !backing->buffer.pinned_host.addr ||
         backing->buffer.capacity < size) {
         return nullptr;
@@ -414,7 +431,8 @@ std::shared_ptr<BufferHandle> AcquireDfsPinnedArena(
     if (capacity_out) *capacity_out = backing->buffer.capacity;
     if (pool_hit_out) *pool_hit_out = pool_hit;
     return std::make_shared<BufferHandle>(
-        backing->buffer.data, size, [backing]() { (void)backing; });
+        backing->buffer.data, size, [backing]() { (void)backing; },
+        backing->buffer.device_data);
 }
 
 }  // namespace
@@ -572,6 +590,7 @@ class RealClient::DfsAsyncScatterContext {
     struct CopyOperation {
         void *dst = nullptr;
         const void *src = nullptr;
+        const void *src_device = nullptr;
         size_t size = 0;
         Target target;
         size_t first_range = 0;
@@ -606,8 +625,8 @@ class RealClient::DfsAsyncScatterContext {
         }
     }
 
-    void AddCopy(void *dst, const void *src, size_t size,
-                 size_t result_index) {
+    void AddCopy(void *dst, const void *src, const void *src_device,
+                 size_t size, size_t result_index) {
         ++original_range_count_;
         if (size == 0) return;
 
@@ -650,13 +669,14 @@ class RealClient::DfsAsyncScatterContext {
         // retain their original order on a single stream.
         if (!operations_.empty() &&
             range_results_[operations_.back().first_range] == result_index &&
-            CanMerge(operations_.back(), dst, src, size, target)) {
+            CanMerge(operations_.back(), dst, src, src_device, size,
+                     target)) {
             operations_.back().size += size;
             ++operations_.back().range_count;
             return;
         }
         operations_.push_back(
-            CopyOperation{dst, src, size, target, range_index, 1});
+            CopyOperation{dst, src, src_device, size, target, range_index, 1});
     }
 
     bool Submit() {
@@ -723,14 +743,32 @@ class RealClient::DfsAsyncScatterContext {
                 }
                 const size_t stream_index = stream_it->second;
                 owned_active.used_streams[stream_index] = true;
-                if (!target.device->CopyFromHostAsync(
-                        operation.dst, operation.src, operation.size,
-                        streams[stream_index])) {
-                    MarkFailed(operation_index);
-                    continue;
-                }
                 owned_active.operations_by_stream[stream_index].push_back(
                     operation_index);
+            }
+
+            // Submit one batch per stream. Unsupported backends use the
+            // default implementation, preserving the original DMA behavior.
+            for (size_t stream_index = 0; stream_index < streams.size();
+                 ++stream_index) {
+                auto &stream_operations =
+                    owned_active.operations_by_stream[stream_index];
+                if (stream_operations.empty()) continue;
+                std::vector<device::HostCopyRange> ranges;
+                ranges.reserve(stream_operations.size());
+                for (size_t operation_index : stream_operations) {
+                    const auto &operation = operations_[operation_index];
+                    ranges.push_back(device::HostCopyRange{
+                        operation.dst, operation.src, operation.size,
+                        operation.src_device});
+                }
+                if (target.device->CopyFromHostBatchAsync(
+                        ranges, streams[stream_index])) {
+                    continue;
+                }
+                for (size_t operation_index : stream_operations) {
+                    MarkFailed(operation_index);
+                }
             }
         }
         return failed_results_.empty();
@@ -823,8 +861,13 @@ class RealClient::DfsAsyncScatterContext {
     }
 
     static bool CanMerge(const CopyOperation &previous, const void *dst,
-                         const void *src, size_t size, const Target &target) {
-        return previous.target == target &&
+                         const void *src, const void *src_device, size_t size,
+                         const Target &target) {
+        const bool source_aliases_match =
+            (previous.src_device == nullptr && src_device == nullptr) ||
+            (previous.src_device != nullptr && src_device != nullptr &&
+             AreContiguous(previous.src_device, previous.size, src_device));
+        return previous.target == target && source_aliases_match &&
                previous.size <=
                    std::numeric_limits<size_t>::max() - size &&
                AreContiguous(previous.src, previous.size, src) &&
@@ -6208,8 +6251,13 @@ void RealClient::process_session_disk_dfs_reads(
             transferred += entry->sizes[j];
             const void *src = static_cast<const char *>(handle->ptr()) +
                               entry->src_offsets[j];
-            async_scatter.AddCopy(entry->buffers[j], src, entry->sizes[j],
-                                  entry->original_idx);
+            const void *src_device =
+                handle->device_ptr()
+                    ? static_cast<const char *>(handle->device_ptr()) +
+                          entry->src_offsets[j]
+                    : nullptr;
+            async_scatter.AddCopy(entry->buffers[j], src, src_device,
+                                  entry->sizes[j], entry->original_idx);
         }
         inflight_handles.push_back(handle);
         pending_scatter_results.push_back(
@@ -6363,8 +6411,13 @@ void RealClient::process_session_disk_dfs_reads(
 
     for (const auto &view : arena_views) {
         auto *view_ptr = static_cast<char *>(arena->ptr()) + view.offset;
+        void *view_device_ptr =
+            arena->device_ptr()
+                ? static_cast<char *>(arena->device_ptr()) + view.offset
+                : nullptr;
         auto handle = std::make_shared<BufferHandle>(
-            view_ptr, view.size, [arena]() { (void)arena; });
+            view_ptr, view.size, [arena]() { (void)arena; },
+            view_device_ptr);
 
         std::vector<Slice> disk_slices;
         allocateSlices(disk_slices, view.entry->replica, handle->ptr());
