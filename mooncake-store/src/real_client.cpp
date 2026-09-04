@@ -89,6 +89,20 @@ bool session_cache_enabled() {
 
 namespace {
 constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
+std::atomic<uint64_t> g_dfs_read_trace_id{0};
+
+uint64_t NextDfsReadTraceId() {
+    uint64_t current = g_dfs_read_trace_id.load(std::memory_order_relaxed);
+    while (true) {
+        const uint64_t next =
+            current == std::numeric_limits<uint64_t>::max() ? 1 : current + 1;
+        if (g_dfs_read_trace_id.compare_exchange_weak(
+                current, next, std::memory_order_relaxed,
+                std::memory_order_relaxed)) {
+            return next;
+        }
+    }
+}
 
 std::string DirectSourceForReplica(const Replica::Descriptor &replica) {
     if (replica.is_memory_replica() || replica.is_nof_replica()) {
@@ -549,6 +563,12 @@ class RealClient::DfsAsyncScatterContext {
         }
     };
 
+    struct CachedRegion {
+        uintptr_t base = 0;
+        size_t size = 0;
+        Target target;
+    };
+
     struct CopyOperation {
         void *dst = nullptr;
         const void *src = nullptr;
@@ -565,9 +585,11 @@ class RealClient::DfsAsyncScatterContext {
     };
 
    public:
-    explicit DfsAsyncScatterContext(DfsH2dStreamPool &stream_pool,
+    explicit DfsAsyncScatterContext(RealClient &owner,
+                                    DfsH2dStreamPool &stream_pool,
                                     bool collect_metrics)
-        : stream_pool_(stream_pool),
+        : owner_(owner),
+          stream_pool_(stream_pool),
           runtime_(device::GetAcceleratorRegistry().RuntimeAccelerators()),
           collect_metrics_(collect_metrics) {}
 
@@ -590,23 +612,36 @@ class RealClient::DfsAsyncScatterContext {
         if (size == 0) return;
 
         Target target;
-        auto target_it = target_cache_.find(dst);
-        if (target_it != target_cache_.end()) {
-            if (collect_metrics_) ++pointer_cache_hits_;
-            target = target_it->second;
-        } else {
-            device::PointerInfo info{};
-            if (collect_metrics_) {
-                const auto query_start = std::chrono::steady_clock::now();
-                target.device = runtime_.FindDeviceForPointer(dst, &info);
-                pointer_query_duration_ +=
-                    std::chrono::steady_clock::now() - query_start;
-                ++pointer_query_count_;
-            } else {
-                target.device = runtime_.FindDeviceForPointer(dst, &info);
+        const uintptr_t address = reinterpret_cast<uintptr_t>(dst);
+        bool region_resolved = false;
+        auto region_it = region_cache_.upper_bound(address);
+        if (region_it != region_cache_.begin()) {
+            --region_it;
+            if (ContainsAddress(region_it->second, address)) {
+                if (collect_metrics_) ++region_cache_hits_;
+                target = region_it->second.target;
+                region_resolved = true;
             }
-            if (target.device) target.device_id = info.device_id;
-            target_cache_.emplace(dst, target);
+        }
+        if (!region_resolved) {
+            if (collect_metrics_) ++region_cache_misses_;
+            const auto region = owner_.resolve_writable_buffer_region(dst);
+            if (region && IsUsableRegion(*region)) {
+                target = QueryTarget(dst);
+                const uintptr_t base = reinterpret_cast<uintptr_t>(region->base);
+                region_cache_.insert_or_assign(
+                    base, CachedRegion{base, region->size, target});
+            } else {
+                auto target_it = target_cache_.find(dst);
+                if (target_it != target_cache_.end()) {
+                    if (collect_metrics_) ++pointer_cache_hits_;
+                    target = target_it->second;
+                } else {
+                    if (collect_metrics_) ++unregistered_pointer_queries_;
+                    target = QueryTarget(dst);
+                    target_cache_.emplace(dst, target);
+                }
+            }
         }
 
         const size_t range_index = range_results_.size();
@@ -738,12 +773,48 @@ class RealClient::DfsAsyncScatterContext {
                                          pointer_query_duration_)
                                          .count());
     }
+    size_t region_cache_hits() const { return region_cache_hits_; }
+    size_t region_cache_misses() const { return region_cache_misses_; }
+    size_t unregistered_pointer_queries() const {
+        return unregistered_pointer_queries_;
+    }
     size_t host_copy_ops() const { return host_copy_ops_; }
     size_t device_copy_ops() const { return device_copy_ops_; }
     size_t host_copy_ranges() const { return host_copy_ranges_; }
     size_t device_copy_ranges() const { return device_copy_ranges_; }
 
    private:
+    static bool IsUsableRegion(const RealClient::WritableBufferRegion &region) {
+        return region.base != nullptr && region.size != 0;
+    }
+
+    static bool ContainsAddress(const CachedRegion &region, uintptr_t address) {
+        if (region.size == 0 || address < region.base) return false;
+        const uintptr_t offset = address - region.base;
+        if (sizeof(size_t) > sizeof(uintptr_t) &&
+            region.size > static_cast<size_t>(
+                              std::numeric_limits<uintptr_t>::max())) {
+            return true;
+        }
+        return offset < static_cast<uintptr_t>(region.size);
+    }
+
+    Target QueryTarget(void *dst) {
+        Target target;
+        device::PointerInfo info{};
+        if (collect_metrics_) {
+            const auto query_start = std::chrono::steady_clock::now();
+            target.device = runtime_.FindDeviceForPointer(dst, &info);
+            pointer_query_duration_ +=
+                std::chrono::steady_clock::now() - query_start;
+            ++pointer_query_count_;
+        } else {
+            target.device = runtime_.FindDeviceForPointer(dst, &info);
+        }
+        if (target.device) target.device_id = info.device_id;
+        return target;
+    }
+
     static bool AreContiguous(const void *begin, size_t size,
                               const void *next) {
         const uintptr_t address = reinterpret_cast<uintptr_t>(begin);
@@ -768,9 +839,11 @@ class RealClient::DfsAsyncScatterContext {
         }
     }
 
+    RealClient &owner_;
     DfsH2dStreamPool &stream_pool_;
     device::RuntimeAccelerator runtime_;
     bool collect_metrics_ = false;
+    std::map<uintptr_t, CachedRegion> region_cache_;
     std::unordered_map<void *, Target> target_cache_;
     std::vector<size_t> range_results_;
     std::vector<CopyOperation> operations_;
@@ -782,6 +855,9 @@ class RealClient::DfsAsyncScatterContext {
     size_t pointer_query_count_ = 0;
     size_t pointer_cache_hits_ = 0;
     std::chrono::steady_clock::duration pointer_query_duration_{};
+    size_t region_cache_hits_ = 0;
+    size_t region_cache_misses_ = 0;
+    size_t unregistered_pointer_queries_ = 0;
     size_t host_copy_ops_ = 0;
     size_t device_copy_ops_ = 0;
     size_t host_copy_ranges_ = 0;
@@ -5621,6 +5697,8 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         return results;
     }
     const auto timing_start = std::chrono::steady_clock::now();
+    const bool trace_enabled = dfs_read_trace_enabled();
+    const uint64_t trace_id = trace_enabled ? NextDfsReadTraceId() : 0;
     const bool record_access = client_->MetricsEnabled();
 
     // No Master RPC here: use cached QueryResult from session start.
@@ -5807,7 +5885,7 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
 
     // DISK/DFS: batch via client_->BatchGet.
     if (!dfs_entries.empty()) {
-        process_session_disk_dfs_reads(dfs_entries, results);
+        process_session_disk_dfs_reads(dfs_entries, results, trace_id);
     }
 
     // Accumulate one logical access per key across all layer/range calls.
@@ -5882,8 +5960,9 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         return std::chrono::duration_cast<std::chrono::microseconds>(b - a)
             .count();
     };
-    if (dfs_read_trace_enabled()) {
-        LOG(INFO) << "batch_get_into_multi_buffer_ranges: keys=" << keys.size()
+    if (trace_enabled) {
+        LOG(INFO) << "batch_get_into_multi_buffer_ranges: trace_id=" << trace_id
+                  << ", keys=" << keys.size()
                   << ", mem_reads=" << mem_count
                   << ", cache_evicted=" << cache_evicted_count
                   << ", local_disk_reads=" << local_disk_count
@@ -6063,7 +6142,8 @@ void RealClient::process_session_local_disk_reads(
 }
 
 void RealClient::process_session_disk_dfs_reads(
-    std::vector<NonMemReadEntry *> &entries, std::vector<int> &results) {
+    std::vector<NonMemReadEntry *> &entries, std::vector<int> &results,
+    uint64_t trace_id) {
     std::shared_lock<std::shared_mutex> dfs_read_lock(
         dfs_read_lifecycle_mutex_);
     if (closed_.load(std::memory_order_acquire) ||
@@ -6077,7 +6157,7 @@ void RealClient::process_session_disk_dfs_reads(
     }
 
     const auto timing_start = std::chrono::steady_clock::now();
-    const bool trace_enabled = dfs_read_trace_enabled();
+    const bool trace_enabled = trace_id != 0;
     const size_t input_entries = entries.size();
     size_t session_cache_hits = 0;
     size_t arena_capacity = 0;
@@ -6100,7 +6180,8 @@ void RealClient::process_session_disk_dfs_reads(
     std::vector<std::shared_ptr<BufferHandle>> inflight_handles;
     inflight_handles.reserve(entries.size());
     uint64_t scatter_bytes = 0;
-    DfsAsyncScatterContext async_scatter(*dfs_h2d_stream_pool_, trace_enabled);
+    DfsAsyncScatterContext async_scatter(*this, *dfs_h2d_stream_pool_,
+                                         trace_enabled);
 
     auto valid_source_handle = [](const NonMemReadEntry *entry,
                                   const std::shared_ptr<BufferHandle> &handle) {
@@ -6460,7 +6541,8 @@ void RealClient::process_session_disk_dfs_reads(
             read_amplification = static_cast<double>(dfs_read_bytes) /
                                  static_cast<double>(dfs_requested_bytes);
         }
-        LOG(INFO) << "process_session_disk_dfs_reads: entries=" << entries.size()
+        LOG(INFO) << "process_session_disk_dfs_reads: trace_id=" << trace_id
+                  << ", entries=" << entries.size()
                   << ", input_entries=" << input_entries
                   << ", session_cache_hits=" << session_cache_hits
                   << ", dfs_batch_entries=" << disk_batch_keys.size()
@@ -6489,6 +6571,12 @@ void RealClient::process_session_disk_dfs_reads(
                   << ", pointer_cache_hits="
                   << async_scatter.pointer_cache_hits()
                   << ", pointer_query_us=" << async_scatter.pointer_query_us()
+                  << ", region_cache_hits="
+                  << async_scatter.region_cache_hits()
+                  << ", region_cache_misses="
+                  << async_scatter.region_cache_misses()
+                  << ", unregistered_pointer_queries="
+                  << async_scatter.unregistered_pointer_queries()
                   << ", host_copy_ops=" << async_scatter.host_copy_ops()
                   << ", device_copy_ops=" << async_scatter.device_copy_ops()
                   << ", host_copy_ranges="
