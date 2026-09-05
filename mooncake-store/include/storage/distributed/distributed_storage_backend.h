@@ -61,6 +61,7 @@ struct DistributedStorageConfig {
     bool Validate() const;
     bool ValidateForAllocator() const;
     bool ValidateForBucketAllocator() const;
+    static bool IsReplicaEnabledFromEnvironment();
     static DistributedStorageConfig FromEnvironment();
     std::string FormatStr() const;
 };
