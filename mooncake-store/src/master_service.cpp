@@ -2536,8 +2536,12 @@ auto MasterService::AllocateAndInsertMetadata(
     const std::string& key, uint64_t value_length,
     const ReplicateConfig& config, const std::string& group_id,
     const TenantId& tenant_id, const std::chrono::system_clock::time_point& now,
-    const std::optional<DistributedFSDescriptor>& preallocated_dfs)
+    const std::optional<DistributedFSDescriptor>& preallocated_dfs,
+    bool* dfs_allocation_failed)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    if (dfs_allocation_failed != nullptr) {
+        *dfs_allocation_failed = false;
+    }
     auto& tenant_state = shard->tenants[tenant_id];
     if (tenant_state.metadata.contains(key)) {
         LOG(INFO) << "key=" << key << ", info=object_already_exists";
@@ -2723,6 +2727,10 @@ auto MasterService::AllocateAndInsertMetadata(
             if (!alloc) {
                 LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
                            << ", error=" << alloc.error();
+                if (dfs_allocation_failed != nullptr) {
+                    *dfs_allocation_failed =
+                        alloc.error() == ErrorCode::NO_AVAILABLE_HANDLE;
+                }
                 abort_reserved_quota();
                 return tl::make_unexpected(alloc.error());
             }
@@ -2867,6 +2875,8 @@ auto MasterService::PutStartInternal(
     const uint64_t requested_quota_charge =
         RequestedMemoryQuotaCharge(slice_length, config);
 
+    bool retried_dfs_allocation = false;
+    bool dfs_allocation_failed = false;
     auto attempt_once =
         [&]() -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
         std::unique_lock<std::mutex> zero_charge_policy_lock(
@@ -2939,7 +2949,8 @@ auto MasterService::PutStartInternal(
                 } else {
                     return AllocateAndInsertMetadata(
                         shard, client_id, key, slice_length, config, group_id,
-                        object_id.tenant_id, now, preallocated_dfs);
+                        object_id.tenant_id, now, preallocated_dfs,
+                        &dfs_allocation_failed);
                 }
             }
         }
@@ -2955,14 +2966,14 @@ auto MasterService::PutStartInternal(
         }
         return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
                                          config, group_id, object_id.tenant_id,
-                                         now, preallocated_dfs);
+                                         now, preallocated_dfs,
+                                         &dfs_allocation_failed);
     };
 
-    bool retried_dfs_allocation = false;
     for (int attempt = 0; attempt <= kMaxTenantQuotaEvictionRetries;
          ++attempt) {
         auto result = attempt_once();
-        if (!result && result.error() == ErrorCode::NO_AVAILABLE_HANDLE &&
+        if (!result && dfs_allocation_failed &&
             config.dfs_replica_num > 0 && bucket_allocator_ != nullptr &&
             !retried_dfs_allocation) {
             retried_dfs_allocation = true;
