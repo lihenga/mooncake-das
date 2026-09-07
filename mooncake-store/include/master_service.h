@@ -2039,7 +2039,8 @@ class MasterService {
         std::optional<std::chrono::system_clock::time_point>
             committed_soft_pin_timeout = std::nullopt,
         const std::optional<DistributedFSDescriptor>& preallocated_dfs =
-            std::nullopt)
+            std::nullopt,
+        bool* dfs_allocation_failed = nullptr)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**
