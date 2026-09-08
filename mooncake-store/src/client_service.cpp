@@ -3282,6 +3282,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
                   .count();
+    if (dfs_read_trace_enabled()) {
+        LOG(INFO) << "BatchPut: transfer_and_dfs_write_duration_us=" << us;
+    }
     if (metrics_) {
         metrics_->transfer_metric.batch_put_latency_us.observe(us);
     }
