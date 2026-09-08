@@ -86,7 +86,8 @@ class BufferHandle {
                  offset_allocator::OffsetAllocationHandle handle);
 
     // View mode: non-owning, calls release_fn on destruction
-    BufferHandle(void* ptr, size_t size, std::function<void()> release_fn);
+    BufferHandle(void* ptr, size_t size, std::function<void()> release_fn,
+                 void* device_ptr = nullptr);
 
     ~BufferHandle();
 
@@ -99,6 +100,8 @@ class BufferHandle {
 
     [[nodiscard]] void* ptr() const;
     [[nodiscard]] size_t size() const;
+    // Device-visible alias for a mapped host view, when one is available.
+    [[nodiscard]] void* device_ptr() const;
 
    private:
     // Owning mode members
@@ -109,6 +112,7 @@ class BufferHandle {
     void* view_ptr_ = nullptr;
     size_t view_size_ = 0;
     std::function<void()> release_fn_;
+    void* view_device_ptr_ = nullptr;
 };
 
 // Utility functions for buffer and slice management
