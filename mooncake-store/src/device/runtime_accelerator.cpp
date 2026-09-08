@@ -63,5 +63,20 @@ bool RuntimeAccelerator::CopyFromHostAsync(void* dst, const void* src,
     return accelerator->CopyFromHostAsync(dst, src, size, stream);
 }
 
+bool RuntimeAccelerator::CopyFromHostBatchAsync(
+    std::span<const HostCopyRange> ranges, void* stream) const {
+    if (ranges.empty()) return true;
+    PointerInfo pointer_info;
+    auto* accelerator = FindDeviceForPointer(ranges.front().dst, &pointer_info);
+    if (!accelerator) {
+        for (const auto& range : ranges) {
+            std::memcpy(range.dst, range.src, range.size);
+        }
+        return true;
+    }
+    accelerator->SetContext(pointer_info.device_id);
+    return accelerator->CopyFromHostBatchAsync(ranges, stream);
+}
+
 }  // namespace device
 }  // namespace mooncake

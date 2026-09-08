@@ -26,6 +26,9 @@ class RuntimeAccelerator {
     bool CopyFromHostAsync(void* dst, const void* src, size_t size,
                            void* stream) const;
 
+    bool CopyFromHostBatchAsync(std::span<const HostCopyRange> ranges,
+                                void* stream) const;
+
    private:
     std::vector<const AcceleratorDevice*> devices_;
 };
