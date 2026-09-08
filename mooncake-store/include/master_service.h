@@ -1545,7 +1545,8 @@ class MasterService {
         const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now,
         const std::optional<DistributedFSDescriptor>& preallocated_dfs =
-            std::nullopt)
+            std::nullopt,
+        bool* dfs_allocation_failed = nullptr)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**

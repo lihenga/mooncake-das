@@ -1007,6 +1007,48 @@ const Replica::Descriptor* FindDfsDescriptor(
 
 }  // namespace
 
+TEST_F(MasterServiceTest, DfsBucketMemoryAllocationFailurePreservesBuckets) {
+    const auto root = MakeDfsTestRoot("memory_failure");
+    ScopedBucketDfsEnv env(root, "8192", "4", "1", "1.0", "0.9");
+
+    {
+        MasterService service;
+        const auto context =
+            PrepareSimpleSegment(service, "small_memory", 0x300000000, 8192);
+        const UUID client_id = context.client_id;
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+
+        for (const std::string& key : {"memory_full_a", "memory_full_b"}) {
+            auto start = service.PutStart(client_id, key,
+                                          TenantId::Default(), 4096, config);
+            ASSERT_TRUE(start.has_value()) << key << ": " << start.error();
+            ASSERT_TRUE(service.PutEnd(client_id, key,
+                                       TenantId::Default(), ReplicaType::ALL)
+                            .has_value());
+        }
+
+        ASSERT_TRUE(service.UnmountSegment(context.segment_id, client_id)
+                        .has_value());
+
+        auto failed = service.PutStart(client_id, "memory_full_c",
+                                       TenantId::Default(), 4096, config);
+        ASSERT_FALSE(failed.has_value());
+        EXPECT_EQ(failed.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+        for (const std::string& key : {"memory_full_a", "memory_full_b"}) {
+            auto query = service.GetReplicaList(key, TenantId::Default());
+            ASSERT_TRUE(query.has_value()) << key;
+            EXPECT_EQ(query->replicas.size(), 1u);
+            EXPECT_TRUE(query->replicas.front().is_dfs_replica());
+        }
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
 TEST_F(MasterServiceTest, DfsBucketModeSupportsPutEndAndQuery) {
     const auto root = MakeDfsTestRoot("put_end");
     ScopedBucketDfsEnv env(root, "1048576", "16");
