@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <sstream>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 
@@ -50,28 +51,6 @@ uint32_t ComputeMetadataChecksum(PersistedBucketMetadata snapshot) {
     std::string payload;
     struct_pb::to_pb(snapshot, payload);
     return Crc32cValue(payload.data(), payload.size());
-}
-
-uint32_t ComputeLegacyMetadataChecksum(LegacyPersistedBucketMetadata snapshot) {
-    snapshot.checksum = 0;
-    std::string payload;
-    struct_pb::to_pb(snapshot, payload);
-    return Crc32cValue(payload.data(), payload.size());
-}
-
-PersistedBucketMetadata UpgradeLegacyMetadata(
-    const LegacyPersistedBucketMetadata& legacy) {
-    PersistedBucketMetadata snapshot;
-    snapshot.version = kBucketMetadataVersion;
-    snapshot.bucket_id = legacy.bucket_id;
-    snapshot.bucket_generation = legacy.bucket_generation;
-    snapshot.capacity = legacy.capacity;
-    snapshot.alignment = legacy.alignment;
-    snapshot.append_offset = legacy.append_offset;
-    snapshot.evicting = legacy.evicting;
-    snapshot.entries = legacy.entries;
-    snapshot.checksum = ComputeMetadataChecksum(snapshot);
-    return snapshot;
 }
 
 /**
@@ -119,7 +98,7 @@ BucketGlobalAllocator::PendingEviction::PendingEviction(
     PendingEviction&& other) noexcept
     : owner_(std::exchange(other.owner_, nullptr)),
       bucket_id_(std::exchange(other.bucket_id_, -1)),
-      bucket_generation_(std::exchange(other.bucket_generation_, 0)),
+      bucket_identity_(std::move(other.bucket_identity_)),
       candidates_(std::move(other.candidates_)) {
     other.candidates_.clear();
 }
@@ -132,14 +111,14 @@ BucketGlobalAllocator::PendingEviction::operator=(
             PendingEviction discarded;
             discarded.owner_ = std::exchange(owner_, nullptr);
             discarded.bucket_id_ = bucket_id_;
-            discarded.bucket_generation_ = bucket_generation_;
+            discarded.bucket_identity_ = std::move(bucket_identity_);
             discarded.candidates_ = std::move(candidates_);
             discarded.owner_->AbortEviction(std::move(discarded),
                                             /*demote=*/false);
         }
         owner_ = std::exchange(other.owner_, nullptr);
         bucket_id_ = std::exchange(other.bucket_id_, -1);
-        bucket_generation_ = std::exchange(other.bucket_generation_, 0);
+        bucket_identity_ = std::move(other.bucket_identity_);
         candidates_ = std::move(other.candidates_);
         other.candidates_.clear();
     }
@@ -257,7 +236,6 @@ PersistedBucketMetadata BucketGlobalAllocator::SnapshotLocked(
     PersistedBucketMetadata snapshot;
     snapshot.version = kBucketMetadataVersion;
     snapshot.bucket_id = bucket.bucket_id;
-    snapshot.bucket_generation = bucket.generation;
     snapshot.capacity = bucket.capacity;
     snapshot.alignment = alignment_;
     snapshot.append_offset = bucket.append_offset;
@@ -354,8 +332,9 @@ tl::expected<void, ErrorCode> BucketGlobalAllocator::PersistMetadata(
         return tl::make_unexpected(sync_file.error());
     }
 
-    // Creating a directory entry needs one directory sync. Rewriting an existing
-    // file changes no namespace metadata and deliberately avoids that DFS lock.
+    // Creating a directory entry needs one directory sync. Rewriting an
+    // existing file changes no namespace metadata and deliberately avoids that
+    // DFS lock.
     if (!meta_existed) {
         auto sync_dir = fs_adapter_->SyncDirectory(fsdir_);
         if (!sync_dir) {
@@ -384,7 +363,8 @@ void BucketGlobalAllocator::DeleteBucketFiles(int64_t bucket_id) {
 // === bucket lifecycle ===
 
 tl::expected<BucketGlobalAllocator::BucketPtr, ErrorCode>
-BucketGlobalAllocator::CreateBucketUnlocked(std::unique_lock<std::mutex>& lock) {
+BucketGlobalAllocator::CreateBucketUnlocked(
+    std::unique_lock<std::mutex>& lock) {
     if (max_bucket_count_ > 0 &&
         static_cast<int64_t>(buckets_.size()) >= max_bucket_count_) {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
@@ -417,11 +397,9 @@ BucketGlobalAllocator::CreateBucketUnlocked(std::unique_lock<std::mutex>& lock) 
     } creation_guard{this};
 
     const int64_t bucket_id = next_bucket_id_++;
-    const uint64_t generation = next_generation_++;
 
     auto bucket = std::make_shared<BucketState>();
     bucket->bucket_id = bucket_id;
-    bucket->generation = generation;
     bucket->capacity = bucket_capacity_;
     bucket->append_offset = 0;
     bucket->live_bytes = 0;
@@ -542,8 +520,8 @@ tl::expected<DistributedFSDescriptor, ErrorCode>
 BucketGlobalAllocator::ReserveInBucketLocked(BucketState& bucket,
                                              const std::string& key,
                                              uint64_t size) {
-    auto layout = ComputeBucketEntryLayout(bucket.append_offset, key.size(),
-                                           size, alignment_);
+    auto layout =
+        ComputeBucketEntryLayout(bucket.append_offset, size, alignment_);
     if (!layout) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -625,8 +603,7 @@ BucketGlobalAllocator::FindMatchingEntryLocked(
 
     auto index_it = key_index_.find(key);
     if (index_it == key_index_.end()) return fail("key_not_indexed");
-    if (index_it->second != bucket_id)
-        return fail("key_index_bucket_mismatch");
+    if (index_it->second != bucket_id) return fail("key_index_bucket_mismatch");
     auto bucket_it = buckets_.find(bucket_id);
     if (bucket_it == buckets_.end()) return fail("bucket_not_found");
 
@@ -642,8 +619,8 @@ BucketGlobalAllocator::FindMatchingEntryLocked(
     if (entry.reserved_size != desc.aligned_size)
         return fail("aligned_size_mismatch");
     if (entry.key_size != key.size()) return fail("key_size_mismatch");
-    auto layout = RebuildBucketEntryLayout(entry.entry_offset, entry.key_size,
-                                           entry.value_size, alignment_);
+    auto layout = RebuildBucketEntryLayout(entry.entry_offset, entry.value_size,
+                                           alignment_);
     if (!layout) return fail("invalid_entry_layout");
     if (layout->value_offset != desc.offset)
         return fail("value_offset_mismatch");
@@ -714,8 +691,7 @@ std::vector<BatchAllocateResult> BucketGlobalAllocator::BatchAllocate(
                 return results;
             }
         }
-        auto layout = ComputeBucketEntryLayout(0, request.key.size(),
-                                               request.size, alignment_);
+        auto layout = ComputeBucketEntryLayout(0, request.size, alignment_);
         if (!layout || layout->reserved_size > bucket_capacity_) {
             LOG(ERROR) << "DFS object for key " << request.key
                        << " exceeds bucket capacity, object_size="
@@ -746,7 +722,7 @@ std::vector<BatchAllocateResult> BucketGlobalAllocator::BatchAllocate(
     struct Reservation {
         size_t request_index = 0;
         int64_t bucket_id = -1;
-        uint64_t generation = 0;
+        BucketPtr bucket_identity;
     };
     std::vector<Reservation> reserved;
     reserved.reserve(allocatable.size());
@@ -767,14 +743,14 @@ std::vector<BatchAllocateResult> BucketGlobalAllocator::BatchAllocate(
     // occur only between two objects, never inside one object.
     for (const size_t index : allocatable) {
         const auto& request = requests[index];
-        auto object_layout = ComputeBucketEntryLayout(
-            0, request.key.size(), request.size, alignment_);
+        auto object_layout =
+            ComputeBucketEntryLayout(0, request.size, alignment_);
         if (!object_layout) {
             fail_allocatable();
             break;
         }
-        auto bucket_result = EnsureActiveBucket(lock,
-                                                object_layout->reserved_size);
+        auto bucket_result =
+            EnsureActiveBucket(lock, object_layout->reserved_size);
         if (!bucket_result) {
             fail_allocatable();
             results[index].error = bucket_result.error();
@@ -791,7 +767,7 @@ std::vector<BatchAllocateResult> BucketGlobalAllocator::BatchAllocate(
         results[index].descriptor = std::move(descriptor.value());
         results[index].success = true;
         results[index].error = ErrorCode::OK;
-        reserved.push_back({index, bucket->bucket_id, bucket->generation});
+        reserved.push_back({index, bucket->bucket_id, bucket});
         TouchLruLocked(bucket->bucket_id, NowNs());
     }
 
@@ -802,7 +778,7 @@ std::vector<BatchAllocateResult> BucketGlobalAllocator::BatchAllocate(
         for (auto it = reserved.rbegin(); it != reserved.rend(); ++it) {
             auto bucket_it = buckets_.find(it->bucket_id);
             if (bucket_it != buckets_.end() &&
-                bucket_it->second->generation == it->generation) {
+                bucket_it->second.get() == it->bucket_identity.get()) {
                 UnreserveInBucketLocked(*bucket_it->second,
                                         requests[it->request_index].key,
                                         results[it->request_index].descriptor);
@@ -823,8 +799,7 @@ bool BucketGlobalAllocator::MarkCommitted(
     const std::string& key, const DistributedFSDescriptor& descriptor) {
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "DFS commit rejected: reason=allocator_not_initialized"
-                   << ", key=" << key
-                   << ", bucket_id=" << descriptor.shard_idx;
+                   << ", key=" << key << ", bucket_id=" << descriptor.shard_idx;
         return false;
     }
 
@@ -838,8 +813,7 @@ bool BucketGlobalAllocator::MarkCommitted(
     }
     if (entry->state != BucketEntryState::PENDING) {
         LOG(ERROR) << "DFS commit rejected: reason=invalid_entry_state"
-                   << ", key=" << key
-                   << ", bucket_id=" << descriptor.shard_idx
+                   << ", key=" << key << ", bucket_id=" << descriptor.shard_idx
                    << ", state=" << static_cast<int32_t>(entry->state);
         return false;
     }
@@ -895,10 +869,11 @@ void BucketGlobalAllocator::Free(const std::string& key,
 size_t BucketGlobalAllocator::FlushDirtyMetadata() {
     if (!initialized_.load(std::memory_order_acquire)) return 0;
 
-    // Snapshot every dirty bucket under the lock, then do the writes without it.
+    // Snapshot every dirty bucket under the lock, then do the writes without
+    // it.
     struct PendingWrite {
         int64_t bucket_id = -1;
-        uint64_t generation = 0;
+        BucketPtr bucket_identity;
         PersistedBucketMetadata snapshot;
     };
     std::vector<PendingWrite> pending;
@@ -908,7 +883,7 @@ size_t BucketGlobalAllocator::FlushDirtyMetadata() {
             // An unsealed bucket is deliberately never written: it is still
             // being appended to, and its data is discarded on the next start.
             if (!bucket->sealed || !bucket->meta_dirty) continue;
-            pending.push_back({bucket_id, bucket->generation,
+            pending.push_back({bucket_id, bucket,
                                SnapshotLocked(*bucket, /*evicting=*/false)});
             // Clear the flag together with taking the snapshot. A change that
             // lands while we are unlocked sets it again and is picked up by the
@@ -928,6 +903,15 @@ size_t BucketGlobalAllocator::FlushDirtyMetadata() {
 
     size_t flushed = 0;
     for (const auto& item : pending) {
+        std::lock_guard<std::mutex> metadata_lock(metadata_io_mutex_);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = buckets_.find(item.bucket_id);
+            if (it == buckets_.end() ||
+                it->second.get() != item.bucket_identity.get()) {
+                continue;
+            }
+        }
         auto persisted = PersistMetadata(item.snapshot);
         if (persisted) {
             ++flushed;
@@ -939,7 +923,8 @@ size_t BucketGlobalAllocator::FlushDirtyMetadata() {
         // bucket changed identity meanwhile - then it is not ours to mark.
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = buckets_.find(item.bucket_id);
-        if (it != buckets_.end() && it->second->generation == item.generation) {
+        if (it != buckets_.end() &&
+            it->second.get() == item.bucket_identity.get()) {
             it->second->meta_dirty = true;
         }
     }
@@ -987,13 +972,12 @@ uint64_t BucketGlobalAllocator::GetUsedBytes() const {
     return UsedBytesLocked();
 }
 
-int64_t BucketGlobalAllocator::SetMaxBucketCount(
-    int64_t new_max_bucket_count) {
+int64_t BucketGlobalAllocator::SetMaxBucketCount(int64_t new_max_bucket_count) {
     std::lock_guard<std::mutex> lock(mutex_);
     int64_t old = max_bucket_count_;
     max_bucket_count_ = new_max_bucket_count;
-    LOG(INFO) << "Dynamic max_bucket_count changed from "
-              << old << " to " << new_max_bucket_count;
+    LOG(INFO) << "Dynamic max_bucket_count changed from " << old << " to "
+              << new_max_bucket_count;
     return old;
 }
 
@@ -1075,8 +1059,7 @@ BucketGlobalAllocator::PrepareEvictionInternal(bool force_one) {
             // live entries need validating.
             if (!IsLive(entry.state)) continue;
             auto layout = RebuildBucketEntryLayout(
-                entry.entry_offset, entry.key_size, entry.value_size,
-                alignment_);
+                entry.entry_offset, entry.value_size, alignment_);
             if (!layout) {
                 LOG(ERROR) << "Skipping DFS eviction of bucket "
                            << victim->bucket_id << ": entry for key " << key
@@ -1089,9 +1072,9 @@ BucketGlobalAllocator::PrepareEvictionInternal(bool force_one) {
             candidate.offset = layout->value_offset;
             // Byte-identical to what Allocate handed out, so the master can
             // match replica metadata field by field.
-            candidate.descriptor = MakeBucketDescriptor(
-                BucketDataPath(victim->bucket_id), *layout, entry.value_size,
-                victim->bucket_id);
+            candidate.descriptor =
+                MakeBucketDescriptor(BucketDataPath(victim->bucket_id), *layout,
+                                     entry.value_size, victim->bucket_id);
             candidates.push_back(std::move(candidate));
         }
 
@@ -1109,7 +1092,7 @@ BucketGlobalAllocator::PrepareEvictionInternal(bool force_one) {
 
         pending.owner_ = this;
         pending.bucket_id_ = victim->bucket_id;
-        pending.bucket_generation_ = victim->generation;
+        pending.bucket_identity_ = victim;
         pending.candidates_ = std::move(candidates);
     }
 
@@ -1124,40 +1107,37 @@ void BucketGlobalAllocator::CommitEviction(PendingEviction&& pending) {
     if (owner != this) return;
 
     const int64_t bucket_id = pending.bucket_id_;
-    const uint64_t generation = pending.bucket_generation_;
+    auto bucket_identity = std::move(pending.bucket_identity_);
     pending.candidates_.clear();
-    if (bucket_id < 0) return;
+    if (bucket_id < 0 || !bucket_identity) return;
 
+    std::lock_guard<std::mutex> metadata_lock(metadata_io_mutex_);
     PersistedBucketMetadata marker;
-    bool have_marker = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = buckets_.find(bucket_id);
-        if (it == buckets_.end() || it->second->generation != generation) {
+        if (it == buckets_.end() || it->second.get() != bucket_identity.get()) {
             return;
         }
         marker = SnapshotLocked(*it->second, /*evicting=*/true);
-        have_marker = true;
     }
 
     // Publish a durable "this bucket is being evicted" marker before deleting
     // anything. If we crash between the marker and the deletes, recovery sees
     // the marker and treats the bucket as gone instead of resurrecting entries
     // whose data file may already be missing.
-    if (have_marker) {
-        auto persisted = PersistMetadata(marker);
-        if (!persisted) {
-            LOG(ERROR) << "Failed to persist DFS eviction marker for bucket "
-                       << bucket_id << ", error=" << persisted.error()
-                       << "; the bucket is already invisible to readers and "
-                          "will be reclaimed on a later attempt";
-        }
+    auto persisted = PersistMetadata(marker);
+    if (!persisted) {
+        LOG(ERROR) << "Failed to persist DFS eviction marker for bucket "
+                   << bucket_id << ", error=" << persisted.error()
+                   << "; the bucket is already invisible to readers and "
+                      "will be reclaimed on a later attempt";
     }
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = buckets_.find(bucket_id);
-        if (it == buckets_.end() || it->second->generation != generation) {
+        if (it == buckets_.end() || it->second.get() != bucket_identity.get()) {
             return;
         }
         for (const auto& [key, entry] : it->second->entries) {
@@ -1189,13 +1169,15 @@ void BucketGlobalAllocator::AbortEviction(PendingEviction&& pending,
     if (owner != this) return;
 
     const int64_t bucket_id = pending.bucket_id_;
-    const uint64_t generation = pending.bucket_generation_;
+    auto bucket_identity = std::move(pending.bucket_identity_);
     pending.candidates_.clear();
-    if (bucket_id < 0) return;
+    if (bucket_id < 0 || !bucket_identity) return;
 
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = buckets_.find(bucket_id);
-    if (it == buckets_.end() || it->second->generation != generation) return;
+    if (it == buckets_.end() || it->second.get() != bucket_identity.get()) {
+        return;
+    }
     it->second->frozen = false;
     if (lru_index_.find(bucket_id) != lru_index_.end()) return;
 
@@ -1245,13 +1227,20 @@ tl::expected<void, ErrorCode> BucketGlobalAllocator::RecoverFromDisk() {
     uint64_t max_generation = 0;
     // Buckets already reclaimed by this pass: their metadata could not be
     // trusted, so both files were deleted. A cache entry that cannot be proven
-    // correct is worse than a miss - the reader would recompute it anyway, while
-    // serving unverifiable bytes would silently corrupt the result. Tracked only
-    // so the orphan sweep below does not report them a second time.
+    // correct is worse than a miss - the reader would recompute it anyway,
+    // while serving unverifiable bytes would silently corrupt the result.
+    // Tracked only so the orphan sweep below does not report them a second
+    // time.
     std::unordered_set<int64_t> discarded_ids;
-    // key -> (generation, bucket_id): resolves the same key appearing in more
-    // than one bucket by keeping the newest committed generation.
-    std::unordered_map<std::string, std::pair<uint64_t, int64_t>> winners;
+    struct RecoveryWinner {
+        uint64_t generation = 0;
+        int64_t bucket_id = -1;
+        uint64_t entry_offset = 0;
+    };
+    // Resolve duplicates by the lexicographically greatest
+    // (generation, bucket_id, entry_offset). The location tie-breaker makes the
+    // result independent of unordered_map and filesystem traversal order.
+    std::unordered_map<std::string, RecoveryWinner> winners;
 
     for (const int64_t bucket_id : meta_ids) {
         max_seen_id = std::max(max_seen_id, bucket_id);
@@ -1271,44 +1260,23 @@ tl::expected<void, ErrorCode> BucketGlobalAllocator::RecoverFromDisk() {
             if (read_ok) {
                 try {
                     struct_pb::from_pb(snapshot, payload);
-                    valid = snapshot.version == kBucketMetadataVersion &&
-                            ComputeMetadataChecksum(snapshot) ==
-                                snapshot.checksum;
+                    valid =
+                        snapshot.version == kBucketMetadataVersion &&
+                        ComputeMetadataChecksum(snapshot) == snapshot.checksum;
                 } catch (...) {
                     valid = false;
-                }
-                if (!valid) {
-                    // Fall back to the version-2 layout so an upgrade does not
-                    // discard buckets written by the previous release.
-                    LegacyPersistedBucketMetadata legacy;
-                    try {
-                        struct_pb::from_pb(legacy, payload);
-                        if (legacy.version == kLegacyBucketMetadataVersion &&
-                            ComputeLegacyMetadataChecksum(legacy) ==
-                                legacy.checksum) {
-                            snapshot = UpgradeLegacyMetadata(legacy);
-                            valid = true;
-                        }
-                    } catch (...) {
-                        valid = false;
-                    }
                 }
             }
         }
         if (!valid || snapshot.bucket_id != bucket_id) {
-            LOG(ERROR) << "Discarding DFS bucket " << bucket_id
-                       << ": no valid metadata snapshot, so none of its data can"
-                          " be proven correct";
+            LOG(ERROR)
+                << "Discarding DFS bucket " << bucket_id
+                << ": no valid metadata snapshot, so none of its data can"
+                   " be proven correct";
             DeleteBucketFiles(bucket_id);
             discarded_ids.insert(bucket_id);
             continue;
         }
-
-        // Account for the generation before any of the checks below can reject
-        // the bucket: stale descriptors handed out by a previous run must never
-        // be confused with a generation this run allocates.
-        max_generation =
-            std::max(max_generation, snapshot.bucket_generation + 1);
 
         if (snapshot.alignment != alignment_) {
             LOG(ERROR) << "Discarding DFS bucket " << bucket_id
@@ -1361,7 +1329,6 @@ tl::expected<void, ErrorCode> BucketGlobalAllocator::RecoverFromDisk() {
 
         auto bucket = std::make_shared<BucketState>();
         bucket->bucket_id = bucket_id;
-        bucket->generation = snapshot.bucket_generation;
         bucket->capacity = snapshot.capacity;
         bucket->append_offset = 0;
         bucket->live_bytes = 0;
@@ -1388,10 +1355,8 @@ tl::expected<void, ErrorCode> BucketGlobalAllocator::RecoverFromDisk() {
                 bucket_ok = false;
                 break;
             }
-            auto layout = RebuildBucketEntryLayout(persisted.entry_offset,
-                                                   persisted.key_size,
-                                                   persisted.value_size,
-                                                   alignment_);
+            auto layout = RebuildBucketEntryLayout(
+                persisted.entry_offset, persisted.value_size, alignment_);
             if (!layout || layout->reserved_size != persisted.reserved_size ||
                 layout->entry_end() > snapshot.capacity) {
                 LOG(ERROR) << "Discarding DFS bucket " << bucket_id
@@ -1440,10 +1405,8 @@ tl::expected<void, ErrorCode> BucketGlobalAllocator::RecoverFromDisk() {
         // COMMITTED entries survive.
         for (auto& [key, entry] : bucket->entries) {
             if (entry.state == BucketEntryState::COMMITTED) {
-                auto layout = RebuildBucketEntryLayout(entry.entry_offset,
-                                                       entry.key_size,
-                                                       entry.value_size,
-                                                       alignment_);
+                auto layout = RebuildBucketEntryLayout(
+                    entry.entry_offset, entry.value_size, alignment_);
                 if (!layout ||
                     layout->entry_end() > static_cast<uint64_t>(*data_size)) {
                     LOG(ERROR) << "Dropping committed DFS entry for key " << key
@@ -1451,6 +1414,7 @@ tl::expected<void, ErrorCode> BucketGlobalAllocator::RecoverFromDisk() {
                                << ": it extends past the data file end";
                     entry.state = BucketEntryState::TOMBSTONE;
                     ++bucket->tombstones;
+                    bucket->meta_dirty = true;
                     continue;
                 }
                 bucket->live_bytes += entry.reserved_size;
@@ -1458,22 +1422,31 @@ tl::expected<void, ErrorCode> BucketGlobalAllocator::RecoverFromDisk() {
             }
             entry.state = BucketEntryState::TOMBSTONE;
             ++bucket->tombstones;
+            bucket->meta_dirty = true;
         }
 
         for (const auto& [key, entry] : bucket->entries) {
             if (entry.state != BucketEntryState::COMMITTED) continue;
             auto winner_it = winners.find(key);
+            const auto candidate =
+                std::tie(entry.generation, bucket_id, entry.entry_offset);
             if (winner_it == winners.end()) {
-                winners[key] = {entry.generation, bucket_id};
-            } else if (entry.generation > winner_it->second.first) {
-                LOG(WARNING) << "DFS key " << key << " found in buckets "
-                             << winner_it->second.second << " and " << bucket_id
-                             << "; keeping the newer generation";
-                winner_it->second = {entry.generation, bucket_id};
+                winners[key] = {entry.generation, bucket_id,
+                                entry.entry_offset};
+            } else if (candidate > std::tie(winner_it->second.generation,
+                                            winner_it->second.bucket_id,
+                                            winner_it->second.entry_offset)) {
+                LOG(WARNING)
+                    << "DFS key " << key << " found in buckets "
+                    << winner_it->second.bucket_id << " and " << bucket_id
+                    << "; keeping the greater generation/location "
+                       "tuple";
+                winner_it->second = {entry.generation, bucket_id,
+                                     entry.entry_offset};
             } else {
                 LOG(WARNING) << "DFS key " << key << " in bucket " << bucket_id
                              << " is superseded by bucket "
-                             << winner_it->second.second;
+                             << winner_it->second.bucket_id;
             }
         }
 
@@ -1486,9 +1459,11 @@ tl::expected<void, ErrorCode> BucketGlobalAllocator::RecoverFromDisk() {
             if (entry.state != BucketEntryState::COMMITTED) continue;
             auto winner_it = winners.find(key);
             if (winner_it == winners.end() ||
-                winner_it->second.second != bucket_id) {
+                winner_it->second.bucket_id != bucket_id ||
+                winner_it->second.entry_offset != entry.entry_offset) {
                 entry.state = BucketEntryState::TOMBSTONE;
                 ++bucket->tombstones;
+                bucket->meta_dirty = true;
                 if (bucket->live_bytes >= entry.reserved_size) {
                     bucket->live_bytes -= entry.reserved_size;
                 } else {
@@ -1499,8 +1474,7 @@ tl::expected<void, ErrorCode> BucketGlobalAllocator::RecoverFromDisk() {
             key_index_[key] = bucket_id;
 
             auto layout = RebuildBucketEntryLayout(
-                entry.entry_offset, entry.key_size, entry.value_size,
-                alignment_);
+                entry.entry_offset, entry.value_size, alignment_);
             if (!layout) continue;
             recovered_replicas_.push_back(RecoveredReplica{
                 key, MakeBucketDescriptor(BucketDataPath(bucket_id), *layout,
@@ -1509,8 +1483,8 @@ tl::expected<void, ErrorCode> BucketGlobalAllocator::RecoverFromDisk() {
     }
 
     // A data file with no `.meta` at all is the signature of a crash while the
-    // bucket was still active: its metadata only lived in memory, so nothing can
-    // ever address the data again. Reclaim it. Buckets rejected above were
+    // bucket was still active: its metadata only lived in memory, so nothing
+    // can ever address the data again. Reclaim it. Buckets rejected above were
     // already deleted, so they are skipped here to avoid a duplicate log line.
     for (const int64_t data_id : data_ids) {
         max_seen_id = std::max(max_seen_id, data_id);

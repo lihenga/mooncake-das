@@ -8,9 +8,11 @@
 
 #include <cerrno>
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <mutex>
 
@@ -254,7 +256,8 @@ tl::expected<int, ErrorCode> PosixFsAdapter::OpenFileDirect(
     const std::string& path) {
 #ifdef O_DIRECT
     int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
-    if (fd < 0 && errno == EINVAL) {
+    if (fd < 0 &&
+        (errno == EINVAL || errno == EOPNOTSUPP || errno == ENOTSUP)) {
         // The filesystem does not support O_DIRECT; fall back to a buffered
         // read-only handle. DirectReadAt stays correct, it just goes through
         // the page cache.
@@ -324,8 +327,9 @@ void PosixFsAdapter::ReleaseDirectStaging(DirectStaging* slot) {
     slot->in_use = false;
 }
 
-tl::expected<size_t, ErrorCode> PosixFsAdapter::DirectReadAt(
-    int fd, iovec* iov, int iovcnt, int64_t offset) {
+tl::expected<size_t, ErrorCode> PosixFsAdapter::DirectReadAt(int fd, iovec* iov,
+                                                             int iovcnt,
+                                                             int64_t offset) {
     if (fd < 0 || offset < 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -334,8 +338,47 @@ tl::expected<size_t, ErrorCode> PosixFsAdapter::DirectReadAt(
     if (iovcnt == 0) return size_t{0};
 
     uint64_t total_length = 0;
-    for (int i = 0; i < iovcnt; ++i) total_length += iov[i].iov_len;
+    bool aligned = static_cast<uint64_t>(offset) % kDirectIoAlignment == 0;
+    for (int i = 0; i < iovcnt; ++i) {
+        if (iov[i].iov_len >
+            std::numeric_limits<uint64_t>::max() - total_length) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        total_length += iov[i].iov_len;
+        if (iov[i].iov_len == 0) continue;
+        aligned =
+            aligned &&
+            reinterpret_cast<uintptr_t>(iov[i].iov_base) % kDirectIoAlignment ==
+                0 &&
+            iov[i].iov_len % kDirectIoAlignment == 0;
+    }
     if (total_length == 0) return size_t{0};
+
+    if (aligned) {
+        return DirectReadAtAligned(fd, iov, iovcnt, offset);
+    }
+    return DirectReadAtStaged(fd, iov, iovcnt, offset);
+}
+
+tl::expected<size_t, ErrorCode> PosixFsAdapter::DirectReadAtAligned(
+    int fd, iovec* iov, int iovcnt, int64_t offset) {
+    // Every direct-I/O constraint has already been checked, so preadv can
+    // scatter straight into the caller's buffers without a bounce or memcpy.
+    const ssize_t ret = ::preadv(fd, iov, iovcnt, static_cast<off_t>(offset));
+    if (ret < 0) return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    return static_cast<size_t>(ret);
+}
+
+tl::expected<size_t, ErrorCode> PosixFsAdapter::DirectReadAtStaged(
+    int fd, iovec* iov, int iovcnt, int64_t offset) {
+    uint64_t total_length = 0;
+    for (int i = 0; i < iovcnt; ++i) {
+        if (iov[i].iov_len >
+            std::numeric_limits<uint64_t>::max() - total_length) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        total_length += iov[i].iov_len;
+    }
 
     // O_DIRECT cannot take the caller's unaligned offset/buffers, so read the
     // covering aligned window into a staging buffer and copy the requested
@@ -345,13 +388,24 @@ tl::expected<size_t, ErrorCode> PosixFsAdapter::DirectReadAt(
     const uint64_t window_start =
         static_cast<uint64_t>(offset) & ~(kDirectIoAlignment - 1);
     const uint64_t skip = static_cast<uint64_t>(offset) - window_start;
+    if (total_length > std::numeric_limits<uint64_t>::max() - skip) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     const uint64_t need = skip + total_length;
+    if (need >
+        std::numeric_limits<uint64_t>::max() - (kDirectIoAlignment - 1)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     const uint64_t window_size =
         (need + kDirectIoAlignment - 1) & ~(kDirectIoAlignment - 1);
+    if (window_size > std::numeric_limits<size_t>::max()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
 
     // RAII over the staging memory: hands a pooled slot back, or frees a
     // transient allocation, whichever this read ended up using.
-    DirectStaging* pooled = AcquireDirectStaging(static_cast<size_t>(window_size));
+    DirectStaging* pooled =
+        AcquireDirectStaging(static_cast<size_t>(window_size));
     void* transient = nullptr;
     char* window = nullptr;
     if (pooled != nullptr) {
