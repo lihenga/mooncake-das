@@ -52,9 +52,9 @@ bool IsDfsDescriptorRangeValid(const DistributedFSDescriptor& desc,
 /**
  * @brief Validate a BUCKET-mode descriptor.
  *
- * Unlike SHARD, the *value* offset of a bucket entry is generally not
- * alignment-aligned (it sits after an 8-byte header plus the key), so the
- * alignment check applies to the entry start and reserved size instead.
+ * A bucket descriptor points directly at an alignment-aligned object start;
+ *
+ * the reserved size covers the object plus trailing alignment padding.
  */
 bool IsBucketDescriptorRangeValid(const DistributedFSDescriptor& desc,
                                   const std::string& key,
@@ -62,13 +62,8 @@ bool IsBucketDescriptorRangeValid(const DistributedFSDescriptor& desc,
     if (desc.object_size == 0 || desc.shard_idx < 0) return false;
     if (key.empty()) return false;
 
-    const uint64_t header_and_key =
-        BucketEntryLayout::kHeaderSize + key.size();
-    if (desc.offset < header_and_key) return false;
-    const uint64_t entry_start = desc.offset - header_and_key;
-
-    auto layout = RebuildBucketEntryLayout(entry_start, key.size(),
-                                           desc.object_size, config.alignment);
+    auto layout = RebuildBucketEntryLayout(desc.offset, desc.object_size,
+                                           config.alignment);
     if (!layout) return false;
     if (layout->value_offset != desc.offset) return false;
     if (layout->reserved_size != desc.aligned_size) return false;
@@ -223,13 +218,6 @@ bool DistributedStorageConfig::ValidateForBucketAllocator() const {
                    << alignment << ")";
         return false;
     }
-    // A single entry must be able to fit: header + key + a non-empty value.
-    if (bucket_capacity <= BucketEntryLayout::kHeaderSize) {
-        LOG(ERROR) << "DistributedStorageConfig: bucket_capacity is too small "
-                      "to hold a single entry, bucket_capacity="
-                   << bucket_capacity;
-        return false;
-    }
     if (max_bucket_count <= 0) {
         // A fixed denominator is required for stable eviction watermarks.
         LOG(ERROR) << "DistributedStorageConfig: max_bucket_count must > 0 in "
@@ -260,7 +248,8 @@ bool DistributedStorageConfig::ValidateForBucketAllocator() const {
 }
 
 bool DistributedStorageConfig::IsReplicaEnabledFromEnvironment() {
-    const bool enabled = Environ::GetBool("MOONCAKE_DFS_FORCE_ONE_REPLICA", false);
+    const bool enabled =
+        Environ::GetBool("MOONCAKE_DFS_FORCE_ONE_REPLICA", false);
     static std::once_flag log_once;
     std::call_once(log_once, [enabled] {
         LOG(INFO) << "MOONCAKE_DFS_FORCE_ONE_REPLICA is "
@@ -618,27 +607,33 @@ DistributedStorageBackend::BatchWrite(
     }
 
     // BUCKET entries are physically contiguous when BatchAllocate succeeded.
-    // Build validated entry payloads first, including the reserved zero padding,
-    // then issue one write per contiguous bounded-size run. SHARD keeps the
-    // original one-request path because its allocator does not promise
-    // contiguity.
+    // Build validated entry payloads first, including the reserved zero
+    // padding, then issue one write per contiguous bounded-size run. SHARD
+    // keeps the original one-request path because its allocator does not
+    // promise contiguity.
     if (!IsBucketMode()) {
         for (size_t i = 0; i < requests.size(); ++i) {
             const auto& request = requests[i];
             auto target = ResolveTarget(request.descriptor, request.key);
-            if (!target) { results[i] = tl::make_unexpected(target.error()); continue; }
+            if (!target) {
+                results[i] = tl::make_unexpected(target.error());
+                continue;
+            }
             std::vector<iovec> iovs;
             uint64_t total = 0, value_size = 0;
             if (request.descriptor.object_size == 0) continue;
             for (const auto& slice : request.slices) {
                 if ((!slice.ptr && slice.size > 0) ||
                     slice.size > std::numeric_limits<uint64_t>::max() - total) {
-                    total = 0; break;
+                    total = 0;
+                    break;
                 }
                 if (slice.size) iovs.push_back({slice.ptr, slice.size});
-                total += slice.size; value_size += slice.size;
+                total += slice.size;
+                value_size += slice.size;
             }
-            if (total == 0 || value_size != request.descriptor.object_size) continue;
+            if (total == 0 || value_size != request.descriptor.object_size)
+                continue;
             std::lock_guard<std::mutex> lock(*target->mutex);
             uint64_t done = 0;
             size_t index = 0;
@@ -646,12 +641,15 @@ DistributedStorageBackend::BatchWrite(
             ErrorCode error = ErrorCode::OK;
             while (done < total && index < iovs.size()) {
                 std::vector<iovec> pending;
-                pending.push_back({static_cast<char*>(iovs[index].iov_base) + consumed,
-                                   iovs[index].iov_len - consumed});
-                for (size_t j = index + 1; j < iovs.size(); ++j) pending.push_back(iovs[j]);
-                auto r = fs_adapter_->WriteAt(target->fd, pending.data(),
-                                              static_cast<int>(pending.size()),
-                                              static_cast<int64_t>(request.descriptor.offset + done));
+                pending.push_back(
+                    {static_cast<char*>(iovs[index].iov_base) + consumed,
+                     iovs[index].iov_len - consumed});
+                for (size_t j = index + 1; j < iovs.size(); ++j)
+                    pending.push_back(iovs[j]);
+                auto r = fs_adapter_->WriteAt(
+                    target->fd, pending.data(),
+                    static_cast<int>(pending.size()),
+                    static_cast<int64_t>(request.descriptor.offset + done));
                 if (!r) {
                     error = r.error();
                     break;
@@ -660,17 +658,25 @@ DistributedStorageBackend::BatchWrite(
                     error = ErrorCode::FILE_WRITE_FAIL;
                     break;
                 }
-                uint64_t advanced = *r; done += advanced;
+                uint64_t advanced = *r;
+                done += advanced;
                 while (advanced && index < iovs.size()) {
                     auto available = iovs[index].iov_len - consumed;
                     auto step = std::min<uint64_t>(advanced, available);
-                    consumed += step; advanced -= step;
-                    if (consumed == iovs[index].iov_len) { ++index; consumed = 0; }
+                    consumed += step;
+                    advanced -= step;
+                    if (consumed == iovs[index].iov_len) {
+                        ++index;
+                        consumed = 0;
+                    }
                 }
             }
-            if (error == ErrorCode::OK && done == total) results[i] = {};
-            else results[i] = tl::make_unexpected(
-                error == ErrorCode::OK ? ErrorCode::FILE_WRITE_FAIL : error);
+            if (error == ErrorCode::OK && done == total)
+                results[i] = {};
+            else
+                results[i] = tl::make_unexpected(
+                    error == ErrorCode::OK ? ErrorCode::FILE_WRITE_FAIL
+                                           : error);
         }
         return results;
     }
@@ -686,32 +692,30 @@ DistributedStorageBackend::BatchWrite(
     for (size_t i = 0; i < requests.size(); ++i) {
         const auto& request = requests[i];
         auto target = ResolveTarget(request.descriptor, request.key);
-        if (!target) { results[i] = tl::make_unexpected(target.error()); continue; }
-        const uint64_t header_size = BucketEntryLayout::kHeaderSize + request.key.size();
-        if (request.descriptor.offset < header_size) continue;
-        const uint64_t entry_size = header_size + request.descriptor.object_size;
-        if (request.descriptor.aligned_size < entry_size) continue;
+        if (!target) {
+            results[i] = tl::make_unexpected(target.error());
+            continue;
+        }
         uint64_t value_size = 0;
-        std::vector<char> payload(static_cast<size_t>(request.descriptor.aligned_size), 0);
-        for (size_t j = 0; j < BucketEntryLayout::kHeaderSize; ++j)
-            payload[j] = static_cast<char>((request.key.size() >> (8 * j)) & 0xff);
-        std::memcpy(payload.data() + BucketEntryLayout::kHeaderSize,
-                    request.key.data(), request.key.size());
-        size_t payload_offset = static_cast<size_t>(header_size);
+        std::vector<char> payload(
+            static_cast<size_t>(request.descriptor.aligned_size), 0);
+        size_t payload_offset = 0;
         bool invalid = false;
         for (const auto& slice : request.slices) {
             if ((!slice.ptr && slice.size > 0) ||
                 slice.size > request.descriptor.object_size - value_size) {
-                invalid = true; break;
+                invalid = true;
+                break;
             }
             if (slice.size) {
-                std::memcpy(payload.data() + payload_offset, slice.ptr, slice.size);
-                payload_offset += slice.size; value_size += slice.size;
+                std::memcpy(payload.data() + payload_offset, slice.ptr,
+                            slice.size);
+                payload_offset += slice.size;
+                value_size += slice.size;
             }
         }
         if (invalid || value_size != request.descriptor.object_size) continue;
-        prepared.push_back({i, std::move(*target),
-                            request.descriptor.offset - header_size,
+        prepared.push_back({i, std::move(*target), request.descriptor.offset,
                             std::move(payload)});
     }
 
@@ -744,7 +748,8 @@ DistributedStorageBackend::BatchWrite(
                 std::vector<iovec> pending;
                 pending.reserve(iovs.size() - iov_index);
                 pending.push_back(
-                    {static_cast<char*>(iovs[iov_index].iov_base) + iov_consumed,
+                    {static_cast<char*>(iovs[iov_index].iov_base) +
+                         iov_consumed,
                      iovs[iov_index].iov_len - iov_consumed});
                 for (size_t j = iov_index + 1; j < iovs.size(); ++j) {
                     pending.push_back(iovs[j]);
@@ -791,11 +796,16 @@ DistributedStorageBackend::BatchWrite(
     };
     size_t run = 0;
     for (size_t i = 1; i <= prepared.size(); ++i) {
-        bool contiguous = i < prepared.size() &&
-            prepared[i-1].target.fd == prepared[i].target.fd &&
-            prepared[i-1].target.mutex == prepared[i].target.mutex &&
-            prepared[i].offset == prepared[i-1].offset + prepared[i-1].payload.size();
-        if (!contiguous) { if (run < i) write_run(run, i); run = i; }
+        bool contiguous =
+            i < prepared.size() &&
+            prepared[i - 1].target.fd == prepared[i].target.fd &&
+            prepared[i - 1].target.mutex == prepared[i].target.mutex &&
+            prepared[i].offset ==
+                prepared[i - 1].offset + prepared[i - 1].payload.size();
+        if (!contiguous) {
+            if (run < i) write_run(run, i);
+            run = i;
+        }
     }
     return results;
 }
@@ -923,9 +933,7 @@ void DistributedStorageBackend::ExecuteMergedRead(
     }
     for (const auto* pr : io.reads) {
         const auto& request = requests[pr->request_index];
-        const uint64_t value_offset = pr->entry_start - io.entry_start +
-                                      BucketEntryLayout::kHeaderSize +
-                                      request.key.size();
+        const uint64_t value_offset = pr->entry_start - io.entry_start;
         CopyToSlices(request, staging.data() + value_offset);
         results[pr->request_index] = {};
     }
@@ -1067,16 +1075,22 @@ void DistributedStorageBackend::ExecuteKeyRead(
 
     while (done < object_size && index < iovs.size()) {
         std::vector<iovec> pending;
-        pending.push_back(
-            {static_cast<char*>(iovs[index].iov_base) + consumed,
-             iovs[index].iov_len - consumed});
+        pending.push_back({static_cast<char*>(iovs[index].iov_base) + consumed,
+                           iovs[index].iov_len - consumed});
         for (size_t j = index + 1;
              j < iovs.size() && pending.size() < kMaxIovChunk; ++j) {
             pending.push_back(iovs[j]);
         }
-        auto read_result = fs_adapter_->DirectReadAt(
-            read.target.fd, pending.data(), static_cast<int>(pending.size()),
-            static_cast<int64_t>(read.value_offset + done));
+        auto read_result =
+            read.target.mutex == nullptr
+                ? fs_adapter_->DirectReadAt(
+                      read.target.fd, pending.data(),
+                      static_cast<int>(pending.size()),
+                      static_cast<int64_t>(read.value_offset + done))
+                : fs_adapter_->ReadAt(
+                      read.target.fd, pending.data(),
+                      static_cast<int>(pending.size()),
+                      static_cast<int64_t>(read.value_offset + done));
         if (!read_result) {
             error = read_result.error();
             break;
@@ -1167,8 +1181,7 @@ DistributedStorageBackend::BatchReadDirect(
                 target->keepalive = std::move(direct.keepalive);
             }
         }
-        prepared.push_back(
-            {i, std::move(*target), request.descriptor.offset});
+        prepared.push_back({i, std::move(*target), request.descriptor.offset});
     }
 
     if (batch_read_pool_ != nullptr && prepared.size() > 1) {
@@ -1176,8 +1189,7 @@ DistributedStorageBackend::BatchReadDirect(
         std::condition_variable completion_cv;
         size_t pending_reads = 0;
 
-        auto mark_done = [&completion_mutex, &completion_cv,
-                          &pending_reads]() {
+        auto mark_done = [&completion_mutex, &completion_cv, &pending_reads]() {
             // Notify while still holding the lock: otherwise a spurious
             // wakeup could let the waiter observe 0, return, and destroy
             // completion_cv out from under this notify_one().
@@ -1197,15 +1209,14 @@ DistributedStorageBackend::BatchReadDirect(
                         try {
                             ExecuteKeyRead(read, requests, results);
                         } catch (const std::exception& e) {
-                            LOG(ERROR)
-                                << "Direct batch read task failed: "
-                                << e.what();
-                            results[read.request_index] = tl::make_unexpected(
-                                ErrorCode::FILE_READ_FAIL);
+                            LOG(ERROR) << "Direct batch read task failed: "
+                                       << e.what();
+                            results[read.request_index] =
+                                tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
                         } catch (...) {
                             LOG(ERROR) << "Direct batch read task failed";
-                            results[read.request_index] = tl::make_unexpected(
-                                ErrorCode::FILE_READ_FAIL);
+                            results[read.request_index] =
+                                tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
                         }
                         mark_done();
                     });
@@ -1245,8 +1256,7 @@ DistributedStorageBackend::BatchReadDirect(
             gbps = static_cast<double>(total_bytes) / duration_us / 1000.0;
         }
         LOG(INFO) << "BatchReadDirect: requests=" << requests.size()
-                  << " bytes=" << total_bytes
-                  << " duration_us=" << duration_us
+                  << " bytes=" << total_bytes << " duration_us=" << duration_us
                   << " bandwidth_GBps=" << gbps;
     }
     return results;
@@ -1299,8 +1309,8 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
         if (!IsBucketMode()) {
             std::vector<char> value(request.descriptor.object_size);
             std::lock_guard<std::mutex> lock(*target->mutex);
-            const ErrorCode error = ReadFully(
-                fs_adapter_.get(), *target, request.descriptor.offset, value);
+            const ErrorCode error = ReadFully(fs_adapter_.get(), *target,
+                                              request.descriptor.offset, value);
             if (error != ErrorCode::OK) {
                 results[i] = tl::make_unexpected(error);
                 continue;
@@ -1310,11 +1320,7 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
             continue;
         }
 
-        const uint64_t header_size =
-            BucketEntryLayout::kHeaderSize + request.key.size();
-        if (request.descriptor.offset < header_size) continue;
-        prepared.push_back({i, std::move(*target),
-                            request.descriptor.offset - header_size,
+        prepared.push_back({i, std::move(*target), request.descriptor.offset,
                             request.descriptor.aligned_size});
     }
 
@@ -1368,11 +1374,9 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
             avg_merged_size = static_cast<double>(merged_bytes) / merged_ios;
         }
         LOG(INFO) << "BatchRead: requests=" << requests.size()
-                  << " buckets=" << groups.size()
-                  << " bytes=" << total_bytes
+                  << " buckets=" << groups.size() << " bytes=" << total_bytes
                   << " duration_us=" << duration_us
-                  << " bandwidth_GBps=" << gbps
-                  << " merged_ios=" << merged_ios
+                  << " bandwidth_GBps=" << gbps << " merged_ios=" << merged_ios
                   << " saved_ios=" << aggregated_reads - merged_ios
                   << " avg_merged_size=" << avg_merged_size;
     }
