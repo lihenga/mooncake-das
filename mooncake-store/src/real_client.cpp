@@ -5885,7 +5885,9 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     size_t mem_count = replicas.size();
     size_t local_disk_count = 0;
     size_t dfs_count = 0;
-
+    LOG(INFO) << "batch_get_into_multi_buffer_ranges: key="
+              << (keys.empty() ? std::string("<empty>") : keys.front())
+              << ", key_count=" << keys.size();
     // 1. Memory replicas: fast scatter path via BatchTransferReadRanges.
     if (!replicas.empty()) {
         auto transfer =
@@ -5912,6 +5914,11 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         }
     }
     const auto t_mem_done = std::chrono::steady_clock::now();
+    LOG(INFO) << "batch_get_into_multi_buffer_ranges: key="
+              << (keys.empty() ? std::string("<empty>") : keys.front())
+              << ", mem_phase_seconds="
+              << std::chrono::duration<double>(t_mem_done - timing_start)
+                     .count();
 
     // 2. Non-memory replicas: batch by endpoint/type, temp buffer + scatter.
     // Group LOCAL_DISK entries by endpoint for batch RPC.

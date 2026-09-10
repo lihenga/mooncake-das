@@ -3019,23 +3019,6 @@ MasterService::ReserveDfsSpaceForBatch(
     if (requests.empty()) return reservations;
 
     auto results = dfs_allocator_->BatchAllocate(requests);
-    bool allocation_exhausted = false;
-    for (const auto& result : results) {
-        allocation_exhausted = allocation_exhausted ||
-                               result.error == ErrorCode::NO_AVAILABLE_HANDLE;
-    }
-    if (allocation_exhausted && bucket_allocator_ != nullptr) {
-        bool released_any = false;
-        for (const auto& result : results) {
-            if (!result.success) continue;
-            dfs_allocator_->Free(result.key, result.descriptor);
-            released_any = true;
-        }
-        if (released_any) bucket_allocator_->FlushDirtyMetadata();
-        if (TryRecoverDfsSpaceAfterAllocationFailure()) {
-            results = dfs_allocator_->BatchAllocate(requests);
-        }
-    }
     if (results.size() != requests.size()) {
         LOG(ERROR) << "DFS BatchAllocate returned " << results.size()
                    << " results for " << requests.size() << " requests";
@@ -5083,7 +5066,76 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
             continue;
         }
 
-        // Phase 2 (commit metadata): remove every candidate replica. Same fixed
+        // Keep object operations out of the gap between revalidation and the
+        // storage commit. PutStart acquires this lock before it can publish a
+        // new PROCESSING replica, so the validation covers the metadata that
+        // will be removed below.
+        std::vector<std::pair<size_t, std::string>> operation_lock_requests;
+        operation_lock_requests.reserve(candidates.size());
+        for (const auto& candidate : candidates) {
+            operation_lock_requests.emplace_back(
+                std::hash<std::string>{}(
+                    tenant_id.MakeScopedKey(candidate.key)) %
+                    kObjectOperationLockStripes,
+                candidate.key);
+        }
+        std::sort(operation_lock_requests.begin(), operation_lock_requests.end());
+        std::vector<std::string> operation_lock_keys;
+        operation_lock_keys.reserve(operation_lock_requests.size());
+        size_t previous_stripe = 0;
+        bool have_previous_stripe = false;
+        for (const auto& [stripe, key] : operation_lock_requests) {
+            if (!have_previous_stripe || stripe != previous_stripe) {
+                operation_lock_keys.push_back(key);
+                previous_stripe = stripe;
+                have_previous_stripe = true;
+            }
+        }
+        std::vector<ObjectOperationLock> object_operation_locks;
+        object_operation_locks.reserve(operation_lock_keys.size());
+        for (const auto& key : operation_lock_keys) {
+            object_operation_locks.emplace_back(
+                AcquireObjectOperationLock(tenant_id, key));
+        }
+
+        // Phase 2 (revalidate): metadata may have changed since Phase 1. A
+        // candidate that became processing (e.g. a concurrent PutStart reused
+        // the key after Phase 1 saw it as evictable) must not be removed.
+        bool phase2_accepted = true;
+        for (const auto& [shard_idx, indexes] : indexes_by_shard) {
+            if (!phase2_accepted) break;
+            std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+            SharedMutexLocker shard_lock(&metadata_shards_[shard_idx].mutex);
+            for (const size_t i : indexes) {
+                const auto& candidate = candidates[i];
+                auto tenant_it =
+                    metadata_shards_[shard_idx].tenants.find(tenant_id);
+                if (tenant_it == metadata_shards_[shard_idx].tenants.end()) {
+                    continue;
+                }
+                auto& tenant_state = tenant_it->second;
+                auto metadata_it = tenant_state.metadata.find(candidate.key);
+                if (metadata_it == tenant_state.metadata.end()) continue;
+
+                auto& metadata = metadata_it->second;
+                const bool candidate_is_processing =
+                    metadata.HasReplica([&](const Replica& replica) {
+                        return matches_candidate(replica, candidate) &&
+                               replica.is_processing();
+                    });
+                if (candidate_is_processing ||
+                    tenant_state.processing_keys.contains(candidate.key)) {
+                    phase2_accepted = false;
+                    break;
+                }
+            }
+        }
+        if (!phase2_accepted) {
+            bucket_allocator_->AbortEviction(std::move(pending));
+            continue;
+        }
+
+        // Phase 3 (commit metadata): remove every candidate replica. Same fixed
         // shard order, and still no DFS I/O under the locks.
         for (const auto& [shard_idx, indexes] : indexes_by_shard) {
             std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
@@ -5103,7 +5155,8 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
                 auto& metadata = metadata_it->second;
                 const size_t erased =
                     metadata.EraseReplicas([&](const Replica& replica) {
-                        return matches_candidate(replica, candidate);
+                        return matches_candidate(replica, candidate) &&
+                               !replica.is_processing();
                     });
                 if (erased > 0 && !metadata.IsValid()) {
                     PublishKvRemovedAfterEvict(candidate.key,
