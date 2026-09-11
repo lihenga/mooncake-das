@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <filesystem>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <sstream>
@@ -520,7 +521,7 @@ DistributedStorageBackend::GetOrOpenBucketDirect(const std::string& path) {
 tl::expected<DistributedStorageBackend::ResolvedTarget, ErrorCode>
 DistributedStorageBackend::ResolveTarget(
     const DistributedFSDescriptor& descriptor, const std::string& key,
-    std::string* resolved_path) {
+    bool read_only) {
     if (!IsBucketMode()) {
         if (descriptor.shard_idx < 0 ||
             descriptor.shard_idx >= static_cast<int>(shard_files_.size())) {
@@ -543,6 +544,9 @@ DistributedStorageBackend::ResolveTarget(
                        << ", shard_capacity="
                        << distributed_config_.shard_capacity;
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (read_only && shard.direct_fd >= 0) {
+            return ResolvedTarget{shard.direct_fd, nullptr, nullptr};
         }
         return ResolvedTarget{shard.fd, &shard.mutex, nullptr};
     }
@@ -578,11 +582,19 @@ DistributedStorageBackend::ResolveTarget(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    if (resolved_path != nullptr) *resolved_path = canonical;
-    auto handle = GetOrOpenBucket(canonical);
+    auto handle = read_only ? GetOrOpenBucketDirect(canonical)
+                            : GetOrOpenBucket(canonical);
+    if (!handle && read_only) {
+        if (handle.error() != ErrorCode::NOT_SUPPORTED) {
+            return tl::make_unexpected(handle.error());
+        }
+        handle = GetOrOpenBucket(canonical);
+        read_only = false;
+    }
     if (!handle) return tl::make_unexpected(handle.error());
     auto& shared = handle.value();
-    return ResolvedTarget{shared->fd, &shared->mutex, shared};
+    return ResolvedTarget{shared->fd, read_only ? nullptr : &shared->mutex,
+                          shared};
 }
 
 tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
@@ -597,89 +609,99 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
 std::vector<tl::expected<void, ErrorCode>>
 DistributedStorageBackend::BatchWrite(
     const std::vector<DfsWriteRequest>& requests) {
-    std::vector<tl::expected<void, ErrorCode>> results(
-        requests.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    std::vector<tl::expected<void, ErrorCode>> results;
     if (!initialized_) {
         LOG(ERROR) << "DistributedStorageBackend is not initialized";
-        std::fill(results.begin(), results.end(),
-                  tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
+        results.assign(requests.size(),
+                       tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
         return results;
     }
 
-    // BUCKET entries are physically contiguous when BatchAllocate succeeded.
     // Build validated entry payloads first, including the reserved zero
     // padding, then issue one write per contiguous bounded-size run. SHARD
     // keeps the original one-request path because its allocator does not
     // promise contiguity.
-    if (!IsBucketMode()) {
-        for (size_t i = 0; i < requests.size(); ++i) {
-            const auto& request = requests[i];
-            auto target = ResolveTarget(request.descriptor, request.key);
-            if (!target) {
-                results[i] = tl::make_unexpected(target.error());
-                continue;
-            }
-            std::vector<iovec> iovs;
-            uint64_t total = 0, value_size = 0;
-            if (request.descriptor.object_size == 0) continue;
-            for (const auto& slice : request.slices) {
-                if ((!slice.ptr && slice.size > 0) ||
-                    slice.size > std::numeric_limits<uint64_t>::max() - total) {
-                    total = 0;
-                    break;
-                }
-                if (slice.size) iovs.push_back({slice.ptr, slice.size});
-                total += slice.size;
-                value_size += slice.size;
-            }
-            if (total == 0 || value_size != request.descriptor.object_size)
-                continue;
-            std::lock_guard<std::mutex> lock(*target->mutex);
-            uint64_t done = 0;
-            size_t index = 0;
-            uint64_t consumed = 0;
-            ErrorCode error = ErrorCode::OK;
-            while (done < total && index < iovs.size()) {
-                std::vector<iovec> pending;
-                pending.push_back(
-                    {static_cast<char*>(iovs[index].iov_base) + consumed,
-                     iovs[index].iov_len - consumed});
-                for (size_t j = index + 1; j < iovs.size(); ++j)
-                    pending.push_back(iovs[j]);
-                auto r = fs_adapter_->WriteAt(
-                    target->fd, pending.data(),
-                    static_cast<int>(pending.size()),
-                    static_cast<int64_t>(request.descriptor.offset + done));
-                if (!r) {
-                    error = r.error();
-                    break;
-                }
-                if (*r == 0) {
-                    error = ErrorCode::FILE_WRITE_FAIL;
-                    break;
-                }
-                uint64_t advanced = *r;
-                done += advanced;
-                while (advanced && index < iovs.size()) {
-                    auto available = iovs[index].iov_len - consumed;
-                    auto step = std::min<uint64_t>(advanced, available);
-                    consumed += step;
-                    advanced -= step;
-                    if (consumed == iovs[index].iov_len) {
-                        ++index;
-                        consumed = 0;
-                    }
-                }
-            }
-            if (error == ErrorCode::OK && done == total)
-                results[i] = {};
-            else
-                results[i] = tl::make_unexpected(
-                    error == ErrorCode::OK ? ErrorCode::FILE_WRITE_FAIL
-                                           : error);
+    if (IsBucketMode()) return BatchWriteBucket(requests);
+    return BatchWriteShard(requests);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+DistributedStorageBackend::BatchWriteShard(
+    const std::vector<DfsWriteRequest>& requests) {
+    std::vector<tl::expected<void, ErrorCode>> results(
+        requests.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const auto& request = requests[i];
+        auto target = ResolveTarget(request.descriptor, request.key);
+        if (!target) {
+            results[i] = tl::make_unexpected(target.error());
+            continue;
         }
-        return results;
+        std::vector<iovec> iovs;
+        uint64_t total = 0, value_size = 0;
+        if (request.descriptor.object_size == 0) continue;
+        for (const auto& slice : request.slices) {
+            if ((!slice.ptr && slice.size > 0) ||
+                slice.size > std::numeric_limits<uint64_t>::max() - total) {
+                total = 0;
+                break;
+            }
+            if (slice.size) iovs.push_back({slice.ptr, slice.size});
+            total += slice.size;
+            value_size += slice.size;
+        }
+        if (total == 0 || value_size != request.descriptor.object_size)
+            continue;
+        std::lock_guard<std::mutex> lock(*target->mutex);
+        uint64_t done = 0;
+        size_t index = 0;
+        uint64_t consumed = 0;
+        ErrorCode error = ErrorCode::OK;
+        while (done < total && index < iovs.size()) {
+            std::vector<iovec> pending;
+            pending.push_back(
+                {static_cast<char*>(iovs[index].iov_base) + consumed,
+                 iovs[index].iov_len - consumed});
+            for (size_t j = index + 1; j < iovs.size(); ++j)
+                pending.push_back(iovs[j]);
+            auto r = fs_adapter_->WriteAt(
+                target->fd, pending.data(), static_cast<int>(pending.size()),
+                static_cast<int64_t>(request.descriptor.offset + done));
+            if (!r) {
+                error = r.error();
+                break;
+            }
+            if (*r == 0) {
+                error = ErrorCode::FILE_WRITE_FAIL;
+                break;
+            }
+            uint64_t advanced = *r;
+            done += advanced;
+            while (advanced && index < iovs.size()) {
+                auto available = iovs[index].iov_len - consumed;
+                auto step = std::min<uint64_t>(advanced, available);
+                consumed += step;
+                advanced -= step;
+                if (consumed == iovs[index].iov_len) {
+                    ++index;
+                    consumed = 0;
+                }
+            }
+        }
+        if (error == ErrorCode::OK && done == total)
+            results[i] = {};
+        else
+            results[i] = tl::make_unexpected(
+                error == ErrorCode::OK ? ErrorCode::FILE_WRITE_FAIL : error);
     }
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+DistributedStorageBackend::BatchWriteBucket(
+    const std::vector<DfsWriteRequest>& requests) {
+    std::vector<tl::expected<void, ErrorCode>> results(
+        requests.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
 
     struct Prepared {
         size_t index;
@@ -708,14 +730,17 @@ DistributedStorageBackend::BatchWrite(
                 break;
             }
             if (slice.size) {
-                std::memcpy(payload.data() + payload_offset, slice.ptr,
-                            slice.size);
+                std::memcpy(payload.data() + payload_offset, slice.ptr, slice.size);
                 payload_offset += slice.size;
                 value_size += slice.size;
             }
         }
-        if (invalid || value_size != request.descriptor.object_size) continue;
-        prepared.push_back({i, std::move(*target), request.descriptor.offset,
+        if (invalid || value_size != request.descriptor.object_size) {
+            results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            continue;
+        }
+        prepared.push_back({i, std::move(*target),
+                            request.descriptor.offset,
                             std::move(payload)});
     }
 
@@ -813,14 +838,18 @@ DistributedStorageBackend::BatchWrite(
 ErrorCode DistributedStorageBackend::ReadFully(FileSystemAdapter* fs_adapter,
                                                const ResolvedTarget& target,
                                                uint64_t offset,
-                                               std::span<char> output) {
+                                               std::span<char> output,
+                                               bool direct_read) {
     const auto start = std::chrono::steady_clock::now();
     uint64_t done = 0;
     ErrorCode error = ErrorCode::OK;
     while (done < output.size()) {
         iovec iov{output.data() + done, output.size() - done};
-        auto read = fs_adapter->ReadAt(target.fd, &iov, 1,
-                                       static_cast<int64_t>(offset + done));
+        auto read = direct_read
+                       ? fs_adapter->DirectReadAt(target.fd, &iov, 1,
+                                                  static_cast<int64_t>(offset + done))
+                       : fs_adapter->ReadAt(target.fd, &iov, 1,
+                                            static_cast<int64_t>(offset + done));
         if (!read) {
             error = read.error();
             break;
@@ -830,15 +859,6 @@ ErrorCode DistributedStorageBackend::ReadFully(FileSystemAdapter* fs_adapter,
             break;
         }
         done += *read;
-    }
-    const int64_t duration_us =
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - start)
-            .count();
-    if (dfs_read_trace_enabled()) {
-        LOG(INFO) << "ReadFully: bytes=" << done << "/" << output.size()
-                  << " duration_us=" << duration_us
-                  << " error=" << static_cast<int>(error);
     }
     return error;
 }
@@ -858,193 +878,112 @@ void DistributedStorageBackend::CopyToSlices(const DfsReadRequest& request,
     }
 }
 
-std::unordered_map<std::mutex*, DistributedStorageBackend::BucketReadGroup>
-DistributedStorageBackend::GroupReadsByBucket(
-    std::vector<PreparedRead>&& prepared) {
-    std::unordered_map<std::mutex*, BucketReadGroup> groups;
-    for (auto& pr : prepared) {
-        auto& group = groups[pr.target.mutex];
-        if (group.mutex == nullptr) group.mutex = pr.target.mutex;
-        group.reads.push_back(std::move(pr));
-    }
-    return groups;
-}
-
-void DistributedStorageBackend::SortGroupByOffset(BucketReadGroup& group) {
-    std::sort(group.reads.begin(), group.reads.end(),
-              [](const PreparedRead& a, const PreparedRead& b) {
-                  return a.entry_start < b.entry_start;
-              });
-}
-
-/**
- * @brief Collapse runs of contiguous entries in a sorted group into one read.
- */
-std::vector<DistributedStorageBackend::MergedIo>
-DistributedStorageBackend::BuildMergedIos(const BucketReadGroup& group) {
-    std::vector<MergedIo> merged;
-    size_t run_begin = 0;
-
-    while (run_begin < group.reads.size()) {
-        size_t run_end = run_begin + 1;
-        while (run_end < group.reads.size()) {
-            const auto& previous = group.reads[run_end - 1];
-            const auto& current = group.reads[run_end];
-            const bool contiguous =
-                current.entry_start ==
-                previous.entry_start + previous.reserved_size;
-            const uint64_t merged_size = current.entry_start +
-                                         current.reserved_size -
-                                         group.reads[run_begin].entry_start;
-            if (!contiguous || merged_size > kMaxMergedIo) break;
-            ++run_end;
+std::vector<DistributedStorageBackend::ReadTask>
+DistributedStorageBackend::PrepareReadTasks(
+    const std::vector<DfsReadRequest>& requests,
+    std::vector<tl::expected<void, ErrorCode>>& results) {
+    std::vector<ReadTask> tasks;
+    std::vector<ReadTask> oversized_tasks;
+    tasks.reserve(requests.size());
+    oversized_tasks.reserve(requests.size());
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const auto& request = requests[i];
+        auto target = ResolveTarget(request.descriptor, request.key,
+                                    distributed_config_.direct_read_enabled);
+        if (!target) {
+            results[i] = tl::make_unexpected(target.error());
+            continue;
         }
 
-        MergedIo io;
-        io.entry_start = group.reads[run_begin].entry_start;
-        io.total_size = group.reads[run_end - 1].entry_start +
-                        group.reads[run_end - 1].reserved_size - io.entry_start;
-        io.reads.reserve(run_end - run_begin);
-        for (size_t j = run_begin; j < run_end; ++j) {
-            io.reads.push_back(&group.reads[j]);
+        uint64_t capacity = 0;
+        bool invalid = false;
+        for (const auto& slice : request.slices) {
+            if ((!slice.ptr && slice.size != 0) ||
+                slice.size > std::numeric_limits<uint64_t>::max() - capacity) {
+                invalid = true;
+                break;
+            }
+            capacity += slice.size;
         }
-        merged.push_back(std::move(io));
-        run_begin = run_end;
+        if (invalid || capacity < request.descriptor.object_size) continue;
+
+        ReadTask task;
+        task.target = std::move(*target);
+        task.io_offset = request.descriptor.offset;
+        task.total_size = IsBucketMode() ? request.descriptor.aligned_size
+                                         : request.descriptor.object_size;
+        task.direct_read = distributed_config_.direct_read_enabled &&
+                           task.target.mutex == nullptr;
+        task.entries.push_back({i, request.descriptor.offset});
+        const bool merge_candidate =
+            IsBucketMode() && distributed_config_.batch_read_merge_enabled &&
+            task.total_size <= kMaxMergedIo;
+        if (merge_candidate) {
+            tasks.push_back(std::move(task));
+        } else {
+            oversized_tasks.push_back(std::move(task));
+        }
     }
+
+    if (!IsBucketMode() || !distributed_config_.batch_read_merge_enabled) {
+        tasks.insert(tasks.end(), std::make_move_iterator(oversized_tasks.begin()),
+                     std::make_move_iterator(oversized_tasks.end()));
+        return tasks;
+    }
+    std::sort(tasks.begin(), tasks.end(), [](const ReadTask& a,
+                                             const ReadTask& b) {
+        if (a.target.fd != b.target.fd) {
+            return a.target.fd < b.target.fd;
+        }
+        return a.io_offset < b.io_offset;
+    });
+
+    std::vector<ReadTask> merged;
+    merged.reserve(tasks.size());
+    for (auto& task : tasks) {
+        const uint64_t task_end = task.io_offset + task.total_size;
+        if (!merged.empty() &&
+            merged.back().target.fd == task.target.fd &&
+            merged.back().target.mutex == task.target.mutex &&
+            merged.back().io_offset + merged.back().total_size ==
+                task.io_offset &&
+            task_end - merged.back().io_offset <= kMaxMergedIo) {
+            merged.back().total_size = task_end - merged.back().io_offset;
+            merged.back().merged = true;
+            merged.back().entries.insert(merged.back().entries.end(),
+                                         task.entries.begin(),
+                                         task.entries.end());
+            continue;
+        }
+        merged.push_back(std::move(task));
+    }
+    merged.insert(merged.end(),
+                  std::make_move_iterator(oversized_tasks.begin()),
+                  std::make_move_iterator(oversized_tasks.end()));
     return merged;
 }
 
-void DistributedStorageBackend::ExecuteMergedRead(
-    const MergedIo& io, const std::vector<DfsReadRequest>& requests,
-    std::vector<tl::expected<void, ErrorCode>>& results,
-    const ResolvedTarget& target, std::mutex* mutex,
-    FileSystemAdapter* fs_adapter, std::vector<char>& staging) {
-    staging.resize(static_cast<size_t>(io.total_size));
-    ErrorCode error;
-    {
-        std::lock_guard<std::mutex> lock(*mutex);
-        error = ReadFully(fs_adapter, target, io.entry_start, staging);
-    }
-    if (error != ErrorCode::OK) {
-        for (const auto* pr : io.reads) {
-            results[pr->request_index] = tl::make_unexpected(error);
-        }
-        return;
-    }
-    for (const auto* pr : io.reads) {
-        const auto& request = requests[pr->request_index];
-        const uint64_t value_offset = pr->entry_start - io.entry_start;
-        CopyToSlices(request, staging.data() + value_offset);
-        results[pr->request_index] = {};
-    }
-}
-
-void DistributedStorageBackend::FailGroupReads(
-    const BucketReadGroup& group,
-    std::vector<tl::expected<void, ErrorCode>>& results, ErrorCode error) {
-    for (const auto& pr : group.reads) {
-        results[pr.request_index] = tl::make_unexpected(error);
-    }
-}
-
-void DistributedStorageBackend::ProcessBucketGroup(
-    BucketReadGroup& group, const std::vector<DfsReadRequest>& requests,
-    std::vector<tl::expected<void, ErrorCode>>& results,
-    FileSystemAdapter* fs_adapter, MergeStats& stats) {
-    const auto& target = group.reads.front().target;
-    std::vector<char> staging;
-    const auto merged = BuildMergedIos(group);
-    uint64_t aggregated_reads = 0;
-    uint64_t merged_ios = 0;
-    uint64_t merged_bytes = 0;
-    for (const auto& io : merged) {
-        if (io.reads.size() > 1) {
-            aggregated_reads += io.reads.size();
-            ++merged_ios;
-            merged_bytes += io.total_size;
-        }
-    }
-    stats.aggregated_reads.fetch_add(aggregated_reads,
-                                     std::memory_order_relaxed);
-    stats.merged_ios.fetch_add(merged_ios, std::memory_order_relaxed);
-    stats.merged_bytes.fetch_add(merged_bytes, std::memory_order_relaxed);
-    for (const auto& io : merged) {
-        ExecuteMergedRead(io, requests, results, target, group.mutex,
-                          fs_adapter, staging);
-    }
-}
-
-/**
- * @brief Run one bucket group per pool task and block until all have finished.
- *
- * Every task must decrement the pending counter exactly once, including on
- * failure: a task that escaped without doing so would both hang this call and
- * terminate the worker thread, since the pool does not catch exceptions.
- */
-void DistributedStorageBackend::DispatchParallelReads(
-    std::unordered_map<std::mutex*, BucketReadGroup>& groups,
-    const std::vector<DfsReadRequest>& requests,
-    std::vector<tl::expected<void, ErrorCode>>& results, ThreadPool& pool,
-    FileSystemAdapter* fs_adapter, MergeStats& stats) {
-    std::vector<BucketReadGroup*> group_ptrs;
-    group_ptrs.reserve(groups.size());
-    for (auto& [mutex, group] : groups) {
-        group_ptrs.push_back(&group);
-    }
-
-    std::mutex completion_mutex;
-    std::condition_variable completion_cv;
-    size_t pending_groups = 0;
-
-    auto mark_done = [&completion_mutex, &completion_cv, &pending_groups]() {
-        // Notify while still holding the lock: otherwise a spurious wakeup
-        // could let the waiter observe 0, return, and destroy completion_cv
-        // out from under this notify_one().
-        std::lock_guard<std::mutex> lock(completion_mutex);
-        --pending_groups;
-        completion_cv.notify_one();
-    };
-
-    for (auto* g : group_ptrs) {
-        {
-            std::lock_guard<std::mutex> lock(completion_mutex);
-            ++pending_groups;
-        }
-        try {
-            pool.enqueue([g, &requests, &results, fs_adapter, &stats,
-                          &mark_done]() {
-                try {
-                    ProcessBucketGroup(*g, requests, results, fs_adapter,
-                                       stats);
-                } catch (const std::exception& e) {
-                    LOG(ERROR) << "Bucket batch read task failed: " << e.what();
-                    FailGroupReads(*g, results, ErrorCode::FILE_READ_FAIL);
-                } catch (...) {
-                    LOG(ERROR) << "Bucket batch read task failed";
-                    FailGroupReads(*g, results, ErrorCode::FILE_READ_FAIL);
-                }
-                mark_done();
-            });
-        } catch (const std::exception& e) {
-            // The pool rejected the task, so nothing will decrement for it.
-            LOG(ERROR) << "Failed to enqueue bucket batch read: " << e.what();
-            FailGroupReads(*g, results, ErrorCode::FILE_READ_FAIL);
-            mark_done();
-        }
-    }
-
-    std::unique_lock<std::mutex> lock(completion_mutex);
-    completion_cv.wait(lock, [&pending_groups] { return pending_groups == 0; });
-}
-
-void DistributedStorageBackend::ExecuteKeyRead(
-    const PreparedKeyRead& read, const std::vector<DfsReadRequest>& requests,
+// Dispatches merged bucket tasks to the staging-buffer path; all other tasks
+// contain one request and use direct scatter reads into the caller's slices.
+void DistributedStorageBackend::ExecuteReadTask(
+    const ReadTask& task, const std::vector<DfsReadRequest>& requests,
     std::vector<tl::expected<void, ErrorCode>>& results) {
-    const auto& request = requests[read.request_index];
-    const uint64_t object_size = request.descriptor.object_size;
+    if (task.merged || task.entries.size() > 1) {
+        ExecuteMergedReadTask(task, requests, results);
+    } else {
+        ExecuteSingleReadTask(task, requests, results);
+    }
+}
 
-    // Scatter the value straight into the caller's slices (clamped to
-    // object_size) so there is no staging buffer or extra copy on this path.
+void DistributedStorageBackend::ExecuteSingleReadTask(
+    const ReadTask& task, const std::vector<DfsReadRequest>& requests,
+    std::vector<tl::expected<void, ErrorCode>>& results) {
+    if (task.entries.empty()) return;
+    const auto& entry = task.entries.front();
+    const auto& request = requests[entry.request_index];
+    const uint64_t object_size = request.descriptor.object_size;
+    const auto start = std::chrono::steady_clock::now();
+
     std::vector<iovec> iovs;
     iovs.reserve(request.slices.size());
     uint64_t remaining = object_size;
@@ -1057,20 +996,14 @@ void DistributedStorageBackend::ExecuteKeyRead(
         }
     }
 
-    // preadv-style interfaces reject iov lists longer than IOV_MAX, so issue
-    // the read in bounded chunks. Short reads resume where they stopped.
     constexpr size_t kMaxIovChunk = 1024;
     ErrorCode error = ErrorCode::OK;
     uint64_t done = 0;
     size_t index = 0;
     size_t consumed = 0;
-
-    // Direct handles are read-only with offset-explicit I/O and arrive here
-    // with a null mutex; the regular fallback handle is shared with writers,
-    // so reads on it keep the legacy serialization.
     std::unique_lock<std::mutex> target_lock;
-    if (read.target.mutex != nullptr) {
-        target_lock = std::unique_lock<std::mutex>(*read.target.mutex);
+    if (task.target.mutex != nullptr) {
+        target_lock = std::unique_lock<std::mutex>(*task.target.mutex);
     }
 
     while (done < object_size && index < iovs.size()) {
@@ -1081,16 +1014,15 @@ void DistributedStorageBackend::ExecuteKeyRead(
              j < iovs.size() && pending.size() < kMaxIovChunk; ++j) {
             pending.push_back(iovs[j]);
         }
-        auto read_result =
-            read.target.mutex == nullptr
-                ? fs_adapter_->DirectReadAt(
-                      read.target.fd, pending.data(),
-                      static_cast<int>(pending.size()),
-                      static_cast<int64_t>(read.value_offset + done))
-                : fs_adapter_->ReadAt(
-                      read.target.fd, pending.data(),
-                      static_cast<int>(pending.size()),
-                      static_cast<int64_t>(read.value_offset + done));
+        auto read_result = task.direct_read
+                               ? fs_adapter_->DirectReadAt(
+                                     task.target.fd, pending.data(),
+                                     static_cast<int>(pending.size()),
+                                     static_cast<int64_t>(entry.value_offset + done))
+                               : fs_adapter_->ReadAt(
+                                     task.target.fd, pending.data(),
+                                     static_cast<int>(pending.size()),
+                                     static_cast<int64_t>(entry.value_offset + done));
         if (!read_result) {
             error = read_result.error();
             break;
@@ -1115,131 +1047,113 @@ void DistributedStorageBackend::ExecuteKeyRead(
     if (error == ErrorCode::OK && done != object_size) {
         error = ErrorCode::FILE_READ_FAIL;
     }
+    results[entry.request_index] =
+        error == ErrorCode::OK ? tl::expected<void, ErrorCode>{}
+                               : tl::make_unexpected(error);
+}
 
-    if (error == ErrorCode::OK) {
-        results[read.request_index] = {};
-    } else {
-        results[read.request_index] = tl::make_unexpected(error);
+void DistributedStorageBackend::ExecuteMergedReadTask(
+    const ReadTask& task, const std::vector<DfsReadRequest>& requests,
+    std::vector<tl::expected<void, ErrorCode>>& results) {
+    if (task.entries.empty()) return;
+    std::vector<char> staging(static_cast<size_t>(task.total_size));
+    ErrorCode error = ErrorCode::OK;
+    {
+        std::unique_lock<std::mutex> target_lock;
+        if (task.target.mutex != nullptr) {
+            target_lock = std::unique_lock<std::mutex>(*task.target.mutex);
+        }
+        error = ReadFully(fs_adapter_.get(), task.target, task.io_offset,
+                          staging, task.direct_read);
+    }
+    if (error != ErrorCode::OK) {
+        for (const auto& entry : task.entries) {
+            results[entry.request_index] = tl::make_unexpected(error);
+        }
+        return;
+    }
+    for (const auto& entry : task.entries) {
+        const auto& request = requests[entry.request_index];
+        const uint64_t value_offset = entry.value_offset - task.io_offset;
+        CopyToSlices(request, staging.data() + value_offset);
+        results[entry.request_index] = {};
     }
 }
 
-/**
- * @brief Per-key read flow: no bucketing or merging, each key is read on its
- * own and the reads are fanned out over the batch read pool.
- */
-std::vector<tl::expected<void, ErrorCode>>
-DistributedStorageBackend::BatchReadDirect(
+void DistributedStorageBackend::ExecuteReadTasks(
+    const std::vector<ReadTask>& tasks,
+    const std::vector<DfsReadRequest>& requests,
+    std::vector<tl::expected<void, ErrorCode>>& results) {
+    if (batch_read_pool_ == nullptr || tasks.size() <= 1) {
+        for (const auto& task : tasks) {
+            ExecuteReadTask(task, requests, results);
+        }
+        return;
+    }
+
+    std::mutex completion_mutex;
+    std::condition_variable completion_cv;
+    size_t pending_tasks = 0;
+    auto mark_done = [&completion_mutex, &completion_cv, &pending_tasks]() {
+        std::lock_guard<std::mutex> lock(completion_mutex);
+        --pending_tasks;
+        completion_cv.notify_one();
+    };
+
+    for (const auto& task : tasks) {
+        {
+            std::lock_guard<std::mutex> lock(completion_mutex);
+            ++pending_tasks;
+        }
+        const auto task_copy = task;
+        try {
+            batch_read_pool_->enqueue(
+                [this, task_copy, &requests, &results, &mark_done]() {
+                    try {
+                        ExecuteReadTask(task_copy, requests, results);
+                    } catch (const std::exception& e) {
+                        LOG(ERROR) << "Batch read task failed: " << e.what();
+                        for (const auto& entry : task_copy.entries) {
+                            results[entry.request_index] = tl::make_unexpected(
+                                ErrorCode::FILE_READ_FAIL);
+                        }
+                    } catch (...) {
+                        LOG(ERROR) << "Batch read task failed";
+                        for (const auto& entry : task_copy.entries) {
+                            results[entry.request_index] = tl::make_unexpected(
+                                ErrorCode::FILE_READ_FAIL);
+                        }
+                    }
+                    mark_done();
+                });
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Failed to enqueue batch read: " << e.what();
+            for (const auto& entry : task_copy.entries) {
+                results[entry.request_index] =
+                    tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+            mark_done();
+        }
+    }
+
+    std::unique_lock<std::mutex> lock(completion_mutex);
+    completion_cv.wait(lock, [&pending_tasks] { return pending_tasks == 0; });
+}
+
+std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     const std::vector<DfsReadRequest>& requests) {
     const auto timing_start = std::chrono::steady_clock::now();
     std::vector<tl::expected<void, ErrorCode>> results(
         requests.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-
-    std::vector<PreparedKeyRead> prepared;
-    prepared.reserve(requests.size());
-    for (size_t i = 0; i < requests.size(); ++i) {
-        const auto& request = requests[i];
-        std::string resolved_path;
-        auto target =
-            ResolveTarget(request.descriptor, request.key, &resolved_path);
-        if (!target) {
-            results[i] = tl::make_unexpected(target.error());
-            continue;
-        }
-
-        uint64_t capacity = 0;
-        bool invalid = false;
-        for (const auto& slice : request.slices) {
-            if ((!slice.ptr && slice.size != 0) ||
-                slice.size > std::numeric_limits<uint64_t>::max() - capacity) {
-                invalid = true;
-                break;
-            }
-            capacity += slice.size;
-        }
-        if (invalid || capacity < request.descriptor.object_size) continue;
-
-        // Switch to the direct read handle when the adapter offers one. The
-        // direct handle is read-only and every read carries an explicit
-        // offset, so it needs no serialization against other reads and the
-        // handle mutex is dropped on purpose.
-        if (distributed_config_.direct_read_enabled) {
-            ResolvedTarget direct;
-            if (IsBucketMode()) {
-                auto handle = GetOrOpenBucketDirect(resolved_path);
-                if (handle) {
-                    direct = ResolvedTarget{(*handle)->fd, nullptr, *handle};
-                }
-            } else {
-                auto& shard = *shard_files_[request.descriptor.shard_idx];
-                if (shard.direct_fd >= 0) {
-                    direct = ResolvedTarget{shard.direct_fd, nullptr, nullptr};
-                }
-            }
-            if (direct.fd >= 0) {
-                target->fd = direct.fd;
-                target->mutex = nullptr;
-                target->keepalive = std::move(direct.keepalive);
-            }
-        }
-        prepared.push_back({i, std::move(*target), request.descriptor.offset});
+    if (!initialized_) {
+        LOG(ERROR) << "DistributedStorageBackend is not initialized";
+        std::fill(results.begin(), results.end(),
+                  tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
+        return results;
     }
 
-    if (batch_read_pool_ != nullptr && prepared.size() > 1) {
-        std::mutex completion_mutex;
-        std::condition_variable completion_cv;
-        size_t pending_reads = 0;
-
-        auto mark_done = [&completion_mutex, &completion_cv, &pending_reads]() {
-            // Notify while still holding the lock: otherwise a spurious
-            // wakeup could let the waiter observe 0, return, and destroy
-            // completion_cv out from under this notify_one().
-            std::lock_guard<std::mutex> lock(completion_mutex);
-            --pending_reads;
-            completion_cv.notify_one();
-        };
-
-        for (const auto& read : prepared) {
-            {
-                std::lock_guard<std::mutex> lock(completion_mutex);
-                ++pending_reads;
-            }
-            try {
-                batch_read_pool_->enqueue(
-                    [this, read, &requests, &results, &mark_done]() {
-                        try {
-                            ExecuteKeyRead(read, requests, results);
-                        } catch (const std::exception& e) {
-                            LOG(ERROR) << "Direct batch read task failed: "
-                                       << e.what();
-                            results[read.request_index] =
-                                tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-                        } catch (...) {
-                            LOG(ERROR) << "Direct batch read task failed";
-                            results[read.request_index] =
-                                tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-                        }
-                        mark_done();
-                    });
-            } catch (const std::exception& e) {
-                // The pool rejected the task, so nothing will decrement for
-                // it.
-                LOG(ERROR) << "Failed to enqueue direct batch read: "
-                           << e.what();
-                results[read.request_index] =
-                    tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-                mark_done();
-            }
-        }
-
-        std::unique_lock<std::mutex> lock(completion_mutex);
-        completion_cv.wait(lock,
-                           [&pending_reads] { return pending_reads == 0; });
-    } else {
-        // No pool (or a single read): nothing to overlap with, run inline.
-        for (const auto& read : prepared) {
-            ExecuteKeyRead(read, requests, results);
-        }
-    }
+    auto tasks = PrepareReadTasks(requests, results);
+    ExecuteReadTasks(tasks, requests, results);
 
     if (dfs_read_trace_enabled()) {
         const int64_t duration_us =
@@ -1255,132 +1169,11 @@ DistributedStorageBackend::BatchReadDirect(
             // bytes / us == MB/s; /1000 -> GB/s.
             gbps = static_cast<double>(total_bytes) / duration_us / 1000.0;
         }
-        LOG(INFO) << "BatchReadDirect: requests=" << requests.size()
-                  << " bytes=" << total_bytes << " duration_us=" << duration_us
+        LOG(INFO) << "BatchRead: requests=" << requests.size()
+                  << " tasks=" << tasks.size() << " bytes=" << total_bytes
+                  << " duration_us=" << duration_us
                   << " bandwidth_GBps=" << gbps;
     }
-    return results;
-}
-
-std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
-    const std::vector<DfsReadRequest>& requests) {
-    const auto timing_start = std::chrono::steady_clock::now();
-    auto elapsed_us = [](const auto& a, const auto& b) {
-        return std::chrono::duration_cast<std::chrono::microseconds>(b - a)
-            .count();
-    };
-    std::vector<tl::expected<void, ErrorCode>> results(
-        requests.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-    if (!initialized_) {
-        std::fill(results.begin(), results.end(),
-                  tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
-        return results;
-    }
-
-    // Default flow: read each key directly, in parallel, with no bucketing.
-    // The merge flow below is kept and can be re-enabled through
-    // MOONCAKE_DFS_BATCH_READ_MERGE_ENABLED.
-    if (!distributed_config_.batch_read_merge_enabled) {
-        return BatchReadDirect(requests);
-    }
-
-    std::vector<PreparedRead> prepared;
-    prepared.reserve(requests.size());
-    for (size_t i = 0; i < requests.size(); ++i) {
-        const auto& request = requests[i];
-        auto target = ResolveTarget(request.descriptor, request.key);
-        if (!target) {
-            results[i] = tl::make_unexpected(target.error());
-            continue;
-        }
-
-        uint64_t capacity = 0;
-        bool invalid = false;
-        for (const auto& slice : request.slices) {
-            if ((!slice.ptr && slice.size != 0) ||
-                slice.size > std::numeric_limits<uint64_t>::max() - capacity) {
-                invalid = true;
-                break;
-            }
-            capacity += slice.size;
-        }
-        if (invalid || capacity < request.descriptor.object_size) continue;
-
-        if (!IsBucketMode()) {
-            std::vector<char> value(request.descriptor.object_size);
-            std::lock_guard<std::mutex> lock(*target->mutex);
-            const ErrorCode error = ReadFully(fs_adapter_.get(), *target,
-                                              request.descriptor.offset, value);
-            if (error != ErrorCode::OK) {
-                results[i] = tl::make_unexpected(error);
-                continue;
-            }
-            CopyToSlices(request, value.data());
-            results[i] = {};
-            continue;
-        }
-
-        prepared.push_back({i, std::move(*target), request.descriptor.offset,
-                            request.descriptor.aligned_size});
-    }
-
-    if (!IsBucketMode()) {
-        if (dfs_read_trace_enabled()) {
-            LOG(INFO) << "BatchRead: requests=" << requests.size()
-                      << " duration_us="
-                      << elapsed_us(timing_start,
-                                    std::chrono::steady_clock::now());
-        }
-        return results;
-    }
-
-    // Bucket the reads by open file handle, then sort each bucket by entry
-    // offset so runs of contiguous entries collapse into a single read
-    // regardless of the order the caller passed them in.
-    auto groups = GroupReadsByBucket(std::move(prepared));
-    for (auto& [mutex, group] : groups) {
-        SortGroupByOffset(group);
-    }
-
-    MergeStats stats;
-    if (batch_read_pool_ != nullptr && groups.size() > 1) {
-        DispatchParallelReads(groups, requests, results, *batch_read_pool_,
-                              fs_adapter_.get(), stats);
-    } else {
-        // A single bucket has nothing to overlap with, so skip the pool.
-        for (auto& [mutex, group] : groups) {
-            ProcessBucketGroup(group, requests, results, fs_adapter_.get(),
-                               stats);
-        }
-    }
-
-    if (dfs_read_trace_enabled()) {
-        const int64_t duration_us =
-            elapsed_us(timing_start, std::chrono::steady_clock::now());
-        uint64_t total_bytes = 0;
-        for (const auto& request : requests) {
-            total_bytes += request.descriptor.object_size;
-        }
-        double gbps = 0.0;
-        if (duration_us > 0) {
-            // bytes / us == MB/s; /1000 -> GB/s.
-            gbps = static_cast<double>(total_bytes) / duration_us / 1000.0;
-        }
-        const uint64_t aggregated_reads = stats.aggregated_reads.load();
-        const uint64_t merged_ios = stats.merged_ios.load();
-        const uint64_t merged_bytes = stats.merged_bytes.load();
-        double avg_merged_size = 0.0;
-        if (merged_ios > 0) {
-            avg_merged_size = static_cast<double>(merged_bytes) / merged_ios;
-        }
-        LOG(INFO) << "BatchRead: requests=" << requests.size()
-                  << " buckets=" << groups.size() << " bytes=" << total_bytes
-                  << " duration_us=" << duration_us
-                  << " bandwidth_GBps=" << gbps << " merged_ios=" << merged_ios
-                  << " saved_ios=" << aggregated_reads - merged_ios
-                  << " avg_merged_size=" << avg_merged_size;
-    }
-
     return results;
 }
 
