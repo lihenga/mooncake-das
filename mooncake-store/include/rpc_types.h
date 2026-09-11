@@ -1,10 +1,18 @@
 #pragma once
 
+#include <optional>
+
 #include "types.h"
 #include "replica.h"
 #include "task_manager.h"
 
 namespace mooncake {
+
+struct ObjectMeta {
+    std::string key;
+    std::optional<uint64_t> object_checksum;
+};
+YLT_REFL(ObjectMeta, key, object_checksum);
 
 /**
  * @brief Response structure for Ping operation

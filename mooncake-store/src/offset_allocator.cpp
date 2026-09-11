@@ -6,6 +6,7 @@
 #include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 
 #include "mutex.h"
 #include "utils.h"
@@ -603,6 +604,25 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
     return OffsetAllocationHandle(
         shared_from_this(), allocation,
         m_base + (allocation.getOffset() << m_multiplier_bits), size);
+}
+
+uint64_t OffsetAllocator::normalizedAllocationSize(size_t size) const {
+    if (size == 0) {
+        return 0;
+    }
+    const uint64_t quantum = uint64_t{1} << m_multiplier_bits;
+    if (size > std::numeric_limits<uint64_t>::max() - (quantum - 1)) {
+        return 0;
+    }
+    const uint64_t fake_size =
+        m_multiplier_bits > 0 ? ((size + quantum - 1) >> m_multiplier_bits)
+                              : size;
+    if (fake_size > SmallFloat::MAX_BIN_SIZE) {
+        return 0;
+    }
+    return static_cast<uint64_t>(SmallFloat::floatToUint(
+               SmallFloat::uintToFloatRoundUp(static_cast<uint32>(fake_size))))
+           << m_multiplier_bits;
 }
 
 OffsetAllocStorageReport OffsetAllocator::storageReport() const {

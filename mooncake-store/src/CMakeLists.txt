@@ -31,6 +31,7 @@ set(MOONCAKE_STORE_SOURCES
     client_buffer.cpp
     aligned_client_buffer.cpp
     real_client.cpp
+    dfs_prefetcher.cpp
     registered_pinned_memory.cpp
     dummy_client.cpp
     uds_transport.cpp
@@ -38,7 +39,10 @@ set(MOONCAKE_STORE_SOURCES
     http_metadata_server.cpp
     file_storage.cpp
     serialize/serializer.cpp
+    storage/distributed/dfs_global_allocator.cpp
+    storage/distributed/bucket_global_allocator.cpp
     storage/distributed/distributed_storage_backend.cpp
+    storage/distributed/posix_fs_adapter.cpp
     device/accelerator_device.cpp
     device/accelerator_registry.cpp
     device/runtime_accelerator.cpp

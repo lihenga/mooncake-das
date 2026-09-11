@@ -104,8 +104,12 @@ BufferHandle::BufferHandle(
     : allocator_(std::move(allocator)), handle_(std::move(handle)) {}
 
 BufferHandle::BufferHandle(void* ptr, size_t size,
-                           std::function<void()> release_fn)
-    : view_ptr_(ptr), view_size_(size), release_fn_(std::move(release_fn)) {}
+                           std::function<void()> release_fn,
+                           void* device_ptr)
+    : view_ptr_(ptr),
+      view_size_(size),
+      release_fn_(std::move(release_fn)),
+      view_device_ptr_(device_ptr) {}
 
 BufferHandle::~BufferHandle() {
     if (release_fn_) {
@@ -120,6 +124,10 @@ void* BufferHandle::ptr() const {
 
 size_t BufferHandle::size() const {
     return view_ptr_ ? view_size_ : handle_.size();
+}
+
+void* BufferHandle::device_ptr() const {
+    return view_ptr_ ? view_device_ptr_ : nullptr;
 }
 
 // Utility functions for buffer and slice management
@@ -149,6 +157,8 @@ uint64_t calculate_total_size(const Replica::Descriptor& replica) {
         total_length = disk_descriptor.object_size;
     } else if (replica.is_local_disk_replica()) {
         total_length = replica.get_local_disk_descriptor().object_size;
+    } else if (replica.is_dfs_replica()) {
+        total_length = replica.get_dfs_descriptor().object_size;
     } else if (replica.is_nof_replica()) {
         total_length = replica.get_nof_descriptor().buffer_descriptor.size_;
     } else {
@@ -172,6 +182,9 @@ int allocateSlices(std::vector<Slice>& slices,
     } else if (replica.is_local_disk_replica()) {
         slices.emplace_back(
             Slice{buffer_ptr, replica.get_local_disk_descriptor().object_size});
+    } else if (replica.is_dfs_replica()) {
+        slices.emplace_back(
+            Slice{buffer_ptr, replica.get_dfs_descriptor().object_size});
     } else if (replica.is_nof_replica()) {
         auto& handle = replica.get_nof_descriptor().buffer_descriptor;
         void* chunk_ptr = buffer_ptr;

@@ -54,6 +54,9 @@ class MasterSnapshotCodecTest;  // test fixture, needs private state access
 }  // namespace ha
 
 class EtcdOpLogStore;
+class DfsGlobalAllocator;
+class BucketGlobalAllocator;
+class GlobalAllocatorInterface;
 
 // Forward declarations
 class AllocationStrategy;
@@ -129,6 +132,27 @@ class MasterService {
     tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
     DeleteTenantQuotaPolicy(const TenantId& tenant_id);
     uint64_t GetTenantQuotaAllocatableCapacityBytes();
+    void RefreshDfsMetrics() const;
+
+    /**
+     * @brief Dynamically set the max_bucket_count of the DFS bucket allocator.
+     *
+     * Only valid in BUCKET mode; returns UNAVAILABLE_IN_CURRENT_MODE otherwise.
+     * @return the previous max_bucket_count on success.
+     */
+    tl::expected<int64_t, ErrorCode> SetDfsMaxBucketCount(
+        int64_t new_max_bucket_count);
+
+    /**
+     * @brief Test-only wrapper around BatchEvict / NoFBatchEvict so that
+     *        unit tests can drive a single eviction cycle synchronously
+     *        without standing up the periodic eviction thread.
+     */
+    void RunBatchEvictForTesting(double evict_ratio_target,
+                                 double evict_ratio_lowerbound);
+    void RunNoFBatchEvictForTesting(double evict_ratio_target,
+                                    double evict_ratio_lowerbound);
+    void RunDfsEvictionForTesting();
 
     /**
      * @brief Mount a memory segment for buffer allocation. This function is
@@ -383,6 +407,21 @@ class MasterService {
                   const TenantId& tenant_id, const uint64_t slice_length,
                   const ReplicateConfig& config)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+
+    /**
+     * @brief Batch variant of PutStart that keeps a batch's DFS entries
+     * contiguous.
+     *
+     * When any key requests a DFS replica, the DFS space for the whole batch is
+     * reserved in a single allocator call before the per-key PutStart work, so
+     * concurrent batches cannot interleave inside a bucket. Keys whose PutStart
+     * subsequently fails have their reservation released.
+     */
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
+                  const TenantId& tenant_id,
+                  const std::vector<uint64_t>& slice_lengths,
+                  const ReplicateConfig& config);
 
     /**
      * @brief Complete a put operation, replica_type indicates the type of
@@ -818,6 +857,18 @@ class MasterService {
    private:
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore();
 
+    /**
+     * @brief PutStart implementation shared by the single-key and batch paths.
+     * `preallocated_dfs` carries a DFS reservation already made by the caller
+     * (BatchPutStart); when nullopt the DFS replica is allocated inline.
+     */
+    auto PutStartInternal(
+        const UUID& client_id, const std::string& key,
+        const TenantId& tenant_id, const uint64_t slice_length,
+        const ReplicateConfig& config,
+        const std::optional<DistributedFSDescriptor>& preallocated_dfs)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+
     // Restore master state
     void RestoreState();
     void ResetStateAfterFailedRestoreAttempt();
@@ -1060,7 +1111,7 @@ class MasterService {
             return EraseReplicas([replica_type](const Replica& replica) {
                 if (replica_type == ReplicaType::ALL) {
                     return replica.is_memory_replica() ||
-                           replica.is_nof_replica();
+                           replica.is_nof_replica() || replica.is_dfs_replica();
                 }
                 return replica.type() == replica_type;
             });
@@ -1482,13 +1533,36 @@ class MasterService {
 
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
     // and return descriptor list.  Shared by PutStart and UpsertStart.
+    //
+    // `preallocated_dfs` lets BatchPutStart reserve the whole batch's DFS space
+    // in one allocator call (keeping the batch contiguous) and hand the
+    // reservation down, instead of this function allocating per key. When it is
+    // nullopt the DFS replica is allocated here as before.
     auto AllocateAndInsertMetadata(
         MetadataShardAccessorRW& shard, const UUID& client_id,
         const std::string& key, uint64_t value_length,
         const ReplicateConfig& config, const std::string& group_id,
         const TenantId& tenant_id,
-        const std::chrono::system_clock::time_point& now)
+        const std::chrono::system_clock::time_point& now,
+        const std::optional<DistributedFSDescriptor>& preallocated_dfs =
+            std::nullopt,
+        bool* dfs_allocation_failed = nullptr)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+
+    /**
+     * @brief Reserve DFS space for a whole batch in one allocator call.
+     *
+     * Returns a per-key descriptor map for the keys that need a DFS replica.
+     * On partial failure every successful reservation is released before
+     * returning, so the batch is all-or-nothing from the allocator's point of
+     * view. `errors_out` receives per-key errors for reporting.
+     */
+    std::unordered_map<std::string, DistributedFSDescriptor>
+    ReserveDfsSpaceForBatch(
+        const std::vector<std::string>& keys,
+        const std::vector<uint64_t>& value_lengths,
+        const std::vector<bool>& needs_dfs,
+        std::unordered_map<std::string, ErrorCode>& errors_out);
 
     /**
      * @brief Helper to discard expired processing keys.
@@ -1496,7 +1570,22 @@ class MasterService {
     void DiscardExpiredProcessingReplicas(
         MetadataShardAccessorRW& shard,
         const std::chrono::system_clock::time_point& now);
-
+    void FreeDfsReplicas(const std::string& key,
+                         const std::vector<Replica>& replicas);
+    void RunDfsEviction();
+    // Whole-bucket eviction (BUCKET mode). Uses a strict two-phase protocol:
+    // validate every candidate first and only mutate metadata once all of them
+    // are accepted, so a bucket file is never deleted while the master still
+    // hands out a descriptor into it.
+    void RunBucketDfsEviction();
+    bool RunBucketDfsEvictionInternal(bool force_one);
+    bool TryRecoverDfsSpaceAfterAllocationFailure();
+    // Shard-mode per-key eviction (unchanged behaviour).
+    void RunShardDfsEviction();
+    // Re-registers DFS replicas recovered from bucket metadata as COMPLETE so
+    // a restarted master can serve them. Called once, before serving traffic.
+    void RestoreRecoveredDfsReplicas();
+    void InitDfsAllocatorFromEnvironment(const MasterServiceConfig& config);
     /**
      * @brief Helper to release space of expired discarded replicas.
      * @return Number of released objects that have memory replicas
@@ -2038,6 +2127,16 @@ class MasterService {
     void cleanupHttpMetadata(const std::string& segment_name);
 
     bool use_disk_replica_{false};
+    bool enable_dfs_{false};
+    // Chosen by configuration at startup: DfsGlobalAllocator (SHARD, the
+    // default) or BucketGlobalAllocator (BUCKET). The master only ever talks
+    // to it through GlobalAllocatorInterface.
+    std::unique_ptr<GlobalAllocatorInterface> dfs_allocator_;
+    // Non-owning downcast of dfs_allocator_, set only in BUCKET mode. Used for
+    // the bucket-specific lifecycle calls (MarkCommitted, two-phase eviction,
+    // recovery, deferred metadata flush) that are not part of the common
+    // interface.
+    BucketGlobalAllocator* bucket_allocator_{nullptr};
 
     // Segment management
     SegmentManager segment_manager_;

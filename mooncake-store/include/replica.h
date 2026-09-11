@@ -27,6 +27,22 @@ namespace mooncake {
  */
 using ReplicaID = uint64_t;
 
+inline constexpr const char* DirectStorageMetricSource(
+    ReplicaType replica_type) noexcept {
+    switch (replica_type) {
+        case ReplicaType::MEMORY:
+        case ReplicaType::NOF_SSD:
+            return "memory";
+        case ReplicaType::LOCAL_DISK:
+            return "local_disk";
+        case ReplicaType::DISK:
+        case ReplicaType::DFS:
+            return "dfs";
+        default:
+            return "unknown";
+    }
+}
+
 /**
  * @brief Stream operator for ReplicaType
  */
@@ -37,7 +53,8 @@ inline std::ostream& operator<<(std::ostream& os,
                              {ReplicaType::DISK, "DISK"},
                              {ReplicaType::LOCAL_DISK, "LOCAL_DISK"},
                              {ReplicaType::NOF_SSD, "NOF_SSD"},
-                             {ReplicaType::ALL, "ALL"}};
+                             {ReplicaType::ALL, "ALL"},
+                             {ReplicaType::DFS, "DFS"}};
 
     os << (replica_type_strings.count(replicaType)
                ? replica_type_strings.at(replicaType)
@@ -56,6 +73,12 @@ enum class ReplicaStatus {
     REMOVED,        // Replica has been removed
     FAILED,         // Failed state (can be used for reassignment)
 };
+
+inline const char* DfsReplicaMetricStatus(ReplicaStatus status) {
+    if (status == ReplicaStatus::PROCESSING) return "processing";
+    if (status == ReplicaStatus::COMPLETE) return "complete";
+    return nullptr;
+}
 
 /**
  * @brief Stream operator for ReplicaStatus
@@ -81,6 +104,7 @@ inline std::ostream& operator<<(std::ostream& os,
 struct ReplicateConfig {
     size_t replica_num{1};
     size_t nof_replica_num{0};
+    size_t dfs_replica_num{0};
     bool with_soft_pin{false};
     bool with_hard_pin{false};  // Hard pin: object cannot be evicted
     std::vector<std::string>
@@ -110,6 +134,7 @@ struct ReplicateConfig {
                                     const ReplicateConfig& config) noexcept {
         os << "ReplicateConfig: { replica_num: " << config.replica_num
            << ", nof_replica_num: " << config.nof_replica_num
+           << ", dfs_replica_num: " << config.dfs_replica_num
            << ", with_soft_pin: " << config.with_soft_pin
            << ", with_hard_pin: " << config.with_hard_pin
            << ", preferred_segments: [";
@@ -155,10 +180,12 @@ enum class ReplicaWriteMode {
 
 inline ReplicaWriteMode DetermineReplicaWriteMode(
     const ReplicateConfig& config) {
-    if (config.replica_num == 1 && config.nof_replica_num == 1) {
+    if (config.dfs_replica_num == 0 && config.replica_num == 1 &&
+        config.nof_replica_num == 1) {
         return ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA;
     }
-    if (config.replica_num > 1 || config.nof_replica_num > 1) {
+    if (config.replica_num > 1 || config.nof_replica_num > 1 ||
+        config.dfs_replica_num > 0) {
         return ReplicaWriteMode::RELIABLE_MULTI_REPLICA;
     }
     return ReplicaWriteMode::SINGLE_REPLICA;
@@ -181,6 +208,20 @@ struct LocalDiskReplicaData {
     UUID client_id;
     uint64_t object_size = 0;
     std::string transport_endpoint;
+};
+
+struct DistributedFSDescriptor {
+    std::string file_path;
+    uint64_t offset = 0;
+    uint64_t object_size = 0;
+    uint64_t aligned_size = 0;
+    int shard_idx = 0;
+    YLT_REFL(DistributedFSDescriptor, file_path, offset, object_size,
+             aligned_size, shard_idx);
+};
+
+struct DfsReplicaData {
+    DistributedFSDescriptor descriptor;
 };
 
 struct MemoryDescriptor {
@@ -251,6 +292,20 @@ class Replica {
         MasterMetricManager::instance().inc_allocated_file_size(object_size);
     }
 
+    // dfs replica constructor
+    Replica(DistributedFSDescriptor descriptor, ReplicaStatus status)
+        : id_(next_id_.fetch_add(1)),
+          data_(DfsReplicaData{std::move(descriptor)}),
+          status_(status),
+          refcnt_(0) {
+        if (is_dfs_replica()) {
+            const char* metric_status = DfsReplicaMetricStatus(status_);
+            if (metric_status != nullptr) {
+                MasterMetricManager::instance().inc_dfs_replica(metric_status);
+            }
+        }
+    }
+
     ~Replica() {
         if (status_ == ReplicaStatus::UNDEFINED) return;
         if (is_disk_replica()) {
@@ -259,6 +314,10 @@ class Replica {
         } else if (is_local_disk_replica()) {
             MasterMetricManager::instance().dec_allocated_file_size(
                 std::get<LocalDiskReplicaData>(data_).object_size);
+        } else if (is_dfs_replica()) {
+            if (const char* metric_status = DfsReplicaMetricStatus(status_)) {
+                MasterMetricManager::instance().dec_dfs_replica(metric_status);
+            }
         }
     }
 
@@ -291,6 +350,12 @@ class Replica {
             } else if (is_local_disk_replica()) {
                 MasterMetricManager::instance().dec_allocated_file_size(
                     std::get<LocalDiskReplicaData>(data_).object_size);
+            } else if (is_dfs_replica()) {
+                if (const char* metric_status =
+                        DfsReplicaMetricStatus(status_)) {
+                    MasterMetricManager::instance().dec_dfs_replica(
+                        metric_status);
+                }
             }
         }
 
@@ -368,6 +433,22 @@ class Replica {
         return replica.is_local_disk_replica();
     }
 
+    [[nodiscard]] bool is_dfs_replica() const {
+        return std::holds_alternative<DfsReplicaData>(data_);
+    }
+
+    [[nodiscard]] static bool fn_is_dfs_replica(const Replica& replica) {
+        return replica.is_dfs_replica();
+    }
+
+    [[nodiscard]] const DistributedFSDescriptor& get_dfs_descriptor() const {
+        return std::get<DfsReplicaData>(data_).descriptor;
+    }
+
+    [[nodiscard]] DistributedFSDescriptor& get_dfs_descriptor() {
+        return std::get<DfsReplicaData>(data_).descriptor;
+    }
+
     [[nodiscard]] bool has_invalid_mem_handle() const {
         if (is_memory_replica()) {
             const auto& mem_data = std::get<MemoryReplicaData>(data_);
@@ -429,6 +510,10 @@ class Replica {
 
     void mark_complete() {
         if (status_ == ReplicaStatus::PROCESSING) {
+            if (is_dfs_replica()) {
+                MasterMetricManager::instance().transition_dfs_replica(
+                    "processing", "complete");
+            }
             status_ = ReplicaStatus::COMPLETE;
         } else if (status_ == ReplicaStatus::COMPLETE) {
             LOG(WARNING) << "Replica already marked as complete";
@@ -439,6 +524,10 @@ class Replica {
 
     void mark_processing() {
         if (status_ == ReplicaStatus::COMPLETE) {
+            if (is_dfs_replica()) {
+                MasterMetricManager::instance().transition_dfs_replica(
+                    "complete", "processing");
+            }
             status_ = ReplicaStatus::PROCESSING;
         } else {
             LOG(ERROR) << "Cannot mark_processing from status: " << status_;
@@ -466,12 +555,15 @@ class Replica {
         ReplicaType operator()(const LocalDiskReplicaData&) const {
             return ReplicaType::LOCAL_DISK;
         }
+        ReplicaType operator()(const DfsReplicaData&) const {
+            return ReplicaType::DFS;
+        }
     };
 
     struct Descriptor {
         ReplicaID id;
         std::variant<MemoryDescriptor, NoFDescriptor, DiskDescriptor,
-                     LocalDiskDescriptor>
+                     LocalDiskDescriptor, DistributedFSDescriptor>
             descriptor_variant;
         ReplicaStatus status;
         YLT_REFL(Descriptor, id, descriptor_variant, status);
@@ -511,6 +603,16 @@ class Replica {
                 descriptor_variant);
         }
 
+        bool is_dfs_replica() noexcept {
+            return std::holds_alternative<DistributedFSDescriptor>(
+                descriptor_variant);
+        }
+
+        bool is_dfs_replica() const noexcept {
+            return std::holds_alternative<DistributedFSDescriptor>(
+                descriptor_variant);
+        }
+
         MemoryDescriptor& get_memory_descriptor() {
             if (auto* desc =
                     std::get_if<MemoryDescriptor>(&descriptor_variant)) {
@@ -539,6 +641,14 @@ class Replica {
                 return *desc;
             }
             throw std::runtime_error("Expected LocalDiskDescriptor");
+        }
+
+        DistributedFSDescriptor& get_dfs_descriptor() {
+            if (auto* desc =
+                    std::get_if<DistributedFSDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected DistributedFSDescriptor");
         }
 
         const MemoryDescriptor& get_memory_descriptor() const {
@@ -570,6 +680,14 @@ class Replica {
             }
             throw std::runtime_error("Expected LocalDiskDescriptor");
         }
+
+        const DistributedFSDescriptor& get_dfs_descriptor() const {
+            if (auto* desc =
+                    std::get_if<DistributedFSDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected DistributedFSDescriptor");
+        }
     };
 
    private:
@@ -577,7 +695,7 @@ class Replica {
 
     ReplicaID id_;
     std::variant<MemoryReplicaData, NoFReplicaData, DiskReplicaData,
-                 LocalDiskReplicaData>
+                 LocalDiskReplicaData, DfsReplicaData>
         data_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
 
@@ -628,6 +746,8 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         local_disk_desc.object_size = disk_data.object_size;
         local_disk_desc.transport_endpoint = disk_data.transport_endpoint;
         desc.descriptor_variant = std::move(local_disk_desc);
+    } else if (is_dfs_replica()) {
+        desc.descriptor_variant = std::get<DfsReplicaData>(data_).descriptor;
     }
 
     return desc;
@@ -679,6 +799,18 @@ inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {
         const auto& disk_data = std::get<DiskReplicaData>(replica.data_);
         os << "type: DISK, file_path: " << disk_data.file_path
            << ", object_size: " << disk_data.object_size;
+    } else if (replica.is_local_disk_replica()) {
+        const auto& disk_data = std::get<LocalDiskReplicaData>(replica.data_);
+        os << "type: LOCAL_DISK, client_id: " << disk_data.client_id
+           << ", object_size: " << disk_data.object_size
+           << ", transport_endpoint: " << disk_data.transport_endpoint;
+    } else if (replica.is_dfs_replica()) {
+        const auto& dfs_data = std::get<DfsReplicaData>(replica.data_);
+        os << "type: DFS, file_path: " << dfs_data.descriptor.file_path
+           << ", offset: " << dfs_data.descriptor.offset
+           << ", object_size: " << dfs_data.descriptor.object_size
+           << ", aligned_size: " << dfs_data.descriptor.aligned_size
+           << ", shard_idx: " << dfs_data.descriptor.shard_idx;
     }
 
     os << ", refcnt: " << replica.refcnt_.load() << " }";

@@ -31,6 +31,8 @@
 namespace mooncake {
 
 class PutOperation;
+class DistributedStorageBackend;
+class RealClient;
 
 /**
  * @brief Result of a query operation containing replica information and lease
@@ -179,6 +181,9 @@ class Client {
                                       const QueryResult& query_result,
                                       std::vector<Slice>& slices,
                                       uint64_t src_offset);
+    std::optional<TransferEngine::ScatterTransferOperation> SubmitScatter(
+        const std::vector<TransferEngine::ScatterTransferRange>& transfers);
+
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects
@@ -214,6 +219,37 @@ class Client {
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
         const ReplicateConfig& config);
+
+    /**
+     * @brief Write slices into a memory replica at an object-byte offset.
+     */
+    ErrorCode TransferWriteRange(const Replica::Descriptor& replica_descriptor,
+                                 std::vector<Slice>& slices,
+                                 uint64_t dst_offset);
+
+    /**
+     * @brief Batch ranged read against cached replicas. Fragments from all
+     * entries are issued as one scatter transfer so the transport can coalesce
+     * everything bound for the same segment, then awaited together. Requires
+     * memory replicas. Returns per-entry total bytes transferred or an
+     * ErrorCode. Used by RealClient get sessions. No Master RPC.
+     */
+    std::vector<tl::expected<int64_t, ErrorCode>> BatchTransferReadRanges(
+        const std::vector<Replica::Descriptor>& replicas,
+        const std::vector<std::vector<Slice>>& slices,
+        const std::vector<std::vector<uint64_t>>& src_offsets);
+
+    /**
+     * @brief Batch ranged write into cached replicas (replication). Fragments
+     * from all entries and all memory replicas are issued as one scatter
+     * transfer, then awaited together. Returns per-entry logical bytes
+     * transferred (counted once, not per replica) or an ErrorCode. Used by
+     * RealClient put sessions.
+     */
+    std::vector<tl::expected<int64_t, ErrorCode>> BatchTransferWriteRanges(
+        const std::vector<std::vector<Replica::Descriptor>>& replicas_per_entry,
+        const std::vector<std::vector<Slice>>& slices,
+        const std::vector<std::vector<uint64_t>>& dst_offsets);
 
     /**
      * @brief Upserts data: inserts if key doesn't exist, updates if it does
@@ -513,6 +549,8 @@ class Client {
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
+    void SetDfsStorageBackend(
+        std::shared_ptr<DistributedStorageBackend> backend);
 
     /**
      * @brief Fetch tasks assigned to a client
@@ -553,6 +591,42 @@ class Client {
         }
     }
 
+    void ObserveDirectAccess(const std::string& source, bool success,
+                             uint64_t bytes) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveDirectAccess(source, success, bytes);
+        }
+    }
+
+    [[nodiscard]] bool MetricsEnabled() const { return metrics_ != nullptr; }
+
+    void ObservePrefetchedTokens(uint64_t tokens) {
+        if (metrics_ != nullptr) {
+            metrics_->ObservePrefetchedTokens(tokens);
+        }
+    }
+
+    void ObserveDirectSessionCache(bool hit) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveDirectSessionCache(hit);
+        }
+    }
+
+    void ObserveDirectSessionCacheEviction() {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveDirectSessionCacheEviction();
+        }
+    }
+
+    void ObserveDirectIo(const std::string& operation,
+                         const std::string& source, bool success,
+                         uint64_t bytes, double duration_seconds) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveDirectIo(operation, source, success, bytes,
+                                      duration_seconds);
+        }
+    }
+
     // For Prometheus-style metrics
     tl::expected<std::string, ErrorCode> SerializeMetrics() {
         if (metrics_ == nullptr) {
@@ -565,6 +639,10 @@ class Client {
 
     SsdMetric* GetSsdMetricPtr() {
         return metrics_ ? &metrics_->ssd_metric : nullptr;
+    }
+
+    DfsPrefetchMetric* GetDfsPrefetchMetricPtr() {
+        return metrics_ ? &metrics_->dfs_prefetch_metric : nullptr;
     }
 
     [[nodiscard]] std::string GetTransportEndpoint() {
@@ -651,6 +729,23 @@ class Client {
 
     bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
 
+    // First half of BatchPut only (size-only slices → StartBatchPut).
+    // Used by RealClient put sessions; not a Master API facade.
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    StartBatchPutForSizes(const std::vector<std::string>& keys,
+                          const std::vector<uint64_t>& object_sizes,
+                          const ReplicateConfig& config);
+
+    // Finalize/revoke a put session for a batch of keys. Thin wrappers over
+    // the master client, exposed so RealClient put sessions can end/revoke
+    // without touching Client internals. Same RPC path as FinalizeBatchPut.
+    std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
+        const std::vector<ObjectMeta>& object_metas,
+        ReplicaType replica_type = ReplicaType::ALL);
+    std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
+        const std::vector<std::string>& keys,
+        ReplicaType replica_type = ReplicaType::ALL);
+
    protected:
     /**
      * @brief Constructor exposed to subclasses for testing only; production
@@ -677,6 +772,15 @@ class Client {
     ErrorCode TransferReadInternal(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices, uint64_t src_offset);
+    // Internal async range submission helpers (return the transfer future).
+    // Used by the synchronous TransferReadRange/WriteRange and the batch
+    // range transfer methods; not part of the public API.
+    std::optional<TransferFuture> SubmitRangeRead(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, uint64_t src_offset);
+    std::optional<TransferFuture> SubmitRangeWrite(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, uint64_t dst_offset);
     ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
                             std::vector<Slice>& slices);
     ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
@@ -684,6 +788,9 @@ class Client {
     ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,
                                 std::vector<Slice>& slices,
                                 uint64_t src_offset);
+    ErrorCode ReadDfsReplica(const std::string& key,
+                             const Replica::Descriptor& replica_descriptor,
+                             std::vector<Slice>& slices);
 
     /**
      * @brief Prepare and use the storage backend for persisting data
@@ -765,6 +872,24 @@ class Client {
                        const ReplicateConfig& config);
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
+
+    /**
+     * @brief Perform the DFS writes for a batch.
+     *
+     * In BUCKET mode this stages every slice into task-owned memory and hands
+     * the work to `write_thread_pool_`, so BatchPut does not wait for DFS I/O;
+     * the background task sends PutEnd/PutRevoke itself. In SHARD mode the
+     * write stays synchronous, preserving the upstream contract that a
+     * successful Put means the DFS copy is already durable.
+     *
+     * @param is_upsert Selects UpsertEnd/UpsertRevoke instead of
+     *        PutEnd/PutRevoke for the asynchronous completion.
+     * @param allow_async Set to false to force the synchronous path even in
+     *        BUCKET mode. Used by the upsert paths, whose finalize RPCs act on
+     *        ReplicaType::ALL and would collide with a deferred completion.
+     */
+    void SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert = false,
+                         bool allow_async = true);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
     void StartBatchUpsert(std::vector<PutOperation>& ops,
                           const ReplicateConfig& config);
@@ -772,13 +897,64 @@ class Client {
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
 
+    std::vector<ErrorCode> WriteDfsReplicas(
+        const std::vector<std::string>& keys,
+        const std::vector<const std::vector<Slice>*>& slice_lists,
+        const std::vector<DistributedFSDescriptor>& descriptors);
+
+    /**
+     * @brief Everything one asynchronous DFS write batch needs, owned outright.
+     *
+     * The background task must not reference the caller's CPU or GPU buffers,
+     * which may be freed or overwritten as soon as BatchPut returns. All slice
+     * bytes are therefore copied into owned storage (pinned host memory when a
+     * GPU is involved, plain host memory otherwise) before the task is queued,
+     * and `slices` points into that storage.
+     *
+     * `backend` and `pinned_pool` are held by shared_ptr so the task keeps them
+     * alive even if the Client is torn down while the write is in flight.
+     */
+    struct AsyncDfsWriteContext {
+        std::vector<std::string> keys;
+        std::vector<DistributedFSDescriptor> descriptors;
+        std::vector<std::vector<Slice>> slices;
+        std::vector<PinnedBufferPool::Buffer> staging;
+        std::vector<std::vector<char>> host_staging;
+        std::shared_ptr<DistributedStorageBackend> backend;
+        std::shared_ptr<PinnedBufferPool> pinned_pool;
+        bool is_upsert = false;
+
+        ~AsyncDfsWriteContext();
+    };
+
+    /**
+     * @brief Copy a batch's slices into context-owned storage.
+     * GPU pointers go through a D2H copy into pinned host memory; host pointers
+     * are memcpy'd. Returns false if any staging step fails.
+     */
+    bool StageDfsWriteData(
+        AsyncDfsWriteContext& context,
+        const std::vector<const std::vector<Slice>*>& slice_lists);
+
+    /**
+     * @brief Run one staged DFS write batch and report the outcome to master.
+     * Executed on `write_thread_pool_`; must only touch context-owned state.
+     */
+    void RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context);
+
+    /**
+     * @brief Wait until every queued asynchronous DFS write has finished.
+     * Called from the destructor before the master client goes away.
+     */
+    void DrainAsyncDfsWrites();
+
     std::vector<tl::expected<void, ErrorCode>> BatchPutWhenPreferSameNode(
         std::vector<PutOperation>& ops);
     std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices);
-    ReplicateConfig AttachHostId(const ReplicateConfig& config) const;
+    ReplicateConfig AttachConfig(const ReplicateConfig& config) const;
 
     // Client identification
     const UUID client_id_;
@@ -825,11 +1001,21 @@ class Client {
     const std::string protocol_;
 
     // Client persistent thread pool for async operations
-    // Pinned host memory pool for GPU D2H staging (must outlive
-    // write_thread_pool_)
-    std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
+    // Pinned host memory pool for GPU D2H staging. Held by shared_ptr so an
+    // in-flight async DFS write keeps it alive even while the Client is being
+    // destroyed.
+    std::shared_ptr<PinnedBufferPool> pinned_buffer_pool_;
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
+    std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;
+
+    // Tracks asynchronous DFS writes so the destructor can drain them before
+    // tearing down the RPC client they report their result through.
+    std::mutex dfs_inflight_mutex_;
+    std::condition_variable dfs_inflight_cv_;
+    size_t dfs_inflight_writes_{0};
+    // Set during destruction: no new async DFS writes are accepted afterwards.
+    std::atomic<bool> dfs_writes_shutting_down_{false};
 
     // For high availability
     std::unique_ptr<ha::LeaderCoordinator> leader_coordinator_;
