@@ -324,7 +324,8 @@ class RealClient : public PyClient {
         std::vector<int> &results);
 
     void process_session_disk_dfs_reads(std::vector<NonMemReadEntry *> &entries,
-                                        std::vector<int> &results);
+                                        std::vector<int> &results,
+                                        uint64_t trace_id);
 
     // Helper: scatter cached entries, return miss entries via
     // move-out parameter
