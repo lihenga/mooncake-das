@@ -6013,8 +6013,18 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
             .count();
     };
     if (trace_enabled) {
+        uint64_t total_bytes = 0;
+        uint64_t total_ranges = 0;
+        for (size_t i = 0; i < all_sizes.size(); ++i) {
+            for (size_t size : all_sizes[i]) {
+                total_bytes += size;
+                total_ranges++;
+            }
+        }
         LOG(INFO) << "batch_get_into_multi_buffer_ranges: trace_id=" << trace_id
                   << ", keys=" << keys.size()
+                  << ", total_ranges=" << total_ranges
+                  << ", total_bytes=" << total_bytes
                   << ", mem_reads=" << mem_count
                   << ", cache_evicted=" << cache_evicted_count
                   << ", local_disk_reads=" << local_disk_count
