@@ -5887,13 +5887,19 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     size_t dfs_count = 0;
 
     // 1. Memory replicas: fast scatter path via BatchTransferReadRanges.
+    auto t_transfer_start = timing_start;
+    auto t_transfer_done = timing_start;
+    auto t_merge_done = timing_start;
     if (!replicas.empty()) {
+        t_transfer_start = std::chrono::steady_clock::now();
         auto transfer =
             client_->BatchTransferReadRanges(replicas, slices, src_offsets);
+        t_transfer_done = std::chrono::steady_clock::now();
 
         // Merge results; drop sessions whose lease expired during the wait.
         {
             std::lock_guard<std::mutex> lock(session_mutex_);
+            t_merge_done = std::chrono::steady_clock::now();
             const auto now = std::chrono::steady_clock::now();
             for (size_t k = 0; k < transfer.size(); ++k) {
                 const size_t i = idx_map[k];
@@ -6030,7 +6036,10 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
                   << ", local_disk_reads=" << local_disk_count
                   << ", dfs_reads=" << dfs_count
                   << ", gc_us=" << elapsed_us(timing_start, t_gc_done)
-                  << ", session_mem_us=" << elapsed_us(t_gc_done, t_mem_done)
+                  << ", session_build_us=" << elapsed_us(t_gc_done, t_transfer_start)
+                  << ", transfer_us=" << elapsed_us(t_transfer_start, t_transfer_done)
+                  << ", merge_lock_us=" << elapsed_us(t_transfer_done, t_merge_done)
+                  << ", merge_work_us=" << elapsed_us(t_merge_done, t_mem_done)
                   << ", disk_access_us=" << elapsed_us(t_mem_done, t_access_done)
                   << ", total_us=" << elapsed_us(timing_start, t_access_done);
     }
