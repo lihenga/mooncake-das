@@ -7051,9 +7051,14 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     auto can_evict_replicas = [&](const ObjectMetadata& metadata) {
         return metadata.HasReplica(is_evictable_memory_replica);
     };
-    auto has_local_disk_replica = [](const ObjectMetadata& metadata) {
-        return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
-    };
+    auto has_completed_persistent_replica =
+        [](const ObjectMetadata& metadata) {
+            return metadata.HasReplica([](const Replica& replica) {
+                return replica.is_completed() &&
+                       (replica.is_local_disk_replica() ||
+                        replica.is_dfs_replica());
+            });
+        };
     auto evict_replicas =
         [&, this](ObjectMetadata& metadata,
                   std::vector<std::vector<Replica>>& deferred_replicas) {
@@ -7088,7 +7093,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                 return evict_replicas(metadata, deferred_replicas);
             }
 
-            if (has_local_disk_replica(metadata)) {
+            if (has_completed_persistent_replica(metadata)) {
                 return evict_replicas(metadata, deferred_replicas);
             }
 
@@ -7312,9 +7317,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
             ? static_cast<long>(offloading_queue_limit_ * offload_cap_ratio_)
             : 0;
 
-    auto has_local_disk_replica = [](const ObjectMetadata& metadata) {
-        return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
-    };
+    auto has_completed_persistent_replica =
+        [](const ObjectMetadata& metadata) {
+            return metadata.HasReplica([](const Replica& replica) {
+                return replica.is_completed() &&
+                       (replica.is_local_disk_replica() ||
+                        replica.is_dfs_replica());
+            });
+        };
 
     // Returns freed bytes. Returns 0 if offload-queued and no additional
     // replicas were evicted (all MEMORY replicas of the key are now pinned).
@@ -7328,8 +7338,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
             return evict_replicas(metadata, deferred_replicas);
         }
 
-        // LOCAL_DISK replica already exists — safe to delete MEMORY immediately
-        if (has_local_disk_replica(metadata)) {
+        // A completed persistent replica already exists; MEMORY can be freed.
+        if (has_completed_persistent_replica(metadata)) {
             return evict_replicas(metadata, deferred_replicas);
         }
 

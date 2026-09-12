@@ -335,12 +335,6 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
                    << init_storage_backend_result.error();
         return init_storage_backend_result;
     }
-    if (config_.enable_dfs) {
-        client_buffer_gc_running_.store(true);
-        client_buffer_gc_thread_ =
-            std::thread(&FileStorage::ClientBufferGCThreadFunc, this);
-        return {};
-    }
     auto enable_offloading_result = IsEnableOffloading();
     if (enable_offloading_result.has_value()) {
         LOG(INFO) << "IsEnableOffloading result: "
