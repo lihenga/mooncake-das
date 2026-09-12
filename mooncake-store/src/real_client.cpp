@@ -5885,17 +5885,21 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     size_t mem_count = replicas.size();
     size_t local_disk_count = 0;
     size_t dfs_count = 0;
-    LOG(INFO) << "batch_get_into_multi_buffer_ranges: key="
-              << (keys.empty() ? std::string("<empty>") : keys.front())
-              << ", key_count=" << keys.size();
+
     // 1. Memory replicas: fast scatter path via BatchTransferReadRanges.
+    auto t_transfer_start = timing_start;
+    auto t_transfer_done = timing_start;
+    auto t_merge_done = timing_start;
     if (!replicas.empty()) {
+        t_transfer_start = std::chrono::steady_clock::now();
         auto transfer =
             client_->BatchTransferReadRanges(replicas, slices, src_offsets);
+        t_transfer_done = std::chrono::steady_clock::now();
 
         // Merge results; drop sessions whose lease expired during the wait.
         {
             std::lock_guard<std::mutex> lock(session_mutex_);
+            t_merge_done = std::chrono::steady_clock::now();
             const auto now = std::chrono::steady_clock::now();
             for (size_t k = 0; k < transfer.size(); ++k) {
                 const size_t i = idx_map[k];
@@ -5914,11 +5918,6 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         }
     }
     const auto t_mem_done = std::chrono::steady_clock::now();
-    LOG(INFO) << "batch_get_into_multi_buffer_ranges: key="
-              << (keys.empty() ? std::string("<empty>") : keys.front())
-              << ", mem_phase_seconds="
-              << std::chrono::duration<double>(t_mem_done - timing_start)
-                     .count();
 
     // 2. Non-memory replicas: batch by endpoint/type, temp buffer + scatter.
     // Group LOCAL_DISK entries by endpoint for batch RPC.
@@ -6020,14 +6019,27 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
             .count();
     };
     if (trace_enabled) {
+        uint64_t total_bytes = 0;
+        uint64_t total_ranges = 0;
+        for (size_t i = 0; i < all_sizes.size(); ++i) {
+            for (size_t size : all_sizes[i]) {
+                total_bytes += size;
+                total_ranges++;
+            }
+        }
         LOG(INFO) << "batch_get_into_multi_buffer_ranges: trace_id=" << trace_id
                   << ", keys=" << keys.size()
+                  << ", total_ranges=" << total_ranges
+                  << ", total_bytes=" << total_bytes
                   << ", mem_reads=" << mem_count
                   << ", cache_evicted=" << cache_evicted_count
                   << ", local_disk_reads=" << local_disk_count
                   << ", dfs_reads=" << dfs_count
                   << ", gc_us=" << elapsed_us(timing_start, t_gc_done)
-                  << ", session_mem_us=" << elapsed_us(t_gc_done, t_mem_done)
+                  << ", session_build_us=" << elapsed_us(t_gc_done, t_transfer_start)
+                  << ", transfer_us=" << elapsed_us(t_transfer_start, t_transfer_done)
+                  << ", merge_lock_us=" << elapsed_us(t_transfer_done, t_merge_done)
+                  << ", merge_work_us=" << elapsed_us(t_merge_done, t_mem_done)
                   << ", disk_access_us=" << elapsed_us(t_mem_done, t_access_done)
                   << ", total_us=" << elapsed_us(timing_start, t_access_done);
     }

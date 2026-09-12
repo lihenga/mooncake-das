@@ -3282,9 +3282,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
                   .count();
-    if (dfs_read_trace_enabled()) {
-        LOG(INFO) << "BatchPut: transfer_and_dfs_write_duration_us=" << us;
-    }
     if (metrics_) {
         metrics_->transfer_metric.batch_put_latency_us.observe(us);
     }
@@ -4288,6 +4285,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
 
     // Every fragment of every entry goes into one scatter submit so the
     // transport sees the whole layer at once instead of one transfer per key.
+    const auto t_build_start = std::chrono::steady_clock::now();
     ScatterRangeBuilder builder(fragment_count);
     std::vector<std::optional<ErrorCode>> entry_errors(replicas.size());
     for (size_t i = 0; i < replicas.size(); ++i) {
@@ -4312,12 +4310,16 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
         }
         results[i] = transferred;  // optimistic; corrected on await
     }
+    const auto t_build_done = std::chrono::steady_clock::now();
 
     if (builder.empty()) {
         return results;
     }
 
+    const auto t_submit_start = t_build_done;
     auto operation = SubmitScatter(builder.ranges());
+    const auto t_submit_done = std::chrono::steady_clock::now();
+
     if (!operation) {
         LOG(ERROR) << "Failed to submit batch range read";
         for (auto& result : results) {
@@ -4327,7 +4329,9 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
         }
         return results;
     }
+    const auto t_wait_start = t_submit_done;
     (void)operation->wait();
+    const auto t_wait_done = std::chrono::steady_clock::now();
 
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i].has_value() || !entry_errors[i].has_value()) {
@@ -4337,6 +4341,20 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
                    << ", error=" << static_cast<int>(entry_errors[i].value());
         results[i] = tl::unexpected(entry_errors[i].value());
     }
+    LOG(INFO) << "BatchTransferReadRanges: fragments=" << fragment_count
+              << ", entries=" << replicas.size()
+              << ", build_us="
+              << std::chrono::duration_cast<std::chrono::microseconds>(
+                     t_build_done - t_build_start)
+                     .count()
+              << ", submit_us="
+              << std::chrono::duration_cast<std::chrono::microseconds>(
+                     t_submit_done - t_submit_start)
+                     .count()
+              << ", wait_us="
+              << std::chrono::duration_cast<std::chrono::microseconds>(
+                     t_wait_done - t_wait_start)
+                     .count();
     return results;
 }
 
