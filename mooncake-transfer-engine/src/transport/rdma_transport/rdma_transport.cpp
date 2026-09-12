@@ -41,6 +41,38 @@
 
 namespace mooncake {
 
+namespace {
+struct PostSendTiming {
+    static constexpr auto kFlushInterval = std::chrono::seconds(10);
+    size_t count = 0;
+    int64_t total_us = 0;
+    size_t total_slices = 0;
+    std::chrono::steady_clock::time_point last_flush =
+        std::chrono::steady_clock::now();
+
+    void record(int64_t us, size_t slices) {
+        total_us += us;
+        total_slices += slices;
+        ++count;
+        if (std::chrono::steady_clock::now() - last_flush >= kFlushInterval)
+            flush();
+    }
+
+    void flush() {
+        if (count == 0) return;
+        LOG(INFO) << "RdmaPostSendTiming: calls=" << count
+                  << ", total_us=" << total_us
+                  << ", total_slices=" << total_slices
+                  << ", avg_us=" << total_us / count;
+        count = 0;
+        total_us = 0;
+        total_slices = 0;
+        last_flush = std::chrono::steady_clock::now();
+    }
+};
+thread_local PostSendTiming post_send_timing_;
+}  // namespace
+
 static bool MCIbRelaxedOrderingEnabled = false;
 static int MCIbRelaxedOrderingMode = 2;
 
@@ -814,8 +846,13 @@ Status RdmaTransport::submitTransferTask(
         }
     }
 
+    const auto post_start = std::chrono::steady_clock::now();
     for (auto &entry : slices_to_post)
         if (!entry.second.empty()) entry.first->submitPostSend(entry.second);
+    auto post_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - post_start)
+                       .count();
+    post_send_timing_.record(post_us, nr_slices);
     return Status::OK();
 }
 

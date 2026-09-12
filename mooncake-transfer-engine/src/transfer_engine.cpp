@@ -896,6 +896,45 @@ class TransferEngine::ScatterTransferOperation::Impl {
 #endif
     };
 
+    // Aggregates per-call timings across calls on this thread; flushes a
+    // summary every kFlushInterval seconds so the logging itself does not
+    // become a serialization point under 8-way concurrency.
+    struct TimingAggregator {
+        static constexpr auto kFlushInterval = std::chrono::seconds(10);
+        size_t count = 0;
+        int64_t total_submit_us = 0;
+        int64_t total_wait_us = 0;
+        size_t total_poll_count = 0;
+        std::chrono::steady_clock::time_point last_flush =
+            std::chrono::steady_clock::now();
+
+        void record(int64_t submit_us, int64_t wait_us, size_t poll_count) {
+            total_submit_us += submit_us;
+            total_wait_us += wait_us;
+            total_poll_count += poll_count;
+            ++count;
+            if (std::chrono::steady_clock::now() - last_flush >=
+                kFlushInterval)
+                flush();
+        }
+
+        void flush() {
+            if (count == 0) return;
+            LOG(INFO) << "ScatterTiming: calls=" << count
+                      << ", total_submit_us=" << total_submit_us
+                      << ", total_wait_us=" << total_wait_us
+                      << ", total_poll_count=" << total_poll_count
+                      << ", avg_submit_us=" << total_submit_us / count
+                      << ", avg_wait_us=" << total_wait_us / count;
+            count = 0;
+            total_submit_us = 0;
+            total_wait_us = 0;
+            total_poll_count = 0;
+            last_flush = std::chrono::steady_clock::now();
+        }
+    };
+    static thread_local TimingAggregator timing_;
+
     Impl(TransferEngine& engine, Backend backend,
          const std::vector<ScatterTransferRange>& ranges)
         : backend_(std::move(backend)) {
@@ -913,10 +952,17 @@ class TransferEngine::ScatterTransferOperation::Impl {
     ~Impl() { wait(); }
 
     Status wait() {
+        const auto wait_start = std::chrono::steady_clock::now();
+        size_t poll_count = 0;
         while (!completed_) {
             poll();
+            ++poll_count;
             if (!completed_) std::this_thread::sleep_for(kPollInterval);
         }
+        auto wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - wait_start)
+                           .count();
+        timing_.record(submit_us_, wait_us, poll_count);
         return aggregate_status_;
     }
 
@@ -1139,6 +1185,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
 
         done_.assign(requests_.size(), false);
         Status submit_status = Status::OK();
+        const auto submit_start = std::chrono::steady_clock::now();
         if (useTent()) {
             task_sizes_.assign(requests_.size(), 1);
             batch_id_ = engine.allocateBatchID(requests_.size());
@@ -1151,6 +1198,10 @@ class TransferEngine::ScatterTransferOperation::Impl {
             batch_id_ = submission.batch_id;
             task_sizes_ = std::move(submission.task_sizes);
         }
+        submit_us_ =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - submit_start)
+                .count();
         remaining_ = task_sizes_.size();
         if (batch_id_ == INVALID_BATCH_ID) {
             failPending(submit_status.ok()
@@ -1276,7 +1327,12 @@ class TransferEngine::ScatterTransferOperation::Impl {
     Status aggregate_status_;
     bool abort_requested_ = false;
     bool completed_ = false;
+    int64_t submit_us_ = 0;
 };
+
+thread_local TransferEngine::ScatterTransferOperation::Impl::
+    TimingAggregator
+        TransferEngine::ScatterTransferOperation::Impl::timing_;
 
 TransferEngine::ScatterTransferOperation::ScatterTransferOperation(
     std::unique_ptr<Impl> impl)
