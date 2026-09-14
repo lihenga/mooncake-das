@@ -14,6 +14,7 @@
 #include <ylt/struct_pb.hpp>
 
 #include "crc32c.h"
+#include "master_metric_manager.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #ifdef USE_3FS
@@ -141,6 +142,7 @@ BucketGlobalAllocator::~BucketGlobalAllocator() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         ready_bucket_ids = DetachReadyBucketsLocked();
+        UpdateBucketPoolMetricsLocked();
     }
     for (const int64_t bucket_id : ready_bucket_ids) {
         DeleteBucketFiles(bucket_id);
@@ -240,6 +242,7 @@ tl::expected<void, ErrorCode> BucketGlobalAllocator::Init(
                 std::chrono::steady_clock::time_point::min();
             initial_ready_target = EffectiveReadyTargetLocked();
             initialization_creations_remaining_ = initial_ready_target;
+            UpdateBucketPoolMetricsLocked();
         }
 
         try {
@@ -256,6 +259,7 @@ tl::expected<void, ErrorCode> BucketGlobalAllocator::Init(
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 ready_bucket_ids = DetachReadyBucketsLocked();
+                UpdateBucketPoolMetricsLocked();
             }
             for (const int64_t bucket_id : ready_bucket_ids) {
                 DeleteBucketFiles(bucket_id);
@@ -298,6 +302,9 @@ tl::expected<void, ErrorCode> BucketGlobalAllocator::Init(
                 initial_creation_error = ErrorCode::OK;
             }
         }
+    } else {
+        std::lock_guard<std::mutex> lock(mutex_);
+        UpdateBucketPoolMetricsLocked();
     }
 
     if (initial_creation_error != ErrorCode::OK) {
@@ -309,6 +316,7 @@ tl::expected<void, ErrorCode> BucketGlobalAllocator::Init(
         {
             std::lock_guard<std::mutex> lock(mutex_);
             ready_bucket_ids = DetachReadyBucketsLocked();
+            UpdateBucketPoolMetricsLocked();
         }
         for (const int64_t bucket_id : ready_bucket_ids) {
             DeleteBucketFiles(bucket_id);
@@ -502,6 +510,7 @@ BucketGlobalAllocator::ReserveBucketCreationLocked() {
     reservation.bucket_id = next_bucket_id_++;
     reservation.generation = next_generation_++;
     ++bucket_creations_in_flight_;
+    UpdateBucketPoolMetricsLocked();
     return reservation;
 }
 
@@ -546,9 +555,11 @@ BucketGlobalAllocator::PromoteReadyBucketLocked() {
         it->second->ready = false;
         active_bucket_id_ = bucket_id;
         TouchLruLocked(bucket_id, CurrentTimeNs());
+        UpdateBucketPoolMetricsLocked();
         RequestRefillLocked();
         return it->second;
     }
+    UpdateBucketPoolMetricsLocked();
     return nullptr;
 }
 
@@ -563,6 +574,12 @@ std::vector<int64_t> BucketGlobalAllocator::DetachReadyBucketsLocked() {
     }
     ready_bucket_ids_.clear();
     return bucket_ids;
+}
+
+void BucketGlobalAllocator::UpdateBucketPoolMetricsLocked() const {
+    MasterMetricManager::instance().set_dfs_bucket_pool_state(
+        ready_bucket_ids_.size(), bucket_creations_in_flight_,
+        static_cast<uint64_t>(ready_bucket_ids_.size()) * bucket_capacity_);
 }
 
 void BucketGlobalAllocator::StopBucketWorkers() {
@@ -613,8 +630,15 @@ void BucketGlobalAllocator::BucketCreateWorker() {
         }
 
         lock.unlock();
+        const auto create_started = std::chrono::steady_clock::now();
         auto preallocated = fs_adapter_->PreallocateFile(
             BucketDataPath(reservation->bucket_id), bucket_capacity_);
+        const auto create_latency_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - create_started)
+                .count();
+        MasterMetricManager::instance().observe_dfs_bucket_create_latency_us(
+            create_latency_us);
         lock.lock();
 
         const bool within_capacity =
@@ -627,6 +651,7 @@ void BucketGlobalAllocator::BucketCreateWorker() {
         const bool publish = preallocated && within_capacity && within_target &&
                              !stop_bucket_workers_;
         bool delete_file = false;
+        const char* result = "failure";
         if (publish) {
             auto bucket = std::make_shared<BucketState>();
             bucket->bucket_id = reservation->bucket_id;
@@ -638,8 +663,10 @@ void BucketGlobalAllocator::BucketCreateWorker() {
             ready_bucket_ids_.push_back(bucket->bucket_id);
             bucket_creation_retry_after_ =
                 std::chrono::steady_clock::time_point::min();
+            result = "success";
         } else if (preallocated) {
             delete_file = true;
+            result = "discarded";
         } else {
             delete_file = true;
             ++bucket_creation_failure_sequence_;
@@ -652,9 +679,11 @@ void BucketGlobalAllocator::BucketCreateWorker() {
         const size_t ready_count = ready_bucket_ids_.size();
         const size_t in_flight = bucket_creations_in_flight_;
         const int64_t max_bucket_count = max_bucket_count_;
+        UpdateBucketPoolMetricsLocked();
         bucket_pool_cv_.notify_all();
         lock.unlock();
 
+        MasterMetricManager::instance().inc_dfs_bucket_create_total(result);
         if (!preallocated) {
             LOG(WARNING) << "Failed to precreate DFS bucket, bucket_id="
                          << reservation->bucket_id
@@ -688,8 +717,15 @@ BucketGlobalAllocator::CreateBucketUnlocked(
     synchronous_creation_in_flight_ = true;
 
     lock.unlock();
+    const auto create_started = std::chrono::steady_clock::now();
     auto preallocated = fs_adapter_->PreallocateFile(
         BucketDataPath(reservation->bucket_id), bucket_capacity_);
+    const auto create_latency_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - create_started)
+            .count();
+    MasterMetricManager::instance().observe_dfs_bucket_create_latency_us(
+        create_latency_us);
     lock.lock();
 
     const bool within_capacity =
@@ -718,9 +754,12 @@ BucketGlobalAllocator::CreateBucketUnlocked(
 
     --bucket_creations_in_flight_;
     synchronous_creation_in_flight_ = false;
+    UpdateBucketPoolMetricsLocked();
     bucket_pool_cv_.notify_all();
 
     lock.unlock();
+    MasterMetricManager::instance().inc_dfs_bucket_create_total(
+        publish ? "success" : (preallocated ? "discarded" : "failure"));
     if (!publish) DeleteBucketFiles(reservation->bucket_id);
     if (publish) FlushDirtyMetadata();
     lock.lock();
@@ -747,14 +786,29 @@ BucketGlobalAllocator::EnsureActiveBucket(std::unique_lock<std::mutex>& lock,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    std::optional<std::chrono::steady_clock::time_point> rollover_started;
     bool pool_exhaustion_recorded = false;
+    const auto observe_rollover = [&rollover_started] {
+        if (!rollover_started) return;
+        const auto latency_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - *rollover_started)
+                .count();
+        MasterMetricManager::instance().observe_dfs_bucket_rollover_latency_us(
+            latency_us);
+    };
 
     while (true) {
         BucketPtr active;
         if (ActiveBucketHasSpaceLocked(required, &active)) {
+            observe_rollover();
             return active;
         }
+        if (!rollover_started && active_bucket_id_ >= 0) {
+            rollover_started = std::chrono::steady_clock::now();
+        }
         if (stop_bucket_workers_) {
+            observe_rollover();
             return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
         }
 
@@ -768,6 +822,7 @@ BucketGlobalAllocator::EnsureActiveBucket(std::unique_lock<std::mutex>& lock,
             }
             auto created = CreateBucketUnlocked(lock);
             if (!created) {
+                observe_rollover();
                 return tl::make_unexpected(created.error());
             }
             continue;
@@ -787,11 +842,14 @@ BucketGlobalAllocator::EnsureActiveBucket(std::unique_lock<std::mutex>& lock,
 
         if (!CanReserveBucketCreationLocked() &&
             bucket_creations_in_flight_ == 0) {
+            observe_rollover();
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
 
         if (!pool_exhaustion_recorded) {
             pool_exhaustion_recorded = true;
+            MasterMetricManager::instance()
+                .inc_dfs_bucket_pool_exhausted_total();
             LOG_EVERY_N(WARNING, 100)
                 << "DFS ready bucket pool exhausted, ready_count="
                 << ready_bucket_ids_.size()
@@ -804,6 +862,7 @@ BucketGlobalAllocator::EnsureActiveBucket(std::unique_lock<std::mutex>& lock,
         const uint64_t failure_sequence = bucket_creation_failure_sequence_;
         RequestRefillLocked(/*urgent=*/true);
         ++waiting_allocators_;
+        const auto wait_started = std::chrono::steady_clock::now();
         bucket_pool_cv_.wait(lock, [this, required, failure_sequence] {
             return stop_bucket_workers_ ||
                    ActiveBucketHasSpaceLocked(required) ||
@@ -814,8 +873,15 @@ BucketGlobalAllocator::EnsureActiveBucket(std::unique_lock<std::mutex>& lock,
                     bucket_creations_in_flight_ == 0);
         });
         --waiting_allocators_;
+        const auto wait_latency_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - wait_started)
+                .count();
+        MasterMetricManager::instance().observe_dfs_bucket_pool_wait_latency_us(
+            wait_latency_us);
 
         if (stop_bucket_workers_) {
+            observe_rollover();
             return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
         }
         if (ready_bucket_ids_.empty() &&
@@ -825,6 +891,7 @@ BucketGlobalAllocator::EnsureActiveBucket(std::unique_lock<std::mutex>& lock,
             const ErrorCode error = last_bucket_creation_error_ == ErrorCode::OK
                                         ? ErrorCode::FILE_WRITE_FAIL
                                         : last_bucket_creation_error_;
+            observe_rollover();
             return tl::make_unexpected(error);
         }
     }
@@ -1389,6 +1456,7 @@ int64_t BucketGlobalAllocator::SetMaxBucketCount(int64_t new_max_bucket_count) {
             bucket_creation_retry_after_ =
                 std::chrono::steady_clock::time_point::min();
         }
+        UpdateBucketPoolMetricsLocked();
     }
 
     for (const int64_t bucket_id : removed_ready_buckets) {
