@@ -403,6 +403,7 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
     void BucketCreateWorker();
     void StopBucketWorkers();
     std::vector<int64_t> DetachReadyBucketsLocked();
+    void UpdateBucketPoolMetricsLocked() const;
 
     // Ensures an active bucket exists with at least `required` bytes free.
     // May temporarily release `lock` to create a bucket.
