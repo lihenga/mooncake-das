@@ -46,6 +46,11 @@ struct DistributedStorageConfig {
     // BUCKET mode only: upper bound on live buckets. Also the fixed
     // denominator for eviction watermarks, so it must be > 0.
     int64_t max_bucket_count = 256;
+    // BUCKET mode only: number of preallocated buckets kept ready for the next
+    // rollover. Zero disables background precreation.
+    int ready_bucket_target = 4;
+    // BUCKET mode only: maximum number of concurrent bucket preallocations.
+    int bucket_create_concurrency = 2;
     // BUCKET mode only: number of threads for parallel batch reads across
     // buckets. Set to 1 to disable parallelism. Must be in
     // [1, kMaxBatchReadThreads].

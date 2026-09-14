@@ -4,12 +4,14 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <list>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -329,6 +331,9 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
 
     struct BucketState {
         int64_t bucket_id = 0;
+        // In-memory identity reserved together with bucket_id before file I/O.
+        // It is intentionally absent from the descriptor and metadata format.
+        uint64_t creation_generation = 0;
         uint64_t capacity = 0;
         uint64_t append_offset = 0;
         // Bytes reserved by entries that are still live (PENDING or
@@ -338,6 +343,9 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
         // Set between PrepareEviction and Commit/Abort. A frozen bucket
         // accepts no new allocations and cannot be selected again.
         bool frozen = false;
+        // A ready bucket owns a fully preallocated data file but has never
+        // accepted an allocation. Ready buckets are absent from the LRU.
+        bool ready = false;
         // True once the bucket has been sealed (it is no longer the active
         // bucket), which is when its `.meta` file starts to exist.
         bool sealed = false;
@@ -352,6 +360,11 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
     };
 
     using BucketPtr = std::shared_ptr<BucketState>;
+
+    struct BucketCreationReservation {
+        int64_t bucket_id = -1;
+        uint64_t generation = 0;
+    };
 
     // --- helpers, called with mutex_ held only where the name says Locked ---
 
@@ -374,12 +387,22 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
     // marks it for persistence. Requires `mutex_`.
     void SealActiveBucketLocked();
 
-    // Creates a fresh bucket: allocates the id under the lock, preallocates
-    // the data file outside the lock, then publishes the bucket. Rolls back
-    // id/state/files on any failure. The new bucket's `.meta` is written only
-    // when it is later sealed.
+    // Synchronous compatibility path used only when ready_bucket_target_ is 0.
+    // It reserves identity under the lock, preallocates outside it, then
+    // publishes the bucket as active without rolling back the monotonic id.
     tl::expected<BucketPtr, ErrorCode> CreateBucketUnlocked(
         std::unique_lock<std::mutex>& lock);
+
+    bool CanReserveBucketCreationLocked() const;
+    std::optional<BucketCreationReservation> ReserveBucketCreationLocked();
+    size_t EffectiveReadyTargetLocked() const;
+    BucketPtr PromoteReadyBucketLocked();
+    bool ActiveBucketHasSpaceLocked(uint64_t required,
+                                    BucketPtr* bucket = nullptr) const;
+    void RequestRefillLocked(bool urgent = false);
+    void BucketCreateWorker();
+    void StopBucketWorkers();
+    std::vector<int64_t> DetachReadyBucketsLocked();
 
     // Ensures an active bucket exists with at least `required` bytes free.
     // May temporarily release `lock` to create a bucket.
@@ -418,6 +441,8 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
     uint64_t bucket_capacity_ = 0;
     uint64_t alignment_ = 4096;
     int64_t max_bucket_count_ = 0;
+    size_t ready_bucket_target_ = 4;
+    size_t bucket_create_concurrency_ = 2;
 
     bool eviction_enabled_ = true;
     double eviction_high_watermark_ = 0.9;
@@ -430,12 +455,18 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
     // captured operation cannot recreate or overwrite metadata for a bucket
     // that has since been removed.
     std::mutex metadata_io_mutex_;
-    // Serializes bucket creation. Creating a bucket releases `mutex_` for the
-    // file I/O, so without this flag several threads would each reserve a
-    // distinct id and race to publish, orphaning all but one and letting a
-    // loser's rollback delete a winner's files.
-    bool bucket_creation_in_flight_ = false;
-    std::condition_variable bucket_creation_cv_;
+    std::deque<int64_t> ready_bucket_ids_;
+    size_t bucket_creations_in_flight_ = 0;
+    size_t waiting_allocators_ = 0;
+    bool synchronous_creation_in_flight_ = false;
+    bool stop_bucket_workers_ = false;
+    size_t initialization_creations_remaining_ = 0;
+    uint64_t bucket_creation_failure_sequence_ = 0;
+    uint64_t last_urgent_refill_sequence_ = static_cast<uint64_t>(-1);
+    ErrorCode last_bucket_creation_error_ = ErrorCode::OK;
+    std::chrono::steady_clock::time_point bucket_creation_retry_after_{};
+    std::condition_variable bucket_pool_cv_;
+    std::vector<std::thread> bucket_create_workers_;
     std::unordered_map<int64_t, BucketPtr> buckets_;
     std::unordered_map<std::string, int64_t> key_index_;
     int64_t next_bucket_id_ = 0;
