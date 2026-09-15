@@ -183,8 +183,13 @@ int allocateSlices(std::vector<Slice>& slices,
         slices.emplace_back(
             Slice{buffer_ptr, replica.get_local_disk_descriptor().object_size});
     } else if (replica.is_dfs_replica()) {
-        slices.emplace_back(
-            Slice{buffer_ptr, replica.get_dfs_descriptor().object_size});
+        // Use aligned_size (value + padding) so the slice length is a multiple
+        // of the DFS block alignment, letting O_DIRECT go through the zero-bounce
+        // preadv path. The trailing padding is read but not scattered.
+        const auto& desc = replica.get_dfs_descriptor();
+        const uint64_t slice_size =
+            desc.aligned_size > 0 ? desc.aligned_size : desc.object_size;
+        slices.emplace_back(Slice{buffer_ptr, slice_size});
     } else if (replica.is_nof_replica()) {
         auto& handle = replica.get_nof_descriptor().buffer_descriptor;
         void* chunk_ptr = buffer_ptr;

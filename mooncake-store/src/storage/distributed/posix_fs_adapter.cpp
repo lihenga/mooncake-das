@@ -16,6 +16,8 @@
 #include <memory>
 #include <mutex>
 
+#include <glog/logging.h>
+
 namespace mooncake {
 
 namespace {
@@ -357,6 +359,12 @@ tl::expected<size_t, ErrorCode> PosixFsAdapter::DirectReadAt(int fd, iovec* iov,
     if (aligned) {
         return DirectReadAtAligned(fd, iov, iovcnt, offset);
     }
+    static std::once_flag once;
+    std::call_once(once, [] {
+        LOG(WARNING) << "DFS direct read falling back to staged bounce path; "
+                      << "buffer address or length is not aligned to "
+                      << kDirectIoAlignment << " bytes";
+    });
     return DirectReadAtStaged(fd, iov, iovcnt, offset);
 }
 
