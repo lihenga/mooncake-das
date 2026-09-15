@@ -15,6 +15,7 @@
 #include "types.h"
 #include "memory_alloc.h"
 #include "ssd_register_client.h"
+#include "read_plan.h"
 #include "device/accelerator_registry.h"
 #include "device/cuda_ipc_buffer.h"
 
@@ -1889,6 +1890,14 @@ class MooncakeDistributedNoFRegisterPyWrapper {
 };
 
 PYBIND11_MODULE(store, m) {
+    py::class_<mooncake::ReadPlan, std::shared_ptr<mooncake::ReadPlan>>(
+        m, "ReadPlan", py::dynamic_attr())
+        .def("run", &mooncake::ReadPlan::run, py::call_guard<py::gil_scoped_release>())
+        .def("wait", &mooncake::ReadPlan::wait, py::arg("group"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("stats", &mooncake::ReadPlan::stats)
+        .def("reuse_stats", &mooncake::ReadPlan::reuse_stats);
+
     m.def("_serialize_tensor", &serialize_tensor_metadata,
           "Inspect a torch tensor as Mooncake tensor metadata, data pointer, "
           "size, and owner.");
@@ -3026,6 +3035,27 @@ PYBIND11_MODULE(store, m) {
             "Get object data directly into multiple pre-allocated buffers for "
             "multiple "
             "keys")
+        .def(
+            "create_read_plan",
+            [](MooncakeStorePyWrapper &self,
+               std::vector<mooncake::ReadLayout> layouts, int num_groups,
+               bool reuse_ranges, py::object buffer_owners) {
+                if (!self.is_client_initialized())
+                    throw std::runtime_error("Client is not initialized");
+                std::shared_ptr<mooncake::ReadPlan> plan;
+                {
+                    py::gil_scoped_release release;
+                    plan = std::make_shared<mooncake::ReadPlan>(
+                        self.store_, std::move(layouts), num_groups, reuse_ranges);
+                }
+                auto object = py::cast(plan);
+                object.attr("_buffer_owners") = std::move(buffer_owners);
+                return object;
+            }, py::arg("layouts"), py::arg("num_groups"),
+            py::arg("reuse_ranges") = false, py::arg("buffer_owners") = py::none(),
+            py::keep_alive<0, 1>(),
+            "Create ordered range reads; retain registered destination memory "
+            "until run completes. No concurrent legacy sessions on these keys.")
         .def(
             "batch_get_session_start",
             [](MooncakeStorePyWrapper &self,
