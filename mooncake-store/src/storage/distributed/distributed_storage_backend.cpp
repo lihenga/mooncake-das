@@ -546,9 +546,9 @@ DistributedStorageBackend::ResolveTarget(
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         if (read_only && shard.direct_fd >= 0) {
-            return ResolvedTarget{shard.direct_fd, nullptr, nullptr};
+            return ResolvedTarget{shard.direct_fd, nullptr, true, nullptr};
         }
-        return ResolvedTarget{shard.fd, &shard.mutex, nullptr};
+        return ResolvedTarget{shard.fd, &shard.mutex, false, nullptr};
     }
 
     // BUCKET mode: the descriptor carries an allocator-chosen path, so it must
@@ -593,8 +593,10 @@ DistributedStorageBackend::ResolveTarget(
     }
     if (!handle) return tl::make_unexpected(handle.error());
     auto& shared = handle.value();
-    return ResolvedTarget{shared->fd, read_only ? nullptr : &shared->mutex,
-                          shared};
+    // BUCKET mode needs no per-fd lock: the allocator hands each object a
+    // unique, non-overlapping on-disk range, so concurrent writers and readers
+    // never touch the same bytes.
+    return ResolvedTarget{shared->fd, nullptr, read_only, shared};
 }
 
 tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
@@ -764,7 +766,6 @@ DistributedStorageBackend::BatchWriteBucket(
                     {prepared[j].payload.data(), prepared[j].payload.size()});
             }
 
-            std::lock_guard<std::mutex> lock(*prepared[pos].target.mutex);
             uint64_t written = 0;
             size_t iov_index = 0;
             uint64_t iov_consumed = 0;
@@ -913,7 +914,7 @@ DistributedStorageBackend::PrepareReadTasks(
         task.total_size = IsBucketMode() ? request.descriptor.aligned_size
                                          : request.descriptor.object_size;
         task.direct_read = distributed_config_.direct_read_enabled &&
-                           task.target.mutex == nullptr;
+                           task.target.direct_read;
         task.entries.push_back({i, request.descriptor.offset});
         const bool merge_candidate =
             IsBucketMode() && distributed_config_.batch_read_merge_enabled &&
