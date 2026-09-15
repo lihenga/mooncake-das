@@ -569,32 +569,51 @@ struct DfsPinnedArenaBacking {
 
 std::shared_ptr<BufferHandle> AcquireDfsPinnedArena(
     const std::shared_ptr<PinnedBufferPool> &pool, size_t size,
-    size_t *capacity_out = nullptr, bool *pool_hit_out = nullptr) {
+    size_t *capacity_out = nullptr, bool *pool_hit_out = nullptr,
+    size_t alignment = 0) {
     if (capacity_out) *capacity_out = 0;
     if (pool_hit_out) *pool_hit_out = false;
     if (!pool || size == 0) return nullptr;
 
+    // Over-allocate so the returned base can be rounded up to `alignment`
+    // when the accelerator's pinned-host allocator does not already guarantee
+    // it (cudaMallocHost et al. do not promise page alignment). The extra
+    // bytes are accounted for by the backing handle; only the aligned view is
+    // exposed to the caller.
+    const size_t padded_size =
+        alignment > 1 ? size + alignment - 1 : size;
     auto backing = std::make_shared<DfsPinnedArenaBacking>();
     backing->pool = pool;
     bool pool_hit = false;
     const bool use_h2d_kernel = DfsH2dKernelEnabled();
     backing->buffer =
-        pool->AcquirePinned(size, &pool_hit, use_h2d_kernel);
+        pool->AcquirePinned(padded_size, &pool_hit, use_h2d_kernel);
     // Mapped host memory is optional. Keep the original pinned-DMA path if the
     // platform cannot expose a device-visible alias.
     if (use_h2d_kernel && !backing->buffer.data) {
         pool_hit = false;
-        backing->buffer = pool->AcquirePinned(size, &pool_hit, false);
+        backing->buffer = pool->AcquirePinned(padded_size, &pool_hit, false);
     }
     if (!backing->buffer.data || !backing->buffer.pinned_host.addr ||
-        backing->buffer.capacity < size) {
+        backing->buffer.capacity < padded_size) {
         return nullptr;
     }
     if (capacity_out) *capacity_out = backing->buffer.capacity;
     if (pool_hit_out) *pool_hit_out = pool_hit;
+
+    char *base = backing->buffer.data;
+    void *device_base = backing->buffer.device_data;
+    if (alignment > 1) {
+        const size_t head_padding =
+            reinterpret_cast<uintptr_t>(base) % alignment == 0
+                ? 0
+                : alignment - reinterpret_cast<uintptr_t>(base) % alignment;
+        base += head_padding;
+        if (device_base)
+            device_base = static_cast<char *>(device_base) + head_padding;
+    }
     return std::make_shared<BufferHandle>(
-        backing->buffer.data, size, [backing]() { (void)backing; },
-        backing->buffer.device_data);
+        base, size, [backing]() { (void)backing; }, device_base);
 }
 
 }  // namespace
@@ -6865,7 +6884,8 @@ void RealClient::process_session_disk_dfs_reads(
         size_t size;
     };
 
-    constexpr size_t kArenaObjectAlignment = 64;
+    const size_t dfs_alignment =
+        GetEnvOr<size_t>("MOONCAKE_DFS_ALIGNMENT", 4096);
     std::vector<ArenaView> arena_views;
     arena_views.reserve(entries.size());
     size_t arena_size = 0;
@@ -6883,22 +6903,28 @@ void RealClient::process_session_disk_dfs_reads(
 
         size_t aligned_offset = 0;
         const size_t object_size = static_cast<size_t>(total_size);
-        if (!AlignUp(arena_size, kArenaObjectAlignment, &aligned_offset) ||
-            object_size >
+        // Reserve aligned_size so the arena slot (and the iovec built from it)
+        // covers the value plus trailing alignment padding.
+        const size_t aligned_object_size =
+            (object_size + dfs_alignment - 1) & ~(dfs_alignment - 1);
+        if (!AlignUp(arena_size, dfs_alignment, &aligned_offset) ||
+            aligned_object_size >
                 std::numeric_limits<size_t>::max() - aligned_offset) {
             LOG(ERROR) << "DFS pinned arena size overflow, key: " << entry.key;
             results[entry.original_idx] =
                 static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
             continue;
         }
-        arena_views.push_back(ArenaView{entry_ptr, aligned_offset, object_size});
-        arena_size = aligned_offset + object_size;
+        arena_views.push_back(
+            ArenaView{entry_ptr, aligned_offset, aligned_object_size});
+        arena_size = aligned_offset + aligned_object_size;
     }
 
     std::shared_ptr<BufferHandle> arena;
     if (!arena_views.empty()) {
         arena = AcquireDfsPinnedArena(dfs_pinned_buffer_pool_, arena_size,
-                                      &arena_capacity, &arena_pool_hit);
+                                      &arena_capacity, &arena_pool_hit,
+                                      dfs_alignment);
         if (!arena) {
             LOG(ERROR) << "DFS pinned host arena allocation failed, size: "
                        << arena_size;

@@ -927,49 +927,6 @@ DistributedStorageBackend::BatchWriteBucket(
     return results;
 }
 
-ErrorCode DistributedStorageBackend::ReadFully(FileSystemAdapter* fs_adapter,
-                                               const ResolvedTarget& target,
-                                               uint64_t offset,
-                                               std::span<char> output,
-                                               bool direct_read) {
-    const auto start = std::chrono::steady_clock::now();
-    uint64_t done = 0;
-    ErrorCode error = ErrorCode::OK;
-    while (done < output.size()) {
-        iovec iov{output.data() + done, output.size() - done};
-        auto read = direct_read
-                       ? fs_adapter->DirectReadAt(target.fd, &iov, 1,
-                                                  static_cast<int64_t>(offset + done))
-                       : fs_adapter->ReadAt(target.fd, &iov, 1,
-                                            static_cast<int64_t>(offset + done));
-        if (!read) {
-            error = read.error();
-            break;
-        }
-        if (*read == 0) {
-            error = ErrorCode::FILE_READ_FAIL;
-            break;
-        }
-        done += *read;
-    }
-    return error;
-}
-
-void DistributedStorageBackend::CopyToSlices(const DfsReadRequest& request,
-                                             const char* value) {
-    uint64_t remaining = request.descriptor.object_size;
-    for (const auto& slice : request.slices) {
-        const size_t size =
-            static_cast<size_t>(std::min<uint64_t>(slice.size, remaining));
-        if (size != 0) {
-            std::memcpy(slice.ptr, value, size);
-            value += size;
-            remaining -= size;
-        }
-        if (remaining == 0) break;
-    }
-}
-
 std::vector<DistributedStorageBackend::ReadTask>
 DistributedStorageBackend::PrepareReadTasks(
     const std::vector<DfsReadRequest>& requests,
@@ -1073,19 +1030,31 @@ void DistributedStorageBackend::ExecuteSingleReadTask(
     if (task.entries.empty()) return;
     const auto& entry = task.entries.front();
     const auto& request = requests[entry.request_index];
-    const uint64_t object_size = request.descriptor.object_size;
+    // Read the full aligned size (value + padding) in bucket mode so the
+    // iovec length is a multiple of the alignment, letting O_DIRECT skip the
+    // adapter's staged bounce. The trailing padding lands in the arena slot but
+    // is never scattered to the caller.
+    const uint64_t read_size = task.total_size;
     const auto start = std::chrono::steady_clock::now();
 
+    const uint64_t alignment = distributed_config_.alignment;
+    std::vector<char> sink(alignment == 0 ? 1 : alignment);
     std::vector<iovec> iovs;
-    iovs.reserve(request.slices.size());
-    uint64_t remaining = object_size;
+    iovs.reserve(request.slices.size() + 1);
+    uint64_t collected = 0;
     for (const auto& slice : request.slices) {
-        if (remaining == 0) break;
-        const uint64_t size = std::min<uint64_t>(slice.size, remaining);
+        if (collected >= read_size) break;
+        const uint64_t size = std::min<uint64_t>(slice.size, read_size - collected);
         if (size != 0) {
             iovs.push_back({slice.ptr, static_cast<size_t>(size)});
-            remaining -= size;
+            collected += size;
         }
+    }
+    // If slices don't cover the full aligned range (e.g. a non-session caller
+    // that allocated object_size bytes), absorb the trailing padding with the
+    // sink so the iovec total matches the on-disk reserved size.
+    if (collected < read_size) {
+        iovs.push_back({sink.data(), static_cast<size_t>(read_size - collected)});
     }
 
     constexpr size_t kMaxIovChunk = 1024;
@@ -1098,7 +1067,7 @@ void DistributedStorageBackend::ExecuteSingleReadTask(
         target_lock = std::unique_lock<std::mutex>(*task.target.mutex);
     }
 
-    while (done < object_size && index < iovs.size()) {
+    while (done < read_size && index < iovs.size()) {
         std::vector<iovec> pending;
         pending.push_back({static_cast<char*>(iovs[index].iov_base) + consumed,
                            iovs[index].iov_len - consumed});
@@ -1136,7 +1105,7 @@ void DistributedStorageBackend::ExecuteSingleReadTask(
             }
         }
     }
-    if (error == ErrorCode::OK && done != object_size) {
+    if (error == ErrorCode::OK && done != read_size) {
         error = ErrorCode::FILE_READ_FAIL;
     }
     results[entry.request_index] =
@@ -1148,27 +1117,95 @@ void DistributedStorageBackend::ExecuteMergedReadTask(
     const ReadTask& task, const std::vector<DfsReadRequest>& requests,
     std::vector<tl::expected<void, ErrorCode>>& results) {
     if (task.entries.empty()) return;
-    std::vector<char> staging(static_cast<size_t>(task.total_size));
+    // Build a single scatter-read iovec chain directly into the caller's
+    // slices. When the session path supplies aligned slices (length ==
+    // aligned_size, address aligned), each iovec already covers the value
+    // plus trailing padding and O_DIRECT goes through the zero-bounce path.
+    // Other paths may pass unaligned, object_size-only slices; a small sink
+    // buffer absorbs the on-disk padding so the disk range stays contiguous.
+    const uint64_t alignment = distributed_config_.alignment;
+    std::vector<char> sink(alignment == 0 ? 1 : alignment);
+    std::vector<iovec> iovs;
+    iovs.reserve(task.entries.size() * 2);
+    for (const auto& entry : task.entries) {
+        const auto& request = requests[entry.request_index];
+        const uint64_t reserved = IsBucketMode()
+                                       ? request.descriptor.aligned_size
+                                       : request.descriptor.object_size;
+        uint64_t collected = 0;
+        for (const auto& slice : request.slices) {
+            if (collected >= reserved) break;
+            const uint64_t size =
+                std::min<uint64_t>(slice.size, reserved - collected);
+            if (size != 0) {
+                iovs.push_back({slice.ptr, static_cast<size_t>(size)});
+                collected += size;
+            }
+        }
+        if (collected < reserved) {
+            iovs.push_back(
+                {sink.data(), static_cast<size_t>(reserved - collected)});
+        }
+    }
+
+    constexpr size_t kMaxIovChunk = 1024;
     ErrorCode error = ErrorCode::OK;
+    uint64_t done = 0;
+    size_t index = 0;
+    uint64_t iov_consumed = 0;
     {
         std::unique_lock<std::mutex> target_lock;
         if (task.target.mutex != nullptr) {
             target_lock = std::unique_lock<std::mutex>(*task.target.mutex);
         }
-        error = ReadFully(fs_adapter_.get(), task.target, task.io_offset,
-                          staging, task.direct_read);
-    }
-    if (error != ErrorCode::OK) {
-        for (const auto& entry : task.entries) {
-            results[entry.request_index] = tl::make_unexpected(error);
+        while (done < task.total_size && index < iovs.size()) {
+            std::vector<iovec> pending;
+            pending.push_back(
+                {static_cast<char*>(iovs[index].iov_base) + iov_consumed,
+                 iovs[index].iov_len - iov_consumed});
+            for (size_t j = index + 1;
+                 j < iovs.size() && pending.size() < kMaxIovChunk; ++j) {
+                pending.push_back(iovs[j]);
+            }
+            auto read_result = task.direct_read
+                                   ? fs_adapter_->DirectReadAt(
+                                         task.target.fd, pending.data(),
+                                         static_cast<int>(pending.size()),
+                                         static_cast<int64_t>(task.io_offset + done))
+                                   : fs_adapter_->ReadAt(
+                                         task.target.fd, pending.data(),
+                                         static_cast<int>(pending.size()),
+                                         static_cast<int64_t>(task.io_offset + done));
+            if (!read_result) {
+                error = read_result.error();
+                break;
+            }
+            if (*read_result == 0) {
+                error = ErrorCode::FILE_READ_FAIL;
+                break;
+            }
+            uint64_t advanced = *read_result;
+            done += advanced;
+            while (advanced != 0 && index < iovs.size()) {
+                const uint64_t available = iovs[index].iov_len - iov_consumed;
+                const uint64_t step =
+                    std::min<uint64_t>(advanced, available);
+                iov_consumed += step;
+                advanced -= step;
+                if (iov_consumed == iovs[index].iov_len) {
+                    ++index;
+                    iov_consumed = 0;
+                }
+            }
         }
-        return;
+    }
+    if (error == ErrorCode::OK && done != task.total_size) {
+        error = ErrorCode::FILE_READ_FAIL;
     }
     for (const auto& entry : task.entries) {
-        const auto& request = requests[entry.request_index];
-        const uint64_t value_offset = entry.value_offset - task.io_offset;
-        CopyToSlices(request, staging.data() + value_offset);
-        results[entry.request_index] = {};
+        results[entry.request_index] =
+            error == ErrorCode::OK ? tl::expected<void, ErrorCode>{}
+                                   : tl::make_unexpected(error);
     }
 }
 
@@ -1250,25 +1287,30 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     }
 
     auto tasks = PrepareReadTasks(requests, results);
+    const auto prepare_done = std::chrono::steady_clock::now();
     ExecuteReadTasks(tasks, requests, results);
 
     if (dfs_read_trace_enabled()) {
-        const int64_t duration_us =
+        const int64_t prepare_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(prepare_done - timing_start)
+                .count();
+        const int64_t read_us =
             std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - timing_start)
+                std::chrono::steady_clock::now() - prepare_done)
                 .count();
         uint64_t total_bytes = 0;
         for (const auto& request : requests) {
             total_bytes += request.descriptor.object_size;
         }
         double gbps = 0.0;
-        if (duration_us > 0) {
+        if (read_us > 0) {
             // bytes / us == MB/s; /1000 -> GB/s.
-            gbps = static_cast<double>(total_bytes) / duration_us / 1000.0;
+            gbps = static_cast<double>(total_bytes) / read_us / 1000.0;
         }
         LOG(INFO) << "BatchRead: requests=" << requests.size()
                   << " tasks=" << tasks.size() << " bytes=" << total_bytes
-                  << " duration_us=" << duration_us
+                  << " prepare_us=" << prepare_us
+                  << " read_us=" << read_us
                   << " bandwidth_GBps=" << gbps;
     }
     return results;

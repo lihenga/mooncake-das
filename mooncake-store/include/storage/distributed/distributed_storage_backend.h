@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
-#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -249,12 +248,6 @@ class DistributedStorageBackend : public StorageBackendInterface {
         bool direct_read = false;
         std::vector<ReadEntry> entries;
     };
-
-    static ErrorCode ReadFully(FileSystemAdapter* fs_adapter,
-                               const ResolvedTarget& target, uint64_t offset,
-                               std::span<char> output, bool direct_read);
-
-    static void CopyToSlices(const DfsReadRequest& request, const char* value);
 
     std::vector<ReadTask> PrepareReadTasks(
         const std::vector<DfsReadRequest>& requests,
