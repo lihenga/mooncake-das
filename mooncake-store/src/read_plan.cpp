@@ -219,7 +219,9 @@ struct ReadPlan::Impl {
             if (results[k] < 0 || size_t(results[k]) != expected)
                 throw std::runtime_error(
                     "Mooncake read plan range get failed at group=" +
-                    std::to_string(group) + " key_index=" + std::to_string(k));
+                    std::to_string(group) + " key_index=" + std::to_string(k) +
+                    " rc=" + std::to_string(results[k]) +
+                    " expected=" + std::to_string(expected));
             bytes += expected;
         }
         ++stats[0];
