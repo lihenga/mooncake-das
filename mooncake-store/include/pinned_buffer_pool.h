@@ -131,24 +131,37 @@ class PinnedBufferPool {
 
     void Release(Buffer buf) {
         if (!buf.data || buf.capacity == 0) return;
-        std::lock_guard<std::mutex> lk(mutex_);
-        if (buf.capacity > max_cached_bytes_ - cached_bytes_) {
-            FreeBuffer(buf);
-            return;
+
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            if (buf.capacity <= max_cached_bytes_ - cached_bytes_) {
+                cached_bytes_ += buf.capacity;
+                pool_[buf.capacity].push_back(std::move(buf));
+                return;
+            }
         }
-        cached_bytes_ += buf.capacity;
-        pool_[buf.capacity].push_back(std::move(buf));
+
+        // Releasing pinned host memory may block in the accelerator runtime.
+        // Do not hold the pool mutex while invoking the buffer deleter, so one
+        // slow hipHostFree cannot block unrelated Acquire/Release operations.
+        FreeBuffer(buf);
     }
 
     void Clear() {
-        std::lock_guard<std::mutex> lk(mutex_);
-        for (auto& [_, buffers] : pool_) {
+        std::map<size_t, std::vector<Buffer>> buffers_to_free;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            buffers_to_free.swap(pool_);
+            cached_bytes_ = 0;
+        }
+
+        // As in Release(), destroy pinned allocations without holding the pool
+        // mutex because the platform deleter may perform a blocking operation.
+        for (auto& [_, buffers] : buffers_to_free) {
             for (auto& buf : buffers) {
                 FreeBuffer(buf);
             }
         }
-        pool_.clear();
-        cached_bytes_ = 0;
     }
 
     size_t cached_bytes() const {
