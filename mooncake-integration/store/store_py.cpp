@@ -2938,21 +2938,22 @@ PYBIND11_MODULE(store, m) {
             "create_read_plan",
             [](MooncakeStorePyWrapper &self,
                std::vector<mooncake::ReadLayout> layouts, int num_groups,
-               bool reuse_ranges, py::object buffer_owners) {
+               bool reuse_ranges, py::object buffer_owners, bool page_wise) {
                 if (!self.is_client_initialized())
                     throw std::runtime_error("Client is not initialized");
                 std::shared_ptr<mooncake::ReadPlan> plan;
                 {
                     py::gil_scoped_release release;
                     plan = std::make_shared<mooncake::ReadPlan>(
-                        self.store_, std::move(layouts), num_groups, reuse_ranges);
+                        self.store_, std::move(layouts), num_groups, reuse_ranges,
+                        page_wise);
                 }
                 auto object = py::cast(plan);
                 object.attr("_buffer_owners") = std::move(buffer_owners);
                 return object;
             }, py::arg("layouts"), py::arg("num_groups"),
             py::arg("reuse_ranges") = false, py::arg("buffer_owners") = py::none(),
-            py::keep_alive<0, 1>(),
+            py::arg("page_wise") = false, py::keep_alive<0, 1>(),
             "Create ordered range reads; retain registered destination memory "
             "until run completes. No concurrent legacy sessions on these keys.")
         .def(

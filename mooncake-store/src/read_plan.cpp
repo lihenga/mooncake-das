@@ -77,6 +77,7 @@ struct ReadPlan::Impl {
     std::vector<Pool> layouts;
     int groups;
     bool reuse;
+    bool page_wise;
     uint64_t built_count = 0, refreshed_count = 0;
     std::mutex mutex;
     std::condition_variable cv;
@@ -103,13 +104,17 @@ struct ReadPlan::Impl {
 
    public:
     Impl(std::shared_ptr<PyClient> c, std::vector<Pool> p, int n,
-         bool reuse_ranges)
+         bool reuse_ranges, bool page_wise_mode)
         : client(std::move(c)),
           layouts(std::move(p)),
           groups(n),
-          reuse(reuse_ranges) {
+          reuse(reuse_ranges),
+          page_wise(page_wise_mode) {
         if (!client) throw std::invalid_argument("read plan requires a client");
         if (n <= 0) throw std::invalid_argument("num_groups must be positive");
+        if (reuse && page_wise)
+            throw std::invalid_argument(
+                "read plan page-wise mode does not support range reuse");
         for (const auto &p : layouts) {
             const auto &[keys, rows, packed, layout] = p;
             if (layout.size() != size_t(n))
@@ -169,6 +174,64 @@ struct ReadPlan::Impl {
                         out.sizes.push_back({i[2]});
                         out.offsets.push_back({i[3]});
                     }
+            }
+        }
+        return out;
+    }
+    // Aggregate every group's components into one range per key. This is the
+    // page-wise path: a single batch_get reads all layers of every page,
+    // giving up layer-wise overlap for minimum RPC count.
+    Ranges build_all() const {
+        Ranges out;
+        size_t total = 0;
+        for (const auto &[keys, rows, packed, layout] : layouts)
+            total = checked_add(total, keys.size());
+        out.keys.reserve(total);
+        out.addresses.reserve(total);
+        out.sizes.reserve(total);
+        out.offsets.reserve(total);
+        for (const auto &[keys, rows, packed, layout] : layouts) {
+            out.keys.insert(out.keys.end(), keys.begin(), keys.end());
+            for (auto row : rows) {
+                if (packed) {
+                    // One key per row; collect all groups' components into its
+                    // range list, matching _load_page_wise's per-page extend.
+                    std::vector<void *> a;
+                    std::vector<size_t> s, o;
+                    for (const auto &items : layout)
+                        for (const auto &i : items) {
+                            a.push_back(reinterpret_cast<void *>(address(i, row)));
+                            s.push_back(i[2]);
+                            o.push_back(i[3]);
+                        }
+                    out.addresses.push_back(std::move(a));
+                    out.sizes.push_back(std::move(s));
+                    out.offsets.push_back(std::move(o));
+                } else {
+                    // One key per (row, component); each key carries the ranges
+                    // of that component across all groups. All non-empty groups
+                    // share the same component count (enforced at construction).
+                    size_t component_count = 0;
+                    for (const auto &group_items : layout)
+                        if (!group_items.empty()) {
+                            component_count = group_items.size();
+                            break;
+                        }
+                    for (size_t c = 0; c < component_count; ++c) {
+                        std::vector<void *> a;
+                        std::vector<size_t> s, o;
+                        for (const auto &group_items : layout) {
+                            if (group_items.size() <= c) continue;
+                            const auto &i = group_items[c];
+                            a.push_back(reinterpret_cast<void *>(address(i, row)));
+                            s.push_back(i[2]);
+                            o.push_back(i[3]);
+                        }
+                        out.addresses.push_back(std::move(a));
+                        out.sizes.push_back(std::move(s));
+                        out.offsets.push_back(std::move(o));
+                    }
+                }
             }
         }
         return out;
@@ -373,7 +436,8 @@ struct ReadPlan::Impl {
             const char *enabled = std::getenv("MOONCAKE_READ_PLAN_PIPELINE");
             const bool requested = enabled && std::string(enabled) == "1";
             const bool pipeline =
-                requested && !reuse && groups > 1 && disjoint_groups();
+                requested && !reuse && !page_wise && groups > 1 &&
+                disjoint_groups();
             if (requested) {
                 static std::atomic<bool> logged_yes{false}, logged_no{false};
                 auto &logged = pipeline ? logged_yes : logged_no;
@@ -384,7 +448,17 @@ struct ReadPlan::Impl {
                         "keys=%zu\n",
                         int(pipeline), groups, session.size());
             }
-            if (pipeline) {
+            if (page_wise) {
+                // One batch_get carries every group's ranges per key; readiness
+                // is published only after the single transfer succeeds.
+                auto r = build_all();
+                ++built_count;
+                if (!r.keys.empty()) {
+                    auto result = client->batch_get_into_multi_buffer_ranges(
+                        r.keys, r.addresses, r.sizes, r.offsets);
+                    check(r, result, -1);
+                }
+            } else if (pipeline) {
                 run_pipelined();
             } else {
                 std::map<std::vector<size_t>, Ranges> cached_ranges;
@@ -456,9 +530,10 @@ struct ReadPlan::Impl {
     }
 };
 ReadPlan::ReadPlan(std::shared_ptr<PyClient> client,
-                   std::vector<ReadLayout> layouts, int groups, bool reuse)
+                   std::vector<ReadLayout> layouts, int groups, bool reuse,
+                   bool page_wise)
     : impl_(std::make_unique<Impl>(std::move(client), std::move(layouts),
-                                   groups, reuse)) {}
+                                   groups, reuse, page_wise)) {}
 ReadPlan::~ReadPlan() = default;
 void ReadPlan::run() { impl_->run(); }
 void ReadPlan::wait(int group) { impl_->wait(group); }
