@@ -6272,15 +6272,6 @@ void RealClient::process_session_disk_dfs_reads(
 
     auto queue_scatter = [&](NonMemReadEntry *entry,
                              const std::shared_ptr<BufferHandle> &handle) {
-        if (std::chrono::steady_clock::now() >= entry->lease_deadline) {
-            results[entry->original_idx] =
-                static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
-            std::lock_guard<std::mutex> lock(session_mutex_);
-            get_sessions_.erase(entry->key);
-            get_session_object_cache_.erase(entry->key);
-            return;
-        }
-
         size_t transferred = 0;
         for (size_t j = 0; j < entry->sizes.size(); ++j) {
             scatter_bytes += entry->sizes[j];
@@ -6581,22 +6572,11 @@ void RealClient::process_session_disk_dfs_reads(
     const uint64_t scatter_ranges = async_scatter.original_range_count();
     const uint64_t scatter_merged_ranges = async_scatter.merged_range_count();
 
-    // Success is published only after all streams have synchronized. The
-    // inflight handles keep each source arena alive through the last DMA.
-    const auto scatter_done = std::chrono::steady_clock::now();
     for (const auto &pending : pending_scatter_results) {
         const size_t result_index = pending.entry->original_idx;
         if (async_scatter.EntryFailed(result_index)) {
             results[result_index] =
                 static_cast<int>(toInt(ErrorCode::TRANSFER_FAIL));
-            continue;
-        }
-        if (scatter_done >= pending.entry->lease_deadline) {
-            results[result_index] =
-                static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
-            std::lock_guard<std::mutex> lock(session_mutex_);
-            get_sessions_.erase(pending.entry->key);
-            get_session_object_cache_.erase(pending.entry->key);
             continue;
         }
         results[result_index] = static_cast<int>(pending.transferred);
