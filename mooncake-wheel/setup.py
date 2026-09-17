@@ -4,6 +4,7 @@
 
 import sys
 import os
+import re
 import platform
 from setuptools import setup, Distribution
 from wheel.bdist_wheel import bdist_wheel
@@ -14,6 +15,10 @@ pwd = os.path.dirname(os.path.abspath(__file__))
 add_git_version = False
 if int(os.environ.get('ADD_GIT_VERSION', '0')) == 1:
     add_git_version = True
+
+add_git_branch = False
+if int(os.environ.get('ADD_GIT_BRANCH', '0')) == 1:
+    add_git_branch = True
 
 # ---------------------------------------------------------------------------
 # Platform guard
@@ -164,6 +169,29 @@ def get_version_add(sha: Optional[str] = None) -> str:
     deepep_root = os.path.dirname(os.path.abspath(__file__))
     add_version_path = os.path.join(os.path.join(deepep_root, "mooncake"), "version.py")
     version = "das.opt1"
+
+    if add_git_branch:
+        # Prefer the remote tracking branch name (e.g. hy/dfs_dev), stripping
+        # the repository prefix. Fall back to the local branch name when no
+        # upstream is configured. PEP 440 local version segments disallow '/',
+        # so replace it (and any other illegal char) with a hyphen.
+        branch = None
+        try:
+            upstream = subprocess.check_output(
+                ['git', 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'],
+                cwd=deepep_root, stderr=subprocess.DEVNULL,
+            ).decode('ascii').strip()
+            if upstream and '/' in upstream:
+                branch = upstream.split('/', 1)[1]
+        except subprocess.CalledProcessError:
+            branch = None
+        if not branch:
+            branch = subprocess.check_output(
+                ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=deepep_root
+            ).decode('ascii').strip()
+        safe_branch = re.sub(r'[^A-Za-z0-9._-]', '-', branch)
+        if safe_branch:
+            version = f"{version}.{safe_branch}"
 
     if add_git_version:
         if sha != 'Unknown':
