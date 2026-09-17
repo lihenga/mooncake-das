@@ -395,7 +395,10 @@ Client::Client(const std::string& local_hostname,
       host_id_(ResolveMooncakeHostId(local_hostname)),
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
-      pinned_buffer_pool_(std::make_shared<PinnedBufferPool>()),
+      pinned_buffer_pool_(
+          std::make_shared<PinnedBufferPool>(Environ::GetSizeT(
+              "MC_STORE_DFS_PINNED_POOL_BYTES",
+              PinnedBufferPool::kDefaultMaxCachedBytes))),
       write_thread_pool_(2),
       task_thread_pool_(4) {
     LOG(INFO) << "client_id=" << client_id_;
