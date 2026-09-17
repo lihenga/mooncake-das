@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
-#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -142,12 +141,13 @@ class DistributedStorageBackend : public StorageBackendInterface {
 
     // BUCKET mode opens bucket data files on demand and caches the handles.
     // Handles are shared_ptr so an in-flight read/write keeps the fd alive even
-    // if the cache entry is dropped (e.g. after the bucket is evicted).
+    // if the cache entry is dropped (e.g. after the bucket is evicted). The
+    // allocator assigns each object a unique offset, so concurrent access to a
+    // bucket file never overlaps and needs no lock.
     struct OpenFileHandle {
         std::string path;
         int fd = -1;
         FileSystemAdapter* adapter = nullptr;
-        std::mutex mutex;
 
         ~OpenFileHandle() {
             if (fd >= 0 && adapter != nullptr) {
@@ -167,11 +167,15 @@ class DistributedStorageBackend : public StorageBackendInterface {
      * `fd` and `mutex` are borrowed: in SHARD mode they belong to the
      * long-lived ShardFile, in BUCKET mode to `keepalive`, whose shared_ptr
      * guarantees the fd stays open for the duration of the I/O even if the
-     * cache entry is dropped concurrently.
+     * cache entry is dropped concurrently. `direct_read` records whether `fd`
+     * is a page-cache-bypassing direct handle so callers can pick the right
+     * read path; in BUCKET mode `mutex` is null because the allocator assigns
+     * each object a non-overlapping offset.
      */
     struct ResolvedTarget {
         int fd = -1;
         std::mutex* mutex = nullptr;
+        bool direct_read = false;
         std::shared_ptr<OpenFileHandle> keepalive;
     };
 
@@ -223,12 +227,6 @@ class DistributedStorageBackend : public StorageBackendInterface {
         bool direct_read = false;
         std::vector<ReadEntry> entries;
     };
-
-    static ErrorCode ReadFully(FileSystemAdapter* fs_adapter,
-                               const ResolvedTarget& target, uint64_t offset,
-                               std::span<char> output, bool direct_read);
-
-    static void CopyToSlices(const DfsReadRequest& request, const char* value);
 
     std::vector<ReadTask> PrepareReadTasks(
         const std::vector<DfsReadRequest>& requests,
