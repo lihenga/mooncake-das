@@ -20,7 +20,6 @@
 #include "pyclient.h"
 #include "client_service.h"
 #include "client_buffer.h"
-#include "dfs_prefetcher.h"
 #include "pinned_buffer_pool.h"
 #include "mutex.h"
 #include "utils.h"
@@ -1006,11 +1005,6 @@ class RealClient : public PyClient {
     bool dfs_read_shutting_down_ = false;
     std::shared_ptr<PinnedBufferPool> dfs_pinned_buffer_pool_;
     std::unique_ptr<DfsH2dStreamPool> dfs_h2d_stream_pool_;
-
-    // Asynchronous DFS-replica prefetcher fed by batchIsExist probes;
-    // consumed by process_session_disk_dfs_reads. Null unless
-    // MC_STORE_ENABLE_DFS_PREFETCH is on.
-    std::unique_ptr<DfsPrefetcher> dfs_prefetcher_;
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,
