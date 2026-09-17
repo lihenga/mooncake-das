@@ -100,6 +100,13 @@ class PinnedBufferPool {
         return AllocWithPageableFallback(capacity);
     }
 
+    // Allocate a pinned backing buffer outside the reusable pool. This is for
+    // long-lived arenas that are themselves sub-allocated by another allocator.
+    // Unlike Acquire(), it never falls back to pageable memory.
+    static Buffer AllocatePinned(size_t size, bool mapped = false) {
+        return AllocPinnedOnly(size, mapped);
+    }
+
     // Acquire only pinned storage; unlike Acquire(), this never falls back to
     // pageable memory and is intended for asynchronous DMA sources.
     Buffer AcquirePinned(size_t size, bool *from_cache = nullptr,

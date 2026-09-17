@@ -333,36 +333,6 @@ inline bool HasMemoryReplica(const std::vector<Replica::Descriptor> &replicas) {
     return false;
 }
 
-size_t DfsPinnedPoolBytes() {
-    constexpr size_t kDefaultBytes = 512ULL * 1024 * 1024;
-    const char *value = std::getenv("MC_STORE_DFS_PINNED_POOL_BYTES");
-    if (!value || value[0] == '\0') return kDefaultBytes;
-
-    errno = 0;
-    char *end = nullptr;
-    const unsigned long long parsed = std::strtoull(value, &end, 10);
-    const bool digits_only =
-        std::all_of(value, value + std::strlen(value), [](unsigned char c) {
-            return std::isdigit(c) != 0;
-        });
-    if (!digits_only || errno != 0 || end == value || *end != '\0' ||
-        parsed > std::numeric_limits<size_t>::max()) {
-        LOG(WARNING) << "Invalid MC_STORE_DFS_PINNED_POOL_BYTES='" << value
-                     << "', using " << kDefaultBytes;
-        return kDefaultBytes;
-    }
-    return static_cast<size_t>(parsed);
-}
-
-bool DfsH2dKernelEnabled() {
-#if defined(USE_HYGON)
-    const char *value = std::getenv("MC_STORE_DFS_H2D_KERNEL");
-    return value && value[0] == '1' && value[1] == '\0';
-#else
-    return false;
-#endif
-}
-
 size_t DfsH2dStreamCount() {
     constexpr size_t kDefaultStreams = 4;
     const char *value = std::getenv("MC_STORE_DFS_H2D_STREAMS");
@@ -396,63 +366,6 @@ bool AlignUp(size_t value, size_t alignment, size_t *aligned) {
     return true;
 }
 
-struct DfsPinnedArenaBacking {
-    std::shared_ptr<PinnedBufferPool> pool;
-    PinnedBufferPool::Buffer buffer;
-
-    ~DfsPinnedArenaBacking() {
-        if (pool) pool->Release(std::move(buffer));
-    }
-};
-
-std::shared_ptr<BufferHandle> AcquireDfsPinnedArena(
-    const std::shared_ptr<PinnedBufferPool> &pool, size_t size,
-    size_t *capacity_out = nullptr, bool *pool_hit_out = nullptr,
-    size_t alignment = 0) {
-    if (capacity_out) *capacity_out = 0;
-    if (pool_hit_out) *pool_hit_out = false;
-    if (!pool || size == 0) return nullptr;
-
-    // Over-allocate so the returned base can be rounded up to `alignment`
-    // when the accelerator's pinned-host allocator does not already guarantee
-    // it (cudaMallocHost et al. do not promise page alignment). The extra
-    // bytes are accounted for by the backing handle; only the aligned view is
-    // exposed to the caller.
-    const size_t padded_size =
-        alignment > 1 ? size + alignment - 1 : size;
-    auto backing = std::make_shared<DfsPinnedArenaBacking>();
-    backing->pool = pool;
-    bool pool_hit = false;
-    const bool use_h2d_kernel = DfsH2dKernelEnabled();
-    backing->buffer =
-        pool->AcquirePinned(padded_size, &pool_hit, use_h2d_kernel);
-    // Mapped host memory is optional. Keep the original pinned-DMA path if the
-    // platform cannot expose a device-visible alias.
-    if (use_h2d_kernel && !backing->buffer.data) {
-        pool_hit = false;
-        backing->buffer = pool->AcquirePinned(padded_size, &pool_hit, false);
-    }
-    if (!backing->buffer.data || !backing->buffer.pinned_host.addr ||
-        backing->buffer.capacity < padded_size) {
-        return nullptr;
-    }
-    if (capacity_out) *capacity_out = backing->buffer.capacity;
-    if (pool_hit_out) *pool_hit_out = pool_hit;
-
-    char *base = backing->buffer.data;
-    void *device_base = backing->buffer.device_data;
-    if (alignment > 1) {
-        const size_t head_padding =
-            reinterpret_cast<uintptr_t>(base) % alignment == 0
-                ? 0
-                : alignment - reinterpret_cast<uintptr_t>(base) % alignment;
-        base += head_padding;
-        if (device_base)
-            device_base = static_cast<char *>(device_base) + head_padding;
-    }
-    return std::make_shared<BufferHandle>(
-        base, size, [backing]() { (void)backing; }, device_base);
-}
 
 }  // namespace
 
@@ -1211,16 +1124,11 @@ RealClient::RealClient() {
     mooncake::init_ylt_log_level();
     const char *hp = std::getenv("MC_STORE_USE_HUGEPAGE");
     use_hugepage_ = (hp != nullptr);
-    const size_t pinned_pool_cache_bytes = DfsPinnedPoolBytes();
     const size_t h2d_streams_per_device = DfsH2dStreamCount();
-    dfs_pinned_buffer_pool_ =
-        std::make_shared<PinnedBufferPool>(pinned_pool_cache_bytes);
     dfs_h2d_stream_pool_ =
         std::make_unique<DfsH2dStreamPool>(h2d_streams_per_device);
-    LOG(INFO) << "DFS staging config: pinned_pool_max_idle_cache_bytes="
-              << pinned_pool_cache_bytes
-              << " (idle cache only, not an active pinned-memory limit)"
-              << ", h2d_streams_per_device=" << h2d_streams_per_device;
+    LOG(INFO) << "DFS staging config: shared pinned restore arena, "
+              << "h2d_streams_per_device=" << h2d_streams_per_device;
 }
 
 RealClient::~RealClient() {
@@ -1845,11 +1753,6 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         std::lock_guard<std::mutex> lock(session_mutex_);
         get_session_object_cache_.clear();
     }
-    if (dfs_pinned_buffer_pool_) {
-        dfs_pinned_buffer_pool_->Clear();
-        dfs_pinned_buffer_pool_.reset();
-    }
-
     if (!client_) {
         // Not initialized or already cleaned; treat as success for idempotence
         return {};
@@ -4075,12 +3978,27 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     };
 
     if (replica.is_local_disk_replica()) {
+        const auto &endpoint =
+            replica.get_local_disk_descriptor().transport_endpoint;
+        void *dst = static_cast<char *>(buffer) + dst_offset;
+        std::unordered_map<std::string, std::vector<Slice>> objects{
+            {key, {{dst, size}}}};
+        if (can_use_pinned_restore_arena(endpoint, objects)) {
+            if (total_size > uint64_t(std::numeric_limits<int64_t>::max())) {
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            const OffloadReadRange read_range{src_offset,
+                                              static_cast<int64_t>(total_size)};
+            auto result = batch_get_into_offload_object_internal(
+                endpoint, objects, &read_range);
+            if (!result) return tl::unexpected(result.error());
+            return static_cast<int64_t>(size);
+        }
+
         // LOCAL_DISK: offload RPC transfers sequentially from remote offset
         // 0, so we only need src_offset + size bytes (not total_size).
         return partial_disk_read(
             [&](void *tmp_buf) -> tl::expected<void, ErrorCode> {
-                const auto &endpoint =
-                    replica.get_local_disk_descriptor().transport_endpoint;
                 std::unordered_map<std::string, std::vector<Slice>> objects;
                 objects.emplace(
                     key, std::vector<Slice>{{static_cast<char *>(tmp_buf),
@@ -6186,8 +6104,7 @@ void RealClient::process_session_disk_dfs_reads(
     std::shared_lock<std::shared_mutex> dfs_read_lock(
         dfs_read_lifecycle_mutex_);
     if (closed_.load(std::memory_order_acquire) ||
-        dfs_read_shutting_down_ || !dfs_h2d_stream_pool_ ||
-        !dfs_pinned_buffer_pool_) {
+        dfs_read_shutting_down_ || !dfs_h2d_stream_pool_) {
         for (auto *entry : entries) {
             results[entry->original_idx] =
                 static_cast<int>(toInt(ErrorCode::TRANSFER_FAIL));
@@ -6200,7 +6117,7 @@ void RealClient::process_session_disk_dfs_reads(
     const size_t input_entries = entries.size();
     size_t session_cache_hits = 0;
     size_t arena_capacity = 0;
-    bool arena_pool_hit = false;
+    bool shared_arena_used = false;
     bool dfs_read_success = false;
     uint64_t dfs_read_bytes = 0;
     uint64_t dfs_requested_bytes = 0;
@@ -6354,22 +6271,46 @@ void RealClient::process_session_disk_dfs_reads(
         arena_size = aligned_offset + aligned_object_size;
     }
 
-    std::shared_ptr<BufferHandle> arena;
-    if (!arena_views.empty()) {
-        arena = AcquireDfsPinnedArena(dfs_pinned_buffer_pool_, arena_size,
-                                      &arena_capacity, &arena_pool_hit,
-                                      dfs_alignment);
-        if (!arena) {
-            LOG(ERROR) << "DFS pinned host arena allocation failed, size: "
-                       << arena_size;
-            for (const auto &view : arena_views) {
-                results[view.entry->original_idx] =
-                    static_cast<int>(toInt(ErrorCode::NO_AVAILABLE_HANDLE));
+    bool targets_device = false;
+    const auto accelerators =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    for (const auto *entry : entries) {
+        for (void *buffer : entry->buffers) {
+            if (accelerators.FindDeviceForPointer(buffer)) {
+                targets_device = true;
+                break;
             }
-            arena_views.clear();
-            arena.reset();
+        }
+        if (targets_device) break;
+    }
+
+    std::shared_ptr<BufferHandle> arena;
+    if (!arena_views.empty() && targets_device && file_storage_) {
+        auto shared_allocation =
+            file_storage_->AllocatePinnedStagingBuffer(arena_size);
+        if (shared_allocation) {
+            arena = std::make_shared<BufferHandle>(
+                std::move(*shared_allocation));
+            shared_arena_used = true;
         }
     }
+    if (!arena_views.empty() && !arena && client_buffer_allocator_) {
+        auto fallback_allocation = client_buffer_allocator_->allocate(arena_size);
+        if (fallback_allocation) {
+            arena = std::make_shared<BufferHandle>(
+                std::move(*fallback_allocation));
+        }
+    }
+    if (!arena_views.empty() && !arena) {
+        LOG(ERROR) << "DFS staging arena allocation failed, size: "
+                   << arena_size;
+        for (const auto &view : arena_views) {
+            results[view.entry->original_idx] =
+                static_cast<int>(toInt(ErrorCode::NO_AVAILABLE_HANDLE));
+        }
+        arena_views.clear();
+    }
+    if (arena) arena_capacity = arena->size();
 
     for (const auto &view : arena_views) {
         auto *view_ptr = static_cast<char *>(arena->ptr()) + view.offset;
@@ -6559,7 +6500,7 @@ void RealClient::process_session_disk_dfs_reads(
                   << ", total_us=" << elapsed_us(timing_start, t_end)
                   << ", arena_requested_bytes=" << arena_size
                   << ", arena_capacity=" << arena_capacity
-                  << ", arena_pool_hit=" << arena_pool_hit
+                  << ", shared_arena_used=" << shared_arena_used
                   << ", dfs_read_success=" << dfs_read_success
                   << ", dfs_read_bytes=" << dfs_read_bytes
                   << ", dfs_requested_bytes=" << dfs_requested_bytes
@@ -7745,38 +7686,113 @@ bool RealClient::release_offload_buffer(uint64_t batch_id) {
     return file_storage_->ReleaseBuffer(batch_id);
 }
 
+bool RealClient::can_use_pinned_restore_arena(
+    const std::string &target_rpc_service_addr,
+    const std::unordered_map<std::string, std::vector<Slice>> &objects) const {
+    if (!file_storage_ || target_rpc_service_addr != local_rpc_addr ||
+        !file_storage_->HasPinnedRestoreArena()) {
+        return false;
+    }
+    auto accelerators = device::GetAcceleratorRegistry().RuntimeAccelerators();
+    bool has_data = false;
+    for (const auto &object : objects) {
+        for (const auto &slice : object.second) {
+            if (slice.size && !accelerators.FindDeviceForPointer(slice.ptr)) {
+                return false;
+            }
+            has_data |= slice.size != 0;
+        }
+    }
+    return has_data;
+}
+
 tl::expected<void, ErrorCode>
 RealClient::batch_get_into_offload_object_internal(
     const std::string &target_rpc_service_addr,
-    std::unordered_map<std::string, std::vector<Slice>> &objects) {
+    std::unordered_map<std::string, std::vector<Slice>> &objects,
+    const OffloadReadRange *read_range) {
     offload_rpc_read_count_.fetch_add(1, std::memory_order_relaxed);
     auto start_time = std::chrono::steady_clock::now();
     std::vector<std::string> keys;
     std::vector<std::string> storage_keys;
     std::vector<int64_t> sizes;
+    if (read_range && objects.size() != 1) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     const TenantId tenant_id(client_->tenant_id());
     for (const auto &object_it : objects) {
         keys.emplace_back(object_it.first);
         storage_keys.emplace_back(tenant_id.MakeScopedKey(object_it.first));
-        int64_t total = 0;
-        for (const auto &s : object_it.second) total += s.size;
-        sizes.emplace_back(total);
+        uint64_t total = 0;
+        for (const auto &slice : object_it.second) {
+            if (slice.size > std::numeric_limits<uint64_t>::max() - total) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            total += slice.size;
+        }
+        if (total > uint64_t(std::numeric_limits<int64_t>::max())) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        int64_t storage_size = static_cast<int64_t>(total);
+        if (read_range) {
+            storage_size = read_range->restore_size;
+            if (storage_size < 0 ||
+                read_range->source_offset > uint64_t(storage_size) ||
+                total > uint64_t(storage_size) - read_range->source_offset) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        }
+        sizes.emplace_back(storage_size);
     }
-    auto batchGetResp = client_requester_->batch_get_offload_object(
-        target_rpc_service_addr, storage_keys, sizes);
-    if (!batchGetResp) {
+
+    const bool local_batch =
+        can_use_pinned_restore_arena(target_rpc_service_addr, objects);
+    std::optional<FileStorage::LocalBatchResult> local_owner;
+    auto response =
+        [&]() -> tl::expected<BatchGetOffloadObjectResponse, ErrorCode> {
+        if (!local_batch) {
+            return client_requester_->batch_get_offload_object(
+                target_rpc_service_addr, storage_keys, sizes);
+        }
+        auto result = file_storage_->BatchGetLocal(storage_keys, sizes);
+        if (!result) return tl::make_unexpected(result.error());
+        local_owner.emplace(std::move(result.value()));
+        return BatchGetOffloadObjectResponse(0,
+                                             std::move(local_owner->pointers),
+                                             client_->GetSegmentEndpoint(), 0);
+    }();
+    if (!response) {
         LOG(ERROR) << "Batch get offload object failed with error: "
-                   << batchGetResp.error();
-        return tl::make_unexpected(batchGetResp.error());
+                   << response.error();
+        return tl::make_unexpected(response.error());
     }
-    if (batchGetResp->pointers.size() != keys.size()) {
+
+    const auto release_buffer = [&]() {
+        if (!local_batch) {
+            client_requester_->release_offload_buffer(target_rpc_service_addr,
+                                                      response->batch_id);
+        }
+    };
+    struct ReleaseGuard {
+        const decltype(release_buffer) &release;
+        ~ReleaseGuard() { release(); }
+    } release_guard{release_buffer};
+    if (response->pointers.size() != keys.size()) {
         LOG(ERROR) << "Pointer count mismatch from owner: expected="
-                   << keys.size() << ", got=" << batchGetResp->pointers.size();
+                   << keys.size() << ", got=" << response->pointers.size();
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto result =
-        client_->BatchGetOffloadObject(batchGetResp->transfer_engine_addr, keys,
-                                       batchGetResp->pointers, objects);
+    if (read_range) {
+        if (response->pointers[0] >
+            std::numeric_limits<uint64_t>::max() - read_range->source_offset) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        response->pointers[0] += read_range->source_offset;
+    }
+    auto result = client_->BatchGetOffloadObject(
+        response->transfer_engine_addr, keys, response->pointers, objects,
+        local_batch ? OffloadBufferAccess::kLocalAddress
+                    : OffloadBufferAccess::kTransferEngine);
     auto end_time = std::chrono::steady_clock::now();
     auto elapsed_time = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(end_time -
@@ -7786,20 +7802,15 @@ RealClient::batch_get_into_offload_object_internal(
               << elapsed_time
               << "ms, with target_rpc_service_addr: " << target_rpc_service_addr
               << ", key size: " << objects.size()
-              << ", batch_id: " << batchGetResp->batch_id
-              << ", gc ttl: " << batchGetResp->gc_ttl_ms << "ms.";
-
-    // Release buffer immediately after transfer completion (fire-and-forget)
-    // This allows early buffer reclamation instead of waiting for GC lease
-    client_requester_->release_offload_buffer(target_rpc_service_addr,
-                                              batchGetResp->batch_id);
+              << ", batch_id: " << response->batch_id
+              << ", gc ttl: " << response->gc_ttl_ms << "ms.";
 
     if (!result) {
         LOG(ERROR) << "Batch get into offload object failed with error: "
                    << result.error();
         return result;
     }
-    if (elapsed_time >= batchGetResp->gc_ttl_ms) {
+    if (!local_batch && elapsed_time >= response->gc_ttl_ms) {
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
     return {};

@@ -20,7 +20,6 @@
 #include "pyclient.h"
 #include "client_service.h"
 #include "client_buffer.h"
-#include "pinned_buffer_pool.h"
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
@@ -809,9 +808,20 @@ class RealClient : public PyClient {
      "ip:port").
 
      */
+    struct OffloadReadRange {
+        uint64_t source_offset;
+        int64_t restore_size;
+    };
+
     tl::expected<void, ErrorCode> batch_get_into_offload_object_internal(
         const std::string &target_rpc_service_addr,
-        std::unordered_map<std::string, std::vector<Slice>> &objects);
+        std::unordered_map<std::string, std::vector<Slice>> &objects,
+        const OffloadReadRange *read_range = nullptr);
+
+    bool can_use_pinned_restore_arena(
+        const std::string &target_rpc_service_addr,
+        const std::unordered_map<std::string, std::vector<Slice>> &objects)
+        const;
 
     int64_t get_offload_rpc_read_count() const {
         return offload_rpc_read_count_.load(std::memory_order_relaxed);
@@ -1003,7 +1013,6 @@ class RealClient : public PyClient {
     class DfsAsyncScatterContext;
     mutable std::shared_mutex dfs_read_lifecycle_mutex_;
     bool dfs_read_shutting_down_ = false;
-    std::shared_ptr<PinnedBufferPool> dfs_pinned_buffer_pool_;
     std::unique_ptr<DfsH2dStreamPool> dfs_h2d_stream_pool_;
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.

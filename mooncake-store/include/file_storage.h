@@ -5,6 +5,8 @@
 #include "storage_backend.h"
 #include "pinned_buffer_pool.h"
 
+#include <optional>
+
 namespace mooncake {
 
 struct SsdMetric;
@@ -29,6 +31,14 @@ class FileStorage {
         std::vector<uint64_t> pointers;
     };
 
+    struct LocalBatchResult {
+        std::vector<uint64_t> pointers;
+
+       private:
+        friend class FileStorage;
+        std::shared_ptr<void> owner;
+    };
+
     /**
      * @brief Reads multiple key-value (KV) entries from local storage and
      * forwards them to a remote node.
@@ -40,6 +50,19 @@ class FileStorage {
     tl::expected<BatchGetResult, ErrorCode> BatchGet(
         const std::vector<std::string>& keys,
         const std::vector<int64_t>& sizes);
+
+    tl::expected<LocalBatchResult, ErrorCode> BatchGetLocal(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& sizes);
+
+    [[nodiscard]] bool HasPinnedRestoreArena() const {
+        return pinned_restore_arena_allocator_ != nullptr;
+    }
+
+    // Allocate request-scoped staging from the shared pinned restore arena.
+    // A mapped backing exposes the corresponding device-visible child alias.
+    [[nodiscard]] std::optional<BufferHandle> AllocatePinnedStagingBuffer(
+        size_t size);
 
     FileStorageConfig config_;
 
@@ -122,8 +145,12 @@ class FileStorage {
     tl::expected<void, ErrorCode> RegisterLocalMemory();
 
     tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode> AllocateBatch(
-        const std::vector<std::string>& keys,
-        const std::vector<int64_t>& sizes);
+        const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+        ClientBufferAllocator& allocator);
+
+    tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode> LoadBatch(
+        const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+        bool prefer_pinned);
 
     void ClientBufferGCThreadFunc();
 
@@ -137,8 +164,10 @@ class FileStorage {
     std::shared_ptr<Client> client_;
     SsdMetric* ssd_metric_{nullptr};
     std::string local_rpc_addr_;
-    // Pinned host memory pool for GPU D2H staging in OffloadObjects
+    // Pinned memory for GPU staging and SSD-to-GPU restores.
     std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
+    PinnedBufferPool::Buffer pinned_restore_arena_;
+    std::shared_ptr<ClientBufferAllocator> pinned_restore_arena_allocator_;
     std::shared_ptr<StorageBackendInterface> storage_backend_;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
     mutable Mutex client_buffer_mutex_;
