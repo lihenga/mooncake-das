@@ -1545,26 +1545,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         local_buffer_size, this->protocol, should_use_hugepage,
         use_spdk_dma_for_client_buffer);
 
-    // Optional DFS prefetcher: uses batchIsExist probes to pull DFS-only
-    // objects into chunked pinned arenas ahead of the session get.
-    if (dfs_prefetch_enabled()) {
-        dfs_prefetcher_ = std::make_unique<DfsPrefetcher>(
-            DfsPrefetchConfig::FromEnv(),
-            [client = client_.get()](const std::vector<std::string> &keys) {
-                return client->BatchQuery(keys);
-            },
-            [client = client_.get()](
-                const std::vector<std::string> &keys,
-                const std::vector<QueryResult> &qrs,
-                std::unordered_map<std::string, std::vector<Slice>> &slices) {
-                return client->BatchGet(keys, qrs, slices);
-            },
-            [client = client_.get()]() { return client->GetLocalEndpoints(); },
-            [pool = dfs_pinned_buffer_pool_](size_t size) {
-                return AcquireDfsPinnedArena(pool, size);
-            },
-            client_->GetDfsPrefetchMetricPtr());
-    }
     if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
                   << " bytes";
@@ -2042,18 +2022,12 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     stop_ipc_server();
     stop_dummy_client_monitor();
     stop_http_server();
-    // Stop and drain prefetch I/O while its pinned arena factory and Client
-    // callbacks are still valid. The object stays alive until existing DFS
-    // read and notification callers leave the shared lifecycle region.
-    if (dfs_prefetcher_) dfs_prefetcher_->Shutdown();
-
     // New callers observe closed_ and return after entering this shared
     // lifecycle region. Taking it exclusively drains existing DFS callers
     // before streams and their pinned sources are released.
     std::unique_lock<std::shared_mutex> dfs_read_lock(
         dfs_read_lifecycle_mutex_);
     dfs_read_shutting_down_ = true;
-    dfs_prefetcher_.reset();
 
     dfs_h2d_stream_pool_.reset();
 
@@ -6081,21 +6055,7 @@ std::vector<tl::expected<bool, ErrorCode>> RealClient::batchIsExist_internal(
     }
 
     // Call client BatchIsExist and return the vector<expected> directly
-    auto results = client_->BatchIsExist(keys);
-
-    // Feed existing keys to the DFS prefetcher. The call is non-blocking;
-    // only keys whose best replica is a DFS replica get prefetched.
-    if (!closed_.load(std::memory_order_acquire) &&
-        !dfs_read_shutting_down_ && dfs_prefetcher_) {
-        std::vector<std::string> existing_keys;
-        for (size_t i = 0; i < keys.size(); ++i) {
-            if (i < results.size() && results[i] && results[i].value()) {
-                existing_keys.push_back(keys[i]);
-            }
-        }
-        dfs_prefetcher_->NotifyExistTrue(std::move(existing_keys));
-    }
-    return results;
+    return client_->BatchIsExist(keys);
 }
 
 int RealClient::put_from_with_metadata(const std::string &key, void *buffer,
@@ -6830,38 +6790,6 @@ void RealClient::process_session_disk_dfs_reads(
     }
     const auto t_cache_hit_done = std::chrono::steady_clock::now();
 
-    // 1.5 Prefetch hit: serve DFS-only objects staged by batchIsExist from
-    // pinned chunks instead of re-reading DFS. Entries that miss or time out
-    // stay in the list and take the normal read path below.
-    size_t prefetch_hits = 0;
-    if (dfs_prefetcher_) {
-        std::vector<NonMemReadEntry *> miss_entries;
-        for (auto *entry_ptr : entries) {
-            auto &entry = *entry_ptr;
-            bool found = false;
-            auto handle = dfs_prefetcher_->TryConsume(entry.key, found);
-            if (!found) {
-                miss_entries.push_back(entry_ptr);
-                continue;
-            }
-            if (!handle) {
-                // Read failed or wait timed out: fall back to a direct read.
-                miss_entries.push_back(entry_ptr);
-                continue;
-            }
-            if (!valid_source_handle(&entry, handle)) {
-                LOG(ERROR) << "Prefetch buffer smaller than replica for key: "
-                           << entry.key;
-                miss_entries.push_back(entry_ptr);
-                continue;
-            }
-            cache_and_queue_scatter(&entry, handle);
-            ++prefetch_hits;
-        }
-        entries = std::move(miss_entries);
-    }
-    const auto t_prefetch_done = std::chrono::steady_clock::now();
-
     // 2. Cache miss: allocate + BatchGet
     std::vector<std::string> disk_batch_keys;
     std::vector<QueryResult> disk_batch_qrs;
@@ -7107,13 +7035,10 @@ void RealClient::process_session_disk_dfs_reads(
                   << ", input_entries=" << input_entries
                   << ", session_cache_hits=" << session_cache_hits
                   << ", dfs_batch_entries=" << disk_batch_keys.size()
-                  << ", prefetch_hits=" << prefetch_hits
                   << ", cache_hit_us="
                   << elapsed_us(timing_start, t_cache_hit_done)
-                  << ", prefetch_us="
-                  << elapsed_us(t_cache_hit_done, t_prefetch_done)
                   << ", alloc_us="
-                  << elapsed_us(t_prefetch_done, t_alloc_done)
+                  << elapsed_us(t_cache_hit_done, t_alloc_done)
                   << ", dfs_read_us=" << elapsed_us(t_alloc_done, t_io_done)
                   << ", scatter_us=" << scatter_us
                   << ", total_us=" << elapsed_us(timing_start, t_end)
