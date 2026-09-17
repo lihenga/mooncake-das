@@ -142,6 +142,7 @@ class MasterService {
      */
     tl::expected<int64_t, ErrorCode> SetDfsMaxBucketCount(
         int64_t new_max_bucket_count);
+    bool UsesDfsBucketAllocator() const { return bucket_allocator_ != nullptr; }
 
     /**
      * @brief Test-only wrapper around BatchEvict / NoFBatchEvict so that
@@ -412,10 +413,10 @@ class MasterService {
      * @brief Batch variant of PutStart that keeps a batch's DFS entries
      * contiguous.
      *
-     * When any key requests a DFS replica, the DFS space for the whole batch is
-     * reserved in a single allocator call before the per-key PutStart work, so
-     * concurrent batches cannot interleave inside a bucket. Keys whose PutStart
-     * subsequently fails have their reservation released.
+     * In BUCKET mode, when any key requests a DFS replica, the DFS space for the
+     * whole batch is reserved in a single allocator call before the per-key
+     * PutStart work, so concurrent batches cannot interleave inside a bucket.
+     * Keys whose PutStart subsequently fails have their reservation released.
      */
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,

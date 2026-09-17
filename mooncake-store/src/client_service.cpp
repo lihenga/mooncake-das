@@ -2641,6 +2641,9 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
     std::vector<const std::vector<Slice>*> slice_lists;
     std::vector<DistributedFSDescriptor> descriptors;
     std::vector<size_t> op_indices;
+    const bool bucket_mode =
+        dfs_storage_backend_ != nullptr &&
+        dfs_storage_backend_->GetAllocatorType() == DfsAllocatorType::BUCKET;
 
     for (size_t i = 0; i < ops.size(); ++i) {
         auto& op = ops[i];
@@ -2649,10 +2652,11 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
             !NonDfsTransfersSucceeded(op.transfer_summary)) {
             continue;
         }
-        // If the requested replica topology was not fully allocated the whole
-        // operation is going to be revoked anyway. Skipping the DFS write keeps
-        // that revoke unambiguous instead of racing a background completion.
-        if (!HasExpectedReplicaAllocation(op.ToReplicateConfig(),
+        // In BUCKET mode, an incomplete requested topology will be revoked.
+        // Skipping the DFS write keeps that revoke unambiguous instead of
+        // racing a background completion.
+        if (bucket_mode &&
+            !HasExpectedReplicaAllocation(op.ToReplicateConfig(),
                                           op.transfer_summary)) {
             continue;
         }
