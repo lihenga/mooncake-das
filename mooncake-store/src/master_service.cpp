@@ -4543,8 +4543,8 @@ auto MasterService::PutStartInternal(
                     return AllocateAndInsertMetadata(
                         shard, client_id, key, slice_length, config,
                         writer_host_id, group_id, object_id.tenant_id, now,
-                        *soft_pin_request, quota_deficit_bytes, preallocated_dfs,
-                        &dfs_allocation_failed);
+                        *soft_pin_request, quota_deficit_bytes, std::nullopt, 
+                        preallocated_dfs, &dfs_allocation_failed);
                 }
             }
         }
@@ -4562,7 +4562,7 @@ auto MasterService::PutStartInternal(
         return AllocateAndInsertMetadata(
             shard, client_id, key, slice_length, config, writer_host_id,
             group_id, object_id.tenant_id, now, *soft_pin_request,
-            quota_deficit_bytes, preallocated_dfs, &dfs_allocation_failed);
+            quota_deficit_bytes, std::nullopt, preallocated_dfs, &dfs_allocation_failed);
     };
 
     for (int attempt = 0; attempt <= kMaxTenantQuotaEvictionRetries;
@@ -7285,11 +7285,10 @@ void MasterService::RestoreRecoveredDfsReplicas() {
             std::piecewise_construct, std::forward_as_tuple(entry.key),
             std::forward_as_tuple(UUID{0, 0}, std::chrono::system_clock::now(),
                                   object_size, std::move(replicas),
-                                  /*enable_soft_pin=*/false,
+                                  std::nullopt,
                                   /*enable_hard_pin=*/false,
                                   ObjectDataType::UNKNOWN, std::string(),
                                   tenant_id, entry.key));
-        IncrementTenantMetadataObjectCount(tenant_id);
         // No quota ledger adoption: a recovered object holds only a DFS
         // replica, which carries no memory quota charge, so there is no
         // pending charge to adopt.

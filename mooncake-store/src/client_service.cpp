@@ -2175,7 +2175,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
-    ReplicateConfig client_cfg = AttachConfig(AttachHostId(config));
+    ReplicateConfig client_cfg = AttachConfig(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
@@ -2875,12 +2875,13 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
 
         tl::expected<void, ErrorCode> completion =
             tl::make_unexpected(ErrorCode::RPC_FAIL);
+        std::optional<uint64_t> object_checksum;
         for (int attempt = 0; attempt < kMaxCompletionAttempts; ++attempt) {
             if (succeeded) {
                 completion =
                     context->is_upsert
-                        ? master_client_.UpsertEnd(key, ReplicaType::DFS)
-                        : master_client_.PutEnd(key, ReplicaType::DFS);
+                        ? master_client_.UpsertEnd(ObjectMeta{key, object_checksum}, ReplicaType::DFS)
+                        : master_client_.PutEnd(ObjectMeta{key, object_checksum}, ReplicaType::DFS);
             } else {
                 completion =
                     context->is_upsert
@@ -3574,7 +3575,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
-    ReplicateConfig client_cfg = AttachConfig(AttachHostId(config));
+    ReplicateConfig client_cfg = AttachConfig(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
