@@ -3006,7 +3006,7 @@ MasterService::ReserveDfsSpaceForBatch(
     const std::vector<bool>& needs_dfs,
     std::unordered_map<std::string, ErrorCode>& errors_out) {
     std::unordered_map<std::string, DistributedFSDescriptor> reservations;
-    if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
+    if (bucket_allocator_ == nullptr || !bucket_allocator_->IsInitialized()) {
         return reservations;
     }
 
@@ -3018,7 +3018,7 @@ MasterService::ReserveDfsSpaceForBatch(
     }
     if (requests.empty()) return reservations;
 
-    auto results = dfs_allocator_->BatchAllocate(requests);
+    auto results = bucket_allocator_->BatchAllocate(requests);
     if (results.size() != requests.size()) {
         LOG(ERROR) << "DFS BatchAllocate returned " << results.size()
                    << " results for " << requests.size() << " requests";
@@ -3062,6 +3062,18 @@ MasterService::BatchPutStart(const UUID& client_id,
     if (keys.size() != slice_lengths.size()) {
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+        return results;
+    }
+
+    // Batch preallocation is a BUCKET-only optimization. SHARD allocation and
+    // requests without DFS replicas retain the original per-key allocation,
+    // failure, and rollback behavior of PutStart.
+    if (bucket_allocator_ == nullptr || config.dfs_replica_num == 0) {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results.emplace_back(PutStart(client_id, keys[i], tenant_id,
+                                          slice_lengths[i],
+                                          config.ForSingleKey(i)));
+        }
         return results;
     }
 
@@ -3109,7 +3121,7 @@ MasterService::BatchPutStart(const UUID& client_id,
         if (!result && preallocated.has_value()) {
             // PutStart rejected this key (duplicate, quota, ...) after we had
             // already reserved its space; give the reservation back.
-            dfs_allocator_->Free(keys[i], *preallocated);
+            bucket_allocator_->Free(keys[i], *preallocated);
         }
         results.emplace_back(std::move(result));
     }
