@@ -239,11 +239,10 @@ bool DistributedStorageConfig::ValidateForBucketAllocator() const {
                       "bucket_capacity overflows";
         return false;
     }
-    if (ready_bucket_target < 0 || ready_bucket_target > max_bucket_count) {
+    if (ready_bucket_target < 0) {
         LOG(ERROR) << "DistributedStorageConfig: ready_bucket_target must be "
-                      "in [0, max_bucket_count], ready_bucket_target="
-                   << ready_bucket_target
-                   << ", max_bucket_count=" << max_bucket_count;
+                      "non-negative, ready_bucket_target="
+                   << ready_bucket_target;
         return false;
     }
     if (bucket_create_concurrency < 1 ||
