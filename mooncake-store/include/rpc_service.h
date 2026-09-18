@@ -242,6 +242,11 @@ class WrappedMasterService {
     tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
     PromotionObjectHeartbeat(const UUID& client_id);
 
+    // DFS promotion channel heartbeat (Step 5): a DFS-capable client claims
+    // pending DFS promotion tasks from the master's global priority queue.
+    tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
+    DfsPromotionObjectHeartbeat(const UUID& client_id);
+
     tl::expected<PromotionAllocStartResponse, ErrorCode> PromotionAllocStart(
         const UUID& client_id, const std::string& key,
         const std::string& tenant_id, uint64_t size,

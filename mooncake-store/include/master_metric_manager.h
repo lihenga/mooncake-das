@@ -337,6 +337,46 @@ class MasterMetricManager {
     void inc_promotion_rejected_watermark(int64_t val = 1);
     void inc_promotion_rejected_cap(int64_t val = 1);
 
+    // DFS promotion metrics (independent DFS -> MEMORY promotion channel;
+    // mirrors the SSD promotion-on-hit metric family above)
+    void inc_dfs_promotion_in_flight(int64_t val = 1);
+    void dec_dfs_promotion_in_flight(int64_t val = 1);
+    void inc_dfs_promotion_admitted(int64_t val = 1);
+    void inc_dfs_promotion_completed(int64_t val = 1);
+    void inc_dfs_promotion_completed_bytes(int64_t bytes);
+    void inc_dfs_promotion_expired(int64_t val = 1);
+    void inc_dfs_promotion_failed(int64_t val = 1);
+    void inc_dfs_promotion_cancelled(int64_t val = 1);
+    void inc_dfs_promotion_rejected_frequency(int64_t val = 1);
+    void inc_dfs_promotion_rejected_low_weight(int64_t val = 1);
+    void inc_dfs_promotion_rejected_watermark(int64_t val = 1);
+    void inc_dfs_promotion_rejected_cap(int64_t val = 1);
+    // Reset the in-flight gauge to zero. Used on reload/leader takeover, where
+    // every DFS task record is dropped and the counter is reset in place.
+    void reset_dfs_promotion_in_flight();
+
+    // DFS promotion metrics getters (mirrors the promotion-on-hit getters
+    // above; used by unit tests and the metrics endpoint).
+    int64_t get_dfs_promotion_in_flight();
+    int64_t get_dfs_promotion_admitted();
+    int64_t get_dfs_promotion_completed();
+    int64_t get_dfs_promotion_completed_bytes();
+    int64_t get_dfs_promotion_expired();
+    int64_t get_dfs_promotion_failed();
+    int64_t get_dfs_promotion_cancelled();
+    int64_t get_dfs_promotion_rejected_frequency();
+    int64_t get_dfs_promotion_rejected_low_weight();
+    int64_t get_dfs_promotion_rejected_watermark();
+    int64_t get_dfs_promotion_rejected_cap();
+    // Ghost-detection gauges: the sketch's total decayed weight vs the weight
+    // of the samples still reachable from live DFS objects. A persistent gap
+    // means samples outlived their objects. Weights are rounded to int64
+    // because gauge_t is an integral gauge.
+    void set_dfs_promotion_sketch_weight(double val);
+    void set_dfs_promotion_members_weight(double val);
+    int64_t get_dfs_promotion_sketch_weight();
+    int64_t get_dfs_promotion_members_weight();
+
     // Tenant quota metrics
     void inc_tenant_quota_reject(const std::string& tenant_id,
                                  const std::string& reason, int64_t val = 1);
@@ -738,6 +778,23 @@ class MasterMetricManager {
     ylt::metric::counter_t promotion_rejected_frequency_;
     ylt::metric::counter_t promotion_rejected_watermark_;
     ylt::metric::counter_t promotion_rejected_cap_;
+    // DFS promotion metrics
+    ylt::metric::gauge_t dfs_promotion_in_flight_metric_;
+    ylt::metric::counter_t dfs_promotion_admitted_;
+    ylt::metric::counter_t dfs_promotion_completed_;
+    ylt::metric::counter_t dfs_promotion_completed_bytes_;
+    ylt::metric::counter_t dfs_promotion_expired_;
+    ylt::metric::counter_t dfs_promotion_failed_;
+    ylt::metric::counter_t dfs_promotion_cancelled_;
+    ylt::metric::counter_t dfs_promotion_rejected_frequency_;
+    ylt::metric::counter_t dfs_promotion_rejected_low_weight_;
+    ylt::metric::counter_t dfs_promotion_rejected_watermark_;
+    ylt::metric::counter_t dfs_promotion_rejected_cap_;
+    // Ghost-detection gauges: the sketch's total decayed
+    // weight vs the weight of the samples still reachable from live DFS
+    // objects. A persistent gap means samples outlived their objects.
+    ylt::metric::gauge_t dfs_promotion_sketch_weight_metric_;
+    ylt::metric::gauge_t dfs_promotion_members_weight_metric_;
     // Promotion retry candidate metrics
     ylt::metric::counter_t promotion_candidate_recorded_;
     ylt::metric::counter_t promotion_candidate_admitted_;

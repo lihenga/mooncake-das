@@ -419,6 +419,55 @@ MasterMetricManager::MasterMetricManager()
           "master_promotion_rejected_cap_total",
           "Promotion attempts rejected because promotion_in_flight was at "
           "promotion_queue_limit"),
+      // DFS promotion metrics (DFS -> MEMORY channel)
+      dfs_promotion_in_flight_metric_(
+          "master_dfs_promotion_in_flight",
+          "Current number of in-flight DFS->MEMORY promotion tasks"),
+      dfs_promotion_admitted_(
+          "master_dfs_promotion_admitted_total",
+          "Total DFS promotion tasks admitted past all gates and enqueued"),
+      dfs_promotion_completed_(
+          "master_dfs_promotion_completed_total",
+          "Total DFS promotion tasks committed via success notification"),
+      dfs_promotion_completed_bytes_(
+          "master_dfs_promotion_completed_bytes_total",
+          "Total bytes promoted from DFS to MEMORY"),
+      dfs_promotion_expired_(
+          "master_dfs_promotion_expired_total",
+          "Total DFS promotion tasks expired via the reaper"),
+      dfs_promotion_failed_(
+          "master_dfs_promotion_failed_total",
+          "Total DFS promotion tasks aborted by the holder via failure "
+          "notification"),
+      dfs_promotion_cancelled_(
+          "master_dfs_promotion_cancelled_total",
+          "Total DFS promotion tasks removed because the prerequisite went "
+          "away (object removal, holder expiry, lost source DFS replica)"),
+      dfs_promotion_rejected_frequency_(
+          "master_dfs_promotion_rejected_frequency_total",
+          "DFS promotion attempts rejected because the decayed heat was "
+          "below the current quantile threshold"),
+      dfs_promotion_rejected_low_weight_(
+          "master_dfs_promotion_rejected_low_weight_total",
+          "DFS promotion attempts rejected because the sketch total weight "
+          "was below dfs_promotion_min_total_weight"),
+      dfs_promotion_rejected_watermark_(
+          "master_dfs_promotion_rejected_watermark_total",
+          "DFS promotion attempts rejected because DRAM was at or above the "
+          "eviction high watermark"),
+      dfs_promotion_rejected_cap_(
+          "master_dfs_promotion_rejected_cap_total",
+          "DFS promotion attempts rejected because in-flight tasks were at "
+          "the queue limit"),
+      dfs_promotion_sketch_weight_metric_(
+          "master_dfs_promotion_sketch_weight",
+          "Total decayed weight of samples in the DFS heat sketch (ghost "
+          "census numerator)"),
+      dfs_promotion_members_weight_metric_(
+          "master_dfs_promotion_members_weight",
+          "Estimated decayed weight of samples still reachable from live DFS "
+          "objects (ghost census denominator)"),
+      // Promotion retry candidate metrics
       promotion_candidate_recorded_(
           "master_promotion_candidate_recorded_total",
           "New promotion retry candidate entries created"),
@@ -550,6 +599,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     file_cache_nums_.update(0);
     put_start_discarded_staging_size_.update(0);
     promotion_in_flight_metric_.update(0);
+    dfs_promotion_in_flight_metric_.update(0);
 
     // Update Counters (use inc(0) to mark as changed)
     promotion_admitted_.inc(0);
@@ -568,6 +618,18 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     promotion_candidate_expired_evaluated_.inc(0);
     promotion_candidate_expired_unevaluated_.inc(0);
     promotion_candidate_dropped_limit_.inc(0);
+    dfs_promotion_admitted_.inc(0);
+    dfs_promotion_completed_.inc(0);
+    dfs_promotion_completed_bytes_.inc(0);
+    dfs_promotion_expired_.inc(0);
+    dfs_promotion_failed_.inc(0);
+    dfs_promotion_cancelled_.inc(0);
+    dfs_promotion_rejected_frequency_.inc(0);
+    dfs_promotion_rejected_low_weight_.inc(0);
+    dfs_promotion_rejected_watermark_.inc(0);
+    dfs_promotion_rejected_cap_.inc(0);
+    dfs_promotion_sketch_weight_metric_.update(0);
+    dfs_promotion_members_weight_metric_.update(0);
     put_start_requests_.inc(0);
     put_start_failures_.inc(0);
     put_start_alloc_failures_.inc(0);
@@ -1315,6 +1377,97 @@ void MasterMetricManager::inc_promotion_rejected_watermark(int64_t val) {
 void MasterMetricManager::inc_promotion_rejected_cap(int64_t val) {
     promotion_rejected_cap_.inc(val);
 }
+
+// --- DFS promotion metrics (DFS -> MEMORY channel) ---
+void MasterMetricManager::inc_dfs_promotion_in_flight(int64_t val) {
+    dfs_promotion_in_flight_metric_.inc(val);
+}
+void MasterMetricManager::dec_dfs_promotion_in_flight(int64_t val) {
+    dfs_promotion_in_flight_metric_.dec(val);
+}
+void MasterMetricManager::inc_dfs_promotion_admitted(int64_t val) {
+    dfs_promotion_admitted_.inc(val);
+}
+void MasterMetricManager::inc_dfs_promotion_completed(int64_t val) {
+    dfs_promotion_completed_.inc(val);
+}
+void MasterMetricManager::inc_dfs_promotion_completed_bytes(int64_t bytes) {
+    dfs_promotion_completed_bytes_.inc(bytes);
+}
+void MasterMetricManager::inc_dfs_promotion_expired(int64_t val) {
+    dfs_promotion_expired_.inc(val);
+}
+void MasterMetricManager::inc_dfs_promotion_failed(int64_t val) {
+    dfs_promotion_failed_.inc(val);
+}
+void MasterMetricManager::inc_dfs_promotion_cancelled(int64_t val) {
+    dfs_promotion_cancelled_.inc(val);
+}
+void MasterMetricManager::inc_dfs_promotion_rejected_frequency(int64_t val) {
+    dfs_promotion_rejected_frequency_.inc(val);
+}
+void MasterMetricManager::inc_dfs_promotion_rejected_low_weight(int64_t val) {
+    dfs_promotion_rejected_low_weight_.inc(val);
+}
+void MasterMetricManager::inc_dfs_promotion_rejected_watermark(int64_t val) {
+    dfs_promotion_rejected_watermark_.inc(val);
+}
+void MasterMetricManager::inc_dfs_promotion_rejected_cap(int64_t val) {
+    dfs_promotion_rejected_cap_.inc(val);
+}
+void MasterMetricManager::reset_dfs_promotion_in_flight() {
+    dfs_promotion_in_flight_metric_.update(0);
+}
+
+// --- DFS promotion metrics getters ---
+int64_t MasterMetricManager::get_dfs_promotion_in_flight() {
+    return dfs_promotion_in_flight_metric_.value();
+}
+int64_t MasterMetricManager::get_dfs_promotion_admitted() {
+    return dfs_promotion_admitted_.value();
+}
+int64_t MasterMetricManager::get_dfs_promotion_completed() {
+    return dfs_promotion_completed_.value();
+}
+int64_t MasterMetricManager::get_dfs_promotion_completed_bytes() {
+    return dfs_promotion_completed_bytes_.value();
+}
+int64_t MasterMetricManager::get_dfs_promotion_expired() {
+    return dfs_promotion_expired_.value();
+}
+int64_t MasterMetricManager::get_dfs_promotion_failed() {
+    return dfs_promotion_failed_.value();
+}
+int64_t MasterMetricManager::get_dfs_promotion_cancelled() {
+    return dfs_promotion_cancelled_.value();
+}
+int64_t MasterMetricManager::get_dfs_promotion_rejected_frequency() {
+    return dfs_promotion_rejected_frequency_.value();
+}
+int64_t MasterMetricManager::get_dfs_promotion_rejected_low_weight() {
+    return dfs_promotion_rejected_low_weight_.value();
+}
+int64_t MasterMetricManager::get_dfs_promotion_rejected_watermark() {
+    return dfs_promotion_rejected_watermark_.value();
+}
+int64_t MasterMetricManager::get_dfs_promotion_rejected_cap() {
+    return dfs_promotion_rejected_cap_.value();
+}
+void MasterMetricManager::set_dfs_promotion_sketch_weight(double val) {
+    dfs_promotion_sketch_weight_metric_.update(
+        static_cast<int64_t>(std::llround(val)));
+}
+void MasterMetricManager::set_dfs_promotion_members_weight(double val) {
+    dfs_promotion_members_weight_metric_.update(
+        static_cast<int64_t>(std::llround(val)));
+}
+int64_t MasterMetricManager::get_dfs_promotion_sketch_weight() {
+    return dfs_promotion_sketch_weight_metric_.value();
+}
+int64_t MasterMetricManager::get_dfs_promotion_members_weight() {
+    return dfs_promotion_members_weight_metric_.value();
+}
+
 void MasterMetricManager::inc_promotion_candidate_recorded(int64_t val) {
     promotion_candidate_recorded_.inc(val);
 }
@@ -2108,6 +2261,22 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(promotion_candidate_expired_evaluated_);
     serialize_metric(promotion_candidate_expired_unevaluated_);
     serialize_metric(promotion_candidate_dropped_limit_);
+
+    // Serialize DFS promotion Metrics
+    serialize_metric(dfs_promotion_in_flight_metric_);
+    serialize_metric(dfs_promotion_admitted_);
+    serialize_metric(dfs_promotion_completed_);
+    serialize_metric(dfs_promotion_completed_bytes_);
+    serialize_metric(dfs_promotion_expired_);
+    serialize_metric(dfs_promotion_failed_);
+    serialize_metric(dfs_promotion_cancelled_);
+    serialize_metric(dfs_promotion_rejected_frequency_);
+    serialize_metric(dfs_promotion_rejected_low_weight_);
+    serialize_metric(dfs_promotion_rejected_watermark_);
+    serialize_metric(dfs_promotion_rejected_cap_);
+    serialize_metric(dfs_promotion_sketch_weight_metric_);
+    serialize_metric(dfs_promotion_members_weight_metric_);
+
     serialize_metric(tenant_quota_reject_total_);
     serialize_metric(tenant_evict_bytes_total_);
 

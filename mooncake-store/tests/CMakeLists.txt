@@ -77,6 +77,9 @@ add_store_test(offload_on_evict_test offload_on_evict_test.cpp)
 add_store_test(promotion_on_hit_test promotion_on_hit_test.cpp)
 add_store_test(dynamic_replication_test dynamic_replication_test.cpp)
 add_store_test(file_storage_promotion_test file_storage_promotion_test.cpp)
+add_store_test(decaying_ddsketch_test decaying_ddsketch_test.cpp)
+add_store_test(decaying_ddsketch_accuracy_test
+               decaying_ddsketch_accuracy_test.cpp)
 add_store_test(master_service_ssd_test_for_snapshot
                ha/snapshot/master_service_ssd_test_for_snapshot.cpp)
 add_store_test(master_service_promotion_test_for_snapshot

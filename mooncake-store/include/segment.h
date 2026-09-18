@@ -15,6 +15,7 @@
 #include "allocation_strategy.h"
 #include "allocator.h"
 #include "local_ssd/persisted_state.h"
+#include "replica.h"
 #include "rpc_types.h"
 #include "storage_usage.h"
 #include "types.h"

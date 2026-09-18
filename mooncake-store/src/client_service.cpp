@@ -4176,6 +4176,20 @@ tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(
     return {};
 }
 
+tl::expected<void, ErrorCode> Client::DfsPromotionObjectHeartbeat(
+    std::vector<PromotionTaskItem>& promotion_objects) {
+    auto response = master_client_.DfsPromotionObjectHeartbeat(client_id_);
+    if (!response) {
+        return tl::make_unexpected(response.error());
+    }
+    promotion_objects = std::move(response.value());
+    return {};
+}
+
+bool Client::HasDfsStorageBackend() const {
+    return dfs_storage_backend_ != nullptr;
+}
+
 tl::expected<PromotionAllocStartResponse, ErrorCode>
 Client::PromotionAllocStart(
     const std::string& key, uint64_t size,
@@ -4215,6 +4229,12 @@ tl::expected<void, ErrorCode> Client::NotifyPromotionFailure(
 ErrorCode Client::PromotionWrite(const Replica::Descriptor& memory_descriptor,
                                  std::vector<Slice>& slices) {
     return TransferWrite(memory_descriptor, slices);
+}
+
+ErrorCode Client::ReadDfsReplicaForPromotion(
+    const std::string& key, const Replica::Descriptor& replica_descriptor,
+    std::vector<Slice>& slices) {
+    return ReadDfsReplica(key, replica_descriptor, slices);
 }
 
 tl::expected<UUID, ErrorCode> Client::CreateCopyTask(

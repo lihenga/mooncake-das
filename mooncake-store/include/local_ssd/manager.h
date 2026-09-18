@@ -13,6 +13,7 @@
 
 #include "local_ssd/persisted_state.h"
 #include "mutex.h"
+#include "replica.h"
 #include "tenant_id.h"
 #include "types.h"
 

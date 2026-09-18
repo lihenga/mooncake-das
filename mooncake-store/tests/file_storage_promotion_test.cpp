@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <filesystem>
+#include <optional>
 #include <set>
 #include <thread>
 
@@ -93,6 +94,7 @@ class FakeClient : public Client {
     ErrorCode PromotionWrite(const Replica::Descriptor&,
                              std::vector<Slice>&) override {
         write_calls.fetch_add(1);
+        events.push_back("write");
         auto it = write_overrides.find(last_alloc_key);
         if (it != write_overrides.end()) {
             return it->second;
@@ -114,6 +116,7 @@ class FakeClient : public Client {
         (void)tenant_id;
         notify_calls.fetch_add(1);
         notify_keys.push_back(key);
+        events.push_back("notify_success");
         auto it = notify_overrides.find(key);
         if (it != notify_overrides.end()) {
             return tl::make_unexpected(it->second);
@@ -137,7 +140,61 @@ class FakeClient : public Client {
         (void)tenant_id;
         notify_failure_calls.fetch_add(1);
         notify_failure_keys.push_back(key);
+        events.push_back("notify_failure");
         return {};
+    }
+
+    // ---- DFS promotion channel. Same shape as the SSD overrides
+    // above, but for Client::DfsPromotionObjectHeartbeat /
+    // HasDfsStorageBackend / ReadDfsReplicaForPromotion. ----
+
+    // A client only serves the DFS channel when it wired a distributed
+    // backend at construction; the fake flips this instead.
+    bool dfs_capable = false;
+
+    bool HasDfsStorageBackend() const override { return dfs_capable; }
+
+    std::vector<PromotionTaskItem> dfs_heartbeat_queue;
+    tl::expected<void, ErrorCode> dfs_heartbeat_result =
+        tl::expected<void, ErrorCode>{};
+
+    tl::expected<void, ErrorCode> DfsPromotionObjectHeartbeat(
+        std::vector<PromotionTaskItem>& promotion_objects) override {
+        dfs_heartbeat_calls.fetch_add(1);
+        if (!dfs_heartbeat_result.has_value()) {
+            return tl::make_unexpected(dfs_heartbeat_result.error());
+        }
+        // Mirror the production master: at most kMaxPerHeartbeat keys per
+        // call, remainder stays queued for subsequent ticks.
+        constexpr size_t kMaxPerHeartbeat = 1;
+        promotion_objects.clear();
+        while (promotion_objects.size() < kMaxPerHeartbeat &&
+               !dfs_heartbeat_queue.empty()) {
+            promotion_objects.push_back(std::move(dfs_heartbeat_queue.back()));
+            dfs_heartbeat_queue.pop_back();
+        }
+        return {};
+    }
+
+    // ReadDfsReplicaForPromotion: per-key dispatch. `key` is the
+    // tenant-scoped storage key the executor derives, so overrides are
+    // registered against TenantId(...).MakeScopedKey(local_key).
+    std::unordered_map<std::string, ErrorCode> dfs_read_overrides;
+    ErrorCode default_dfs_read_result = ErrorCode::OK;
+
+    ErrorCode ReadDfsReplicaForPromotion(
+        const std::string& key, const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices) override {
+        (void)replica_descriptor;
+        (void)slices;
+        dfs_read_calls.fetch_add(1);
+        last_dfs_read_key = key;
+        events.push_back("dfs_read");
+        auto it = dfs_read_overrides.find(key);
+        if (it != dfs_read_overrides.end()) {
+            return it->second;
+        }
+        return default_dfs_read_result;
     }
 
     std::atomic<int> heartbeat_calls{0};
@@ -145,9 +202,17 @@ class FakeClient : public Client {
     std::atomic<int> write_calls{0};
     std::atomic<int> notify_calls{0};
     std::atomic<int> notify_failure_calls{0};
+    std::atomic<int> dfs_heartbeat_calls{0};
+    std::atomic<int> dfs_read_calls{0};
     std::vector<std::string> notify_keys;
     std::vector<std::string> notify_failure_keys;
     std::string last_alloc_key;
+    std::string last_dfs_read_key;
+
+    // Ordered log of the RPCs the executor issued. Lets tests assert the
+    // read -> TE-write -> commit sequence (and that no write/commit ran when
+    // the read failed). Single-threaded use only.
+    std::vector<std::string> events;
 };
 
 }  // namespace fs_test
@@ -192,6 +257,40 @@ class FileStoragePromotionTest : public ::testing::Test {
         return file_storage->ProcessPromotionTasks();
     }
 
+    tl::expected<void, ErrorCode> CallProcessDfsPromotionTasks() {
+        return file_storage->ProcessDfsPromotionTasks();
+    }
+
+    // Build a DFS-channel task carrying a COMPLETE DFS source descriptor, the
+    // shape MasterService::DfsPromotionObjectHeartbeat hands to a capable
+    // client.
+    static PromotionTaskItem MakeDfsTask(
+        const std::string& key, int64_t size,
+        const std::string& file_path = "/dfs/obj", uint64_t offset = 0) {
+        PromotionTaskItem task;
+        task.tenant_id = std::string(TenantId::kDefaultValue);
+        task.key = key;
+        task.size = size;
+        DistributedFSDescriptor dfs_desc;
+        dfs_desc.file_path = file_path;
+        dfs_desc.offset = offset;
+        dfs_desc.object_size = static_cast<uint64_t>(size);
+        dfs_desc.aligned_size = static_cast<uint64_t>(size);
+        dfs_desc.shard_idx = 0;
+        Replica::Descriptor desc{};
+        desc.id = 0;
+        desc.status = ReplicaStatus::COMPLETE;
+        desc.descriptor_variant = dfs_desc;
+        task.source_dfs = std::move(desc);
+        return task;
+    }
+
+    // The tenant-scoped storage key the executor derives for a local key.
+    static std::string ScopedKey(const std::string& local_key) {
+        return TenantId(std::string(TenantId::kDefaultValue))
+            .MakeScopedKey(local_key);
+    }
+
     // Drain a multi-key queue across multiple ticks. ProcessPromotionTasks
     // caps work at 1 task/tick (heartbeat-safety) and the FakeClient's
     // PromotionObjectHeartbeat mirrors production by clearing the queue on
@@ -208,7 +307,10 @@ class FileStoragePromotionTest : public ::testing::Test {
             fake->heartbeat_queue.reserve(remaining.size());
             for (const auto& [key, size] : remaining) {
                 fake->heartbeat_queue.push_back(PromotionTaskItem{
-                    .tenant_id = "default", .key = key, .size = size});
+                    .tenant_id = "default",
+                    .key = key,
+                    .size = size,
+                    .source_dfs = std::nullopt});
             }
             last_res = CallProcessPromotionTasks();
             if (!last_res.has_value()) return last_res;
@@ -256,8 +358,14 @@ TEST_F(FileStoragePromotionTest, HeartbeatHardErrorPropagates) {
 // Non-positive size in queue: skip that key, continue.
 TEST_F(FileStoragePromotionTest, NonPositiveSizeSkipped) {
     fake->heartbeat_queue = {
-        {.tenant_id = "default", .key = "k_bad", .size = 0},
-        {.tenant_id = "default", .key = "k_good", .size = 1024}};
+        {.tenant_id = "default",
+         .key = "k_bad",
+         .size = 0,
+         .source_dfs = std::nullopt},
+        {.tenant_id = "default",
+         .key = "k_good",
+         .size = 1024,
+         .source_dfs = std::nullopt}};
     auto res = CallProcessPromotionTasks();
     EXPECT_TRUE(res.has_value());
     // Only k_good should reach AllocStart.
@@ -282,7 +390,10 @@ TEST_F(FileStoragePromotionTest, AllocStartFailureSkipsKey) {
 // Master-side reaper handles the orphaned PROCESSING replica.
 TEST_F(FileStoragePromotionTest, BatchLoadFailureLeavesNoNotify) {
     fake->heartbeat_queue = {
-        {.tenant_id = "default", .key = "k_missing", .size = 1024}};
+        {.tenant_id = "default",
+         .key = "k_missing",
+         .size = 1024,
+         .source_dfs = std::nullopt}};
     // Default alloc succeeds; BatchLoad will fail because there's no file
     // at data_path/k_missing for the storage backend to read.
     auto res = CallProcessPromotionTasks();
@@ -298,7 +409,10 @@ TEST_F(FileStoragePromotionTest, BatchLoadFailureLeavesNoNotify) {
 // PromotionWrite failure: no Notify.
 TEST_F(FileStoragePromotionTest, TransferWriteFailureLeavesNoNotify) {
     fake->heartbeat_queue = {
-        {.tenant_id = "default", .key = "k_te_fail", .size = 1024}};
+        {.tenant_id = "default",
+         .key = "k_te_fail",
+         .size = 1024,
+         .source_dfs = std::nullopt}};
     fake->default_write_result = ErrorCode::TRANSFER_FAIL;
     auto res = CallProcessPromotionTasks();
     EXPECT_TRUE(res.has_value());
@@ -342,7 +456,10 @@ TEST_F(FileStoragePromotionTest, PerKeyFailuresAreIndependent) {
 // DRAM-pressure spike into a sustained outage of promotion_queue_limit_.
 TEST_F(FileStoragePromotionTest, AllocStartFailureNotifiesMaster) {
     fake->heartbeat_queue = {
-        {.tenant_id = "default", .key = "k_alloc_fail", .size = 1024}};
+        {.tenant_id = "default",
+         .key = "k_alloc_fail",
+         .size = 1024,
+         .source_dfs = std::nullopt}};
     fake->alloc_overrides["k_alloc_fail"] = ErrorCode::NO_AVAILABLE_HANDLE;
     auto res = CallProcessPromotionTasks();
     EXPECT_TRUE(res.has_value());
@@ -392,6 +509,159 @@ TEST_F(FileStoragePromotionTest, PostAllocFailuresAllNotifyMaster) {
     EXPECT_EQ(got.count("k_alloc_fail"), 1u);
     EXPECT_EQ(got.count("k_load_fail"), 1u);
     EXPECT_EQ(got.count("k_notify_fail"), 1u);
+}
+
+// ================= DFS promotion executor =================
+// FileStorage::ProcessDfsPromotionTasks mirrors the SSD executor above but
+// reads the source bytes from the DFS backend
+// (Client::ReadDfsReplicaForPromotion) instead of local SSD, and only runs on
+// DFS-capable clients (those with a distributed backend).
+
+// A client without a distributed backend must not poll the DFS channel at
+// all: the whole tick is a no-op.
+TEST_F(FileStoragePromotionTest, DfsNonCapableClientSkipsChannel) {
+    fake->dfs_capable = false;
+    fake->dfs_heartbeat_queue = {MakeDfsTask("k_dfs", 1024)};
+
+    auto res = CallProcessDfsPromotionTasks();
+    EXPECT_TRUE(res.has_value());
+    EXPECT_EQ(fake->dfs_heartbeat_calls.load(), 0)
+        << "Non-DFS-capable clients must not poll DfsPromotionObjectHeartbeat";
+    EXPECT_EQ(fake->alloc_calls.load(), 0);
+}
+
+// Capable client, empty queue: heartbeat runs, nothing else.
+TEST_F(FileStoragePromotionTest, DfsEmptyQueueIsNoOp) {
+    fake->dfs_capable = true;
+    auto res = CallProcessDfsPromotionTasks();
+    EXPECT_TRUE(res.has_value());
+    EXPECT_EQ(fake->dfs_heartbeat_calls.load(), 1);
+    EXPECT_EQ(fake->alloc_calls.load(), 0);
+    EXPECT_EQ(fake->dfs_read_calls.load(), 0);
+}
+
+// Heartbeat hard error propagates to the caller (mirrors the SSD channel).
+TEST_F(FileStoragePromotionTest, DfsHeartbeatHardErrorPropagates) {
+    fake->dfs_capable = true;
+    fake->dfs_heartbeat_result = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+
+    auto res = CallProcessDfsPromotionTasks();
+    ASSERT_FALSE(res.has_value());
+    EXPECT_EQ(res.error(), ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(fake->alloc_calls.load(), 0);
+}
+
+// A DFS task missing its source descriptor cannot be executed: release the
+// claimed slot immediately instead of pinning it for the reaper TTL.
+TEST_F(FileStoragePromotionTest, DfsTaskWithoutSourceNotifiesFailure) {
+    fake->dfs_capable = true;
+    PromotionTaskItem no_source;
+    no_source.tenant_id = std::string(TenantId::kDefaultValue);
+    no_source.key = "k_no_source";
+    no_source.size = 1024;
+    no_source.source_dfs.reset();
+    fake->dfs_heartbeat_queue = {std::move(no_source)};
+
+    auto res = CallProcessDfsPromotionTasks();
+    EXPECT_TRUE(res.has_value());
+    EXPECT_EQ(fake->alloc_calls.load(), 0);
+    EXPECT_EQ(fake->dfs_read_calls.load(), 0);
+    EXPECT_EQ(fake->notify_calls.load(), 0);
+    EXPECT_EQ(fake->notify_failure_calls.load(), 1);
+    ASSERT_EQ(fake->notify_failure_keys.size(), 1u);
+    EXPECT_EQ(fake->notify_failure_keys[0], "k_no_source");
+}
+
+// Non-positive size is skipped before any RPC: nothing to release.
+TEST_F(FileStoragePromotionTest, DfsNonPositiveSizeSkipped) {
+    fake->dfs_capable = true;
+    fake->dfs_heartbeat_queue = {MakeDfsTask("k_bad", 0)};
+
+    auto res = CallProcessDfsPromotionTasks();
+    EXPECT_TRUE(res.has_value());
+    EXPECT_EQ(fake->alloc_calls.load(), 0);
+    EXPECT_EQ(fake->dfs_read_calls.load(), 0);
+    EXPECT_EQ(fake->notify_failure_calls.load(), 0);
+}
+
+// Happy path: AllocStart -> read DFS source -> TE-write -> commit, in that
+// order, using the tenant-scoped storage key for the DFS read.
+TEST_F(FileStoragePromotionTest, DfsHappyPathReadsWritesCommits) {
+    fake->dfs_capable = true;
+    fake->dfs_heartbeat_queue = {MakeDfsTask("k_dfs_ok", 1024, "/dfs/x", 4096)};
+
+    auto res = CallProcessDfsPromotionTasks();
+    EXPECT_TRUE(res.has_value());
+    EXPECT_EQ(fake->alloc_calls.load(), 1);
+    EXPECT_EQ(fake->dfs_read_calls.load(), 1);
+    EXPECT_EQ(fake->write_calls.load(), 1);
+    EXPECT_EQ(fake->notify_calls.load(), 1);
+    EXPECT_EQ(fake->notify_failure_calls.load(), 0);
+    EXPECT_EQ(fake->last_dfs_read_key, ScopedKey("k_dfs_ok"));
+    EXPECT_EQ(fake->events,
+              (std::vector<std::string>{"dfs_read", "write",
+                                        "notify_success"}));
+}
+
+// DFS read failure: no TE write, no commit, slot released.
+TEST_F(FileStoragePromotionTest, DfsReadFailureNotifiesFailure) {
+    fake->dfs_capable = true;
+    fake->dfs_heartbeat_queue = {MakeDfsTask("k_dfs_read_fail", 1024)};
+    fake->dfs_read_overrides[ScopedKey("k_dfs_read_fail")] =
+        ErrorCode::DFS_SERVICE_UNAVAILABLE;
+
+    auto res = CallProcessDfsPromotionTasks();
+    EXPECT_TRUE(res.has_value());
+    EXPECT_EQ(fake->alloc_calls.load(), 1);
+    EXPECT_EQ(fake->dfs_read_calls.load(), 1);
+    EXPECT_EQ(fake->write_calls.load(), 0)
+        << "TE write must not run when the DFS read failed";
+    EXPECT_EQ(fake->notify_calls.load(), 0);
+    EXPECT_EQ(fake->notify_failure_calls.load(), 1);
+}
+
+// AllocStart failure (e.g. no free DRAM): no read, slot released.
+TEST_F(FileStoragePromotionTest, DfsAllocStartFailureNotifiesFailure) {
+    fake->dfs_capable = true;
+    fake->dfs_heartbeat_queue = {MakeDfsTask("k_dfs_alloc_fail", 1024)};
+    fake->alloc_overrides["k_dfs_alloc_fail"] = ErrorCode::NO_AVAILABLE_HANDLE;
+
+    auto res = CallProcessDfsPromotionTasks();
+    EXPECT_TRUE(res.has_value());
+    EXPECT_EQ(fake->alloc_calls.load(), 1);
+    EXPECT_EQ(fake->dfs_read_calls.load(), 0);
+    EXPECT_EQ(fake->notify_calls.load(), 0);
+    EXPECT_EQ(fake->notify_failure_calls.load(), 1);
+}
+
+// TE write failure: no commit, slot released.
+TEST_F(FileStoragePromotionTest, DfsTransferWriteFailureNotifiesFailure) {
+    fake->dfs_capable = true;
+    fake->dfs_heartbeat_queue = {MakeDfsTask("k_dfs_write_fail", 1024)};
+    fake->write_overrides["k_dfs_write_fail"] = ErrorCode::TRANSFER_FAIL;
+
+    auto res = CallProcessDfsPromotionTasks();
+    EXPECT_TRUE(res.has_value());
+    EXPECT_EQ(fake->dfs_read_calls.load(), 1);
+    EXPECT_EQ(fake->write_calls.load(), 1);
+    EXPECT_EQ(fake->notify_calls.load(), 0);
+    EXPECT_EQ(fake->notify_failure_calls.load(), 1);
+}
+
+// Commit failure: the bytes landed but the commit did not. The slot must
+// still be released; the orphaned PROCESSING replica is reaped by the
+// master's DFS promotion reaper.
+TEST_F(FileStoragePromotionTest, DfsNotifySuccessFailureNotifiesFailure) {
+    fake->dfs_capable = true;
+    fake->dfs_heartbeat_queue = {MakeDfsTask("k_dfs_notify_fail", 1024)};
+    fake->notify_overrides["k_dfs_notify_fail"] = ErrorCode::OBJECT_NOT_FOUND;
+
+    auto res = CallProcessDfsPromotionTasks();
+    EXPECT_TRUE(res.has_value());
+    EXPECT_EQ(fake->dfs_read_calls.load(), 1);
+    EXPECT_EQ(fake->write_calls.load(), 1);
+    EXPECT_EQ(fake->notify_calls.load(), 1);
+    EXPECT_EQ(fake->notify_failure_calls.load(), 1);
 }
 
 }  // namespace mooncake

@@ -509,6 +509,26 @@ class Client {
         std::vector<PromotionTaskItem>& promotion_objects);
 
     /**
+     * @brief Heartbeat-driven pull of pending DFS->DRAM promotion work for
+     * this client. Mirror of PromotionObjectHeartbeat for the DFS channel:
+     * returns tasks carrying the source DFS replica descriptor, which the
+     * caller (FileStorage) reads into a staging buffer and stages as a MEMORY
+     * replica via PromotionAllocStart + PromotionWrite +
+     * NotifyPromotionSuccess. A DFS-capable client is expected to keep polling
+     * while it has spare capacity; the master reaper reclaims unacknowledged
+     * tasks on TTL expiry.
+     */
+    // Virtual to enable subclassing in unit tests.
+    virtual tl::expected<void, ErrorCode> DfsPromotionObjectHeartbeat(
+        std::vector<PromotionTaskItem>& promotion_objects);
+
+    /**
+     * @brief Whether this client has a distributed (DFS) storage backend
+     * wired in. Only such clients serve the DFS promotion channel.
+     */
+    virtual bool HasDfsStorageBackend() const;
+
+    /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key during
      * L2->L1 promotion. Returns the new replica's descriptor that the caller
      * writes via Transfer Engine before calling NotifyPromotionSuccess.
@@ -547,6 +567,17 @@ class Client {
      */
     virtual ErrorCode PromotionWrite(
         const Replica::Descriptor& memory_descriptor,
+        std::vector<Slice>& slices);
+
+    /**
+     * @brief Read a DFS source replica into `slices` for the DFS promotion
+     * executor. Public counterpart of the internal DFS read path: FileStorage
+     * fills its staging buffer with this before PromotionWrite. `key` must be
+     * the tenant-scoped storage key.
+     */
+    virtual ErrorCode ReadDfsReplicaForPromotion(
+        const std::string& key,
+        const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices);
 
     /**
