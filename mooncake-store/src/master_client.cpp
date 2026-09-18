@@ -243,6 +243,11 @@ struct RpcNameTraits<&WrappedMasterService::PromotionObjectHeartbeat> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::DfsPromotionObjectHeartbeat> {
+    static constexpr const char* value = "DfsPromotionObjectHeartbeat";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::PromotionAllocStart> {
     static constexpr const char* value = "PromotionAllocStart";
 };
@@ -1071,6 +1076,14 @@ MasterClient::PromotionObjectHeartbeat(const UUID& client_id) {
     ScopedVLogTimer timer(1, "MasterClient::PromotionObjectHeartbeat");
     timer.LogRequest("client_id=", client_id);
     return invoke_rpc<&WrappedMasterService::PromotionObjectHeartbeat,
+                      std::vector<PromotionTaskItem>>(client_id);
+}
+
+tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
+MasterClient::DfsPromotionObjectHeartbeat(const UUID& client_id) {
+    ScopedVLogTimer timer(1, "MasterClient::DfsPromotionObjectHeartbeat");
+    timer.LogRequest("client_id=", client_id);
+    return invoke_rpc<&WrappedMasterService::DfsPromotionObjectHeartbeat,
                       std::vector<PromotionTaskItem>>(client_id);
 }
 

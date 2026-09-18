@@ -477,6 +477,17 @@ class MasterClient {
     PromotionObjectHeartbeat(const UUID& client_id);
 
     /**
+     * @brief DFS promotion channel heartbeat: polls
+     * master for pending DFS promotion work. The returned tasks carry the
+     * source DFS replica descriptor (`PromotionTaskItem::source_dfs`), which
+     * the caller reads to stage a MEMORY replica. A DFS-capable client must
+     * keep polling while it has spare promotion capacity; claimed tasks not
+     * acknowledged within the task TTL are reclaimed by the master reaper.
+     */
+    [[nodiscard]] tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
+    DfsPromotionObjectHeartbeat(const UUID& client_id);
+
+    /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key during
      * promotion. Returns the new replica's descriptor that the caller writes
      * via Transfer Engine.

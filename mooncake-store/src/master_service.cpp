@@ -59,6 +59,9 @@
 #include "utils.h"
 #include "kv_event/kv_event_config.h"
 #include "master_snapshot_manager.h"
+// Embedded internal component (mooncake::tool::DecayingDdSketch); only this
+// translation unit includes the real header.
+#include "decaying_quantile/decaying_ddsketch.hpp"
 #include "master_snapshot_repository.h"
 #include "ha_metric_manager.h"
 #include "metadata_store.h"
@@ -433,6 +436,76 @@ MasterService::MasterService(const MasterServiceConfig& config)
                   << dynamic_replication_admission_qps_threshold_
                   << ", max_memory_replicas="
                   << dynamic_replication_max_memory_replicas_;
+    }
+    // DFS -> MEMORY promotion: keep a decayed heat sketch over DFS-served
+    // replicas. Sketch mapping internals (relative_accuracy=0.05,
+    // [1e-3, 1e7], shard_count=64) are fixed constants; only the half-life
+    // follows the configured epoch-minute value. An invalid config throws in
+    // the sketch constructor, so the channel is disabled loudly instead of
+    // crashing the master.
+    dfs_promotion_enabled_ = config.dfs_promotion.enable;
+    if (dfs_promotion_enabled_) {
+        dfs_promotion_threshold_quantile_ =
+            config.dfs_promotion.threshold_quantile;
+        dfs_promotion_absolute_hot_threshold_ =
+            config.dfs_promotion.absolute_hot_threshold;
+        dfs_promotion_half_life_min_ = config.dfs_promotion.half_life_min;
+        if (dfs_promotion_half_life_min_ == 0) {
+            LOG(WARNING) << "dfs_promotion_half_life_min=0 is invalid; "
+                            "clamping to 1.";
+            dfs_promotion_half_life_min_ = 1;
+        }
+        dfs_promotion_threshold_refresh_min_ =
+            config.dfs_promotion.threshold_refresh_min;
+        dfs_promotion_min_total_weight_ = config.dfs_promotion.min_total_weight;
+        dfs_promotion_queue_limit_ = config.dfs_promotion.queue_limit;
+        dfs_promotion_max_per_heartbeat_ =
+            config.dfs_promotion.max_per_heartbeat;
+        dfs_promotion_scan_interval_min_ =
+            config.dfs_promotion.scan_interval_min;
+        dfs_promotion_scan_batch_ = config.dfs_promotion.scan_batch;
+        dfs_promotion_task_ttl_min_ = config.dfs_promotion.task_ttl_min;
+        dfs_promotion_cooldown_min_ = config.dfs_promotion.cooldown_min;
+
+        // Publish the conservative absolute floor as the initial threshold.
+        // GetDfsHeatThreshold advances cached_at_min_ *before* the winner runs
+        // RefreshDfsHeatThreshold, so a reader racing the very first refresh
+        // would otherwise observe the 0.0 default and admit every candidate for
+        // one window. Seeding the floor makes that transient read safe.
+        dfs_threshold_cache_.store(dfs_promotion_absolute_hot_threshold_,
+                                   std::memory_order_relaxed);
+        dfs_threshold_low_weight_.store(true, std::memory_order_relaxed);
+
+        mooncake::tool::DecayingDdSketch::Config sketch_config;
+        sketch_config.relative_accuracy = 0.05;
+        sketch_config.min_indexed_value = 1e-3;
+        sketch_config.max_indexed_value = 1e7;
+        sketch_config.half_life =
+            static_cast<mooncake::tool::DecayingDdSketch::Timestamp>(
+                dfs_promotion_half_life_min_);
+        sketch_config.shard_count = 64;
+        try {
+            dfs_heat_sketch_ =
+                std::make_unique<mooncake::tool::DecayingDdSketch>(
+                    sketch_config);
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "DFS promotion was requested but the "
+                          "DecayingDdSketch configuration is invalid: "
+                       << e.what() << "; DFS promotion is disabled.";
+            dfs_promotion_enabled_ = false;
+            dfs_heat_sketch_.reset();
+        }
+    }
+    if (dfs_promotion_enabled_) {
+        LOG(INFO) << "DFS promotion enabled: half_life="
+                  << dfs_promotion_half_life_min_
+                  << "min, threshold_quantile="
+                  << dfs_promotion_threshold_quantile_
+                  << ", absolute_hot_threshold="
+                  << dfs_promotion_absolute_hot_threshold_
+                  << ", queue_limit=" << dfs_promotion_queue_limit_
+                  << ", max_per_heartbeat=" << dfs_promotion_max_per_heartbeat_
+                  << ")";
     }
 
     InitDfsAllocatorFromEnvironment(config);
@@ -1824,6 +1897,15 @@ size_t MasterService::EraseReplicasWithCacheTotalAccounting(
     // No-op for memory/noF replicas, so it is safe to call unconditionally.
     ReleaseLocalDiskUsage(erased_replicas);
     FreeDfsReplicas(metadata.user_key, erased_replicas);
+    // DFS promotion "enter collection": if this erasure removed a non-DFS
+    // replica (e.g. a MEMORY or LOCAL_DISK replica was evicted) and a COMPLETE
+    // DFS replica now serves the object again, register an Add(0) sample.
+    // Registered members stay untouched, and DFS replicas popped above were
+    // already removed (before destruction) inside FreeDfsReplicas.
+    if (!erased_replicas.empty() && dfs_promotion_enabled_ &&
+        dfs_heat_sketch_ != nullptr) {
+        ReconcileDfsHeat(metadata, DfsNowEpochMin(), /*access_hit=*/false);
+    }
     return erased_replicas.size();
 }
 
@@ -3680,6 +3762,7 @@ auto MasterService::GetReplicaList(const std::string& key,
     GetReplicaListResponse resp({}, default_kv_lease_ttl_);
     bool promotion_eligible = false;
     bool dynamic_replication_observed = false;
+    bool dfs_served = false;
     {
         MetadataAccessorRO accessor(this, object_id);
 
@@ -3735,6 +3818,14 @@ auto MasterService::GetReplicaList(const std::string& key,
             metadata.GrantReadLease(default_kv_lease_ttl_);
         }
 
+        // DFS promotion read-hit detection: DFS is the serving layer only when
+        // it is the first COMPLETED replica we return (i.e. no MEMORY replica
+        // takes precedence). Decided here under the RO accessor; the actual
+        // heat bump happens after the accessor is released below (same
+        // lock-upgrade pattern as promotion_on_hit).
+        dfs_served = dfs_promotion_enabled_ && !replica_list.empty() &&
+                     replica_list[0].is_dfs_replica();
+
         // Promotion-on-hit eligibility: only when no MEMORY replica is
         // present but at least one LOCAL_DISK replica is. Decided here while
         // we hold the RO accessor; the actual enqueue happens after we
@@ -3769,6 +3860,13 @@ auto MasterService::GetReplicaList(const std::string& key,
     }
     if (dynamic_replication_observed) {
         MaybeQueueDynamicReplicaProposal(object_id);
+    }
+    // DFS promotion: bump the decayed heat sample for a DFS-served read.
+    // ReconcileDfsHeatOnRead() re-checks the collection state under RW so a
+    // concurrent MEMORY completion is still handled (active leave) and two
+    // concurrent readers cannot double-submit (per-key serialization).
+    if (dfs_served) {
+        ReconcileDfsHeatOnRead(object_id);
     }
     return resp;
 }
@@ -3854,6 +3952,12 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         std::vector<ObjectIdentity> promotion_candidates;
         std::vector<ObjectIdentity> dynamic_replication_candidates;
         std::unordered_set<std::string> dynamic_replication_seen;
+        // DFS promotion read-hit keys: a key counts as DFS-served when DFS is
+        // the first COMPLETED replica, i.e. no MEMORY replica takes precedence.
+        // Collected under the RO shard accessor, bumped after it is released,
+        // mirroring the single-key GetReplicaList pattern and the
+        // promotion_candidates handling below.
+        std::vector<ObjectIdentity> dfs_promotion_reads;
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
         {
             MetadataShardAccessorRO shard(this, shard_idx);
@@ -3887,8 +3991,12 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                     [this](const Replica& replica) {
                         return IsReplicaReadable(replica);
                     },
-                    [&replica_list](const Replica& replica) {
+                    [this, &key, &replica_list](const Replica& replica) {
                         replica_list.emplace_back(replica.get_descriptor());
+                        if (replica.is_dfs_replica() && dfs_allocator_) {
+                            dfs_allocator_->UpdateAccess(
+                                key, replica.get_dfs_descriptor());
+                        }
                     });
 
                 if (replica_list.empty()) {
@@ -3918,6 +4026,17 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                 }
                 MasterMetricManager::instance().inc_valid_get_nums();
                 GrantLeaseForGroup(tenant_state, key, metadata);
+
+                // DFS promotion read-hit detection: DFS is the serving layer
+                // only when it is the first COMPLETED replica we return, i.e.
+                // no MEMORY replica takes precedence. Decided under the RO
+                // shard accessor; the heat bump happens after the accessor is
+                // released below.
+                if (dfs_promotion_enabled_ &&
+                    replica_list[0].is_dfs_replica()) {
+                    dfs_promotion_reads.push_back(
+                        MakeObjectIdentity(key, normalized_tenant));
+                }
 
                 if (promotion_on_hit_) {
                     const bool any_memory =
@@ -3965,6 +4084,15 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         }
         for (const auto& object_id : dynamic_replication_candidates) {
             MaybeQueueDynamicReplicaProposal(object_id);
+        }
+
+        // DFS promotion: bump the decayed heat sample for every DFS-served
+        // read in this shard. ReconcileDfsHeatOnRead() re-checks the
+        // collection state under RW so a concurrent MEMORY completion is
+        // still handled (active leave) and two concurrent readers cannot
+        // double-submit (per-key serialization).
+        for (const auto& object_id : dfs_promotion_reads) {
+            ReconcileDfsHeatOnRead(object_id);
         }
     }
 
@@ -4837,6 +4965,14 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         const auto soft_pin_result =
             metadata.CommitPendingSoftPin(std::chrono::system_clock::now());
         ApplySoftPinEvaluation(metadata, soft_pin_result);
+    }
+
+    // DFS promotion: the newly COMPLETE replicas may have changed the serving
+    // layer (e.g. a fresh MEMORY replica now tops a previously DFS-served
+    // object -> active leave / Remove; or a new DFS generation with no MEMORY
+    // replica yet -> Add(0) entry). Reconcile the collection membership.
+    if (dfs_promotion_enabled_ && dfs_heat_sketch_ != nullptr) {
+        ReconcileDfsHeat(metadata, DfsNowEpochMin(), /*access_hit=*/false);
     }
 
     if (object_meta.object_checksum.has_value() ||
@@ -6211,6 +6347,13 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
 
     accessor.EraseReplicationTask();
 
+    // DFS promotion: the copy targets marked COMPLETE above may have made a
+    // MEMORY replica the new serving layer of a previously DFS-served object
+    // (active leave -> Remove), so reconcile the collection membership.
+    if (dfs_promotion_enabled_ && dfs_heat_sketch_ != nullptr) {
+        ReconcileDfsHeat(metadata, DfsNowEpochMin(), /*access_hit=*/false);
+    }
+
     return all_complete ? tl::expected<void, ErrorCode>()
                         : tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
 }
@@ -6594,6 +6737,13 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
         }
     }
 
+    // DFS promotion: reconcile after the move committed. A MEMORY move target
+    // that just became COMPLETE tops a previously DFS-served object -> active
+    // leave (Remove); source replicas popped above were already removed inside
+    // FreeDfsReplicas before their records were discarded.
+    if (dfs_promotion_enabled_ && dfs_heat_sketch_ != nullptr) {
+        ReconcileDfsHeat(metadata, DfsNowEpochMin(), /*access_hit=*/false);
+    }
     accessor.EraseReplicationTask();
 
     return {};
@@ -7244,6 +7394,35 @@ bool MasterService::CleanupStaleHandles(
 
 void MasterService::FreeDfsReplicas(const std::string& key,
                                     const std::vector<Replica>& replicas) {
+    // DFS promotion: drop any registered heat samples *before* the replica
+    // records are destroyed (their fields would be lost afterwards). DFS
+    // replicas are only created under the default tenant today, so the scoped
+    // key used at registration time is reproducible here. This is the "先
+    // Remove 后销毁" ordering required by the impl contract for every
+    // destroy-style replica departure (whole-object delete, generation reset,
+    // MEMORY/LOCAL_DISK eviction that pops a DFS replica, move source, ...).
+    //
+    // The heat cleanup is deliberately *not* gated on dfs_allocator_: the guard
+    // below only exists to skip the allocator Free() when DFS storage is off,
+    // whereas the sample bookkeeping has to stay coupled to the metadata
+    // lifecycle (a missing allocator must not leak ghost samples).
+    if (dfs_promotion_enabled_ && dfs_heat_sketch_ != nullptr) {
+        const uint64_t key_hash =
+            DfsHeatKeyHash(TenantId::Default().MakeScopedKey(key));
+        for (const auto& replica : replicas) {
+            if (!replica.is_dfs_replica() || !replica.is_completed()) continue;
+            const auto* dfs = replica.dfs_data();
+            if (dfs == nullptr || dfs->dfs_last_access_min == 0) continue;
+            if (!dfs_heat_sketch_->Remove(
+                    key_hash, static_cast<double>(dfs->dfs_heat),
+                    static_cast<mooncake::tool::DecayingDdSketch::Timestamp>(
+                        dfs->dfs_last_access_min))) {
+                LOG(WARNING) << "DFS promotion: Remove rejected on free for "
+                                "key="
+                             << key;
+            }
+        }
+    }
     if (!dfs_allocator_) return;
     for (const auto& replica : replicas) {
         if (!replica.is_dfs_replica()) continue;
@@ -7253,6 +7432,976 @@ void MasterService::FreeDfsReplicas(const std::string& key,
         // that replaced it.
         dfs_allocator_->Free(key, replica.get_dfs_descriptor());
     }
+}
+
+namespace {
+// Cap for indexed DFS heat values. Must stay consistent with the sketch config
+// in the MasterService constructor (max_indexed_value = 1e7).
+constexpr double kDfsHeatMaxValue = 1e7;
+}  // namespace
+
+uint64_t MasterService::DfsNowEpochMin() {
+    const auto now = std::chrono::system_clock::now().time_since_epoch();
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(now).count() /
+        60000);
+}
+
+uint64_t MasterService::DfsHeatKeyHash(const std::string& scoped_key) {
+    // FNV-1a 64-bit: deterministic across processes and platforms. The result
+    // is only used to pick a DecayingDdSketch shard; it is never persisted and
+    // never compared across objects, so cross-key mixing is harmless.
+    uint64_t hash = 14695981039346656037ULL;
+    for (const unsigned char c : scoped_key) {
+        hash ^= c;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+void MasterService::RemoveRegisteredDfsSamples(ObjectMetadata& metadata) {
+    if (!dfs_promotion_enabled_ || dfs_heat_sketch_ == nullptr) return;
+    if (!metadata.tenant_id.IsDefault()) return;  // DFS promotion: default tenant only.
+    const uint64_t key_hash =
+        DfsHeatKeyHash(metadata.tenant_id.MakeScopedKey(metadata.user_key));
+    while (true) {
+        Replica* dfs = metadata.GetFirstReplica([](const Replica& replica) {
+            if (!replica.is_dfs_replica() || !replica.is_completed()) return false;
+            const auto* d = replica.dfs_data();
+            return d != nullptr && d->dfs_last_access_min != 0;
+        });
+        if (dfs == nullptr) return;
+        auto* d = dfs->dfs_data();
+        if (!dfs_heat_sketch_->Remove(
+                key_hash, static_cast<double>(d->dfs_heat),
+                static_cast<mooncake::tool::DecayingDdSketch::Timestamp>(
+                    d->dfs_last_access_min))) {
+            LOG(WARNING) << "DFS promotion: Remove rejected for key_hash="
+                         << key_hash;
+        }
+        d->dfs_heat = 0.0f;
+        d->dfs_last_access_min = 0;
+    }
+}
+
+void MasterService::ReconcileDfsHeat(ObjectMetadata& metadata,
+                                     const uint64_t now_min,
+                                     const bool access_hit) {
+    if (!dfs_promotion_enabled_ || dfs_heat_sketch_ == nullptr) return;
+    if (!metadata.tenant_id.IsDefault()) {
+        // DFS replicas are only created for the default tenant today (same
+        // constraint as the Put/UpsertStart checks), so nothing to reconcile.
+        return;
+    }
+    Replica* const top = metadata.GetFirstReplica(&Replica::fn_is_completed);
+    if (top == nullptr) return;  // No COMPLETE replica yet; nothing to do.
+    if (!top->is_dfs_replica()) {
+        // The top COMPLETE replica is MEMORY/LOCAL_DISK/NOF: the object is no
+        // longer DFS-served. If a COMPLETE DFS replica still carries a
+        // registered sample it has just left the collection (active leave:
+        // MEMORY took over, generation reset, disk took over, ...). Drop and
+        // zero it now; the sample keeps decaying otherwise and would skew the
+        // promotion threshold once it ages back out.
+        RemoveRegisteredDfsSamples(metadata);
+        return;
+    }
+    DfsReplicaData* const dfs = top->dfs_data();
+    if (dfs == nullptr) return;
+    using Timestamp = mooncake::tool::DecayingDdSketch::Timestamp;
+    const uint64_t key_hash =
+        DfsHeatKeyHash(metadata.tenant_id.MakeScopedKey(metadata.user_key));
+    if (dfs->dfs_last_access_min == 0) {
+        // Not a member yet. A read hit registers heat=1 (design: Add on first
+        // DFS-served access); every other transition registers heat=0 so the
+        // sample keeps the collection membership observable (e.g. a MEMORY
+        // replica was just evicted while a COMPLETE DFS replica stayed, or a
+        // new DFS generation was committed with no MEMORY replica yet).
+        const double heat = access_hit ? 1.0 : 0.0;
+        if (!dfs_heat_sketch_->Add(key_hash, heat, now_min)) {
+            LOG(WARNING) << "DFS promotion: Add rejected for key="
+                         << metadata.user_key << " heat=" << heat;
+            return;  // H6: on a failed submit the metadata stays unchanged.
+        }
+        dfs->dfs_heat = static_cast<float>(heat);
+        dfs->dfs_last_access_min = static_cast<uint32_t>(now_min);
+        return;
+    }
+    if (!access_hit) return;  // Already a registered member; nothing changed.
+
+    // Read hit on a registered member: decay the stored heat, then add 1.
+    const uint64_t last = dfs->dfs_last_access_min;
+    const uint64_t delta = now_min > last ? now_min - last : 0;
+    const uint64_t half_life = std::max<uint64_t>(
+        dfs_promotion_half_life_min_, static_cast<uint64_t>(1));
+    const double decay = std::exp2(-static_cast<double>(delta) /
+                                   static_cast<double>(half_life));
+    double updated = static_cast<double>(dfs->dfs_heat) * decay + 1.0;
+    updated = std::clamp(updated, 0.0, kDfsHeatMaxValue);
+    if (!dfs_heat_sketch_->Replace(key_hash, static_cast<double>(dfs->dfs_heat),
+                                   static_cast<Timestamp>(last), updated,
+                                   static_cast<Timestamp>(now_min))) {
+        LOG(WARNING) << "DFS promotion: Replace rejected for key="
+                     << metadata.user_key << " updated_heat=" << updated;
+        return;
+    }
+    dfs->dfs_heat = static_cast<float>(updated);
+    dfs->dfs_last_access_min = static_cast<uint32_t>(now_min);
+}
+
+void MasterService::ReconcileDfsHeatOnRead(const ObjectIdentity& object_id) {
+    if (!dfs_promotion_enabled_ || dfs_heat_sketch_ == nullptr) return;
+    const uint64_t now_min = DfsNowEpochMin();
+    MetadataAccessorRW accessor(this, object_id);
+    if (!accessor.Exists()) return;
+    ObjectMetadata& metadata = accessor.Get();
+    ReconcileDfsHeat(metadata, now_min, true);
+    // The read-hit path is the primary trigger: right after the heat sample is
+    // committed, run one admission attempt. Only keys that are still
+    // DFS-served with a live sample are eligible; ReconcileDfsHeat above
+    // already handled every active-leave / membership transition, so a
+    // registered sample here implies the object is DFS-served.
+    Replica* const top = metadata.GetFirstReplica(&Replica::fn_is_completed);
+    if (top == nullptr || !top->is_dfs_replica()) return;
+    DfsReplicaData* const dfs = top->dfs_data();
+    if (dfs == nullptr || dfs->dfs_last_access_min == 0) return;
+    (void)TryAdmitDfsPromotion(accessor.GetTenantState(), metadata,
+                               static_cast<double>(dfs->dfs_heat), now_min,
+                               /*backoff_on_transient=*/false);
+}
+
+// ---- DFS promotion admission layer. ----
+
+void MasterService::RefreshDfsHeatThreshold(uint64_t now_min) {
+    if (dfs_heat_sketch_ == nullptr) return;
+    using Timestamp = mooncake::tool::DecayingDdSketch::Timestamp;
+    const auto p90 = dfs_heat_sketch_->GetQuantile(
+        dfs_promotion_threshold_quantile_, static_cast<Timestamp>(now_min));
+    const auto total_weight = dfs_heat_sketch_->GetTotalWeight(
+        static_cast<Timestamp>(now_min));
+    double updated;
+    const bool low_weight = !p90.has_value() || !total_weight.has_value() ||
+                            total_weight.value() <
+                                dfs_promotion_min_total_weight_;
+    // low_weight describes whether the sketch carries enough weight to trust
+    // the quantile -- independent of whether T itself moved. Store it before
+    // the minimal-change filter below: that filter only guards the cached T,
+    // so letting it gate this flag as well leaves a stale "cold start" mark
+    // forever once T settles on the absolute floor, which mis-attributes every
+    // later below-threshold rejection to cold start.
+    dfs_threshold_low_weight_.store(low_weight, std::memory_order_relaxed);
+    if (low_weight) {
+        // Not enough samples to trust the P90 estimate: only the absolute
+        // floor is used, so a handful of early accesses never trips
+        // admission.
+        updated = dfs_promotion_absolute_hot_threshold_;
+    } else {
+        updated = std::max(p90.value(),
+                           dfs_promotion_absolute_hot_threshold_);
+        // Minimal-change filter: skip sub-5% jitter so the cached gauge does
+        // not churn on every refresh.
+        constexpr double kMinRelativeChange = 0.05;
+        const double prev = dfs_threshold_cache_.load(
+            std::memory_order_relaxed);
+        if (prev > 0.0 &&
+            std::abs(updated - prev) / prev < kMinRelativeChange) {
+            return;  // keep the previous T; cached_at_min_ already freshened
+        }
+    }
+    // Keep the low-weight attribution in lockstep with the cached threshold:
+    // the flag describes the provenance of whatever T is currently cached.
+    dfs_threshold_cache_.store(updated, std::memory_order_relaxed);
+}
+
+double MasterService::GetDfsHeatThreshold(uint64_t now_min) {
+    // Debug/dev mode: refresh_min == 0 means "recompute on every evaluation",
+    // which bypasses the cache entirely.
+    if (dfs_promotion_threshold_refresh_min_ == 0) {
+        RefreshDfsHeatThreshold(now_min);
+        return dfs_threshold_cache_.load(std::memory_order_relaxed);
+    }
+    uint64_t cached_at =
+        dfs_threshold_cached_at_min_.load(std::memory_order_relaxed);
+    const uint64_t refresh_period =
+        std::max<uint64_t>(dfs_promotion_threshold_refresh_min_, 1);
+    if (cached_at == 0 || now_min >= cached_at + refresh_period) {
+        // Try to claim the refresh; losers keep reading the previous T while
+        // the winner recomputes, so concurrent read hits never pile into a
+        // sketch quantile query.
+        if (dfs_threshold_cached_at_min_.compare_exchange_strong(
+                cached_at, now_min, std::memory_order_relaxed)) {
+            RefreshDfsHeatThreshold(now_min);
+        }
+    }
+    return dfs_threshold_cache_.load(std::memory_order_relaxed);
+}
+
+MasterService::DfsAdmissionResult MasterService::TryAdmitDfsPromotion(
+    TenantState& tenant_state, ObjectMetadata& metadata, double heat,
+    uint64_t now_min, bool backoff_on_transient) {
+    if (!dfs_promotion_enabled_ || dfs_heat_sketch_ == nullptr) {
+        return DfsAdmissionResult::kDisabled;
+    }
+    const std::string& key = metadata.user_key;
+
+    const auto record_or_backoff = [&](DfsAdmissionResult result) {
+        PromotionCandidateReason reason;
+        switch (result) {
+            case DfsAdmissionResult::kWatermarkRejected:
+                reason = PromotionCandidateReason::kWatermark;
+                break;
+            case DfsAdmissionResult::kQueueCapRejected:
+                reason = PromotionCandidateReason::kQueueCap;
+                break;
+            default:
+                // No DFS-specific candidate reasons exist yet; kPushFailed
+                // doubles as the generic "admission deferred" marker.
+                reason = PromotionCandidateReason::kPushFailed;
+                break;
+        }
+        if (backoff_on_transient) {
+            BackoffDfsCandidate(tenant_state, key, result);
+        } else {
+            RecordOrUpdateDfsCandidate(
+                tenant_state, key, static_cast<float>(heat), reason,
+                ErrorCode::OK);
+        }
+    };
+
+    // Heat gate: admit only keys hotter than T = max(P90, absolute floor), and
+    // drop any stale candidate for a now-cold key so the retry sweep cannot
+    // resurrect it.
+    const double threshold = GetDfsHeatThreshold(now_min);
+    if (heat < threshold) {
+        EraseDfsCandidate(tenant_state, key);
+        // Attribute the rejection: while the sketch is still too
+        // light to trust a quantile, the threshold is only the absolute floor,
+        // so a rejection there is a cold-start signal rather than a frequency
+        // one.
+        if (dfs_threshold_low_weight_.load(std::memory_order_relaxed)) {
+            MasterMetricManager::instance()
+                .inc_dfs_promotion_rejected_low_weight();
+        } else {
+            MasterMetricManager::instance()
+                .inc_dfs_promotion_rejected_frequency();
+        }
+        return DfsAdmissionResult::kBelowThreshold;
+    }
+
+    // A COMPLETE MEMORY replica means the object is already served from DRAM
+    // and its DFS sample left the heat collection — nothing to promote.
+    if (metadata.HasReplica([](const Replica& r) {
+            return r.is_memory_replica() && r.is_completed();
+        })) {
+        EraseDfsCandidate(tenant_state, key);
+        return DfsAdmissionResult::kMemoryPresent;
+    }
+    // Per-key anti-thrash cooldown: a key that recently
+    // completed a promotion must not be promoted again until the window
+    // elapses, otherwise a hot object can ping-pong between DRAM and DFS and
+    // burn copy bandwidth. The stamp lives on the DFS source replica, so an
+    // object that was never promoted (or a new generation) starts clean. A
+    // disabled cooldown (0) skips the check entirely.
+    if (dfs_promotion_cooldown_min_ > 0) {
+        Replica* const cooldown_src =
+            metadata.GetFirstReplica([](const Replica& replica) {
+                return replica.is_dfs_replica() && replica.is_completed();
+            });
+        if (cooldown_src != nullptr) {
+            const DfsReplicaData* const dfs = cooldown_src->dfs_data();
+            if (dfs != nullptr && dfs->dfs_last_promoted_min != 0 &&
+                now_min < static_cast<uint64_t>(dfs->dfs_last_promoted_min) +
+                              dfs_promotion_cooldown_min_) {
+                EraseDfsCandidate(tenant_state, key);
+                VLOG(1) << "dfs_promotion_cooling key=" << key
+                        << " last_promoted_min=" << dfs->dfs_last_promoted_min
+                        << " now_min=" << now_min;
+                return DfsAdmissionResult::kCooling;
+            }
+        }
+    }
+    // Per-key in-flight dedup shared with the SSD channel: at most one
+    // in-flight MEMORY promotion per key, otherwise the two channels could
+    // both stage a MEMORY replica for the same object. Both channels' task
+    // tables are authoritative; the DFS record covers queued + claimed states
+    // so a queued-but-not-yet-dispatched task still blocks re-admission.
+    if (tenant_state.promotion_tasks.count(key) > 0 ||
+        tenant_state.dfs_promotion_tasks.count(key) > 0) {
+        EraseDfsCandidate(tenant_state, key);
+        return DfsAdmissionResult::kDupInFlight;
+    }
+    // DRAM watermark gate: refuse new copies when DRAM is at/above the
+    // eviction high watermark (mirrors TryPushPromotionQueue).
+    const double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
+    if (used_ratio >= eviction_high_watermark_ratio_) {
+        MasterMetricManager::instance().inc_dfs_promotion_rejected_watermark();
+        record_or_backoff(DfsAdmissionResult::kWatermarkRejected);
+        return DfsAdmissionResult::kWatermarkRejected;
+    }
+    // In-flight cap gate (soft cap; same TOCTOU rationale as the SSD channel).
+    if (dfs_promotion_in_flight_.load(std::memory_order_relaxed) >=
+        dfs_promotion_queue_limit_) {
+        MasterMetricManager::instance().inc_dfs_promotion_rejected_cap();
+        record_or_backoff(DfsAdmissionResult::kQueueCapRejected);
+        return DfsAdmissionResult::kQueueCapRejected;
+    }
+    // Source availability: the copy source must be the top COMPLETE DFS
+    // replica.
+    Replica* const top = metadata.GetFirstReplica(&Replica::fn_is_completed);
+    if (top == nullptr || !top->is_dfs_replica()) {
+        record_or_backoff(DfsAdmissionResult::kNoDfsSource);
+        return DfsAdmissionResult::kNoDfsSource;
+    }
+    // Object operability: hard pin makes the object
+    // immutable; an active writer lease means the object is mid-write, so
+    // defer rather than race the generation swap.
+    if (metadata.IsHardPinned()) {
+        record_or_backoff(DfsAdmissionResult::kHardPinned);
+        return DfsAdmissionResult::kHardPinned;
+    }
+    // ObjectMetadata::IsLeaseExpired takes now by mutable reference.
+    auto now = std::chrono::system_clock::now();
+    if (!metadata.IsLeaseExpired(now)) {
+        record_or_backoff(DfsAdmissionResult::kLeaseActive);
+        return DfsAdmissionResult::kLeaseActive;
+    }
+
+    // Every gate passed. Drop any stale candidate and enqueue the task:
+    // snapshot the source descriptor, register the in-flight record, protect
+    // the source key + lease, push the global queue.
+    EraseDfsCandidate(tenant_state, key);
+    EnqueueDfsPromotionTask(tenant_state, metadata, static_cast<float>(heat));
+    return DfsAdmissionResult::kAdmitted;
+}
+
+void MasterService::EnqueueDfsPromotionTask(TenantState& tenant_state,
+                                            ObjectMetadata& metadata,
+                                            float heat) {
+    // Source snapshot: the top COMPLETE replica (TryAdmitDfsPromotion gated
+    // on a COMPLETE DFS source). Bail defensively if it vanished concurrently
+    // without booking anything.
+    Replica* const source = metadata.GetFirstReplica(&Replica::fn_is_completed);
+    if (source == nullptr || !source->is_dfs_replica()) {
+        LOG(WARNING) << "dfs_promotion_enqueue_no_source key="
+                     << metadata.user_key;
+        return;
+    }
+    const std::string& key = metadata.user_key;
+    const auto now = std::chrono::steady_clock::now();
+    Replica::Descriptor source_desc = source->get_descriptor();
+
+    DfsQueueNode node;
+    node.tenant_id = metadata.tenant_id.value();
+    node.key = key;
+    node.size = metadata.size;
+    node.heat = heat;
+    uint64_t seq = 0;
+    {
+        // Admission holds the object shard lock; never take a shard lock while
+        // holding the queue mutex (see ClaimDfsPromotionTasks).
+        std::lock_guard<std::mutex> lock(dfs_promotion_queue_mutex_);
+        seq = ++dfs_promotion_next_seq_;
+        node.seq = seq;
+        dfs_promotion_queue_.push_back(std::move(node));
+        std::push_heap(dfs_promotion_queue_.begin(),
+                       dfs_promotion_queue_.end(), DfsQueueLess{});
+    }
+    // The caller (TryAdmitDfsPromotion) already holds the shard lock, so the
+    // record is visible to dedup/claim validation before any heartbeat can
+    // pop the node we just pushed.
+    tenant_state.dfs_promotion_tasks.emplace(
+        key, DfsPromotionTaskRecord{.source_dfs = source_desc,
+                                    .seq = seq,
+                                    .size = static_cast<int64_t>(metadata.size),
+                                    .holder = UUID{0, 0},
+                                    .enqueued_at = now,
+                                    .claimed_at = now});
+    // Protect the source DFS replica from DFS capacity eviction for the whole
+    // in-flight window, and grant a lease covering it as an eviction-side
+    // backstop: even if protection is lost, the lease keeps the source alive
+    // until the task settles or the TTL reaper reclaims it.
+    tenant_state.dfs_protected_keys.insert(key);
+    const uint64_t ttl_ms = dfs_promotion_task_ttl_min_ * 60000ULL;
+    metadata.GrantReadLease(ttl_ms);
+    dfs_promotion_in_flight_.fetch_add(1, std::memory_order_relaxed);
+    MasterMetricManager::instance().inc_dfs_promotion_in_flight();
+    MasterMetricManager::instance().inc_dfs_promotion_admitted();
+    VLOG(1) << "dfs_promotion_enqueued key=" << key << " heat=" << heat
+            << " seq=" << seq;
+}
+
+void MasterService::RecordOrUpdateDfsCandidate(
+    TenantState& tenant_state, const std::string& key, float heat,
+    PromotionCandidateReason reason, ErrorCode last_error) {
+    const auto now = std::chrono::steady_clock::now();
+    auto it = tenant_state.dfs_promotion_candidates.find(key);
+    if (it != tenant_state.dfs_promotion_candidates.end()) {
+        it->second.last_seen = now;
+        it->second.last_reason = reason;
+        it->second.last_error = last_error;
+        if (heat > it->second.heat) it->second.heat = heat;
+        it->second.retry_after = now;  // let the sweep re-evaluate promptly
+        it->second.retry_count = 0;
+        return;
+    }
+    // Reserve a slot against the DFS channel's candidate budget.
+    uint64_t count =
+        dfs_promotion_candidate_count_.load(std::memory_order_relaxed);
+    while (count < kDfsPromotionCandidateLimit) {
+        if (dfs_promotion_candidate_count_.compare_exchange_weak(
+                count, count + 1, std::memory_order_relaxed)) {
+            break;
+        }
+        // count is reloaded on CAS failure.
+    }
+    if (count >= kDfsPromotionCandidateLimit) {
+        VLOG(1) << "dfs_promotion_candidate_dropped key=" << key
+                << " reason=global_limit";
+        return;
+    }
+    const auto [unused_it, inserted] =
+        tenant_state.dfs_promotion_candidates.emplace(
+            key, DfsPromotionCandidate{
+                     .heat = heat,
+                     .first_seen = now,
+                     .last_seen = now,
+                     .retry_after = now,
+                     .last_reason = reason,
+                     .last_error = last_error,
+                 });
+    if (!inserted) {
+        DecrementDfsCandidateCount();
+    }
+}
+
+void MasterService::EraseDfsCandidate(TenantState& tenant_state,
+                                      const std::string& key) {
+    if (tenant_state.dfs_promotion_candidates.erase(key) > 0) {
+        DecrementDfsCandidateCount();
+    }
+}
+
+void MasterService::DecrementDfsCandidateCount() {
+    dfs_promotion_candidate_count_.fetch_sub(1, std::memory_order_relaxed);
+}
+
+void MasterService::EraseDfsCandidate(const ObjectIdentity& object_id) {
+    const size_t shard_idx = getMetadataShardIndex(
+        object_id.tenant_id, object_id.user_key);
+    MetadataShardAccessorRW shard(this, shard_idx);
+    auto tenant_it = shard->tenants.find(object_id.tenant_id);
+    if (tenant_it == shard->tenants.end()) return;
+    EraseDfsCandidate(tenant_it->second, object_id.user_key);
+    if (tenant_it->second.Empty()) {
+        shard->tenants.erase(tenant_it);
+    }
+}
+
+void MasterService::BackoffDfsCandidate(TenantState& tenant_state,
+                                        const std::string& key,
+                                        DfsAdmissionResult result) {
+    const auto now = std::chrono::steady_clock::now();
+    auto candidate_it = tenant_state.dfs_promotion_candidates.find(key);
+    if (candidate_it == tenant_state.dfs_promotion_candidates.end()) {
+        // Normally a record precedes a backoff; if the sweep raced a fresh
+        // record, seed one so the retry bookkeeping has state to mutate.
+        RecordOrUpdateDfsCandidate(tenant_state, key, 0.0f,
+                                   PromotionCandidateReason::kQueueCap,
+                                   ErrorCode::OK);
+        candidate_it = tenant_state.dfs_promotion_candidates.find(key);
+        if (candidate_it == tenant_state.dfs_promotion_candidates.end()) {
+            return;
+        }
+    }
+    auto& candidate = candidate_it->second;
+    ++candidate.retry_count;
+    switch (result) {
+        case DfsAdmissionResult::kWatermarkRejected:
+            candidate.last_reason = PromotionCandidateReason::kWatermark;
+            break;
+        case DfsAdmissionResult::kQueueCapRejected:
+            candidate.last_reason = PromotionCandidateReason::kQueueCap;
+            break;
+        default:
+            candidate.last_reason = PromotionCandidateReason::kPushFailed;
+            break;
+    }
+    const bool ttl_expired =
+        now - candidate.last_seen >= kPromotionCandidateTtl;
+    if (ttl_expired || candidate.retry_count >= kPromotionCandidateMaxRetries) {
+        VLOG(1) << "dfs_promotion_candidate_expired key=" << key
+                << " retry_count=" << candidate.retry_count;
+        EraseDfsCandidate(tenant_state, key);
+        return;
+    }
+    candidate.retry_after = now + CandidateBackoff(candidate.retry_count);
+}
+
+size_t MasterService::RunDfsPromotionCandidateRetry(size_t max_shards_to_scan) {
+    if (!dfs_promotion_enabled_ || dfs_heat_sketch_ == nullptr ||
+        dfs_promotion_candidate_count_.load(std::memory_order_relaxed) == 0) {
+        return 0;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<ObjectIdentity> due_candidates;
+    due_candidates.reserve(kPromotionRetryBatchSize);
+
+    const size_t shards_to_scan = std::min(max_shards_to_scan, kNumShards);
+    if (shards_to_scan == 0) return 0;
+    const size_t start_shard = dfs_promotion_retry_cursor_.fetch_add(
+                                   shards_to_scan, std::memory_order_relaxed) %
+                               kNumShards;
+
+    {
+        std::shared_lock<std::shared_mutex> snap_lock(snapshot_mutex_);
+        for (size_t scanned = 0;
+             scanned < shards_to_scan &&
+             due_candidates.size() < kPromotionRetryBatchSize;
+             ++scanned) {
+            const size_t i = (start_shard + scanned) % kNumShards;
+            MetadataShardAccessorRW shard(this, i);
+            for (auto tenant_it = shard->tenants.begin();
+                 tenant_it != shard->tenants.end() &&
+                 due_candidates.size() < kPromotionRetryBatchSize;) {
+                auto& tenant_state = tenant_it->second;
+                for (auto cit = tenant_state.dfs_promotion_candidates.begin();
+                     cit != tenant_state.dfs_promotion_candidates.end() &&
+                     due_candidates.size() < kPromotionRetryBatchSize;) {
+                    const auto& key = cit->first;
+                    auto& candidate = cit->second;
+
+                    const bool ttl_expired =
+                        now - candidate.last_seen >= kPromotionCandidateTtl;
+                    if (ttl_expired ||
+                        candidate.retry_count >=
+                            kPromotionCandidateMaxRetries) {
+                        VLOG(1) << "dfs_promotion_candidate_expired key="
+                                << key << " retry_count="
+                                << candidate.retry_count;
+                        cit = tenant_state.dfs_promotion_candidates.erase(cit);
+                        DecrementDfsCandidateCount();
+                        continue;
+                    }
+                    if (candidate.retry_after > now) {
+                        ++cit;
+                        continue;
+                    }
+
+                    // Quick pre-filter under the shard lock; full gating is
+                    // re-done by TryAdmitDfsPromotion below.
+                    auto meta_it = tenant_state.metadata.find(key);
+                    if (meta_it == tenant_state.metadata.end() ||
+                        !meta_it->second.IsValid() ||
+                        tenant_state.promotion_tasks.count(key) > 0 ||
+                        tenant_state.dfs_promotion_tasks.count(key) > 0 ||
+                        meta_it->second.HasReplica([](const Replica& r) {
+                            return r.is_memory_replica() && r.is_completed();
+                        })) {
+                        cit = tenant_state.dfs_promotion_candidates.erase(cit);
+                        DecrementDfsCandidateCount();
+                        continue;
+                    }
+
+                    due_candidates.push_back(ObjectIdentity{
+                        .tenant_id = tenant_it->first, .user_key = key});
+                    ++cit;
+                }
+
+                if (tenant_state.Empty()) {
+                    tenant_it = shard->tenants.erase(tenant_it);
+                } else {
+                    ++tenant_it;
+                }
+            }
+        }
+    }
+
+    size_t admitted = 0;
+    {
+        std::shared_lock<std::shared_mutex> snap_lock(snapshot_mutex_);
+        for (const auto& object_id : due_candidates) {
+            MetadataAccessorRW accessor(this, object_id);
+            if (!accessor.Exists()) {
+                EraseDfsCandidate(object_id);
+                continue;
+            }
+            auto& tenant_state = accessor.GetTenantState();
+            const auto cit = tenant_state.dfs_promotion_candidates.find(
+                object_id.user_key);
+            if (cit == tenant_state.dfs_promotion_candidates.end()) continue;
+            const double heat = static_cast<double>(cit->second.heat);
+            const auto result = TryAdmitDfsPromotion(
+                tenant_state, accessor.Get(), heat, DfsNowEpochMin(),
+                /*backoff_on_transient=*/true);
+            if (result == DfsAdmissionResult::kAdmitted) {
+                // The task was enqueued inside TryAdmitDfsPromotion via
+                // EnqueueDfsPromotionTask.
+                ++admitted;
+            }
+        }
+    }
+    return admitted;
+}
+
+size_t MasterService::RunDfsPromotionCandidateRetry() {
+    return RunDfsPromotionCandidateRetry(kPromotionRetryShardBatch);
+}
+
+size_t MasterService::RunDfsPromotionCandidateRetryForTesting() {
+    return RunDfsPromotionCandidateRetry(kNumShards);
+}
+
+void MasterService::ProtectDfsSource(const ObjectIdentity& object_id) {
+    if (!dfs_promotion_enabled_ || dfs_heat_sketch_ == nullptr) return;
+    MetadataAccessorRW accessor(this, object_id);
+    if (!accessor.Exists()) return;
+    accessor.GetTenantState().dfs_protected_keys.insert(object_id.user_key);
+}
+
+void MasterService::UnprotectDfsSource(const ObjectIdentity& object_id) {
+    const size_t shard_idx = getMetadataShardIndex(
+        object_id.tenant_id, object_id.user_key);
+    MetadataShardAccessorRW shard(this, shard_idx);
+    auto tenant_it = shard->tenants.find(object_id.tenant_id);
+    if (tenant_it == shard->tenants.end()) return;
+    tenant_it->second.dfs_protected_keys.erase(object_id.user_key);
+    // Drop the admission-time lease backstop alongside the protected key: the
+    // source is safe to evict again once the task is no longer in flight.
+    auto md_it = tenant_it->second.metadata.find(object_id.user_key);
+    if (md_it != tenant_it->second.metadata.end()) {
+        md_it->second.ReleaseLease();
+    }
+    if (tenant_it->second.Empty()) {
+        shard->tenants.erase(tenant_it);
+    }
+}
+
+size_t MasterService::ClaimDfsPromotionTasks(
+    const UUID& client_id, size_t max_tasks,
+    std::vector<PromotionTaskItem>& out) {
+    if (!dfs_promotion_enabled_ || dfs_heat_sketch_ == nullptr ||
+        max_tasks == 0) {
+        return 0;
+    }
+    const UUID kNoHolder{0, 0};
+    size_t claimed = 0;
+    // Cancellation/completion never removes a node physically, so the heap can
+    // accumulate entries that no longer match a task record. Each stale node
+    // costs a metadata shard lock to validate; bound how many one call drains
+    // so a single heartbeat cannot spend O(queue depth) shard locks (while
+    // holding snapshot_mutex_ shared for the whole call) before returning. Any
+    // remainder is left to the next heartbeat or the oversized-queue rebuild.
+    constexpr size_t kMaxStaleDropsPerClaim = 64;
+    size_t stale_dropped = 0;
+    while (claimed < max_tasks) {
+        if (stale_dropped >= kMaxStaleDropsPerClaim) break;
+        DfsQueueNode node;
+        {
+            // Pop-first-then-validate: never hold the queue mutex while
+            // acquiring a shard lock (admission path takes shard -> queue, so
+            // this preserves that order). A popped node is validated against
+            // the task table before it can be claimed.
+            std::lock_guard<std::mutex> lock(dfs_promotion_queue_mutex_);
+            if (dfs_promotion_queue_.empty()) break;
+            std::pop_heap(dfs_promotion_queue_.begin(),
+                          dfs_promotion_queue_.end(), DfsQueueLess{});
+            node = std::move(dfs_promotion_queue_.back());
+            dfs_promotion_queue_.pop_back();
+        }
+        const ObjectIdentity object_id{.tenant_id = TenantId(node.tenant_id),
+                                       .user_key = node.key};
+        MetadataAccessorRW accessor(this, object_id);
+        if (!accessor.Exists()) {
+            // Object deleted while queued: drop the stale node. The record (if
+            // any) is released by the reaper.
+            ++stale_dropped;
+            continue;
+        }
+        auto& tenant_state = accessor.GetTenantState();
+        const auto it = tenant_state.dfs_promotion_tasks.find(node.key);
+        if (it == tenant_state.dfs_promotion_tasks.end() ||
+            it->second.seq != node.seq || it->second.holder != kNoHolder) {
+            // Cancelled / superseded / already claimed by a concurrent
+            // heartbeat: drop the stale node without re-enqueuing.
+            ++stale_dropped;
+            continue;
+        }
+        it->second.holder = client_id;
+        it->second.claimed_at = std::chrono::steady_clock::now();
+        PromotionTaskItem item;
+        item.tenant_id = node.tenant_id;
+        item.key = node.key;
+        item.size = node.size;
+        item.source_dfs = it->second.source_dfs;
+        out.push_back(std::move(item));
+        ++claimed;
+    }
+    return claimed;
+}
+
+auto MasterService::DfsPromotionObjectHeartbeat(const UUID& client_id)
+    -> tl::expected<std::vector<PromotionTaskItem>, ErrorCode> {
+    if (!dfs_promotion_enabled_ || dfs_heat_sketch_ == nullptr) {
+        return std::vector<PromotionTaskItem>{};
+    }
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    std::vector<PromotionTaskItem> tasks;
+    ClaimDfsPromotionTasks(client_id, dfs_promotion_max_per_heartbeat_, tasks);
+    return tasks;
+}
+
+void MasterService::ReapDfsPromotionTasks() {
+    if (!dfs_promotion_enabled_ || dfs_heat_sketch_ == nullptr) return;
+    const auto now = std::chrono::steady_clock::now();
+    const auto ttl = std::chrono::minutes(dfs_promotion_task_ttl_min_);
+    const UUID kNoHolder{0, 0};
+
+    // 1) Physical-queue growth guard: once the heap holds more nodes
+    // than dfs_promotion_queue_limit_ (stale entries accumulate because
+    // cancellation never removes them physically), drain it, keep only nodes
+    // that still match an unclaimed task-table record, and push them back.
+    bool oversized = false;
+    {
+        std::lock_guard<std::mutex> lock(dfs_promotion_queue_mutex_);
+        oversized = dfs_promotion_queue_.size() > dfs_promotion_queue_limit_;
+    }
+    if (oversized) {
+        std::vector<DfsQueueNode> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(dfs_promotion_queue_mutex_);
+            snapshot.reserve(dfs_promotion_queue_.size());
+            while (!dfs_promotion_queue_.empty()) {
+                std::pop_heap(dfs_promotion_queue_.begin(),
+                              dfs_promotion_queue_.end(), DfsQueueLess{});
+                snapshot.push_back(std::move(dfs_promotion_queue_.back()));
+                dfs_promotion_queue_.pop_back();
+            }
+        }
+        std::vector<DfsQueueNode> keep;
+        keep.reserve(snapshot.size());
+        for (const auto& node : snapshot) {
+            const ObjectIdentity object_id{.tenant_id = TenantId(node.tenant_id),
+                                           .user_key = node.key};
+            MetadataAccessorRW accessor(this, object_id);
+            if (!accessor.Exists()) continue;  // object gone => stale
+            const auto& tenant_state = accessor.GetTenantState();
+            const auto it = tenant_state.dfs_promotion_tasks.find(node.key);
+            if (it == tenant_state.dfs_promotion_tasks.end() ||
+                it->second.seq != node.seq || it->second.holder != kNoHolder) {
+                continue;  // cancelled / superseded / claimed => stale
+            }
+            keep.push_back(node);
+        }
+        {
+            std::lock_guard<std::mutex> lock(dfs_promotion_queue_mutex_);
+            for (auto& node : keep) {
+                dfs_promotion_queue_.push_back(std::move(node));
+                std::push_heap(dfs_promotion_queue_.begin(),
+                               dfs_promotion_queue_.end(), DfsQueueLess{});
+            }
+        }
+        VLOG(1) << "dfs_promotion_queue_rebuilt physical=" << snapshot.size()
+                << " kept=" << keep.size();
+    }
+
+    // 2) TTL reclamation: reclaim queued/claimed tasks whose
+    // age exceeds dfs_promotion_task_ttl_min_, erasing the record, releasing
+    // the DFS source protection and decrementing the in-flight counter.
+    // Skips entirely when nothing is in flight.
+    if (dfs_promotion_in_flight_.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+    // Incremental sweep: visit kDfsReapShardBatch shards per maintenance tick
+    // (every shard is covered over kNumShards / batch ticks).
+    constexpr size_t kDfsReapShardBatch = 256;
+    const size_t start_shard = dfs_promotion_reap_cursor_.fetch_add(
+                                   kDfsReapShardBatch, std::memory_order_relaxed) %
+                               kNumShards;
+    std::shared_lock<std::shared_mutex> snap_lock(snapshot_mutex_);
+    for (size_t scanned = 0; scanned < kDfsReapShardBatch; ++scanned) {
+        const size_t i = (start_shard + scanned) % kNumShards;
+        MetadataShardAccessorRW shard(this, i);
+        for (auto tenant_it = shard->tenants.begin();
+             tenant_it != shard->tenants.end();) {
+            auto& tenant_state = tenant_it->second;
+            bool erased_any = false;
+            for (auto it = tenant_state.dfs_promotion_tasks.begin();
+                 it != tenant_state.dfs_promotion_tasks.end();) {
+                const auto& record = it->second;
+                const auto deadline =
+                    record.holder == kNoHolder ? record.enqueued_at
+                                               : record.claimed_at;
+                if (now - deadline < ttl) {
+                    ++it;
+                    continue;
+                }
+                VLOG(1) << "dfs_promotion_task_expired key=" << it->first
+                        << " holder=" << record.holder << " age_ms="
+                        << std::chrono::duration_cast<std::chrono::milliseconds>(
+                               now - deadline)
+                               .count();
+                tenant_state.dfs_protected_keys.erase(it->first);
+                // Release the admission-time lease backstop too: otherwise the
+                // object stays kLeaseActive-blocked for a full task TTL after
+                // reclaim.
+                auto md_it = tenant_state.metadata.find(it->first);
+                if (md_it != tenant_state.metadata.end()) {
+                    md_it->second.ReleaseLease();
+                    // If PromotionAllocStart already staged a PROCESSING
+                    // MEMORY replica, reclaim it: with the task record gone
+                    // nothing else points at that replica (the generic
+                    // PROCESSING reaper iterates processing_keys, which
+                    // promotion never populates), so it would leak DRAM until
+                    // the object is evicted. Mirrors the SSD channel in
+                    // DiscardExpiredProcessingReplicas.
+                    if (record.alloc_id != 0) {
+                        const ReplicaID alloc_id = record.alloc_id;
+                        EraseReplicasWithCacheTotalAccounting(
+                            md_it->second, [alloc_id](const Replica& replica) {
+                                return replica.id() == alloc_id;
+                            });
+                    }
+                }
+                // Return the reserved quota whether or not the metadata still
+                // exists: the reservation is a tenant-level ledger entry that
+                // would otherwise stay charged forever.
+                ReleaseTenantQuota(GetBoundTenantQuotaHandle(tenant_state),
+                                   record.pending_quota_charge_bytes);
+                it = tenant_state.dfs_promotion_tasks.erase(it);
+                dfs_promotion_in_flight_.fetch_sub(1,
+                                                   std::memory_order_relaxed);
+                MasterMetricManager::instance()
+                    .dec_dfs_promotion_in_flight();
+                MasterMetricManager::instance().inc_dfs_promotion_expired();
+                erased_any = true;
+            }
+            if (erased_any && tenant_state.Empty()) {
+                tenant_it = shard->tenants.erase(tenant_it);
+            } else {
+                ++tenant_it;
+            }
+        }
+    }
+}
+
+void MasterService::UpdateDfsPromotionGhostMetrics(const uint64_t now_min) {
+    if (!dfs_promotion_enabled_ || dfs_heat_sketch_ == nullptr) return;
+    const uint64_t half_life = std::max<uint64_t>(
+        dfs_promotion_half_life_min_, static_cast<uint64_t>(1));
+    double members_weight = 0.0;
+    for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
+        MetadataShardAccessorRO shard(this, shard_idx);
+        for (const auto& tenant_entry : shard->tenants) {
+            if (!tenant_entry.first.IsDefault()) continue;
+            for (const auto& metadata_entry : tenant_entry.second.metadata) {
+                const ObjectMetadata& metadata = metadata_entry.second;
+                const Replica* top = nullptr;
+                metadata.VisitReplicas(&Replica::fn_is_completed,
+                                       [&top](const Replica& replica) {
+                                           if (top == nullptr) top = &replica;
+                                       });
+                if (top == nullptr || !top->is_dfs_replica()) continue;
+                const DfsReplicaData* const dfs = top->dfs_data();
+                if (dfs == nullptr || dfs->dfs_last_access_min == 0) continue;
+                const uint64_t delta =
+                    now_min > dfs->dfs_last_access_min
+                        ? now_min - dfs->dfs_last_access_min
+                        : 0;
+                // Every live member contributes exactly one sketch sample:
+                // Add/Replace only move the sample between buckets and always
+                // at unit weight, so the reachable weight is the decayed COUNT
+                // of members -- not heat-weighted. Multiplying by dfs_heat here
+                // made the census compare apples to oranges.
+                members_weight += std::exp2(-static_cast<double>(delta) /
+                                            static_cast<double>(half_life));
+            }
+        }
+    }
+    const auto sketch_weight = dfs_heat_sketch_->GetTotalWeight(
+        static_cast<mooncake::tool::DecayingDdSketch::Timestamp>(now_min));
+    MasterMetricManager::instance().set_dfs_promotion_members_weight(
+        members_weight);
+    MasterMetricManager::instance().set_dfs_promotion_sketch_weight(
+        sketch_weight.value_or(0.0));
+    VLOG(1) << "dfs_promotion_ghost_census members_weight=" << members_weight
+            << " sketch_weight=" << sketch_weight.value_or(0.0);
+}
+
+void MasterService::UpdateDfsPromotionGhostMetricsForTesting() {
+    UpdateDfsPromotionGhostMetrics(DfsNowEpochMin());
+}
+
+void MasterService::RunDfsPromotionReconcileScanForTesting() {
+    // Bypass the interval throttle so tests can drive the sweep directly.
+    dfs_promotion_next_scan_min_.store(0, std::memory_order_relaxed);
+    RunDfsPromotionReconcileScan();
+}
+
+void MasterService::RunDfsPromotionReconcileScan() {
+    if (!dfs_promotion_enabled_ || dfs_heat_sketch_ == nullptr) return;
+    const uint64_t now_min = DfsNowEpochMin();
+    uint64_t next = dfs_promotion_next_scan_min_.load(std::memory_order_relaxed);
+    if (now_min < next) return;
+    // CAS so two maintenance ticks can never scan concurrently; the loser
+    // returns and lets a later tick pick the work up.
+    const uint64_t interval =
+        std::max<uint32_t>(dfs_promotion_scan_interval_min_, 1);
+    if (!dfs_promotion_next_scan_min_.compare_exchange_strong(
+            next, now_min + interval, std::memory_order_relaxed)) {
+        return;
+    }
+
+    const size_t batch = std::max<uint32_t>(dfs_promotion_scan_batch_, 1);
+    // Bound the number of shards touched per pass: shards without a DFS
+    // object contribute nothing to `visited`, so without this cap a sparse
+    // workload could make one tick walk the entire table.
+    constexpr size_t kMaxShardsPerPass = 128;
+    size_t visited = 0;
+    const size_t start_cursor =
+        dfs_promotion_scan_cursor_.load(std::memory_order_relaxed) % kNumShards;
+    size_t shard_idx = start_cursor;
+    for (size_t shards = 0; shards < kMaxShardsPerPass && visited < batch;
+         ++shards) {
+        {
+            MetadataShardAccessorRW shard(this, shard_idx);
+            for (auto& tenant_entry : shard->tenants) {
+                if (!tenant_entry.first.IsDefault()) continue;
+                for (auto& metadata_entry : tenant_entry.second.metadata) {
+                    ObjectMetadata& metadata = metadata_entry.second;
+                    if (!metadata.HasReplica(&Replica::fn_is_dfs_replica)) {
+                        continue;
+                    }
+                    // access_hit=false: repair membership state only, never
+                    // invent heat. ReconcileDfsHeat is idempotent, so an
+                    // already-consistent object is a no-op.
+                    ReconcileDfsHeat(metadata, now_min, /*access_hit=*/false);
+                    if (++visited >= batch) break;
+                }
+                if (visited >= batch) break;
+            }
+        }
+        shard_idx = (shard_idx + 1) % kNumShards;
+    }
+    dfs_promotion_scan_cursor_.store(shard_idx, std::memory_order_relaxed);
+    // The cursor wrapped past shard 0: a full sweep just completed, so take a
+    // fresh ghost census (total sketch weight vs reachable sample weight).
+    if (shard_idx <= start_cursor) {
+        UpdateDfsPromotionGhostMetrics(now_min);
+    }
+}
+
+void MasterService::DfsPromotionMaintenance() {
+    if (!dfs_promotion_enabled_ || dfs_heat_sketch_ == nullptr) return;
+    // Keep the threshold cache fresh even when reads are sparse.
+    (void)GetDfsHeatThreshold(DfsNowEpochMin());
+    if (dfs_promotion_candidate_count_.load(std::memory_order_relaxed) > 0) {
+        RunDfsPromotionCandidateRetry();
+    }
+    // Task reaper: TTL reclamation + physical-queue rebuild.
+    ReapDfsPromotionTasks();
+    // Reconcile self-healing pass: repair heat samples a missed structural
+    // hook left inconsistent with the live objects.
+    RunDfsPromotionReconcileScan();
 }
 
 void MasterService::RestoreRecoveredDfsReplicas() {
@@ -7424,6 +8573,7 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
                 const bool acceptable =
                     !candidate_is_processing &&
                     !tenant_state.processing_keys.contains(candidate.key) &&
+                    !tenant_state.dfs_protected_keys.contains(candidate.key) &&
                     !metadata.IsHardPinned() && metadata.IsLeaseExpired(now);
                 if (!acceptable) {
                     // Whole-bucket eviction is all-or-nothing: one protected
@@ -7526,6 +8676,13 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
                 if (metadata_it == tenant_state.metadata.end()) continue;
 
                 auto& metadata = metadata_it->second;
+                // DFS promotion: drop any registered sample *before* the DFS
+                // replica record is erased (先 Remove 后销毁). Bucket eviction
+                // reclaims storage via CommitEviction below, so this path never
+                // reaches FreeDfsReplicas and must remove the sample here.
+                if (dfs_promotion_enabled_ && dfs_heat_sketch_ != nullptr) {
+                    RemoveRegisteredDfsSamples(metadata);
+                }
                 const size_t erased =
                     metadata.EraseReplicas([&](const Replica& replica) {
                         return matches_candidate(replica, candidate) &&
@@ -7648,6 +8805,7 @@ void MasterService::RunShardDfsEviction() {
                 accepted[i] =
                     !candidate_is_processing &&
                     !tenant_state.processing_keys.contains(candidate.key) &&
+                    !tenant_state.dfs_protected_keys.contains(candidate.key) &&
                     !metadata.IsHardPinned() && metadata.IsLeaseExpired(now) &&
                     (!IsSoftPinActive(metadata, now) ||
                      allow_evict_soft_pinned_objects_);
@@ -7657,6 +8815,12 @@ void MasterService::RunShardDfsEviction() {
                 // evicted from the master's point of view. Otherwise remove
                 // the accepted descriptor before its allocator extent can be
                 // committed and reused.
+                // DFS promotion: same 先 Remove 后销毁 ordering as the bucket
+                // eviction path above -- shard eviction frees storage through
+                // the allocator protocol, not FreeDfsReplicas.
+                if (dfs_promotion_enabled_ && dfs_heat_sketch_ != nullptr) {
+                    RemoveRegisteredDfsSamples(metadata);
+                }
                 const size_t erased =
                     metadata.EraseReplicas([&](const Replica& replica) {
                         return matches_candidate(replica, candidate) &&
@@ -8168,12 +9332,16 @@ tl::expected<void, ErrorCode> MasterService::PushPromotionQueue(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto err = local_ssd_manager_.EnqueuePromotion(
-        *holder_id, PromotionTaskItem{.tenant_id = object_id.tenant_id.value(),
-                                      .key = object_id.user_key,
-                                      .size = static_cast<int64_t>(
-                                          source_replica.get_descriptor()
-                                              .get_local_disk_descriptor()
-                                              .object_size)});
+        *holder_id,
+        PromotionTaskItem{
+            .tenant_id = object_id.tenant_id.value(),
+            .key = object_id.user_key,
+            .size = static_cast<int64_t>(
+                source_replica.get_descriptor()
+                    .get_local_disk_descriptor()
+                    .object_size),
+            // SSD-channel tasks carry no DFS source descriptor.
+            .source_dfs = std::nullopt});
     if (err == ErrorCode::SEGMENT_NOT_FOUND) {
         // Holder client expired or never registered LocalSSD;
         // the LOCAL_DISK replica will be cleaned up by ClientMonitorFunc on
@@ -8337,11 +9505,47 @@ void MasterService::ClearCandidatesForReload() {
         for (auto& [tenant_id, tenant_state] : shard->tenants) {
             (void)tenant_id;
             tenant_state.promotion_candidates.clear();
+            // DFS channel in-memory decision state is rebuilt by reads and
+            // periodic reconcile after a reload/leader takeover: the new leader
+            // cannot trust the previous process's candidate and protection
+            // state, and no DFS task survived the reload, so drop both.
+            tenant_state.dfs_promotion_candidates.clear();
+            tenant_state.dfs_protected_keys.clear();
+            // No DFS task survives the reload: drop the global task records too
+            // so a stale source descriptor can never be handed to a client.
+            // Without this the records would outlive the in-flight counter
+            // reset below, and the reaper (which early-returns on a zero
+            // in-flight count) would never reclaim them.
+            tenant_state.dfs_promotion_tasks.clear();
         }
+    }
+    // The global physical queue is process-local and cannot survive a reload
+    // either: every node referenced a task record just erased above. Drop them
+    // and restart the enqueue sequence so a post-reload leader does not carry
+    // up to dfs_promotion_queue_limit_ dead nodes that each cost a shard lock
+    // to discard (the claim path drains them lazily, the oversized-queue
+    // rebuild only past the limit).
+    {
+        std::lock_guard<std::mutex> queue_lock(dfs_promotion_queue_mutex_);
+        dfs_promotion_queue_.clear();
+        dfs_promotion_next_seq_ = 0;
     }
     promotion_candidate_count_.store(0, std::memory_order_relaxed);
     promotion_retry_cursor_.store(0, std::memory_order_relaxed);
     promotion_in_flight_.store(0, std::memory_order_relaxed);
+    dfs_promotion_candidate_count_.store(0, std::memory_order_relaxed);
+    dfs_promotion_retry_cursor_.store(0, std::memory_order_relaxed);
+    dfs_promotion_in_flight_.store(0, std::memory_order_relaxed);
+    MasterMetricManager::instance().reset_dfs_promotion_in_flight();
+    dfs_threshold_cached_at_min_.store(0, std::memory_order_relaxed);
+    // Conservative floor (same rationale as the constructor): a reader racing
+    // the first post-reload refresh must never observe a 0.0 threshold.
+    dfs_threshold_cache_.store(dfs_promotion_absolute_hot_threshold_,
+                               std::memory_order_relaxed);
+    dfs_threshold_low_weight_.store(true, std::memory_order_relaxed);
+    // Restart the self-healing sweep from the first shard after a reload.
+    dfs_promotion_next_scan_min_.store(0, std::memory_order_relaxed);
+    dfs_promotion_scan_cursor_.store(0, std::memory_order_relaxed);
 }
 
 size_t MasterService::RunPromotionCandidateRetry() {
@@ -9152,6 +10356,14 @@ MasterService::PromotionQueueResult MasterService::TryPushPromotionQueue(
 
     // Dedup: don't queue twice if a promotion is already in flight or if a
     // MEMORY replica has appeared since GetReplicaList observed only-disk.
+    // The SSD and DFS channels share one rule: at most one in-flight MEMORY
+    // promotion per key, so a task already owned by the DFS channel must block
+    // the SSD channel too. Both task tables are consulted here, mirroring the
+    // check in TryAdmitDfsPromotion.
+    if (tenant_state.dfs_promotion_tasks.count(key) > 0) {
+        EraseCandidate(tenant_state, key);
+        return PromotionQueueResult::kAlreadyInFlight;
+    }
     if (tenant_state.promotion_tasks.count(key) > 0) {
         // A read hit an already in-flight promotion: re-mark the queued
         // entry's recency so the next heartbeat delivers it ahead of stale
@@ -9296,14 +10508,29 @@ auto MasterService::PromotionAllocStart(
     // nothing left to iterate, leaking the buffer until the object is
     // removed or evicted. The shard mutex is held for the rest of this
     // function, so the iterator stays valid across the allocation step.
+    // Both channels share this RPC: the SSD channel keeps its
+    // per-LOCAL_DISK task in promotion_tasks, the DFS channel keeps a global
+    // record in dfs_promotion_tasks. Admission dedup guarantees a key is in at
+    // most one of them, so the channel is resolved by probing both.
     auto& tenant_state = accessor.GetTenantState();
-    auto task_it = tenant_state.promotion_tasks.find(object_id.user_key);
-    if (task_it == tenant_state.promotion_tasks.end()) {
+    const std::string& user_key = object_id.user_key;
+    auto ssd_it = tenant_state.promotion_tasks.find(user_key);
+    auto dfs_it = tenant_state.dfs_promotion_tasks.find(user_key);
+    const bool is_dfs = ssd_it == tenant_state.promotion_tasks.end();
+    if (is_dfs && dfs_it == tenant_state.dfs_promotion_tasks.end()) {
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
-    // Holder-only gate (see PromotionTask::holder_id doc).
-    if (task_it->second.holder_id != client_id) {
+    // Holder-only gate (see PromotionTask::holder_id doc): only the client
+    // that claimed the task may stage its MEMORY replica.
+    if (is_dfs) {
+        if (dfs_it->second.holder != client_id) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (dfs_it->second.size != static_cast<int64_t>(size)) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    } else if (ssd_it->second.holder_id != client_id) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -9311,14 +10538,19 @@ auto MasterService::PromotionAllocStart(
     // descriptor's object_size captured at admission. A mismatch would
     // let a buggy caller request a wrong-sized allocation — smaller
     // risks RDMA overflow, larger wastes DRAM pinned until reaper TTL.
-    if (task_it->second.object_size != size) {
+    if (!is_dfs && ssd_it->second.object_size != size) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (metadata.HasReplica(&Replica::fn_is_memory_replica)) {
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
-    if (task_it->second.alloc_id != 0 ||
-        task_it->second.pending_quota_charge_bytes != 0) {
+    if (is_dfs) {
+        if (dfs_it->second.alloc_id != 0 ||
+            dfs_it->second.pending_quota_charge_bytes != 0) {
+            return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+        }
+    } else if (ssd_it->second.alloc_id != 0 ||
+               ssd_it->second.pending_quota_charge_bytes != 0) {
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
@@ -9382,9 +10614,18 @@ auto MasterService::PromotionAllocStart(
     // EraseReplicaByID mid-RDMA-write. The queue-waiting phase
     // (alloc_id == 0) is bounded by its own original start_time window
     // during which the reaper's EraseReplicaByID branch is a no-op.
-    task_it->second.alloc_id = new_id;
-    task_it->second.pending_quota_charge_bytes = pending_quota_charge;
-    task_it->second.start_time = std::chrono::system_clock::now();
+    if (is_dfs) {
+        dfs_it->second.alloc_id = new_id;
+        dfs_it->second.pending_quota_charge_bytes = pending_quota_charge;
+        // Reset the reaper anchor so the active-transfer phase gets its own
+        // full TTL window instead of inheriting the queue-wait time (mirrors
+        // the SSD channel's start_time reset).
+        dfs_it->second.claimed_at = std::chrono::steady_clock::now();
+    } else {
+        ssd_it->second.alloc_id = new_id;
+        ssd_it->second.pending_quota_charge_bytes = pending_quota_charge;
+        ssd_it->second.start_time = std::chrono::system_clock::now();
+    }
     return PromotionAllocStartResponse{std::move(desc)};
 }
 
@@ -9400,6 +10641,16 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
     }
     auto& metadata = accessor.Get();
     auto& tenant_state = accessor.GetTenantState();
+
+    // DFS channel shares this RPC: both promotion channels settle their tasks
+    // through the same success notification. Admission dedup keeps a key
+    // in at most one channel's in-flight table, so when the SSD table has no
+    // task we hand off to the DFS terminal path.
+    if (tenant_state.promotion_tasks.find(object_id.user_key) ==
+        tenant_state.promotion_tasks.end()) {
+        return NotifyDfsPromotionSuccess(client_id, object_id, metadata,
+                                         tenant_state);
+    }
 
     // Look up the in-flight task to find the exact replica we staged. A
     // concurrent Put on this key may have created other PROCESSING MEMORY
@@ -9497,6 +10748,13 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
     } else {
         MasterMetricManager::instance().inc_promotion_cancelled();
     }
+    // DFS promotion: a staged MEMORY replica just became COMPLETE. When it now
+    // tops a previously DFS-served object, the object leaves the collection
+    // (Remove + zero). The DFS channel reuses this RPC with a DFS
+    // source replica, so the same transition applies there.
+    if (committed && dfs_promotion_enabled_ && dfs_heat_sketch_ != nullptr) {
+        ReconcileDfsHeat(metadata, DfsNowEpochMin(), /*access_hit=*/false);
+    }
 
     // Erase the per-client promotion mailbox entry (best-effort; the
     // heartbeat may have already drained it).
@@ -9521,6 +10779,14 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     }
     auto& metadata = accessor.Get();
     auto& tenant_state = accessor.GetTenantState();
+
+    // DFS channel shares this RPC with the SSD channel, so a key with no SSD
+    // in-flight task belongs to the DFS channel; see NotifyPromotionSuccess.
+    if (tenant_state.promotion_tasks.find(object_id.user_key) ==
+        tenant_state.promotion_tasks.end()) {
+        return NotifyDfsPromotionFailure(client_id, object_id, metadata,
+                                         tenant_state);
+    }
 
     auto task_it = tenant_state.promotion_tasks.find(object_id.user_key);
     if (task_it == tenant_state.promotion_tasks.end()) {
@@ -9604,11 +10870,144 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     return {};
 }
 
+tl::expected<void, ErrorCode> MasterService::NotifyDfsPromotionSuccess(
+    const UUID& client_id, const ObjectIdentity& object_id,
+    ObjectMetadata& metadata, TenantState& tenant_state) {
+    auto dfs_it = tenant_state.dfs_promotion_tasks.find(object_id.user_key);
+    if (dfs_it == tenant_state.dfs_promotion_tasks.end() ||
+        dfs_it->second.alloc_id == 0) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+
+    // Holder-only gate: only the client that claimed the task may commit.
+    if (dfs_it->second.holder != client_id) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Commit exactly the replica this task staged (alloc_id), never "first
+    // PROCESSING MEMORY": a concurrent Put may have staged others.
+    bool committed = false;
+    Replica* staged = metadata.GetReplicaByID(dfs_it->second.alloc_id);
+    if (staged != nullptr && staged->is_memory_replica() &&
+        staged->is_processing()) {
+        staged->mark_complete();
+        committed = true;
+    }
+
+    const uint64_t completed_bytes = static_cast<uint64_t>(dfs_it->second.size);
+    // Captured before the task record is erased below.
+    const ReplicaID source_id = dfs_it->second.source_dfs.id;
+    const uint64_t now_min = DfsNowEpochMin();
+    if (committed) {
+        if (enable_multi_tenants_) {
+            auto settle_result = metadata.quota_ledger.SettleAdditional(
+                GetBoundTenantQuotaHandle(tenant_state),
+                dfs_it->second.pending_quota_charge_bytes, completed_bytes);
+            if (!settle_result) {
+                LogTenantQuotaLedgerError(settle_result, "settle_additional",
+                                          object_id.tenant_id,
+                                          object_id.user_key);
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+        }
+    } else {
+        ReleaseTenantQuota(
+            GetBoundTenantQuotaHandle(tenant_state),
+            std::exchange(dfs_it->second.pending_quota_charge_bytes, 0));
+    }
+
+    // Release the DFS source protection + admission-time lease backstop
+    // (nothing else needs the source pinned once the task is settled) and drop
+    // the task record.
+    tenant_state.dfs_protected_keys.erase(object_id.user_key);
+    metadata.ReleaseLease();
+    tenant_state.dfs_promotion_tasks.erase(dfs_it);
+    dfs_promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+    MasterMetricManager::instance().dec_dfs_promotion_in_flight();
+    if (committed) {
+        // Stamp the per-key anti-thrash cooldown on the DFS source replica so
+        // it cannot be re-promoted immediately. Best effort: if the source was
+        // evicted
+        // concurrently the object is no longer DFS-served and the cooldown is
+        // moot.
+        Replica* const cooldown_src = metadata.GetReplicaByID(source_id);
+        if (cooldown_src != nullptr && cooldown_src->is_dfs_replica()) {
+            DfsReplicaData* const dfs = cooldown_src->dfs_data();
+            if (dfs != nullptr) {
+                dfs->dfs_last_promoted_min = static_cast<uint32_t>(now_min);
+            }
+        }
+        MasterMetricManager::instance().inc_dfs_promotion_completed();
+        MasterMetricManager::instance().inc_dfs_promotion_completed_bytes(
+            static_cast<int64_t>(completed_bytes));
+        SyncCacheTotalAccounting(metadata);
+        VLOG(1) << "dfs_promotion_completed key=" << object_id.user_key
+                << " bytes=" << completed_bytes;
+    } else {
+        // The commit path ran but the staged replica was no longer a
+        // PROCESSING MEMORY replica (e.g. superseded by a concurrent Put).
+        // Count it as a failure so success + failure accounts for every task
+        // that reached a terminal state.
+        MasterMetricManager::instance().inc_dfs_promotion_failed();
+        VLOG(1) << "dfs_promotion_commit_failed key=" << object_id.user_key;
+    }
+
+    // The staged MEMORY replica just became COMPLETE: when it now tops a
+    // previously DFS-served object, the object leaves the collection
+    // (Remove + zero) — same transition as the SSD channel.
+    if (committed && dfs_promotion_enabled_ && dfs_heat_sketch_ != nullptr) {
+        ReconcileDfsHeat(metadata, now_min, /*access_hit=*/false);
+    }
+
+    if (!committed) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> MasterService::NotifyDfsPromotionFailure(
+    const UUID& client_id, const ObjectIdentity& object_id,
+    ObjectMetadata& metadata, TenantState& tenant_state) {
+    auto dfs_it = tenant_state.dfs_promotion_tasks.find(object_id.user_key);
+    if (dfs_it == tenant_state.dfs_promotion_tasks.end()) {
+        // No task to release: the reaper already swept it or the key never
+        // had one. Keep the RPC idempotent (mirrors the SSD channel).
+        return {};
+    }
+
+    // Holder-only gate: only the client that claimed the task may abort it.
+    if (dfs_it->second.holder != client_id) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Drop the staged PROCESSING MEMORY replica (if AllocStart got that far)
+    // and release the reserved quota; the DFS source stays untouched so the
+    // object remains DFS-served and can be re-evaluated on a later hit.
+    if (dfs_it->second.alloc_id != 0) {
+        const ReplicaID alloc_id = dfs_it->second.alloc_id;
+        EraseReplicasWithCacheTotalAccounting(
+            metadata, [alloc_id](const Replica& replica) {
+                return replica.id() == alloc_id;
+            });
+    }
+    ReleaseTenantQuota(
+        GetBoundTenantQuotaHandle(tenant_state),
+        std::exchange(dfs_it->second.pending_quota_charge_bytes, 0));
+    tenant_state.dfs_protected_keys.erase(object_id.user_key);
+    metadata.ReleaseLease();
+    tenant_state.dfs_promotion_tasks.erase(dfs_it);
+    dfs_promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+    MasterMetricManager::instance().dec_dfs_promotion_in_flight();
+    MasterMetricManager::instance().inc_dfs_promotion_failed();
+    return {};
+}
+
 void MasterService::EvictionThreadFunc() {
     VLOG(1) << "action=eviction_thread_started";
 
     auto last_discard_time = std::chrono::system_clock::now();
     auto next_dfs_eviction_time = std::chrono::steady_clock::now();
+    auto next_dfs_promotion_maintenance = std::chrono::steady_clock::now();
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
         double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
@@ -9679,6 +11078,18 @@ void MasterService::EvictionThreadFunc() {
 
         if (promotion_candidate_count_.load(std::memory_order_relaxed) > 0) {
             RunPromotionCandidateRetry();
+        }
+
+        // DFS promotion maintenance: threshold cache refresh (also happens on
+        // demand in the read-hit path) plus the DFS candidate retry sweep.
+        // Throttled to 1 s so an idle DFS channel costs ~nothing per loop.
+        if (dfs_promotion_enabled_ && dfs_heat_sketch_ != nullptr) {
+            const auto maintenance_now = std::chrono::steady_clock::now();
+            if (maintenance_now >= next_dfs_promotion_maintenance) {
+                DfsPromotionMaintenance();
+                next_dfs_promotion_maintenance =
+                    maintenance_now + std::chrono::milliseconds(1000);
+            }
         }
 
         std::this_thread::sleep_for(

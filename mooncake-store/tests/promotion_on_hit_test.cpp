@@ -4,16 +4,26 @@
 
 #include "master_service.h"
 
+// master_service.h only forward-declares the heat sketch (the real header is
+// confined to the master_service.cpp TU), but these tests drive the sketch
+// directly through the ...ForTesting funnels, so the full definition is needed.
+#include "decaying_quantile/decaying_ddsketch.hpp"
+
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -31,6 +41,38 @@ size_t CountPromotionTask(const std::vector<PromotionTaskItem>& tasks,
         tasks.begin(), tasks.end(),
         [&key](const PromotionTaskItem& task) { return task.key == key; });
 }
+
+// RAII override for a process environment variable. The DFS allocator is
+// configured exclusively from the environment at MasterService construction
+// time, so the tests that need a real DFS backend (eviction) have to flip these
+// before building the service and restore them afterwards.
+class ScopedEnv {
+   public:
+    ScopedEnv(const char* name, const char* value) : name_(name) {
+        const char* previous = std::getenv(name);
+        if (previous != nullptr) {
+            had_previous_ = true;
+            previous_ = previous;
+        }
+        ::setenv(name, value, /*overwrite=*/1);
+    }
+
+    ~ScopedEnv() {
+        if (had_previous_) {
+            ::setenv(name_.c_str(), previous_.c_str(), /*overwrite=*/1);
+        } else {
+            ::unsetenv(name_.c_str());
+        }
+    }
+
+    ScopedEnv(const ScopedEnv&) = delete;
+    ScopedEnv& operator=(const ScopedEnv&) = delete;
+
+   private:
+    std::string name_;
+    bool had_previous_ = false;
+    std::string previous_;
+};
 
 class PromotionOnHitTest : public ::testing::Test {
    protected:
@@ -247,6 +289,261 @@ class PromotionOnHitTest : public ::testing::Test {
         return res.has_value();
     }
 
+    // ---- DFS promotion channel helpers. PromotionOnHitTest is
+    // friended by MasterService, so these funnels can drive the DFS
+    // master-side queue/heartbeat logic directly without the full Put/DFS
+    // pipeline (which would need the DFS backend environment + a real client
+    // to later read the source). ----
+
+    // Inject a synthetic DFS-only object directly into the metadata shard.
+    // The DFS replica is COMPLETE and no MEMORY replica exists, so admission
+    // sees exactly the "top COMPLETE replica is DFS" state.
+    bool InjectDfsOnlyObject(MasterService& service, const std::string& key,
+                             size_t size = 1024,
+                             const std::string& file_path = "/dfs/test/obj",
+                             uint64_t offset = 0, bool hard_pinned = false,
+                             ReplicaStatus status = ReplicaStatus::COMPLETE) {
+        const TenantId tenant = TenantId::Default();
+        const size_t shard_index = service.getMetadataShardIndex(tenant, key);
+        DistributedFSDescriptor dfs_desc;
+        dfs_desc.file_path = file_path;
+        dfs_desc.offset = offset;
+        dfs_desc.object_size = size;
+        dfs_desc.aligned_size = size;
+        dfs_desc.shard_idx = static_cast<int>(shard_index);
+        std::vector<Replica> replicas;
+        replicas.emplace_back(std::move(dfs_desc), status);
+        // Hold the shard's write lock for the injection. The master starts its
+        // background threads (eviction discard sweep, DFS reconcile scan, ghost
+        // census) as soon as it is constructed and they walk these very maps
+        // under this lock; poking them unlocked raced those scans and could
+        // make the injected object invisible to the admit call right after it.
+        MasterService::MetadataShardAccessorRW shard_accessor(&service,
+                                                              shard_index);
+        auto& tenant_shard = shard_accessor.get();
+        const auto [it, inserted] = tenant_shard.tenants[tenant].metadata.emplace(
+            std::piecewise_construct, std::forward_as_tuple(key),
+            std::forward_as_tuple(
+                generate_uuid(), std::chrono::system_clock::now(), size,
+                std::move(replicas),
+                std::nullopt /*committed_soft_pin_timeout: no soft pin*/,
+                hard_pinned /*enable_hard_pin*/, ObjectDataType::UNKNOWN,
+                std::string() /*group_id*/, tenant, key));
+        (void)it;
+        EXPECT_TRUE(inserted) << "duplicate DFS-only key: " << key;
+        return inserted;
+    }
+
+    // Run one admission pass for an injected DFS-only key (the same entry
+    // point the read-hit / candidate-retry paths funnel into).
+    static bool AdmitDfsPromotionForTesting(MasterService* service,
+                                            const std::string& key,
+                                            double heat = 100.0) {
+        const MasterService::ObjectIdentity object_id{TenantId::Default(), key};
+        MasterService::MetadataAccessorRW accessor(service, object_id);
+        if (!accessor.Exists()) return false;
+        return service->TryAdmitDfsPromotion(
+                   accessor.GetTenantState(), accessor.Get(), heat,
+                   service->DfsNowEpochMin(), false) ==
+               MasterService::DfsAdmissionResult::kAdmitted;
+    }
+
+    // Mark `key` as a protected DFS source without running the full
+    // admission path, so the DFS eviction acceptance can be driven exactly.
+    static void ProtectDfsSourceForTesting(MasterService* service,
+                                           const std::string& key) {
+        service->ProtectDfsSource(
+            MasterService::ObjectIdentity{TenantId::Default(), key});
+    }
+
+    static uint32_t GetDfsPromotionInFlightForTesting(MasterService* service) {
+        return service->dfs_promotion_in_flight_.load(
+            std::memory_order_relaxed);
+    }
+
+    static size_t GetDfsPromotionQueueSizeForTesting(MasterService* service) {
+        std::lock_guard<std::mutex> lock(service->dfs_promotion_queue_mutex_);
+        return service->dfs_promotion_queue_.size();
+    }
+
+    static size_t GetDfsPromotionTaskTableSizeForTesting(
+        MasterService* service) {
+        size_t total = 0;
+        for (size_t i = 0; i < service->metadata_shards_.size(); ++i) {
+            // Read every shard under its lock: the background DFS maintenance
+            // pass mutates these tables concurrently.
+            MasterService::MetadataShardAccessorRO shard(service, i);
+            for (const auto& [tenant, state] : shard->tenants) {
+                (void)tenant;
+                total += state.dfs_promotion_tasks.size();
+            }
+        }
+        return total;
+    }
+
+    static bool IsDfsSourceProtectedForTesting(MasterService* service,
+                                               const std::string& key) {
+        const MasterService::ObjectIdentity object_id{TenantId::Default(), key};
+        MasterService::MetadataAccessorRW accessor(service, object_id);
+        if (!accessor.Exists()) return false;
+        return accessor.GetTenantState().dfs_protected_keys.count(key) > 0;
+    }
+
+    // Cancel a queued/claimed task exactly like a completion/cancel would:
+    // erase the record, release the DFS source protection, decrement the
+    // in-flight counter. The physical queue node is intentionally left behind
+    // (design: cancellation never removes queue nodes; a later claim or the
+    // oversize rebuild drops them as stale).
+    static bool CancelDfsPromotionTaskForTesting(MasterService* service,
+                                                 const std::string& key) {
+        const MasterService::ObjectIdentity object_id{TenantId::Default(), key};
+        MasterService::MetadataAccessorRW accessor(service, object_id);
+        if (!accessor.Exists()) return false;
+        auto& tenant_state = accessor.GetTenantState();
+        if (tenant_state.dfs_promotion_tasks.erase(key) == 0) return false;
+        tenant_state.dfs_protected_keys.erase(key);
+        service->dfs_promotion_in_flight_.fetch_sub(1,
+                                                    std::memory_order_relaxed);
+        return true;
+    }
+
+    // Age a task's enqueued/claimed timestamps so the TTL reaper sees it as
+    // expired without sleeping.
+    static void BackdateDfsPromotionTaskForTesting(
+        MasterService* service, const std::string& key,
+        std::chrono::minutes age) {
+        const MasterService::ObjectIdentity object_id{TenantId::Default(), key};
+        MasterService::MetadataAccessorRW accessor(service, object_id);
+        if (!accessor.Exists()) return;
+        auto& record = accessor.GetTenantState().dfs_promotion_tasks.at(key);
+        const auto past = std::chrono::steady_clock::now() - age;
+        record.enqueued_at = past;
+        record.claimed_at = past;
+    }
+
+    // ReapDfsPromotionTasks only sweeps a fixed batch of shards per call
+    // (round-robin over the whole array); loop enough passes to cover every
+    // shard deterministically.
+    static void RunDfsPromotionReaperForTesting(MasterService* service) {
+        constexpr int kPassesToCoverAllShards = 8;
+        for (int i = 0; i < kPassesToCoverAllShards; ++i) {
+            service->ReapDfsPromotionTasks();
+        }
+    }
+
+    static void OverrideDfsPromotionQueueLimitForTesting(
+        MasterService* service, uint32_t limit) {
+        service->dfs_promotion_queue_limit_ = limit;
+    }
+
+    // ---- Metrics / reconcile self-healing / ghost census /
+    // anti-thrash cooldown helpers. ----
+
+    // Same funnel as AdmitDfsPromotionForTesting, but returns the raw verdict
+    // so tests can tell kCooling apart from the other rejection paths.
+    static MasterService::DfsAdmissionResult AdmitDfsPromotionResultForTesting(
+        MasterService* service, const std::string& key, double heat = 100.0) {
+        const MasterService::ObjectIdentity object_id{TenantId::Default(), key};
+        MasterService::MetadataAccessorRW accessor(service, object_id);
+        if (!accessor.Exists()) {
+            return MasterService::DfsAdmissionResult::kDisabled;
+        }
+        return service->TryAdmitDfsPromotion(accessor.GetTenantState(),
+                                             accessor.Get(), heat,
+                                             service->DfsNowEpochMin(), false);
+    }
+
+    // Expose the cached admission threshold so a failing expectation can show
+    // the value the gate actually compared against.
+    static double GetDfsHeatThresholdForTesting(MasterService* service) {
+        return service->GetDfsHeatThreshold(service->DfsNowEpochMin());
+    }
+
+    // Drive the DFS heat state machine directly; the read-hit path would need
+    // a full GetReplicaList round trip through the RPC layer.
+    static void ReconcileDfsHeatForTesting(MasterService* service,
+                                           const std::string& key,
+                                           bool access_hit) {
+        const MasterService::ObjectIdentity object_id{TenantId::Default(), key};
+        MasterService::MetadataAccessorRW accessor(service, object_id);
+        if (!accessor.Exists()) return;
+        service->ReconcileDfsHeat(accessor.Get(), service->DfsNowEpochMin(),
+                                  access_hit);
+    }
+
+    // Run `fn` on the DFS replica data of `key` while the shard lock is held.
+    // Returning a bare DfsReplicaData* (as this helper used to) dropped the
+    // lock at the call site, yet the master's background eviction / DFS
+    // maintenance threads mutate the very same fields under that lock.
+    template <typename Fn>
+    static auto WithDfsReplicaDataForTesting(MasterService* service,
+                                             const std::string& key, Fn&& fn) {
+        const MasterService::ObjectIdentity object_id{TenantId::Default(), key};
+        MasterService::MetadataAccessorRW accessor(service, object_id);
+        DfsReplicaData* data = nullptr;
+        if (accessor.Exists()) {
+            Replica* const dfs =
+                accessor.Get().GetFirstReplica(&Replica::fn_is_dfs_replica);
+            if (dfs != nullptr) data = dfs->dfs_data();
+        }
+        return fn(data);
+    }
+
+    static void SetDfsLastPromotedMinForTesting(MasterService* service,
+                                                const std::string& key,
+                                                uint32_t value) {
+        WithDfsReplicaDataForTesting(
+            service, key, [value](DfsReplicaData* data) {
+                if (data != nullptr) data->dfs_last_promoted_min = value;
+            });
+    }
+
+    static uint32_t GetDfsLastPromotedMinForTesting(MasterService* service,
+                                                    const std::string& key) {
+        return WithDfsReplicaDataForTesting(
+            service, key, [](const DfsReplicaData* data) -> uint32_t {
+                return data != nullptr ? data->dfs_last_promoted_min : 0;
+            });
+    }
+
+    static uint32_t GetDfsLastAccessMinForTesting(MasterService* service,
+                                                  const std::string& key) {
+        return WithDfsReplicaDataForTesting(
+            service, key, [](const DfsReplicaData* data) -> uint32_t {
+                return data != nullptr ? data->dfs_last_access_min : 0;
+            });
+    }
+
+    // Self-healing sweep, ghost census, cooldown config hooks and the
+    // private DfsAdmissionResult verdicts (TEST_F bodies are not friended, so
+    // they must funnel through this class).
+    static void RunDfsPromotionReconcileScanForTesting(MasterService* service) {
+        service->RunDfsPromotionReconcileScanForTesting();
+    }
+
+    static void RunDfsPromotionGhostMetricsForTesting(MasterService* service) {
+        service->UpdateDfsPromotionGhostMetricsForTesting();
+    }
+
+    static uint64_t DfsNowEpochMinForTesting(MasterService* service) {
+        return service->DfsNowEpochMin();
+    }
+
+    static uint32_t GetDfsPromotionCooldownMinForTesting(
+        MasterService* service) {
+        return service->dfs_promotion_cooldown_min_;
+    }
+
+    static MasterService::DfsAdmissionResult DfsAdmissionResultBelowThreshold() {
+        return MasterService::DfsAdmissionResult::kBelowThreshold;
+    }
+    static MasterService::DfsAdmissionResult DfsAdmissionResultCooling() {
+        return MasterService::DfsAdmissionResult::kCooling;
+    }
+    static MasterService::DfsAdmissionResult DfsAdmissionResultAdmitted() {
+        return MasterService::DfsAdmissionResult::kAdmitted;
+    }
+
     // Register a client as a LOCAL_DISK holder only (no DRAM segment).
     // This simulates the cross-host case where the LOCAL_DISK source lives
     // on a different node than the DRAM target chosen for promotion.
@@ -255,6 +552,212 @@ class PromotionOnHitTest : public ::testing::Test {
         auto mount_ld = service.MountLocalDiskSegment(client_id, true);
         EXPECT_TRUE(mount_ld.has_value());
         return client_id;
+    }
+
+    // Count replicas of `key` matching `pred`. Used by the execution-layer
+    // tests to
+    // observe PROCESSING / COMPLETE MEMORY replicas and the DFS source.
+    static size_t CountReplicasForTesting(
+        MasterService* service, const std::string& key,
+        const std::function<bool(const Replica&)>& pred) {
+        const MasterService::ObjectIdentity object_id{TenantId::Default(), key};
+        MasterService::MetadataAccessorRW accessor(service, object_id);
+        if (!accessor.Exists()) return 0;
+        return accessor.Get().CountReplicas(pred);
+    }
+
+    // ---- Coverage hardening helpers for the DFS channel. ----
+    // The behaviours that have to be locked down go beyond the happy paths:
+    // the heat state machine, decay monotonicity, threshold provenance, every
+    // admission gate, queue dispatch and eviction protection. These funnels
+    // expose the remaining private state so a TEST_F body can drive it
+    // directly.
+
+    static double GetDfsHeatForTesting(MasterService* service,
+                                       const std::string& key) {
+        return WithDfsReplicaDataForTesting(
+            service, key, [](const DfsReplicaData* data) -> double {
+                return data != nullptr ? static_cast<double>(data->dfs_heat)
+                                       : -1.0;
+            });
+    }
+
+    // Simulate an already-registered sketch member carrying `heat` as of
+    // `last_access_min`. The production state machine keeps the metadata and
+    // the sketch in lockstep (Add on first membership, Replace on later hits),
+    // so this helper registers the matching sample too: otherwise the next
+    // ReconcileDfsHeat hit would Replace a sample the sketch never held and the
+    // assertion would be testing an impossible state.
+    static void SetDfsHeatStateForTesting(MasterService* service,
+                                          const std::string& key, float heat,
+                                          uint32_t last_access_min) {
+        WithDfsReplicaDataForTesting(service, key, [&](DfsReplicaData* data) {
+            if (data == nullptr) return;
+            if (service->dfs_heat_sketch_ != nullptr && last_access_min != 0) {
+                const uint64_t key_hash = MasterService::DfsHeatKeyHash(
+                    TenantId::Default().MakeScopedKey(key));
+                if (data->dfs_last_access_min == 0) {
+                    service->dfs_heat_sketch_->Add(
+                        key_hash, static_cast<double>(heat),
+                        static_cast<uint64_t>(last_access_min));
+                } else {
+                    service->dfs_heat_sketch_->Replace(
+                        key_hash, static_cast<double>(data->dfs_heat),
+                        static_cast<uint64_t>(data->dfs_last_access_min),
+                        static_cast<double>(heat),
+                        static_cast<uint64_t>(last_access_min));
+                }
+            }
+            data->dfs_heat = heat;
+            data->dfs_last_access_min = last_access_min;
+        });
+    }
+
+    // Feed the sketch directly: shaping the P90 / total-weight inputs through
+    // real read hits would need hundreds of metadata round trips.
+    static bool AddDfsHeatSampleForTesting(MasterService* service,
+                                           const std::string& scoped_key,
+                                           double heat) {
+        return service->dfs_heat_sketch_->Add(
+            MasterService::DfsHeatKeyHash(scoped_key), heat,
+            service->DfsNowEpochMin());
+    }
+
+    static void RefreshDfsHeatThresholdForTesting(MasterService* service) {
+        service->RefreshDfsHeatThreshold(service->DfsNowEpochMin());
+    }
+
+    // Total weight of the heat sketch: the observable proxy for "how many
+    // samples does the collection still hold", used to prove the active-leave
+    // path really erased the sample instead of only zeroing the metadata.
+    static double GetDfsSketchTotalWeightForTesting(MasterService* service) {
+        const auto weight = service->dfs_heat_sketch_->GetTotalWeight(
+            service->DfsNowEpochMin());
+        return weight.has_value() ? weight.value() : -1.0;
+    }
+
+    static bool GetDfsThresholdLowWeightForTesting(MasterService* service) {
+        return service->dfs_threshold_low_weight_.load(
+            std::memory_order_relaxed);
+    }
+
+    static void SetDfsThresholdRefreshMinForTesting(MasterService* service,
+                                                    uint32_t value) {
+        service->dfs_promotion_threshold_refresh_min_ = value;
+    }
+
+    static void SetDfsMaxPerHeartbeatForTesting(MasterService* service,
+                                                uint32_t value) {
+        service->dfs_promotion_max_per_heartbeat_ = value;
+    }
+
+    static void GrantObjectLeaseForTesting(MasterService* service,
+                                           const std::string& key,
+                                           uint64_t ttl_ms) {
+        const MasterService::ObjectIdentity object_id{TenantId::Default(), key};
+        MasterService::MetadataAccessorRW accessor(service, object_id);
+        if (!accessor.Exists()) return;
+        accessor.Get().GrantReadLease(ttl_ms);
+    }
+
+    // ReconcileDfsHeat decides "DFS-served" from the *first* COMPLETE replica
+    // only, so pushing the DFS replica to the back of the vector is how a test
+    // forces the active-leave transition without running a real promotion.
+    static bool MoveDfsReplicaLastForTesting(MasterService* service,
+                                             const std::string& key) {
+        const MasterService::ObjectIdentity object_id{TenantId::Default(), key};
+        MasterService::MetadataAccessorRW accessor(service, object_id);
+        if (!accessor.Exists()) return false;
+        std::vector<Replica> moved =
+            accessor.Get().PopReplicas(&Replica::fn_is_dfs_replica);
+        if (moved.empty()) return false;
+        accessor.Get().AddReplicas(std::move(moved));
+        return true;
+    }
+
+    // The SSD channel shares the per-key in-flight dedup with DFS; planting a
+    // record is enough to exercise the cross-channel branch.
+    static void AddSsdPromotionTaskForTesting(MasterService* service,
+                                              const std::string& key) {
+        const MasterService::ObjectIdentity object_id{TenantId::Default(), key};
+        MasterService::MetadataAccessorRW accessor(service, object_id);
+        if (!accessor.Exists()) return;
+        accessor.GetTenantState().promotion_tasks.emplace(
+            key, MasterService::PromotionTask{});
+    }
+
+    // Reverse direction of the "one in-flight task per key" rule: attach a
+    // COMPLETE LOCAL_DISK replica to an object
+    // that already exists, so a DFS-only object becomes eligible for the SSD
+    // channel while its DFS task is still in flight.
+    static bool AttachLocalDiskReplicaForTesting(MasterService* service,
+                                                 const UUID& client_id,
+                                                 const std::string& key,
+                                                 int64_t size,
+                                                 const std::string& endpoint) {
+        const MasterService::ObjectIdentity object_id{TenantId::Default(), key};
+        MasterService::MetadataAccessorRW accessor(service, object_id);
+        if (!accessor.Exists()) return false;
+        std::vector<Replica> replicas;
+        replicas.emplace_back(client_id, size, endpoint, ReplicaStatus::COMPLETE);
+        accessor.Get().AddReplicas(std::move(replicas));
+        accessor.GetShard().OnDiskReplicaAdded(accessor.Get());
+        return true;
+    }
+
+    static size_t GetDfsCandidateCountForTesting(MasterService* service,
+                                                 const std::string& key) {
+        const MasterService::ObjectIdentity object_id{TenantId::Default(), key};
+        MasterService::MetadataAccessorRW accessor(service, object_id);
+        if (!accessor.Exists()) return 0;
+        return accessor.GetTenantState().dfs_promotion_candidates.count(key);
+    }
+
+    static MasterService::PromotionCandidateReason
+    GetDfsCandidateReasonForTesting(MasterService* service,
+                                    const std::string& key) {
+        const MasterService::ObjectIdentity object_id{TenantId::Default(), key};
+        MasterService::MetadataAccessorRW accessor(service, object_id);
+        if (!accessor.Exists()) {
+            return MasterService::PromotionCandidateReason::kPushFailed;
+        }
+        auto& candidates = accessor.GetTenantState().dfs_promotion_candidates;
+        const auto it = candidates.find(key);
+        if (it == candidates.end()) {
+            return MasterService::PromotionCandidateReason::kPushFailed;
+        }
+        return it->second.last_reason;
+    }
+
+    static MasterService::DfsAdmissionResult DfsAdmissionResultDisabled() {
+        return MasterService::DfsAdmissionResult::kDisabled;
+    }
+    static MasterService::DfsAdmissionResult DfsAdmissionResultMemoryPresent() {
+        return MasterService::DfsAdmissionResult::kMemoryPresent;
+    }
+    static MasterService::DfsAdmissionResult DfsAdmissionResultNoDfsSource() {
+        return MasterService::DfsAdmissionResult::kNoDfsSource;
+    }
+    static MasterService::DfsAdmissionResult DfsAdmissionResultHardPinned() {
+        return MasterService::DfsAdmissionResult::kHardPinned;
+    }
+    static MasterService::DfsAdmissionResult DfsAdmissionResultLeaseActive() {
+        return MasterService::DfsAdmissionResult::kLeaseActive;
+    }
+    static MasterService::DfsAdmissionResult DfsAdmissionResultQueueCap() {
+        return MasterService::DfsAdmissionResult::kQueueCapRejected;
+    }
+    static MasterService::DfsAdmissionResult DfsAdmissionResultWatermark() {
+        return MasterService::DfsAdmissionResult::kWatermarkRejected;
+    }
+    static MasterService::DfsAdmissionResult DfsAdmissionResultDupInFlight() {
+        return MasterService::DfsAdmissionResult::kDupInFlight;
+    }
+    static MasterService::PromotionCandidateReason DfsCandidateReasonWatermark() {
+        return MasterService::PromotionCandidateReason::kWatermark;
+    }
+    static MasterService::PromotionCandidateReason DfsCandidateReasonQueueCap() {
+        return MasterService::PromotionCandidateReason::kQueueCap;
     }
 
     std::vector<std::string> policy_files_;
@@ -393,6 +896,11 @@ TEST_F(PromotionOnHitTest, BatchGetReplicaListPromotesLocalDiskOnlyObject) {
     EXPECT_EQ(pending->size(), 2u);
     EXPECT_EQ(CountPromotionTask(*pending, single_key), 1u);
     EXPECT_EQ(CountPromotionTask(*pending, batch_key), 1u);
+    // H12: the SSD channel never fills the DFS-only source snapshot, so a task
+    // produced by it must carry no source_dfs at all.
+    for (const auto& task : *pending) {
+        EXPECT_FALSE(task.source_dfs.has_value()) << "key=" << task.key;
+    }
 
     service->RemoveAll();
 }
@@ -3237,6 +3745,1646 @@ TEST_F(PromotionOnHitTest, RetryCandidate_ClearOnReload) {
     EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 0u);
 
     service->RemoveAll();
+}
+
+// ---------------- Admission and dispatch of the DFS promotion channel --------
+// The DFS promotion channel copies hot DFS-only objects back into MEMORY:
+// admission (read-hit / retry) enqueues a task carrying a snapshot of the
+// COMPLETE DFS source replica; a DFS-capable client claims tasks via the
+// DfsPromotionObjectHeartbeat; claimed/uncompleted tasks are reclaimed by the
+// TTL reaper. Tests here drive the master-side logic directly through the
+// friend funnels above (no DFS backend, no real executor). The client-side
+// executor (read source -> write MEMORY -> Notify success) is covered by the
+// file_storage promotion tests.
+
+MasterServiceConfig MakeDfsPromotionConfig() {
+    MasterServiceConfig config;
+    config.dfs_promotion.enable = true;
+    config.dfs_promotion.task_ttl_min = 1;  // fast TTL for the reaper tests
+    // Pin the P90 trust gate explicitly: the threshold-provenance tests shape
+    // the sketch by hand with tens of samples, so they must not silently start
+    // depending on how the production default is tuned.
+    config.dfs_promotion.min_total_weight = 8.0;
+    // The execution-layer tests stage the promoted MEMORY replica on a mounted
+    // DRAM segment, so MountLocalDiskSegment must be permitted (it gates on
+    // enable_offload_); the admission/dispatch tests never mount a segment.
+    config.enable_offload = true;
+    // Keep the DRAM watermark gate open regardless of other tests' segment
+    // allocations (metrics are process-global).
+    config.eviction_high_watermark_ratio = 1.0;
+    return config;
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionAdmissionEnqueuesAndHeartbeatDispatches) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs", 1024, "/dfs/obj/k_dfs",
+                                    4096));
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_dfs"));
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 1u);
+    EXPECT_EQ(GetDfsPromotionQueueSizeForTesting(service.get()), 1u);
+    EXPECT_EQ(GetDfsPromotionTaskTableSizeForTesting(service.get()), 1u);
+    EXPECT_TRUE(IsDfsSourceProtectedForTesting(service.get(), "k_dfs"));
+
+    // First heartbeat dispatches the task with the source DFS descriptor.
+    const UUID executor = generate_uuid();
+    auto resp = service->DfsPromotionObjectHeartbeat(executor);
+    ASSERT_TRUE(resp.has_value());
+    ASSERT_EQ(resp->size(), 1u);
+    const auto& task = resp->front();
+    EXPECT_EQ(task.key, "k_dfs");
+    EXPECT_EQ(task.size, 1024);
+    ASSERT_TRUE(task.source_dfs.has_value());
+    ASSERT_TRUE(task.source_dfs->is_dfs_replica());
+    const auto& src = task.source_dfs->get_dfs_descriptor();
+    EXPECT_EQ(src.file_path, "/dfs/obj/k_dfs");
+    EXPECT_EQ(src.offset, 4096);
+    EXPECT_EQ(src.object_size, 1024);
+
+    // The queue node was popped at claim and the record is claimed, so no
+    // re-dispatch (even from a different client id).
+    EXPECT_EQ(GetDfsPromotionQueueSizeForTesting(service.get()), 0u);
+    auto again = service->DfsPromotionObjectHeartbeat(generate_uuid());
+    ASSERT_TRUE(again.has_value());
+    EXPECT_TRUE(again->empty());
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionQueuedTaskBlocksReAdmission) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dup", 1024));
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_dup"));
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 1u);
+
+    // While the task is still queued (not yet claimed), re-admission of the
+    // same key must be rejected by the per-key dedup gate shared with the SSD
+    // channel, and must not create a second task/record.
+    EXPECT_FALSE(AdmitDfsPromotionForTesting(service.get(), "k_dup", 500.0));
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 1u);
+    EXPECT_EQ(GetDfsPromotionTaskTableSizeForTesting(service.get()), 1u);
+    EXPECT_EQ(GetDfsPromotionQueueSizeForTesting(service.get()), 1u);
+
+    // A different key is unaffected.
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_other", 1024));
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_other"));
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 2u);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionHeartbeatIsFifoForEqualHeat) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+    const std::vector<std::string> keys{"k_a", "k_b", "k_c"};
+    for (const auto& key : keys) {
+        ASSERT_TRUE(InjectDfsOnlyObject(*service, key, 1024));
+        ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), key));
+    }
+    // All tasks carry the same admission heat, so the comparator orders by
+    // enqueue sequence => dispatch order equals admission order (FIFO).
+    std::vector<std::string> dispatched;
+    const UUID executor = generate_uuid();
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto resp = service->DfsPromotionObjectHeartbeat(executor);
+        ASSERT_TRUE(resp.has_value());
+        ASSERT_EQ(resp->size(), 1u) << "dispatch " << i;
+        dispatched.push_back(resp->front().key);
+    }
+    EXPECT_EQ(dispatched[0], "k_a");
+    EXPECT_EQ(dispatched[1], "k_b");
+    EXPECT_EQ(dispatched[2], "k_c");
+    EXPECT_EQ(GetDfsPromotionQueueSizeForTesting(service.get()), 0u);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionClaimDropsCancelledStaleNode) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_cancel", 1024));
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_cancel"));
+    // Cancellation erases the record but deliberately leaves the queue node.
+    ASSERT_TRUE(CancelDfsPromotionTaskForTesting(service.get(), "k_cancel"));
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 0u);
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_live", 1024));
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_live"));
+    EXPECT_EQ(GetDfsPromotionQueueSizeForTesting(service.get()), 2u);
+
+    // The heartbeat pops the stale (cancelled) node first and drops it, then
+    // dispatches the live task.
+    auto resp = service->DfsPromotionObjectHeartbeat(generate_uuid());
+    ASSERT_TRUE(resp.has_value());
+    ASSERT_EQ(resp->size(), 1u);
+    EXPECT_EQ(resp->front().key, "k_live");
+    EXPECT_EQ(GetDfsPromotionQueueSizeForTesting(service.get()), 0u);
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 1u);
+}
+
+// A burst of cancelled tasks leaves a pile of stale nodes behind (cancellation
+// never removes a node physically). Each stale node costs a metadata shard
+// lock to discard, so a single claim must not walk the whole backlog while
+// holding snapshot_mutex_ shared; it drops up to a fixed cap and leaves the
+// rest to later heartbeats (or the oversized-queue rebuild).
+TEST_F(PromotionOnHitTest, DfsPromotionClaimBoundsStaleDropsPerHeartbeat) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+
+    constexpr size_t kStale = 100;
+    constexpr size_t kStaleCap = 64;  // mirrors kMaxStaleDropsPerClaim
+    for (size_t i = 0; i < kStale; ++i) {
+        const std::string key = "k_stale_" + std::to_string(i);
+        ASSERT_TRUE(InjectDfsOnlyObject(*service, key, 1024));
+        ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), key));
+        ASSERT_TRUE(CancelDfsPromotionTaskForTesting(service.get(), key));
+    }
+    // One live task sits behind the stale ones: equal heat, so the heap orders
+    // by enqueue sequence and the live node is popped last.
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_live", 1024));
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_live"));
+    ASSERT_EQ(GetDfsPromotionQueueSizeForTesting(service.get()), kStale + 1);
+
+    // First heartbeat drains only the cap and returns nothing, without yet
+    // reaching the live task buried underneath.
+    auto first = service->DfsPromotionObjectHeartbeat(generate_uuid());
+    ASSERT_TRUE(first.has_value());
+    EXPECT_TRUE(first->empty());
+    EXPECT_EQ(GetDfsPromotionQueueSizeForTesting(service.get()),
+              kStale + 1 - kStaleCap);
+
+    // The next heartbeat clears the remainder and dispatches the live task.
+    auto second = service->DfsPromotionObjectHeartbeat(generate_uuid());
+    ASSERT_TRUE(second.has_value());
+    ASSERT_EQ(second->size(), 1u);
+    EXPECT_EQ(second->front().key, "k_live");
+    EXPECT_EQ(GetDfsPromotionQueueSizeForTesting(service.get()), 0u);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionReaperReclaimsExpiredClaimedTask) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_expire", 1024));
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_expire"));
+    const UUID executor = generate_uuid();
+    auto resp = service->DfsPromotionObjectHeartbeat(executor);
+    ASSERT_TRUE(resp.has_value());
+    ASSERT_EQ(resp->size(), 1u);
+    ASSERT_TRUE(IsDfsSourceProtectedForTesting(service.get(), "k_expire"));
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 1u);
+
+    // A claimed-but-never-acknowledged task ages past its TTL: the reaper
+    // erases the record, releases the DFS source protection and decrements
+    // the in-flight counter.
+    BackdateDfsPromotionTaskForTesting(service.get(), "k_expire",
+                                       std::chrono::minutes(5));
+    RunDfsPromotionReaperForTesting(service.get());
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 0u);
+    EXPECT_EQ(GetDfsPromotionTaskTableSizeForTesting(service.get()), 0u);
+    EXPECT_FALSE(IsDfsSourceProtectedForTesting(service.get(), "k_expire"));
+
+    // The record is gone: re-admission is allowed again.
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_expire"));
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 1u);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionQueueRebuildDropsStaleNodes) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_s1", 1024));
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_s2", 1024));
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_s1"));
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_s2"));
+    ASSERT_TRUE(CancelDfsPromotionTaskForTesting(service.get(), "k_s1"));
+    // Physical queue still holds both nodes but the logical state has one task.
+    EXPECT_EQ(GetDfsPromotionQueueSizeForTesting(service.get()), 2u);
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 1u);
+
+    // Force the oversize trigger (physical > limit): the rebuild drains the
+    // heap, keeps only nodes that still match an unclaimed record, and pushes
+    // them back - dropping the cancelled k_s1 node.
+    OverrideDfsPromotionQueueLimitForTesting(service.get(), 1);
+    RunDfsPromotionReaperForTesting(service.get());
+    EXPECT_EQ(GetDfsPromotionQueueSizeForTesting(service.get()), 1u);
+
+    auto resp = service->DfsPromotionObjectHeartbeat(generate_uuid());
+    ASSERT_TRUE(resp.has_value());
+    ASSERT_EQ(resp->size(), 1u);
+    EXPECT_EQ(resp->front().key, "k_s2");
+    EXPECT_EQ(GetDfsPromotionQueueSizeForTesting(service.get()), 0u);
+}
+
+// ---------------- DFS promotion execution layer ----------------
+// The DFS channel reuses the SSD channel's RPCs (PromotionAllocStart /
+// NotifyPromotionSuccess / NotifyPromotionFailure) but keeps its own global
+// task table. These tests drive the master side of that reuse: staging a
+// PROCESSING MEMORY replica for a claimed DFS task, committing it, aborting
+// it, and reclaiming it on TTL expiry. The client-side executor
+// (FileStorage::ProcessDfsPromotionTasks) is exercised separately.
+
+TEST_F(PromotionOnHitTest,
+       DfsPromotionAllocStartAndCommitCompletesMemoryReplica) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "dfs_commit_seg", kDefaultSegmentBase,
+                              seg_size);
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_commit", 1024));
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_dfs_commit"));
+
+    auto claimed = service->DfsPromotionObjectHeartbeat(ctx.client_id);
+    ASSERT_TRUE(claimed.has_value());
+    ASSERT_EQ(claimed->size(), 1u);
+    ASSERT_EQ(claimed->front().key, "k_dfs_commit");
+    ASSERT_TRUE(claimed->front().source_dfs.has_value());
+
+    // Stage a PROCESSING MEMORY replica through the shared AllocStart RPC.
+    const std::vector<std::string> preferred;
+    auto alloc = service->PromotionAllocStart(
+        ctx.client_id, "k_dfs_commit", TenantId::Default(), 1024, preferred);
+    ASSERT_TRUE(alloc.has_value()) << "AllocStart rejected the DFS task";
+    EXPECT_EQ(CountReplicasForTesting(
+                  service.get(), "k_dfs_commit", [](const Replica& replica) {
+                      return Replica::fn_is_memory_replica(replica) &&
+                             Replica::fn_is_processing(replica);
+                  }),
+              1u);
+
+    // Commit: the staged replica flips to COMPLETE and every DFS bookkeeping
+    // entry is released (task table, in-flight, source protection).
+    auto notify = service->NotifyPromotionSuccess(
+        ctx.client_id, "k_dfs_commit", TenantId::Default());
+    ASSERT_TRUE(notify.has_value());
+    EXPECT_EQ(CountReplicasForTesting(
+                  service.get(), "k_dfs_commit", [](const Replica& replica) {
+                      return Replica::fn_is_memory_replica(replica) &&
+                             Replica::fn_is_completed(replica);
+                  }),
+              1u);
+    EXPECT_EQ(GetDfsPromotionTaskTableSizeForTesting(service.get()), 0u);
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 0u);
+    EXPECT_FALSE(IsDfsSourceProtectedForTesting(service.get(), "k_dfs_commit"));
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionNotifyFailureReleasesStagedReplica) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx =
+        PrepareSegment(*service, "dfs_fail_seg", kDefaultSegmentBase, seg_size);
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_fail", 1024));
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_dfs_fail"));
+    auto claimed = service->DfsPromotionObjectHeartbeat(ctx.client_id);
+    ASSERT_TRUE(claimed.has_value());
+    ASSERT_EQ(claimed->size(), 1u);
+
+    const std::vector<std::string> preferred;
+    auto alloc = service->PromotionAllocStart(
+        ctx.client_id, "k_dfs_fail", TenantId::Default(), 1024, preferred);
+    ASSERT_TRUE(alloc.has_value());
+    ASSERT_EQ(CountReplicasForTesting(
+                  service.get(), "k_dfs_fail", [](const Replica& replica) {
+                      return Replica::fn_is_memory_replica(replica);
+                  }),
+              1u);
+
+    // Failure: the staged MEMORY replica is erased and all bookkeeping is
+    // released, while the DFS source stays so the object remains retryable.
+    auto notify = service->NotifyPromotionFailure(
+        ctx.client_id, "k_dfs_fail", TenantId::Default());
+    ASSERT_TRUE(notify.has_value());
+    EXPECT_EQ(CountReplicasForTesting(
+                  service.get(), "k_dfs_fail", [](const Replica& replica) {
+                      return Replica::fn_is_memory_replica(replica);
+                  }),
+              0u);
+    EXPECT_EQ(CountReplicasForTesting(
+                  service.get(), "k_dfs_fail", [](const Replica& replica) {
+                      return Replica::fn_is_dfs_replica(replica);
+                  }),
+              1u);
+    EXPECT_EQ(GetDfsPromotionTaskTableSizeForTesting(service.get()), 0u);
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 0u);
+    EXPECT_FALSE(IsDfsSourceProtectedForTesting(service.get(), "k_dfs_fail"));
+
+    // Releasing a failed task must not poison the key: once the task record
+    // is gone the object can be admitted again on a later hit.
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_dfs_fail"));
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionReaperReclaimsStagedProcessingReplica) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx =
+        PrepareSegment(*service, "dfs_reap_seg", kDefaultSegmentBase, seg_size);
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_reap", 1024));
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_dfs_reap"));
+    auto claimed = service->DfsPromotionObjectHeartbeat(ctx.client_id);
+    ASSERT_TRUE(claimed.has_value());
+    ASSERT_EQ(claimed->size(), 1u);
+
+    const std::vector<std::string> preferred;
+    auto alloc = service->PromotionAllocStart(
+        ctx.client_id, "k_dfs_reap", TenantId::Default(), 1024, preferred);
+    ASSERT_TRUE(alloc.has_value());
+
+    // The holder stalls after staging: age the task past TTL and reap. The
+    // staged PROCESSING MEMORY replica must be reclaimed with it, otherwise
+    // the buffer leaks (no task record would point at it anymore).
+    BackdateDfsPromotionTaskForTesting(service.get(), "k_dfs_reap",
+                                       std::chrono::minutes(5));
+    RunDfsPromotionReaperForTesting(service.get());
+    EXPECT_EQ(CountReplicasForTesting(
+                  service.get(), "k_dfs_reap", [](const Replica& replica) {
+                      return Replica::fn_is_memory_replica(replica);
+                  }),
+              0u);
+    EXPECT_EQ(GetDfsPromotionTaskTableSizeForTesting(service.get()), 0u);
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 0u);
+}
+
+// ---------------- Metrics / self-healing / anti-thrash cooldown --------------
+// Covers the reconcile self-healing scan and ghost census plus the per-key
+// anti-thrash cooldown that stops a key from being promoted repeatedly, and
+// the dfs_promotion_* metric wiring. Metrics are process-global, so every
+// assertion is a delta.
+
+TEST_F(PromotionOnHitTest, DfsPromotionMetricsTrackAdmitCommitAndInFlight) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "dfs_metrics_seg", kDefaultSegmentBase,
+                              seg_size);
+    auto& mm = MasterMetricManager::instance();
+    const int64_t admitted_pre = mm.get_dfs_promotion_admitted();
+    const int64_t completed_pre = mm.get_dfs_promotion_completed();
+    const int64_t bytes_pre = mm.get_dfs_promotion_completed_bytes();
+    const int64_t in_flight_pre = mm.get_dfs_promotion_in_flight();
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_metric", 2048));
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_dfs_metric"));
+    EXPECT_EQ(mm.get_dfs_promotion_admitted(), admitted_pre + 1);
+    EXPECT_EQ(mm.get_dfs_promotion_in_flight(), in_flight_pre + 1);
+
+    auto claimed = service->DfsPromotionObjectHeartbeat(ctx.client_id);
+    ASSERT_TRUE(claimed.has_value());
+    ASSERT_EQ(claimed->size(), 1u);
+    const std::vector<std::string> preferred;
+    ASSERT_TRUE(service
+                    ->PromotionAllocStart(ctx.client_id, "k_dfs_metric",
+                                          TenantId::Default(), 2048, preferred)
+                    .has_value());
+    ASSERT_TRUE(service
+                    ->NotifyPromotionSuccess(ctx.client_id, "k_dfs_metric",
+                                             TenantId::Default())
+                    .has_value());
+    EXPECT_EQ(mm.get_dfs_promotion_completed(), completed_pre + 1);
+    EXPECT_EQ(mm.get_dfs_promotion_completed_bytes(), bytes_pre + 2048);
+    EXPECT_EQ(mm.get_dfs_promotion_in_flight(), in_flight_pre);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionMetricsTrackFailureAndExpiry) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "dfs_metrics_seg2", kDefaultSegmentBase,
+                              seg_size);
+    auto& mm = MasterMetricManager::instance();
+    const int64_t failed_pre = mm.get_dfs_promotion_failed();
+    const int64_t expired_pre = mm.get_dfs_promotion_expired();
+    const int64_t in_flight_pre = mm.get_dfs_promotion_in_flight();
+
+    // Failure path: the staged replica is released and the task is counted as
+    // failed so success + failure accounts for every terminal task.
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_metric_fail", 1024));
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_dfs_metric_fail"));
+    auto claimed = service->DfsPromotionObjectHeartbeat(ctx.client_id);
+    ASSERT_TRUE(claimed.has_value());
+    ASSERT_EQ(claimed->size(), 1u);
+    const std::vector<std::string> preferred;
+    ASSERT_TRUE(
+        service
+            ->PromotionAllocStart(ctx.client_id, "k_dfs_metric_fail",
+                                  TenantId::Default(), 1024, preferred)
+            .has_value());
+    ASSERT_TRUE(service
+                    ->NotifyPromotionFailure(ctx.client_id, "k_dfs_metric_fail",
+                                             TenantId::Default())
+                    .has_value());
+    EXPECT_EQ(mm.get_dfs_promotion_failed(), failed_pre + 1);
+    EXPECT_EQ(mm.get_dfs_promotion_in_flight(), in_flight_pre);
+
+    // Expiry path: a claimed-but-silent task ages past TTL and is counted as
+    // expired (not as a failure).
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_metric_exp", 1024));
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_dfs_metric_exp"));
+    auto claimed2 = service->DfsPromotionObjectHeartbeat(ctx.client_id);
+    ASSERT_TRUE(claimed2.has_value());
+    ASSERT_EQ(claimed2->size(), 1u);
+    BackdateDfsPromotionTaskForTesting(service.get(), "k_dfs_metric_exp",
+                                       std::chrono::minutes(5));
+    RunDfsPromotionReaperForTesting(service.get());
+    EXPECT_EQ(mm.get_dfs_promotion_expired(), expired_pre + 1);
+    EXPECT_EQ(mm.get_dfs_promotion_in_flight(), in_flight_pre);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionMetricsTrackCancellationOnRemoval) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+    auto& mm = MasterMetricManager::instance();
+    const int64_t cancelled_pre = mm.get_dfs_promotion_cancelled();
+    const int64_t in_flight_pre = mm.get_dfs_promotion_in_flight();
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_metric_cancel", 1024));
+    ASSERT_TRUE(
+        AdmitDfsPromotionForTesting(service.get(), "k_dfs_metric_cancel"));
+    // Erasing the object cancels the in-flight task through
+    // ErasePromotionTaskIfPresent.
+    ASSERT_TRUE(service->Remove("k_dfs_metric_cancel", TenantId::Default(),
+                                /*force=*/true)
+                    .has_value());
+    EXPECT_EQ(mm.get_dfs_promotion_cancelled(), cancelled_pre + 1);
+    EXPECT_EQ(mm.get_dfs_promotion_in_flight(), in_flight_pre);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionLowWeightRejectionIsAttributed) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+    auto& mm = MasterMetricManager::instance();
+    const int64_t low_weight_pre = mm.get_dfs_promotion_rejected_low_weight();
+    const int64_t frequency_pre = mm.get_dfs_promotion_rejected_frequency();
+
+    // A fresh sketch has total weight 0, so the threshold degrades to the
+    // absolute floor. A heat below that floor must be attributed to the
+    // low-weight (cold start) bucket, not to the frequency bucket.
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_loww", 1024));
+    EXPECT_EQ(AdmitDfsPromotionResultForTesting(service.get(), "k_dfs_loww",
+                                                /*heat=*/1.0),
+              DfsAdmissionResultBelowThreshold())
+        << "threshold=" << GetDfsHeatThresholdForTesting(service.get());
+    EXPECT_EQ(mm.get_dfs_promotion_rejected_low_weight(), low_weight_pre + 1);
+    EXPECT_EQ(mm.get_dfs_promotion_rejected_frequency(), frequency_pre);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionReconcileScanRegistersMissedSample) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+
+    // The injected object holds a COMPLETE DFS replica but was never
+    // registered in the heat sketch: exactly the "missed Add" drift the
+    // self-healing sweep is meant to repair.
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_scan", 1024));
+    EXPECT_EQ(GetDfsLastAccessMinForTesting(service.get(), "k_dfs_scan"), 0u);
+
+    // One pass walks at most 128 of the 1024 shards (kMaxShardsPerPass), so
+    // drive the sweep until its cursor wraps around and reaches this object's
+    // shard. The scan is idempotent, so extra passes are harmless.
+    for (int pass = 0;
+         pass < 16 &&
+         GetDfsLastAccessMinForTesting(service.get(), "k_dfs_scan") == 0;
+         ++pass) {
+        RunDfsPromotionReconcileScanForTesting(service.get());
+    }
+    EXPECT_NE(GetDfsLastAccessMinForTesting(service.get(), "k_dfs_scan"), 0u);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionGhostCensusMatchesSketchWeight) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+    auto& mm = MasterMetricManager::instance();
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_ghost", 1024));
+    // Register + heat the sample through the read-hit state machine.
+    for (int i = 0; i < 3; ++i) {
+        ReconcileDfsHeatForTesting(service.get(), "k_dfs_ghost",
+                                   /*access_hit=*/true);
+    }
+    RunDfsPromotionGhostMetricsForTesting(service.get());
+
+    // No drift here: the weight reachable from live objects must be positive
+    // and match the sketch's own total weight (a ghost would show as a gap).
+    EXPECT_GT(mm.get_dfs_promotion_members_weight(), 0);
+    EXPECT_NEAR(mm.get_dfs_promotion_members_weight(),
+                mm.get_dfs_promotion_sketch_weight(), 1);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionCooldownStampedOnCompletion) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx =
+        PrepareSegment(*service, "dfs_cool_seg", kDefaultSegmentBase, seg_size);
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_cool", 1024));
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_dfs_cool"));
+    auto claimed = service->DfsPromotionObjectHeartbeat(ctx.client_id);
+    ASSERT_TRUE(claimed.has_value());
+    ASSERT_EQ(claimed->size(), 1u);
+    const std::vector<std::string> preferred;
+    ASSERT_TRUE(service
+                    ->PromotionAllocStart(ctx.client_id, "k_dfs_cool",
+                                          TenantId::Default(), 1024, preferred)
+                    .has_value());
+    EXPECT_EQ(GetDfsLastPromotedMinForTesting(service.get(), "k_dfs_cool"), 0u);
+
+    ASSERT_TRUE(service
+                    ->NotifyPromotionSuccess(ctx.client_id, "k_dfs_cool",
+                                             TenantId::Default())
+                    .has_value());
+    // A completed promotion stamps the cooldown on the DFS source replica.
+    EXPECT_NE(GetDfsLastPromotedMinForTesting(service.get(), "k_dfs_cool"), 0u);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionCooldownBlocksReAdmission) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_cool_block", 1024));
+    // Pretend the key completed a promotion "now": the object is DFS-served
+    // again (its MEMORY replica was evicted), so without the cooldown it would
+    // be admitted immediately.
+    const uint32_t now_min =
+        static_cast<uint32_t>(DfsNowEpochMinForTesting(service.get()));
+    SetDfsLastPromotedMinForTesting(service.get(), "k_dfs_cool_block", now_min);
+    EXPECT_EQ(AdmitDfsPromotionResultForTesting(service.get(),
+                                                "k_dfs_cool_block"),
+              DfsAdmissionResultCooling());
+
+    // Once the window has elapsed the same key is admissible again.
+    SetDfsLastPromotedMinForTesting(
+        service.get(), "k_dfs_cool_block",
+        now_min - GetDfsPromotionCooldownMinForTesting(service.get()) - 1);
+    EXPECT_EQ(AdmitDfsPromotionResultForTesting(service.get(),
+                                                "k_dfs_cool_block"),
+              DfsAdmissionResultAdmitted());
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionCooldownDisabledAllowsReAdmission) {
+    auto config = MakeDfsPromotionConfig();
+    config.dfs_promotion.cooldown_min = 0;  // disable the anti-thrash window
+    auto service = std::make_unique<MasterService>(config);
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_cool_off", 1024));
+    const uint32_t now_min =
+        static_cast<uint32_t>(DfsNowEpochMinForTesting(service.get()));
+    SetDfsLastPromotedMinForTesting(service.get(), "k_dfs_cool_off", now_min);
+    EXPECT_EQ(AdmitDfsPromotionResultForTesting(service.get(),
+                                                "k_dfs_cool_off"),
+              DfsAdmissionResultAdmitted());
+}
+
+// ===================== DFS channel coverage hardening =====================
+// The DFS channel has to be locked down well beyond the happy paths covered
+// above: the heat state machine (membership / idempotence / active leave /
+// generation swap), decay monotonicity, threshold provenance, every admission
+// gate, queue dispatch ordering, holder authorization, and concurrent
+// bookkeeping consistency. Every case below is deterministic: the epoch minute
+// is injected through the friend funnels instead of sleeping.
+
+// ---- Heat state machine + decay ----
+
+TEST_F(PromotionOnHitTest, DfsPromotionHeatRegistersMemberOnNonHitTransition) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_reg", 1024));
+    EXPECT_EQ(GetDfsLastAccessMinForTesting(service.get(), "k_dfs_reg"), 0u);
+
+    // A non-hit transition (MEMORY evicted / fresh generation) still has to
+    // register the sample with heat 0, otherwise the object silently drops out
+    // of the sketch and its later hits start from an unknown baseline.
+    ReconcileDfsHeatForTesting(service.get(), "k_dfs_reg", /*access_hit=*/false);
+    EXPECT_NE(GetDfsLastAccessMinForTesting(service.get(), "k_dfs_reg"), 0u);
+    EXPECT_DOUBLE_EQ(GetDfsHeatForTesting(service.get(), "k_dfs_reg"), 0.0);
+    EXPECT_NEAR(GetDfsSketchTotalWeightForTesting(service.get()), 1.0, 0.05);
+
+    // Already a member: further non-hit transitions must be no-ops, so the
+    // collection does not grow without bound on every eviction sweep.
+    const uint32_t registered_at =
+        GetDfsLastAccessMinForTesting(service.get(), "k_dfs_reg");
+    ReconcileDfsHeatForTesting(service.get(), "k_dfs_reg", false);
+    ReconcileDfsHeatForTesting(service.get(), "k_dfs_reg", false);
+    EXPECT_EQ(GetDfsLastAccessMinForTesting(service.get(), "k_dfs_reg"),
+              registered_at);
+    EXPECT_DOUBLE_EQ(GetDfsHeatForTesting(service.get(), "k_dfs_reg"), 0.0);
+    EXPECT_NEAR(GetDfsSketchTotalWeightForTesting(service.get()), 1.0, 0.05);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionHeatGrowsByOnePerDenseHit) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_dense", 1024));
+
+    // No idle gap between hits (same epoch minute), so the decay factor is 1
+    // and heat degenerates into a plain hit counter.
+    for (int hit = 1; hit <= 4; ++hit) {
+        ReconcileDfsHeatForTesting(service.get(), "k_dfs_dense",
+                                   /*access_hit=*/true);
+        EXPECT_DOUBLE_EQ(GetDfsHeatForTesting(service.get(), "k_dfs_dense"),
+                         static_cast<double>(hit));
+    }
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionHeatDecaysByExactlyOneHalfLife) {
+    auto config = MakeDfsPromotionConfig();
+    auto service = std::make_unique<MasterService>(config);
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_halflife", 1024));
+
+    const uint32_t now_min =
+        static_cast<uint32_t>(DfsNowEpochMinForTesting(service.get()));
+    const uint32_t half_life = config.dfs_promotion.half_life_min;
+    ASSERT_GT(half_life, 0u);
+
+    // heat 8 exactly one half-life ago -> 8 * 2^-1 + 1 = 5 after this hit.
+    SetDfsHeatStateForTesting(service.get(), "k_dfs_halflife", /*heat=*/8.0f,
+                              now_min - half_life);
+    ReconcileDfsHeatForTesting(service.get(), "k_dfs_halflife", true);
+    EXPECT_NEAR(GetDfsHeatForTesting(service.get(), "k_dfs_halflife"), 5.0,
+                1e-6);
+    EXPECT_EQ(GetDfsLastAccessMinForTesting(service.get(), "k_dfs_halflife"),
+              now_min);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionHeatSparseHitsStayColderThanDenseHits) {
+    auto config = MakeDfsPromotionConfig();
+    auto service = std::make_unique<MasterService>(config);
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_dense_cmp", 1024));
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_sparse_cmp", 1024));
+
+    const uint32_t now_min =
+        static_cast<uint32_t>(DfsNowEpochMinForTesting(service.get()));
+    const uint32_t half_life = config.dfs_promotion.half_life_min;
+
+    // Identical starting heat (16) and one hit each: the key that idled a full
+    // half-life before the hit must come out strictly colder. This pins decay
+    // monotonicity: idling can only cool a key, never heat it.
+    SetDfsHeatStateForTesting(service.get(), "k_dfs_dense_cmp", 16.0f, now_min);
+    SetDfsHeatStateForTesting(service.get(), "k_dfs_sparse_cmp", 16.0f,
+                              now_min - half_life);
+    ReconcileDfsHeatForTesting(service.get(), "k_dfs_dense_cmp", true);
+    ReconcileDfsHeatForTesting(service.get(), "k_dfs_sparse_cmp", true);
+
+    const double dense = GetDfsHeatForTesting(service.get(), "k_dfs_dense_cmp");
+    const double sparse =
+        GetDfsHeatForTesting(service.get(), "k_dfs_sparse_cmp");
+    EXPECT_DOUBLE_EQ(dense, 17.0);
+    EXPECT_DOUBLE_EQ(sparse, 9.0);
+    EXPECT_LT(sparse, dense);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionHeatSaturatesAtSketchMaxValue) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_clamp", 1024));
+
+    const uint32_t now_min =
+        static_cast<uint32_t>(DfsNowEpochMinForTesting(service.get()));
+    // Heat doubles as the sketch's indexed value, whose upper bound is 1e7.
+    // A hit on a saturated key must clamp instead of overflowing the indexed
+    // range, which would make the sketch reject the sample outright.
+    SetDfsHeatStateForTesting(service.get(), "k_dfs_clamp", 1e7f, now_min);
+    ReconcileDfsHeatForTesting(service.get(), "k_dfs_clamp", true);
+
+    EXPECT_DOUBLE_EQ(GetDfsHeatForTesting(service.get(), "k_dfs_clamp"), 1e7);
+    EXPECT_EQ(GetDfsLastAccessMinForTesting(service.get(), "k_dfs_clamp"),
+              now_min);
+    // Still exactly one sample in the collection: the clamped replace must not
+    // have inserted a second bucket.
+    EXPECT_NEAR(GetDfsSketchTotalWeightForTesting(service.get()), 1.0, 0.05);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionHeatActiveLeaveClearsRegisteredSample) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "dfs_leave_seg", kDefaultSegmentBase,
+                              seg_size);
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_leave", 1024));
+    ReconcileDfsHeatForTesting(service.get(), "k_dfs_leave", true);
+    ASSERT_NE(GetDfsLastAccessMinForTesting(service.get(), "k_dfs_leave"), 0u);
+    ASSERT_DOUBLE_EQ(GetDfsHeatForTesting(service.get(), "k_dfs_leave"), 1.0);
+    ASSERT_NEAR(GetDfsSketchTotalWeightForTesting(service.get()), 1.0, 0.05);
+
+    // A MEMORY/LOCAL_DISK replica takes over as the top COMPLETE replica: the
+    // object left the DFS collection, so the registered sample must be removed
+    // from the sketch and zeroed in the metadata instead of being left to decay
+    // and skew the P90 threshold.
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, ctx.client_id, "k_dfs_leave",
+                                       1024, ctx.segment_name));
+    ASSERT_TRUE(MoveDfsReplicaLastForTesting(service.get(), "k_dfs_leave"));
+    ReconcileDfsHeatForTesting(service.get(), "k_dfs_leave", true);
+
+    EXPECT_EQ(GetDfsLastAccessMinForTesting(service.get(), "k_dfs_leave"), 0u);
+    EXPECT_DOUBLE_EQ(GetDfsHeatForTesting(service.get(), "k_dfs_leave"), 0.0);
+    EXPECT_NEAR(GetDfsSketchTotalWeightForTesting(service.get()), 0.0, 0.05);
+
+    // The leave path runs on every later reconcile; a DFS replica that no
+    // longer carries a sample must not be removed a second time (which would
+    // drive the sketch weight negative).
+    ReconcileDfsHeatForTesting(service.get(), "k_dfs_leave", false);
+    ReconcileDfsHeatForTesting(service.get(), "k_dfs_leave", false);
+    EXPECT_NEAR(GetDfsSketchTotalWeightForTesting(service.get()), 0.0, 0.05);
+}
+
+// H5 destroy-style sink: erasing the object destroys the replica records that
+// carry the registered heat/timestamp, so the sample has to be Removed *first*.
+// Unlike the active-leave case above this runs through FreeDfsReplicas, so it
+// also pins down that the heat cleanup is not coupled to the DFS allocator
+// being present (the unit harness never initializes one).
+TEST_F(PromotionOnHitTest, DfsPromotionHeatDestructionRemovesRegisteredSample) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_destroy", 1024));
+    ReconcileDfsHeatForTesting(service.get(), "k_dfs_destroy", true);
+    ASSERT_NE(GetDfsLastAccessMinForTesting(service.get(), "k_dfs_destroy"), 0u);
+    ASSERT_NEAR(GetDfsSketchTotalWeightForTesting(service.get()), 1.0, 0.05);
+
+    auto rm =
+        service->Remove("k_dfs_destroy", TenantId::Default(), /*force=*/true);
+    ASSERT_TRUE(rm.has_value()) << "Remove failed; error=" << rm.error();
+
+    // No ghost: the sample left the sketch together with the replica records.
+    EXPECT_NEAR(GetDfsSketchTotalWeightForTesting(service.get()), 0.0, 0.05);
+
+    // A second Remove has nothing to erase and must not touch the sketch again.
+    auto rm_again =
+        service->Remove("k_dfs_destroy", TenantId::Default(), /*force=*/true);
+    EXPECT_FALSE(rm_again.has_value());
+    EXPECT_NEAR(GetDfsSketchTotalWeightForTesting(service.get()), 0.0, 0.05);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionHeatIgnoresObjectWithoutCompleteReplica) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+    // Only a PROCESSING DFS replica exists: the object is not readable yet, so
+    // it is not part of the DFS collection and must not enter the sketch.
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_no_complete", 1024,
+                                    "/dfs/obj/pending", 0, /*hard_pinned=*/false,
+                                    ReplicaStatus::PROCESSING));
+
+    ReconcileDfsHeatForTesting(service.get(), "k_dfs_no_complete", true);
+    EXPECT_EQ(GetDfsLastAccessMinForTesting(service.get(), "k_dfs_no_complete"),
+              0u);
+    EXPECT_DOUBLE_EQ(GetDfsHeatForTesting(service.get(), "k_dfs_no_complete"),
+                     0.0);
+    EXPECT_DOUBLE_EQ(GetDfsSketchTotalWeightForTesting(service.get()), 0.0);
+}
+
+// ---- Read-hit hook parity ----
+// GetReplicaList is the natural hook for observing the serving layer, and the
+// SSD channel (promotion_on_hit) hooks both the single-key and the batch path.
+// The DFS channel used to hook only the single-key path, so DFS-only objects
+// read through BatchGetReplicaList never accumulated dfs_heat and were never
+// promoted. These two tests pin the resulting symmetry.
+
+TEST_F(PromotionOnHitTest, BatchGetReplicaListBumpsDfsHeat) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_single", 1024,
+                                    "/dfs/obj/single", 4096));
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_batch", 1024,
+                                    "/dfs/obj/batch", 4096));
+
+    // Baseline: the single-key path has always bumped the heat.
+    auto single = service->GetReplicaList("k_dfs_single", TenantId::Default());
+    ASSERT_TRUE(single.has_value());
+    ASSERT_FALSE(single->replicas.empty());
+    ASSERT_TRUE(single->replicas[0].is_dfs_replica())
+        << "precondition: DFS must be the serving layer";
+    EXPECT_GT(GetDfsHeatForTesting(service.get(), "k_dfs_single"), 0.0);
+
+    // The batch path must behave identically: one DFS-served read -> heat 1.
+    auto batch = service->BatchGetReplicaList(
+        std::vector<std::string>{"k_dfs_batch"}, TenantId::Default());
+    ASSERT_EQ(batch.size(), 1u);
+    ASSERT_TRUE(batch[0].has_value());
+    ASSERT_FALSE(batch[0]->replicas.empty());
+    ASSERT_TRUE(batch[0]->replicas[0].is_dfs_replica())
+        << "precondition: DFS must be the serving layer";
+    EXPECT_DOUBLE_EQ(GetDfsHeatForTesting(service.get(), "k_dfs_batch"), 1.0);
+
+    service->RemoveAll();
+}
+
+TEST_F(PromotionOnHitTest, BatchGetReplicaListForAdminDoesNotBumpDfsHeat) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_admin", 1024,
+                                    "/dfs/obj/admin", 4096));
+
+    auto result = service->BatchGetReplicaListForAdmin(
+        std::vector<std::string>{"k_dfs_admin"}, TenantId::Default());
+    ASSERT_EQ(result.size(), 1u);
+    ASSERT_TRUE(result[0].has_value());
+    ASSERT_FALSE(result[0]->replicas.empty());
+    ASSERT_TRUE(result[0]->replicas[0].is_dfs_replica())
+        << "precondition: DFS must be the serving layer";
+
+    // The read-only admin query observes state; it must not feed the heat
+    // sketch (same contract as the SSD channel's admin path).
+    EXPECT_DOUBLE_EQ(GetDfsHeatForTesting(service.get(), "k_dfs_admin"), 0.0);
+    EXPECT_DOUBLE_EQ(GetDfsSketchTotalWeightForTesting(service.get()), 0.0);
+
+    service->RemoveAll();
+}
+
+// ---- Threshold provenance ----
+
+TEST_F(PromotionOnHitTest, DfsPromotionThresholdStartsAtAbsoluteFloor) {
+    auto config = MakeDfsPromotionConfig();
+    auto service = std::make_unique<MasterService>(config);
+
+    // Regression for the threshold-cache race: T must be published as the
+    // absolute floor
+    // before any refresh runs, so a reader that loses the refresh CAS can never
+    // observe 0.0 (which would admit every DFS object on the node).
+    EXPECT_DOUBLE_EQ(GetDfsHeatThresholdForTesting(service.get()),
+                     config.dfs_promotion.absolute_hot_threshold);
+    EXPECT_TRUE(GetDfsThresholdLowWeightForTesting(service.get()));
+    EXPECT_DOUBLE_EQ(GetDfsHeatThresholdForTesting(service.get()),
+                     config.dfs_promotion.absolute_hot_threshold);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionThresholdFallsBackBelowMinTotalWeight) {
+    auto config = MakeDfsPromotionConfig();
+    auto service = std::make_unique<MasterService>(config);
+    const TenantId tenant = TenantId::Default();
+
+    // The fixture pins min_total_weight to 8.0: seven very hot samples are
+    // still not enough to trust a P90, so the floor must win and be attributed
+    // as low-weight.
+    for (int i = 0; i < 7; ++i) {
+        ASSERT_TRUE(AddDfsHeatSampleForTesting(
+            service.get(), tenant.MakeScopedKey("hot_" + std::to_string(i)),
+            100.0));
+    }
+    RefreshDfsHeatThresholdForTesting(service.get());
+    EXPECT_TRUE(GetDfsThresholdLowWeightForTesting(service.get()));
+    EXPECT_DOUBLE_EQ(GetDfsHeatThresholdForTesting(service.get()),
+                     config.dfs_promotion.absolute_hot_threshold);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionLowWeightFlagTracksJitterSkippedRefresh) {
+    auto config = MakeDfsPromotionConfig();
+    auto service = std::make_unique<MasterService>(config);
+    const TenantId tenant = TenantId::Default();
+    const double absolute_floor = config.dfs_promotion.absolute_hot_threshold;
+
+    // Cold start publishes the floor and marks the sketch low-weight.
+    EXPECT_DOUBLE_EQ(GetDfsHeatThresholdForTesting(service.get()),
+                     absolute_floor);
+    ASSERT_TRUE(GetDfsThresholdLowWeightForTesting(service.get()));
+
+    // Enough samples to clear min_total_weight (8.0), yet every heat stays
+    // below the floor: p90 < floor, so the candidate T equals the cached T and
+    // the minimal-change filter skips the refresh altogether. This is exactly
+    // the steady state of a node that only ever sees cold DFS keys.
+    for (int i = 0; i < 16; ++i) {
+        ASSERT_TRUE(AddDfsHeatSampleForTesting(
+            service.get(), tenant.MakeScopedKey("warm_" + std::to_string(i)),
+            /*heat=*/1.0));
+    }
+    RefreshDfsHeatThresholdForTesting(service.get());
+
+    // The jitter filter guards T only. T stays on the floor, but the low-weight
+    // flag must still be recomputed: leaving it at its cold-start value makes
+    // every later below-threshold rejection attribute to "cold start" instead
+    // of "frequency", so dfs_promotion_rejected_low_weight stays inflated and
+    // dfs_promotion_rejected_frequency stays pinned at zero.
+    EXPECT_DOUBLE_EQ(GetDfsHeatThresholdForTesting(service.get()),
+                     absolute_floor);
+    EXPECT_FALSE(GetDfsThresholdLowWeightForTesting(service.get()));
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionThresholdUsesP90OnceWeightIsSufficient) {
+    auto config = MakeDfsPromotionConfig();
+    auto service = std::make_unique<MasterService>(config);
+    const TenantId tenant = TenantId::Default();
+
+    // 64 samples at heat 100 give weight 64 >= min_total_weight, so the P90
+    // becomes trustworthy and T has to jump from the floor to ~100.
+    for (int i = 0; i < 64; ++i) {
+        ASSERT_TRUE(AddDfsHeatSampleForTesting(
+            service.get(), tenant.MakeScopedKey("p90_" + std::to_string(i)),
+            100.0));
+    }
+    RefreshDfsHeatThresholdForTesting(service.get());
+    EXPECT_FALSE(GetDfsThresholdLowWeightForTesting(service.get()));
+
+    const double threshold = GetDfsHeatThresholdForTesting(service.get());
+    EXPECT_GT(threshold, config.dfs_promotion.absolute_hot_threshold);
+    // The sketch is lossy (relative_accuracy 0.05) and returns a bucket
+    // representative, so only the documented tolerance can be asserted.
+    EXPECT_NEAR(threshold, 100.0, 15.0);
+
+    // Heat below T is rejected and attributed to the frequency path; heat at T
+    // passes the heat gate and reaches the queue.
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_below_t", 1024));
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_at_t", 1024));
+    const int64_t frequency_pre =
+        MasterMetricManager::instance().get_dfs_promotion_rejected_frequency();
+    EXPECT_EQ(AdmitDfsPromotionResultForTesting(service.get(), "k_dfs_below_t",
+                                                threshold - 10.0),
+              DfsAdmissionResultBelowThreshold());
+    // T came from the P90 path (not the low-weight fallback), so this rejection
+    // belongs to the frequency counter rather than the low-weight one.
+    EXPECT_EQ(
+        MasterMetricManager::instance().get_dfs_promotion_rejected_frequency(),
+        frequency_pre + 1);
+    EXPECT_EQ(AdmitDfsPromotionResultForTesting(service.get(), "k_dfs_at_t",
+                                                threshold),
+              DfsAdmissionResultAdmitted());
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionThresholdRefreshZeroTracksSketch) {
+    auto config = MakeDfsPromotionConfig();
+    config.dfs_promotion.threshold_refresh_min = 0;  // dev mode: no cache
+    auto service = std::make_unique<MasterService>(config);
+    const TenantId tenant = TenantId::Default();
+
+    for (int i = 0; i < 8; ++i) {
+        ASSERT_TRUE(AddDfsHeatSampleForTesting(
+            service.get(), tenant.MakeScopedKey("cool_" + std::to_string(i)),
+            50.0));
+    }
+    const double cool = GetDfsHeatThresholdForTesting(service.get());
+    EXPECT_GT(cool, config.dfs_promotion.absolute_hot_threshold);
+    EXPECT_NEAR(cool, 50.0, 10.0);
+
+    // refresh_min == 0 means the next evaluation must pick the hotter
+    // distribution up immediately, without waiting for a cache window.
+    for (int i = 0; i < 64; ++i) {
+        ASSERT_TRUE(AddDfsHeatSampleForTesting(
+            service.get(), tenant.MakeScopedKey("hot_" + std::to_string(i)),
+            1000.0));
+    }
+    const double hot = GetDfsHeatThresholdForTesting(service.get());
+    EXPECT_GT(hot, cool);
+    EXPECT_GT(hot, 800.0);
+    EXPECT_LT(hot, 1500.0);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionThresholdCacheHoldsWithinRefreshWindow) {
+    auto config = MakeDfsPromotionConfig();
+    config.dfs_promotion.threshold_refresh_min = 60;  // one hour window
+    auto service = std::make_unique<MasterService>(config);
+    const TenantId tenant = TenantId::Default();
+
+    // The first evaluation publishes the cold-start floor and claims the
+    // window.
+    const double initial = GetDfsHeatThresholdForTesting(service.get());
+    EXPECT_DOUBLE_EQ(initial, config.dfs_promotion.absolute_hot_threshold);
+
+    // The sketch turns hot, but the window has not elapsed: T must stay put so
+    // a burst of new samples cannot silently re-open the gate.
+    for (int i = 0; i < 64; ++i) {
+        ASSERT_TRUE(AddDfsHeatSampleForTesting(
+            service.get(), tenant.MakeScopedKey("burst_" + std::to_string(i)),
+            1000.0));
+    }
+    EXPECT_DOUBLE_EQ(GetDfsHeatThresholdForTesting(service.get()), initial);
+
+    // An explicit refresh (the maintenance tick / window expiry) publishes the
+    // new estimate.
+    RefreshDfsHeatThresholdForTesting(service.get());
+    EXPECT_GT(GetDfsHeatThresholdForTesting(service.get()), initial);
+}
+
+// ---- Admission gate coverage ----
+
+TEST_F(PromotionOnHitTest, DfsPromotionAdmissionRejectedWhenChannelDisabled) {
+    auto config = MakeDfsPromotionConfig();
+    config.dfs_promotion.enable = false;
+    auto service = std::make_unique<MasterService>(config);
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_off", 1024));
+    EXPECT_EQ(AdmitDfsPromotionResultForTesting(service.get(), "k_dfs_off"),
+              DfsAdmissionResultDisabled());
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 0u);
+    EXPECT_EQ(GetDfsPromotionQueueSizeForTesting(service.get()), 0u);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionAdmissionRejectedWhenMemoryReplicaPresent) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "dfs_mem_seg", kDefaultSegmentBase,
+                              seg_size);
+
+    // A COMPLETE MEMORY replica means the object already left the DFS
+    // collection; admission must refuse before touching the queue.
+    PutObject(*service, ctx.client_id, "k_dfs_mem");
+    EXPECT_EQ(AdmitDfsPromotionResultForTesting(service.get(), "k_dfs_mem"),
+              DfsAdmissionResultMemoryPresent());
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 0u);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionAdmissionRejectedWithoutCompleteDfsSource) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+
+    // A PROCESSING DFS replica is not a usable copy source: no COMPLETE replica
+    // exists yet, so the source gate must reject.
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_processing", 1024,
+                                    "/dfs/obj/proc", 0, /*hard_pinned=*/false,
+                                    ReplicaStatus::PROCESSING));
+    EXPECT_EQ(
+        AdmitDfsPromotionResultForTesting(service.get(), "k_dfs_processing"),
+        DfsAdmissionResultNoDfsSource());
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 0u);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionAdmissionRejectedForHardPinnedObject) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+
+    // Hard-pinned objects must never be moved, regardless of how hot they are.
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_hard_pin", 1024,
+                                    "/dfs/obj/hard_pin", 0,
+                                    /*hard_pinned=*/true));
+    EXPECT_EQ(AdmitDfsPromotionResultForTesting(service.get(), "k_dfs_hard_pin"),
+              DfsAdmissionResultHardPinned());
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 0u);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionAdmissionRejectedWhileWriterLeaseActive) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+
+    // An active writer lease means the object is being written right now; the
+    // admission must not race the writer.
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_lease", 1024));
+    GrantObjectLeaseForTesting(service.get(), "k_dfs_lease", 60000);
+    EXPECT_EQ(AdmitDfsPromotionResultForTesting(service.get(), "k_dfs_lease"),
+              DfsAdmissionResultLeaseActive());
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 0u);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionAdmissionRejectedAtInFlightCap) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t rejected_pre = metrics.get_dfs_promotion_rejected_cap();
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_cap", 1024));
+    // in_flight (0) >= limit (0) -> the queue is saturated.
+    OverrideDfsPromotionQueueLimitForTesting(service.get(), 0);
+    EXPECT_EQ(AdmitDfsPromotionResultForTesting(service.get(), "k_dfs_cap"),
+              DfsAdmissionResultQueueCap());
+    EXPECT_EQ(metrics.get_dfs_promotion_rejected_cap(), rejected_pre + 1);
+    // A cap rejection is transient: the key is recorded as a retry candidate
+    // with its reason so the next sweep can reconsider it.
+    EXPECT_EQ(GetDfsCandidateCountForTesting(service.get(), "k_dfs_cap"), 1u);
+    EXPECT_EQ(GetDfsCandidateReasonForTesting(service.get(), "k_dfs_cap"),
+              DfsCandidateReasonQueueCap());
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 0u);
+    EXPECT_EQ(GetDfsPromotionTaskTableSizeForTesting(service.get()), 0u);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionAdmissionRejectedAboveDramWatermark) {
+    // The high watermark is a const member fixed at construction, so force the
+    // gate through the config: ratio 0 means the current DRAM usage (0.0 with
+    // no mounted capacity) is already "above" it, and promoting more into DRAM
+    // would fight the eviction thread.
+    auto config = MakeDfsPromotionConfig();
+    config.eviction_high_watermark_ratio = 0.0;
+    auto service = std::make_unique<MasterService>(config);
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t rejected_pre = metrics.get_dfs_promotion_rejected_watermark();
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_watermark", 1024));
+    EXPECT_EQ(
+        AdmitDfsPromotionResultForTesting(service.get(), "k_dfs_watermark"),
+        DfsAdmissionResultWatermark());
+    EXPECT_EQ(metrics.get_dfs_promotion_rejected_watermark(), rejected_pre + 1);
+    EXPECT_EQ(GetDfsCandidateCountForTesting(service.get(), "k_dfs_watermark"),
+              1u);
+    EXPECT_EQ(GetDfsCandidateReasonForTesting(service.get(), "k_dfs_watermark"),
+              DfsCandidateReasonWatermark());
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 0u);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionAdmissionRejectedWhenSsdChannelTaskInFlight) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_cross_dup", 1024));
+    // The SSD channel's task table is authoritative for the shared per-key
+    // dedup: a queued or claimed SSD promotion must block a DFS one, otherwise
+    // both channels would race to publish the same MEMORY replica.
+    AddSsdPromotionTaskForTesting(service.get(), "k_dfs_cross_dup");
+    EXPECT_EQ(
+        AdmitDfsPromotionResultForTesting(service.get(), "k_dfs_cross_dup"),
+        DfsAdmissionResultDupInFlight());
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 0u);
+    EXPECT_EQ(GetDfsPromotionTaskTableSizeForTesting(service.get()), 0u);
+}
+
+// The reverse of the case above: the shared per-key in-flight gate has to be
+// symmetric. Once a key's DFS promotion is queued, a later LOCAL_DISK replica
+// must not let the SSD channel stage a second PROCESSING MEMORY replica for the
+// same key (at most one in-flight MEMORY promotion per key).
+TEST_F(PromotionOnHitTest, LocalDiskChannelRejectedWhenDfsTaskInFlight) {
+    auto config = MakeDfsPromotionConfig();
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "dfs_ssd_dedup_seg", kDefaultSegmentBase,
+                              seg_size);
+
+    const std::string key = "k_dual_dedup";
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, key, 1024));
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), key));
+    ASSERT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 1u);
+
+    // Attach a LOCAL_DISK replica while the DFS task is still in flight so the
+    // SSD channel becomes eligible (!any_memory && any_local_disk).
+    ASSERT_TRUE(AttachLocalDiskReplicaForTesting(service.get(), ctx.client_id,
+                                                 key, 1024, ctx.segment_name));
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t admitted_pre = mm.get_promotion_admitted();
+
+    auto result = service->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(result.has_value());
+
+    // No second (SSD) task may appear, and the DFS task must be untouched.
+    EXPECT_EQ(mm.get_promotion_admitted(), admitted_pre)
+        << "SSD channel must dedup against the in-flight DFS task";
+    auto pending = service->PromotionObjectHeartbeat(ctx.client_id);
+    ASSERT_TRUE(pending.has_value());
+    EXPECT_EQ(pending->size(), 0u);
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 1u);
+}
+
+// ---- Queue dispatch ----
+
+TEST_F(PromotionOnHitTest, DfsPromotionHeartbeatDispatchesHottestTaskFirst) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_q_cold", 1024));
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_q_warm", 1024));
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_q_hot", 1024));
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_dfs_q_cold", 3.0));
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_dfs_q_warm", 30.0));
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_dfs_q_hot", 300.0));
+
+    // The heap is a max-heap on the admission-time heat snapshot, so the
+    // hottest task must come out first even though it was enqueued last.
+    const UUID executor = generate_uuid();
+    for (const char* expected : {"k_dfs_q_hot", "k_dfs_q_warm",
+                                 "k_dfs_q_cold"}) {
+        auto batch = service->DfsPromotionObjectHeartbeat(executor);
+        ASSERT_TRUE(batch.has_value());
+        ASSERT_EQ(batch->size(), 1u) << "expected " << expected;
+        EXPECT_EQ(batch->front().key, expected);
+    }
+    auto drained = service->DfsPromotionObjectHeartbeat(executor);
+    ASSERT_TRUE(drained.has_value());
+    EXPECT_TRUE(drained->empty());
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionHeartbeatHonorsMaxPerHeartbeat) {
+    auto config = MakeDfsPromotionConfig();
+    config.dfs_promotion.max_per_heartbeat = 3;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr int kTasks = 5;
+    for (int i = 0; i < kTasks; ++i) {
+        const std::string key = "k_dfs_batch_" + std::to_string(i);
+        ASSERT_TRUE(InjectDfsOnlyObject(*service, key, 1024));
+        ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), key, 10.0 + i));
+    }
+
+    const UUID executor = generate_uuid();
+    auto first = service->DfsPromotionObjectHeartbeat(executor);
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->size(), 3u);  // exactly max_per_heartbeat
+    auto second = service->DfsPromotionObjectHeartbeat(executor);
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(second->size(), 2u);  // remainder
+    auto third = service->DfsPromotionObjectHeartbeat(executor);
+    ASSERT_TRUE(third.has_value());
+    EXPECT_TRUE(third->empty());
+
+    // No task may be handed out twice across the batches.
+    std::set<std::string> keys;
+    for (const auto& task : *first) {
+        EXPECT_TRUE(keys.insert(task.key).second);
+    }
+    for (const auto& task : *second) {
+        EXPECT_TRUE(keys.insert(task.key).second);
+    }
+    EXPECT_EQ(keys.size(), static_cast<size_t>(kTasks));
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()),
+              static_cast<uint32_t>(kTasks));
+}
+
+// ---- Execution-layer authorization ----
+
+TEST_F(PromotionOnHitTest, DfsPromotionAllocStartRejectsNonHolder) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "dfs_holder_seg", kDefaultSegmentBase,
+                              seg_size);
+    const UUID other_client = PrepareLocalDiskOnlyClient(*service);
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_holder", 1024));
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_dfs_holder"));
+    auto claimed = service->DfsPromotionObjectHeartbeat(ctx.client_id);
+    ASSERT_TRUE(claimed.has_value());
+    ASSERT_EQ(claimed->size(), 1u);
+
+    // Only the claiming client may stage the promotion target; anyone else
+    // would publish a replica it does not own.
+    const std::vector<std::string> preferred;
+    auto stolen = service->PromotionAllocStart(
+        other_client, "k_dfs_holder", TenantId::Default(), 1024, preferred);
+    EXPECT_FALSE(stolen.has_value());
+    EXPECT_EQ(CountReplicasForTesting(
+                  service.get(), "k_dfs_holder",
+                  [](const Replica& replica) {
+                      return Replica::fn_is_memory_replica(replica);
+                  }),
+              0u);
+
+    // The task is untouched, so the real holder can still stage it.
+    auto owned = service->PromotionAllocStart(
+        ctx.client_id, "k_dfs_holder", TenantId::Default(), 1024, preferred);
+    ASSERT_TRUE(owned.has_value());
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionAllocStartRejectsSizeMismatch) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "dfs_size_seg", kDefaultSegmentBase,
+                              seg_size);
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_size", 1024));
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_dfs_size"));
+    auto claimed = service->DfsPromotionObjectHeartbeat(ctx.client_id);
+    ASSERT_TRUE(claimed.has_value());
+    ASSERT_EQ(claimed->size(), 1u);
+
+    // A target whose size does not match the source descriptor would produce a
+    // replica that can never be committed.
+    const std::vector<std::string> preferred;
+    auto mismatched = service->PromotionAllocStart(
+        ctx.client_id, "k_dfs_size", TenantId::Default(), 2048, preferred);
+    EXPECT_FALSE(mismatched.has_value());
+    EXPECT_EQ(CountReplicasForTesting(
+                  service.get(), "k_dfs_size",
+                  [](const Replica& replica) {
+                      return Replica::fn_is_memory_replica(replica);
+                  }),
+              0u);
+
+    auto matched = service->PromotionAllocStart(
+        ctx.client_id, "k_dfs_size", TenantId::Default(), 1024, preferred);
+    ASSERT_TRUE(matched.has_value());
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionAllocStartRejectsReapedTask) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "dfs_reaped_seg", kDefaultSegmentBase,
+                              seg_size);
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_reaped", 1024));
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_dfs_reaped"));
+    auto claimed = service->DfsPromotionObjectHeartbeat(ctx.client_id);
+    ASSERT_TRUE(claimed.has_value());
+    ASSERT_EQ(claimed->size(), 1u);
+
+    // The client went away; the reaper reclaims the task, after which a late
+    // alloc-start must be refused instead of resurrecting a dead promotion.
+    BackdateDfsPromotionTaskForTesting(service.get(), "k_dfs_reaped",
+                                       std::chrono::minutes(5));
+    RunDfsPromotionReaperForTesting(service.get());
+    ASSERT_EQ(GetDfsPromotionTaskTableSizeForTesting(service.get()), 0u);
+
+    const std::vector<std::string> preferred;
+    auto late = service->PromotionAllocStart(
+        ctx.client_id, "k_dfs_reaped", TenantId::Default(), 1024, preferred);
+    EXPECT_FALSE(late.has_value());
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 0u);
+    EXPECT_FALSE(IsDfsSourceProtectedForTesting(service.get(), "k_dfs_reaped"));
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionAllocStartRejectsSecondStage) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "dfs_double_seg", kDefaultSegmentBase,
+                              seg_size);
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_double", 1024));
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_dfs_double"));
+    auto claimed = service->DfsPromotionObjectHeartbeat(ctx.client_id);
+    ASSERT_TRUE(claimed.has_value());
+    ASSERT_EQ(claimed->size(), 1u);
+
+    const std::vector<std::string> preferred;
+    ASSERT_TRUE(service
+                    ->PromotionAllocStart(ctx.client_id, "k_dfs_double",
+                                          TenantId::Default(), 1024, preferred)
+                    .has_value());
+    // A retry (client lost the response) must not stage a second replica.
+    auto again = service->PromotionAllocStart(
+        ctx.client_id, "k_dfs_double", TenantId::Default(), 1024, preferred);
+    EXPECT_FALSE(again.has_value());
+    EXPECT_EQ(CountReplicasForTesting(
+                  service.get(), "k_dfs_double",
+                  [](const Replica& replica) {
+                      return Replica::fn_is_memory_replica(replica);
+                  }),
+              1u);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionNotifyRejectsNonHolder) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "dfs_notify_seg", kDefaultSegmentBase,
+                              seg_size);
+    const UUID other_client = PrepareLocalDiskOnlyClient(*service);
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_notify", 1024));
+    ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), "k_dfs_notify"));
+    auto claimed = service->DfsPromotionObjectHeartbeat(ctx.client_id);
+    ASSERT_TRUE(claimed.has_value());
+    ASSERT_EQ(claimed->size(), 1u);
+
+    const std::vector<std::string> preferred;
+    ASSERT_TRUE(service
+                    ->PromotionAllocStart(ctx.client_id, "k_dfs_notify",
+                                          TenantId::Default(), 1024, preferred)
+                    .has_value());
+
+    // Neither terminal notification may be accepted from a non-holder: a bogus
+    // success would publish an unverified replica, a bogus failure would tear
+    // down a healthy promotion.
+    auto bogus_success = service->NotifyPromotionSuccess(
+        other_client, "k_dfs_notify", TenantId::Default());
+    EXPECT_FALSE(bogus_success.has_value());
+    auto bogus_failure = service->NotifyPromotionFailure(
+        other_client, "k_dfs_notify", TenantId::Default());
+    EXPECT_FALSE(bogus_failure.has_value());
+
+    // The task survived both: still in flight, still owned by the holder.
+    EXPECT_EQ(GetDfsPromotionTaskTableSizeForTesting(service.get()), 1u);
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 1u);
+    EXPECT_EQ(CountReplicasForTesting(
+                  service.get(), "k_dfs_notify",
+                  [](const Replica& replica) {
+                      return Replica::fn_is_memory_replica(replica) &&
+                             Replica::fn_is_completed(replica);
+                  }),
+              0u);
+}
+
+// ---- Reload / leader takeover ----
+
+TEST_F(PromotionOnHitTest, DfsPromotionReloadDropsAllInMemoryTaskState) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+
+    constexpr int kTasks = 3;
+    for (int i = 0; i < kTasks; ++i) {
+        const std::string key = "k_dfs_reload_" + std::to_string(i);
+        ASSERT_TRUE(InjectDfsOnlyObject(*service, key, 1024));
+        ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), key, 50.0));
+    }
+    ASSERT_EQ(GetDfsPromotionInFlightForTesting(service.get()),
+              static_cast<uint32_t>(kTasks));
+    ASSERT_EQ(GetDfsPromotionTaskTableSizeForTesting(service.get()),
+              static_cast<size_t>(kTasks));
+    ASSERT_TRUE(IsDfsSourceProtectedForTesting(service.get(), "k_dfs_reload_0"));
+    ASSERT_EQ(GetDfsPromotionQueueSizeForTesting(service.get()),
+              static_cast<size_t>(kTasks));
+
+    // No DFS task survives a reload: the new leader rebuilds the collection
+    // from reads, so every in-memory record must go, including the source
+    // protection and the published threshold.
+    ClearCandidatesForReloadForTesting(service.get());
+
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 0u);
+    EXPECT_EQ(GetDfsPromotionTaskTableSizeForTesting(service.get()), 0u);
+    EXPECT_FALSE(IsDfsSourceProtectedForTesting(service.get(), "k_dfs_reload_0"));
+    EXPECT_EQ(GetDfsCandidateCountForTesting(service.get(), "k_dfs_reload_0"),
+              0u);
+    // The physical queue is process-local and cannot survive the takeover
+    // either: it is dropped eagerly alongside the records it referenced, so no
+    // dead node is left for a later claim to walk (each stale node costs a
+    // metadata shard lock). Without the eager clear the residual nodes would
+    // only drain through the claim path or the oversized-queue rebuild.
+    EXPECT_EQ(GetDfsPromotionQueueSizeForTesting(service.get()), 0u);
+    // The conservative floor is re-published together with the cache stamp.
+    EXPECT_DOUBLE_EQ(GetDfsHeatThresholdForTesting(service.get()),
+                     MakeDfsPromotionConfig().dfs_promotion.absolute_hot_threshold);
+
+    // A stale task must never be handed to a client after the takeover.
+    auto batch = service->DfsPromotionObjectHeartbeat(generate_uuid());
+    ASSERT_TRUE(batch.has_value());
+    EXPECT_TRUE(batch->empty());
+    EXPECT_EQ(GetDfsPromotionQueueSizeForTesting(service.get()), 0u);
+}
+
+// ---- Concurrency / stress: bookkeeping under contention ----
+
+TEST_F(PromotionOnHitTest, DfsPromotionConcurrentAdmissionsKeepBookkeepingConsistent) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+
+    constexpr int kThreads = 8;
+    constexpr int kKeysPerThread = 64;
+    constexpr int kKeys = kThreads * kKeysPerThread;
+    for (int i = 0; i < kKeys; ++i) {
+        ASSERT_TRUE(
+            InjectDfsOnlyObject(*service, "k_dfs_race_" + std::to_string(i),
+                                1024));
+    }
+
+    std::atomic<int> admitted{0};
+    std::atomic<bool> start{false};
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t]() {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            for (int i = 0; i < kKeysPerThread; ++i) {
+                const std::string key =
+                    "k_dfs_race_" + std::to_string(t * kKeysPerThread + i);
+                if (AdmitDfsPromotionForTesting(service.get(), key, 100.0)) {
+                    admitted.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    // Every admission has to show up exactly once in all four bookkeeping
+    // structures: the counter, the task table, the heap and the protection set.
+    EXPECT_EQ(admitted.load(std::memory_order_relaxed), kKeys);
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()),
+              static_cast<uint32_t>(kKeys));
+    EXPECT_EQ(GetDfsPromotionTaskTableSizeForTesting(service.get()),
+              static_cast<size_t>(kKeys));
+    EXPECT_EQ(GetDfsPromotionQueueSizeForTesting(service.get()),
+              static_cast<size_t>(kKeys));
+    for (int i = 0; i < kKeys; ++i) {
+        ASSERT_TRUE(IsDfsSourceProtectedForTesting(
+            service.get(), "k_dfs_race_" + std::to_string(i)))
+            << "key " << i;
+    }
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionConcurrentHeartbeatsNeverDoubleClaim) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+
+    constexpr int kKeys = 256;
+    for (int i = 0; i < kKeys; ++i) {
+        const std::string key = "k_dfs_claim_" + std::to_string(i);
+        ASSERT_TRUE(InjectDfsOnlyObject(*service, key, 1024));
+        ASSERT_TRUE(AdmitDfsPromotionForTesting(service.get(), key, 100.0));
+    }
+
+    constexpr int kClients = 4;
+    std::mutex collect_mutex;
+    std::vector<std::string> claimed_keys;
+    std::atomic<int> empty_batches{0};
+    std::atomic<bool> start{false};
+    std::vector<std::thread> threads;
+    threads.reserve(kClients);
+    for (int c = 0; c < kClients; ++c) {
+        threads.emplace_back([&]() {
+            const UUID executor = generate_uuid();
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            for (int attempt = 0; attempt < kKeys; ++attempt) {
+                auto batch = service->DfsPromotionObjectHeartbeat(executor);
+                if (!batch.has_value()) {
+                    ADD_FAILURE() << "heartbeat failed";
+                    return;
+                }
+                if (batch->empty()) {
+                    empty_batches.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+                std::lock_guard<std::mutex> lock(collect_mutex);
+                for (const auto& task : *batch) {
+                    claimed_keys.push_back(task.key);
+                }
+            }
+        });
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    // The heap pop and the holder stamp are not atomic with respect to each
+    // other, so the claim loop is the only thing preventing two clients from
+    // staging the same promotion: assert it holds under contention.
+    EXPECT_EQ(claimed_keys.size(), static_cast<size_t>(kKeys));
+    const std::set<std::string> unique_keys(claimed_keys.begin(),
+                                            claimed_keys.end());
+    EXPECT_EQ(unique_keys.size(), claimed_keys.size());
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()),
+              static_cast<uint32_t>(kKeys));
+    EXPECT_EQ(GetDfsPromotionTaskTableSizeForTesting(service.get()),
+              static_cast<size_t>(kKeys));
+    EXPECT_EQ(GetDfsPromotionQueueSizeForTesting(service.get()), 0u);
+}
+
+TEST_F(PromotionOnHitTest, DfsPromotionConcurrentSameKeyAdmitsExactlyOnce) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+
+    constexpr int kThreads = 8;
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_same_key", 1024));
+
+    std::atomic<int> admitted{0};
+    std::atomic<bool> start{false};
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&]() {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            if (AdmitDfsPromotionForTesting(service.get(), "k_dfs_same_key",
+                                            100.0)) {
+                admitted.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    // The per-key in-flight dedup must be race-free: one admission, one task,
+    // one heap node, one protection entry.
+    EXPECT_EQ(admitted.load(std::memory_order_relaxed), 1);
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 1u);
+    EXPECT_EQ(GetDfsPromotionTaskTableSizeForTesting(service.get()), 1u);
+    EXPECT_EQ(GetDfsPromotionQueueSizeForTesting(service.get()), 1u);
+    EXPECT_TRUE(IsDfsSourceProtectedForTesting(service.get(), "k_dfs_same_key"));
+}
+
+// Source-protection end-to-end: a DFS replica that is the source of a
+// protected (in-flight)
+// promotion must be vetoed by the DFS eviction acceptance even when the
+// allocator has picked it as the coldest candidate, and the veto must not stop
+// the scan from reclaiming capacity through the other candidates. This is the
+// only DFS path that needs a real allocator, hence the environment setup
+// mirroring the master_service_test DFS-eviction fixture.
+TEST_F(PromotionOnHitTest, DfsPromotionSourceProtectedFromDfsEviction) {
+    const auto dfs_root = (std::filesystem::temp_directory_path() /
+                           ("promo_dfs_protect_" + std::to_string(::getpid())))
+                              .string();
+    std::filesystem::create_directories(dfs_root);
+    ScopedEnv enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnv fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnv root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
+    ScopedEnv shard_count("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnv shard_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "32768");
+    ScopedEnv alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    // Keep the background path disabled and drive one exact pass by hand.
+    ScopedEnv eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+    ScopedEnv high_watermark("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.9");
+    ScopedEnv low_watermark("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.7");
+    ScopedEnv deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnv single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    {
+        MasterService service(MakeDfsPromotionConfig());
+        constexpr size_t seg_size = 1024 * 1024 * 16;
+        auto ctx = PrepareSegment(service, "dfs_protect_seg",
+                                  kDefaultSegmentBase, seg_size);
+
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+
+        // Four 100-byte objects fill the 32768-byte / 4096-aligned shard, so
+        // one eviction pass is forced (same shape as the master_service_test
+        // DFS eviction cases).
+        std::vector<std::string> keys;
+        for (int i = 0; i < 4; ++i) {
+            keys.push_back("dfs_protect_" + std::to_string(i));
+            auto start = service.PutStart(ctx.client_id, keys.back(),
+                                          TenantId::Default(), 100, config);
+            ASSERT_TRUE(start.has_value()) << "allocation " << i;
+            ASSERT_TRUE(service
+                            .PutEnd(ctx.client_id, keys.back(),
+                                    TenantId::Default(), ReplicaType::ALL)
+                            .has_value());
+        }
+
+        // The first allocation is the coldest candidate; protect it and evict.
+        ProtectDfsSourceForTesting(&service, keys.front());
+        service.RunDfsEvictionForTesting();
+
+        auto protected_result =
+            service.GetReplicaList(keys.front(), TenantId::Default());
+        ASSERT_TRUE(protected_result.has_value());
+        EXPECT_EQ(protected_result->replicas.size(), 2u)
+            << "protected DFS source must survive the eviction pass";
+
+        // The veto must not stall the scan: at least one unprotected key still
+        // lost its DFS replica (candidates behind the protected one are
+        // revisited because the rejection moves it to the MRU side).
+        size_t reclaimed_elsewhere = 0;
+        for (size_t i = 1; i < keys.size(); ++i) {
+            auto result = service.GetReplicaList(keys[i], TenantId::Default());
+            if (result.has_value() && result->replicas.size() < 2u) {
+                ++reclaimed_elsewhere;
+            }
+        }
+        EXPECT_GT(reclaimed_elsewhere, 0u)
+            << "eviction must still reclaim capacity elsewhere";
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(dfs_root, ec);
 }
 
 }  // namespace mooncake::test

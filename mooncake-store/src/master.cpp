@@ -251,6 +251,41 @@ DEFINE_double(
 DEFINE_uint64(
     dynamic_replication_max_memory_replicas, 2,
     "Maximum MEMORY replicas allowed for one dynamically replicated key");
+DEFINE_bool(enable_dfs_promotion, false,
+            "Enable DFS -> MEMORY promotion: track a decayed per-replica "
+            "access heat (dfs_heat, epoch-minute domain) for DFS-only keys "
+            "and asynchronously copy the hottest ones back into MEMORY");
+DEFINE_double(dfs_promotion_threshold_quantile, 0.90,
+              "Admission quantile over the decayed DFS heat distribution "
+              "(default P90)");
+DEFINE_double(dfs_promotion_absolute_hot_threshold, 2.0,
+              "Absolute heat floor below which no DFS promotion is admitted");
+DEFINE_uint32(dfs_promotion_half_life_min, 60,
+              "Exponential decay half-life for dfs_heat, in minutes; also "
+              "the time unit for every timestamp fed to the heat sketch");
+DEFINE_uint32(dfs_promotion_threshold_refresh_min, 1,
+              "How often the P90 threshold cache is refreshed (minutes)");
+DEFINE_double(dfs_promotion_min_total_weight, 100.0,
+              "Minimum effective sketch total weight (decayed sample count) "
+              "before the quantile threshold is trusted (below it only the "
+              "absolute floor acts). The default keeps a P90 estimated from a "
+              "handful of samples from gating admission");
+DEFINE_uint32(dfs_promotion_queue_limit, 10000,
+              "Max in-flight DFS promotion tasks across all shards");
+DEFINE_uint32(dfs_promotion_max_per_heartbeat, 1,
+              "Max DFS promotion tasks returned to a single client per "
+              "heartbeat call");
+DEFINE_uint32(dfs_promotion_scan_interval_min, 1,
+              "Cadence (minutes) of the background DFS heat reconcile/scan");
+DEFINE_uint32(dfs_promotion_scan_batch, 256,
+              "Max DFS heat entries scanned per reconcile pass");
+DEFINE_uint32(dfs_promotion_task_ttl_min, 10,
+              "TTL (minutes) before an in-flight DFS promotion task is "
+              "reclaimed by the reaper");
+DEFINE_uint32(dfs_promotion_cooldown_min, 10,
+              "Per-key anti-thrash cooldown (minutes): a key is not promoted "
+              "again until this window elapses after a completed promotion "
+              "(0 disables the cooldown)");
 DEFINE_bool(enable_kv_events, false,
             "Enable RFC #1527 KV cache event publisher over ZMQ");
 DEFINE_string(kv_events_bind_endpoint, "",
@@ -569,6 +604,45 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
         master_config.dynamic_replication_max_memory_replicas =
             static_cast<size_t>(tmp_dynamic_replication_max_memory_replicas);
     }
+    // DFS -> MEMORY promotion channel (see DfsPromotionConfig).
+    default_config.GetBool("enable_dfs_promotion",
+                           &master_config.dfs_promotion.enable,
+                           FLAGS_enable_dfs_promotion);
+    default_config.GetDouble("dfs_promotion_threshold_quantile",
+                             &master_config.dfs_promotion.threshold_quantile,
+                             FLAGS_dfs_promotion_threshold_quantile);
+    default_config.GetDouble("dfs_promotion_absolute_hot_threshold",
+                             &master_config.dfs_promotion
+                                  .absolute_hot_threshold,
+                             FLAGS_dfs_promotion_absolute_hot_threshold);
+    default_config.GetUInt32("dfs_promotion_half_life_min",
+                             &master_config.dfs_promotion.half_life_min,
+                             FLAGS_dfs_promotion_half_life_min);
+    default_config.GetUInt32("dfs_promotion_threshold_refresh_min",
+                             &master_config.dfs_promotion
+                                  .threshold_refresh_min,
+                             FLAGS_dfs_promotion_threshold_refresh_min);
+    default_config.GetDouble("dfs_promotion_min_total_weight",
+                             &master_config.dfs_promotion.min_total_weight,
+                             FLAGS_dfs_promotion_min_total_weight);
+    default_config.GetUInt32("dfs_promotion_queue_limit",
+                             &master_config.dfs_promotion.queue_limit,
+                             FLAGS_dfs_promotion_queue_limit);
+    default_config.GetUInt32("dfs_promotion_max_per_heartbeat",
+                             &master_config.dfs_promotion.max_per_heartbeat,
+                             FLAGS_dfs_promotion_max_per_heartbeat);
+    default_config.GetUInt32("dfs_promotion_scan_interval_min",
+                             &master_config.dfs_promotion.scan_interval_min,
+                             FLAGS_dfs_promotion_scan_interval_min);
+    default_config.GetUInt32("dfs_promotion_scan_batch",
+                             &master_config.dfs_promotion.scan_batch,
+                             FLAGS_dfs_promotion_scan_batch);
+    default_config.GetUInt32("dfs_promotion_task_ttl_min",
+                             &master_config.dfs_promotion.task_ttl_min,
+                             FLAGS_dfs_promotion_task_ttl_min);
+    default_config.GetUInt32("dfs_promotion_cooldown_min",
+                             &master_config.dfs_promotion.cooldown_min,
+                             FLAGS_dfs_promotion_cooldown_min);
     default_config.GetBool("enable_kv_events", &master_config.enable_kv_events,
                            FLAGS_enable_kv_events);
     default_config.GetString("kv_events_bind_endpoint",
@@ -965,6 +1039,82 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         master_config.dynamic_replication_max_memory_replicas =
             static_cast<size_t>(FLAGS_dynamic_replication_max_memory_replicas);
     }
+    if ((google::GetCommandLineFlagInfo("enable_dfs_promotion", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.dfs_promotion.enable = FLAGS_enable_dfs_promotion;
+    }
+    if ((google::GetCommandLineFlagInfo("dfs_promotion_threshold_quantile",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.dfs_promotion.threshold_quantile =
+            FLAGS_dfs_promotion_threshold_quantile;
+    }
+    if ((google::GetCommandLineFlagInfo("dfs_promotion_absolute_hot_threshold",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.dfs_promotion.absolute_hot_threshold =
+            FLAGS_dfs_promotion_absolute_hot_threshold;
+    }
+    if ((google::GetCommandLineFlagInfo("dfs_promotion_half_life_min", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.dfs_promotion.half_life_min =
+            FLAGS_dfs_promotion_half_life_min;
+    }
+    if ((google::GetCommandLineFlagInfo("dfs_promotion_threshold_refresh_min",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.dfs_promotion.threshold_refresh_min =
+            FLAGS_dfs_promotion_threshold_refresh_min;
+    }
+    if ((google::GetCommandLineFlagInfo("dfs_promotion_min_total_weight",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.dfs_promotion.min_total_weight =
+            FLAGS_dfs_promotion_min_total_weight;
+    }
+    if ((google::GetCommandLineFlagInfo("dfs_promotion_queue_limit", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.dfs_promotion.queue_limit =
+            FLAGS_dfs_promotion_queue_limit;
+    }
+    if ((google::GetCommandLineFlagInfo("dfs_promotion_max_per_heartbeat",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.dfs_promotion.max_per_heartbeat =
+            FLAGS_dfs_promotion_max_per_heartbeat;
+    }
+    if ((google::GetCommandLineFlagInfo("dfs_promotion_scan_interval_min",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.dfs_promotion.scan_interval_min =
+            FLAGS_dfs_promotion_scan_interval_min;
+    }
+    if ((google::GetCommandLineFlagInfo("dfs_promotion_scan_batch", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.dfs_promotion.scan_batch = FLAGS_dfs_promotion_scan_batch;
+    }
+    if ((google::GetCommandLineFlagInfo("dfs_promotion_task_ttl_min", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.dfs_promotion.task_ttl_min =
+            FLAGS_dfs_promotion_task_ttl_min;
+    }
+    if ((google::GetCommandLineFlagInfo("dfs_promotion_cooldown_min", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.dfs_promotion.cooldown_min =
+            FLAGS_dfs_promotion_cooldown_min;
+    }
     if ((google::GetCommandLineFlagInfo("enable_kv_events", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -1060,6 +1210,67 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         LOG(WARNING)
             << "dynamic_replication_max_memory_replicas=0; clamping to 1";
         master_config.dynamic_replication_max_memory_replicas = 1;
+    }
+    // DFS promotion numeric guards. Interval knobs must be >= 1 so later code
+    // never divides by zero or busy-loops; keep quantile within (0, 1] and
+    // heat/weight floors non-negative. Values outside are clamped loudly
+    // rather than misbehaving at runtime (mirrors promotion_max_per_heartbeat
+    // handling above).
+    {
+        auto& dfs = master_config.dfs_promotion;
+        if (dfs.half_life_min == 0) {
+            LOG(WARNING) << "dfs_promotion_half_life_min=0 is invalid; "
+                            "clamping to 1.";
+            dfs.half_life_min = 1;
+        }
+        if (dfs.threshold_refresh_min == 0) {
+            LOG(WARNING) << "dfs_promotion_threshold_refresh_min=0 is "
+                            "invalid; clamping to 1.";
+            dfs.threshold_refresh_min = 1;
+        }
+        if (dfs.scan_interval_min == 0) {
+            LOG(WARNING) << "dfs_promotion_scan_interval_min=0 is invalid; "
+                            "clamping to 1.";
+            dfs.scan_interval_min = 1;
+        }
+        if (dfs.scan_batch == 0) {
+            LOG(WARNING) << "dfs_promotion_scan_batch=0 is invalid; clamping "
+                            "to 1.";
+            dfs.scan_batch = 1;
+        }
+        if (dfs.task_ttl_min == 0) {
+            LOG(WARNING) << "dfs_promotion_task_ttl_min=0 is invalid; "
+                            "clamping to 1.";
+            dfs.task_ttl_min = 1;
+        }
+        if (dfs.queue_limit == 0) {
+            LOG(WARNING) << "dfs_promotion_queue_limit=0 is invalid; "
+                            "clamping to 1.";
+            dfs.queue_limit = 1;
+        }
+        if (dfs.max_per_heartbeat == 0) {
+            LOG(WARNING) << "dfs_promotion_max_per_heartbeat=0 is invalid; "
+                            "clamping to 1.";
+            dfs.max_per_heartbeat = 1;
+        }
+        if (dfs.absolute_hot_threshold < 0.0) {
+            LOG(WARNING) << "dfs_promotion_absolute_hot_threshold="
+                         << dfs.absolute_hot_threshold
+                         << " is negative; clamping to 0.0.";
+            dfs.absolute_hot_threshold = 0.0;
+        }
+        if (dfs.min_total_weight < 0.0) {
+            LOG(WARNING) << "dfs_promotion_min_total_weight="
+                         << dfs.min_total_weight << " is negative; clamping "
+                         << "to 0.0.";
+            dfs.min_total_weight = 0.0;
+        }
+        if (!(dfs.threshold_quantile > 0.0 && dfs.threshold_quantile <= 1.0)) {
+            LOG(WARNING) << "dfs_promotion_threshold_quantile="
+                         << dfs.threshold_quantile
+                         << " is outside (0, 1]; clamping to 0.90.";
+            dfs.threshold_quantile = 0.90;
+        }
     }
     if ((google::GetCommandLineFlagInfo("ha_backend_type", &info) &&
          !info.is_default) ||
