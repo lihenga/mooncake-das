@@ -165,6 +165,17 @@ class FileStorage {
      */
     tl::expected<void, ErrorCode> ProcessPromotionTasks();
 
+    /**
+     * @brief Drives the DFS->DRAM promotion pipeline for one heartbeat tick.
+     * Mirror of ProcessPromotionTasks for the DFS channel: pulls tasks from the
+     * master, stages a MEMORY replica for each key, copies the bytes from the
+     * source DFS replica into that replica, and notifies the master on
+     * success. Only DFS-capable clients (those with a distributed backend) run
+     * this; failures are logged per-key and never propagate.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> ProcessDfsPromotionTasks();
+
     tl::expected<bool, ErrorCode> IsEnableOffloading();
 
     tl::expected<void, ErrorCode> RunDiskWatermarkEviction();

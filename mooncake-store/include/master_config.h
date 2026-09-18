@@ -26,6 +26,47 @@ inline std::string ResolveConfiguredHABackendConnstring(
     return {};
 }
 
+// DFS -> MEMORY promotion channel configuration. When a key is served only
+// by COMPLETE DFS replicas, each read bumps a decayed per-replica access heat
+// (dfs_heat, epoch-minute domain) recorded on the DfsReplicaData metadata and
+// fed into a DecayingDdSketch; the hottest DFS-only keys are asynchronously
+// copied back into MEMORY. Defaults are conservative (channel disabled).
+// The sketch mapping parameters (relative_accuracy=0.05, [1e-3, 1e7],
+// shard_count=64) are fixed internal constants, mirroring how CountMinSketch
+// internals are not operator-configurable.
+struct DfsPromotionConfig {
+    bool enable = false;
+    // Admission quantile over the heat distribution (P90 by default).
+    double threshold_quantile = 0.90;
+    // Absolute floor below which no promotion is admitted, even when the
+    // quantile estimate is unreliable (cold start / low total weight).
+    double absolute_hot_threshold = 2.0;
+    // Exponential decay half-life for dfs_heat, in epoch minutes. >= 1; this
+    // is also the unit of every timestamp handed to the sketch.
+    uint32_t half_life_min = 60;
+    // How often the P90 threshold cache is refreshed (minutes).
+    uint32_t threshold_refresh_min = 1;
+    // Minimum effective sketch total weight (decayed sample count) before the
+    // quantile estimate is trusted; below it the threshold degrades to
+    // absolute_hot_threshold. The default keeps a P90 estimated from only a
+    // handful of samples from gating admission.
+    double min_total_weight = 100.0;
+    // Max in-flight DFS promotion tasks across all shards.
+    uint32_t queue_limit = 10000;
+    // Max tasks returned to a single client per heartbeat call.
+    uint32_t max_per_heartbeat = 1;
+    // Background reconcile/scan cadence (minutes) and per-pass batch size.
+    uint32_t scan_interval_min = 1;
+    uint32_t scan_batch = 256;
+    // In-flight task TTL before the reaper reclaims it (minutes).
+    uint32_t task_ttl_min = 10;
+    // Per-key anti-thrash cooldown (minutes): after a key completes a
+    // promotion it is not admitted again until this window elapses, so a hot
+    // object cannot ping-pong between promote and evict. 0 disables the
+    // cooldown.
+    uint32_t cooldown_min = 10;
+};
+
 // The configuration for the master server
 struct MasterConfig {
     bool enable_metric_reporting;
@@ -141,6 +182,9 @@ struct MasterConfig {
     // rich clusters may safely raise it.
     uint32_t promotion_max_per_heartbeat = 1;
 
+    // DFS -> MEMORY promotion channel (see DfsPromotionConfig above).
+    DfsPromotionConfig dfs_promotion;
+
     // Dynamic MEMORY replica fanout for hot read-only objects.
     // Kept intentionally small: mode + frequency window + max replicas.
     std::string dynamic_replication_mode = "off";
@@ -249,6 +293,7 @@ class MasterServiceSupervisorConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    DfsPromotionConfig dfs_promotion;
     std::string dynamic_replication_mode = "off";
     uint32_t dynamic_replication_heat_window_seconds = 10;
     double dynamic_replication_admission_qps_threshold = 0.8;
@@ -309,6 +354,7 @@ class MasterServiceSupervisorConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        dfs_promotion = config.dfs_promotion;
         dynamic_replication_mode = config.dynamic_replication_mode;
         dynamic_replication_heat_window_seconds =
             config.dynamic_replication_heat_window_seconds;
@@ -505,6 +551,7 @@ class WrappedMasterServiceConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    DfsPromotionConfig dfs_promotion;
     std::string dynamic_replication_mode = "off";
     uint32_t dynamic_replication_heat_window_seconds = 10;
     double dynamic_replication_admission_qps_threshold = 0.8;
@@ -599,6 +646,7 @@ class WrappedMasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        dfs_promotion = config.dfs_promotion;
         dynamic_replication_mode = config.dynamic_replication_mode;
         dynamic_replication_heat_window_seconds =
             config.dynamic_replication_heat_window_seconds;
@@ -723,6 +771,7 @@ class WrappedMasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        dfs_promotion = config.dfs_promotion;
         dynamic_replication_mode = config.dynamic_replication_mode;
         dynamic_replication_heat_window_seconds =
             config.dynamic_replication_heat_window_seconds;
@@ -1182,6 +1231,7 @@ class MasterServiceConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    DfsPromotionConfig dfs_promotion;
     std::string dynamic_replication_mode = "off";
     uint32_t dynamic_replication_heat_window_seconds = 10;
     double dynamic_replication_admission_qps_threshold = 0.8;
@@ -1272,6 +1322,7 @@ class MasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        dfs_promotion = config.dfs_promotion;
         dynamic_replication_mode = config.dynamic_replication_mode;
         dynamic_replication_heat_window_seconds =
             config.dynamic_replication_heat_window_seconds;

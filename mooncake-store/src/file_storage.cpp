@@ -142,6 +142,29 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         return init_storage_backend_result;
     }
     if (config_.enable_dfs) {
+        // DFS-only mode: there is no local SSD backend to offload to, so the
+        // steps below (MountLocalDiskSegment / ReportSsdCapacity / ScanMeta)
+        // are intentionally skipped. The periodic driver must still be started
+        // though: it is the only thing that runs ProcessDfsPromotionTasks(),
+        // the client-side executor of the DFS->DRAM promotion channel. Leaving
+        // it out makes the channel inert — master admits tasks and nobody ever
+        // claims them, which looks exactly like a master-side bug.
+        heartbeat_running_.store(true);
+        heartbeat_thread_ = std::thread([this]() {
+            LOG(INFO) << "Starting DFS promotion poll with interval: "
+                      << config_.heartbeat_interval_seconds << "s";
+            while (heartbeat_running_.load()) {
+                // Drive the DFS executor directly rather than going through
+                // Heartbeat(): the latter leads with the SSD offload RPC
+                // (OffloadObjectHeartbeat) and returns early when that fails,
+                // which would strand the DFS channel behind an unrelated
+                // transport error. In DFS-only mode the SSD promotion executor
+                // (ProcessPromotionTasks) has no backend to work on either.
+                (void)ProcessDfsPromotionTasks();
+                std::this_thread::sleep_for(
+                    std::chrono::seconds(config_.heartbeat_interval_seconds));
+            }
+        });
         client_buffer_gc_running_.store(true);
         client_buffer_gc_thread_ =
             std::thread(&FileStorage::ClientBufferGCThreadFunc, this);
@@ -787,6 +810,10 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     // promotion is best-effort and must never break offload.
     (void)ProcessPromotionTasks();
 
+    // Drive the DFS->DRAM promotion channel as well. No-op for clients without
+    // a distributed backend; failures are likewise logged per-key.
+    (void)ProcessDfsPromotionTasks();
+
     // Proactive disk watermarks keep LOCAL_DISK usage below the configured
     // low watermark even when no new write arrives to trigger reactive
     // eviction.
@@ -997,6 +1024,166 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         }
 
         VLOG(1) << "Promotion completed for key=" << key << ", size=" << size;
+    }
+
+    return {};
+}
+
+tl::expected<void, ErrorCode> FileStorage::ProcessDfsPromotionTasks() {
+    if (client_ == nullptr) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    // Only DFS-capable clients (those that wired a distributed backend into
+    // the client at construction) serve the DFS promotion channel.
+    if (!client_->HasDfsStorageBackend()) {
+        return {};
+    }
+
+    std::vector<PromotionTaskItem> promotion_objects;
+    auto heartbeat_result =
+        client_->DfsPromotionObjectHeartbeat(promotion_objects);
+    if (!heartbeat_result) {
+        LOG(WARNING) << "DfsPromotionObjectHeartbeat failed: "
+                     << heartbeat_result.error();
+        return tl::make_unexpected(heartbeat_result.error());
+    }
+    if (promotion_objects.empty()) {
+        return {};
+    }
+
+    VLOG(1) << "ProcessDfsPromotionTasks pulled " << promotion_objects.size()
+            << " DFS promotion candidate(s) from master";
+
+    // No segment preference from the client: let master pick from any DRAM
+    // segment.
+    const std::vector<std::string> preferred_segments;
+
+    for (const auto& task : promotion_objects) {
+        const auto& key = task.key;
+        const auto& tenant_id = task.tenant_id;
+        const int64_t size = task.size;
+        if (size <= 0) {
+            LOG(WARNING) << "Skipping DFS promotion for key=" << key
+                         << " with non-positive size=" << size;
+            continue;
+        }
+        if (!task.source_dfs.has_value()) {
+            // A DFS-channel task must carry the source descriptor; without it
+            // the bytes cannot be located. Release the claimed slot.
+            LOG(WARNING) << "DFS promotion task for key=" << key
+                         << " has no source_dfs descriptor";
+            auto release = client_->NotifyPromotionFailure(key, tenant_id);
+            if (!release) {
+                VLOG(1) << "DFS Promotion: NotifyPromotionFailure failed for "
+                           "key="
+                        << key << ", error=" << release.error();
+            }
+            continue;
+        }
+
+        auto alloc_result = client_->PromotionAllocStart(
+            key, tenant_id, static_cast<uint64_t>(size), preferred_segments);
+        if (!alloc_result) {
+            // No staged buffer to release, but the claimed task already holds
+            // a dfs_promotion_in_flight_ slot on the master. Notify immediately
+            // so transient DRAM pressure does not pin the slot for the reaper
+            // TTL. Notify is idempotent and handles alloc_id == 0 correctly.
+            VLOG(1) << "DFS PromotionAllocStart failed for key=" << key
+                    << ", error=" << alloc_result.error()
+                    << " (likely no free DRAM); releasing master slot";
+            auto release = client_->NotifyPromotionFailure(key, tenant_id);
+            if (!release) {
+                VLOG(1) << "DFS Promotion: NotifyPromotionFailure failed for "
+                           "key="
+                        << key << ", error=" << release.error()
+                        << "; master reaper will reclaim on TTL expiry";
+            }
+            continue;
+        }
+
+        // Every failure path past this point has a master-side staged
+        // PROCESSING MEMORY buffer and an incremented in-flight slot. Notify
+        // eagerly so the buffer is reclaimed and the slot freed; the reaper is
+        // the long-stop.
+        auto release_master_state = [this, &key, &tenant_id]() {
+            auto release = client_->NotifyPromotionFailure(key, tenant_id);
+            if (!release) {
+                VLOG(1) << "DFS Promotion: NotifyPromotionFailure failed for "
+                           "key="
+                        << key << ", error=" << release.error()
+                        << "; master reaper will reclaim on TTL expiry";
+            }
+        };
+
+        const auto storage_key = TenantId(tenant_id).MakeScopedKey(key);
+
+        // (a) Allocate a staging buffer and read the DFS source bytes into it.
+        // AllocateBatch hands back a shared_ptr<AllocatedBatch> whose
+        // BufferHandles RAII-release the staging space when it goes out of
+        // scope. Unlike the SSD channel there is no O_DIRECT alignment
+        // requirement, but reusing the same registered buffer keeps the
+        // staging memory TE-visible for the subsequent PromotionWrite.
+        std::vector<std::string> single_key{storage_key};
+        std::vector<int64_t> single_size{size};
+        auto allocate_res =
+            AllocateBatch(single_key, single_size, *client_buffer_allocator_);
+        if (!allocate_res) {
+            LOG(WARNING) << "DFS Promotion: AllocateBatch failed for key=" << key
+                         << ", error=" << allocate_res.error();
+            release_master_state();
+            continue;
+        }
+        auto staging = allocate_res.value();
+        auto slice_it = staging->slices.find(storage_key);
+        if (slice_it == staging->slices.end()) {
+            LOG(WARNING) << "DFS Promotion: staging slice missing for key="
+                         << key;
+            release_master_state();
+            continue;
+        }
+        std::vector<Slice> read_slices{slice_it->second};
+        ErrorCode read_err = client_->ReadDfsReplicaForPromotion(
+            storage_key, task.source_dfs.value(), read_slices);
+        if (read_err != ErrorCode::OK) {
+            LOG(WARNING) << "DFS Promotion: read failed for key=" << key
+                         << ", error=" << read_err;
+            release_master_state();
+            continue;
+        }
+
+        // (b) TE-write the staged bytes into the freshly-allocated MEMORY
+        // replica. Re-read the slice: the DFS read may have advanced its
+        // pointer, mirroring the SSD channel's O_DIRECT offset correction.
+        slice_it = staging->slices.find(storage_key);
+        if (slice_it == staging->slices.end()) {
+            LOG(WARNING) << "DFS Promotion: staging slice missing after read "
+                            "for key="
+                         << key;
+            release_master_state();
+            continue;
+        }
+        std::vector<Slice> tx_slices{slice_it->second};
+        ErrorCode write_err = client_->PromotionWrite(
+            alloc_result.value().memory_descriptor, tx_slices);
+        if (write_err != ErrorCode::OK) {
+            LOG(WARNING) << "DFS Promotion: TransferWrite failed for key=" << key
+                         << ", error=" << write_err;
+            release_master_state();
+            continue;
+        }
+
+        // (c) Commit. Master flips the PROCESSING replica to COMPLETE.
+        auto notify_res = client_->NotifyPromotionSuccess(key, tenant_id);
+        if (!notify_res) {
+            LOG(WARNING) << "DFS Promotion: NotifyPromotionSuccess failed for "
+                            "key="
+                         << key << ", error=" << notify_res.error();
+            release_master_state();
+            continue;
+        }
+
+        VLOG(1) << "DFS promotion completed for key=" << key
+                << ", size=" << size;
     }
 
     return {};
