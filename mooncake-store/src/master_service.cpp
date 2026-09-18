@@ -7395,9 +7395,9 @@ bool MasterService::CleanupStaleHandles(
 void MasterService::FreeDfsReplicas(const std::string& key,
                                     const std::vector<Replica>& replicas) {
     // DFS promotion: drop any registered heat samples *before* the replica
-    // records are destroyed (their fields would be lost afterwards). DFS
-    // replicas are only created under the default tenant today, so the scoped
-    // key used at registration time is reproducible here. This is the "先
+    // records are destroyed (their fields would be lost afterwards). Each
+    // registered DFS replica carries the scoped-key hash it was registered
+    // with, so no scoped key string has to be rebuilt here. This is the "先
     // Remove 后销毁" ordering required by the impl contract for every
     // destroy-style replica departure (whole-object delete, generation reset,
     // MEMORY/LOCAL_DISK eviction that pops a DFS replica, move source, ...).
@@ -7407,14 +7407,15 @@ void MasterService::FreeDfsReplicas(const std::string& key,
     // whereas the sample bookkeeping has to stay coupled to the metadata
     // lifecycle (a missing allocator must not leak ghost samples).
     if (dfs_promotion_enabled_ && dfs_heat_sketch_ != nullptr) {
-        const uint64_t key_hash =
-            DfsHeatKeyHash(TenantId::Default().MakeScopedKey(key));
         for (const auto& replica : replicas) {
             if (!replica.is_dfs_replica() || !replica.is_completed()) continue;
             const auto* dfs = replica.dfs_data();
             if (dfs == nullptr || dfs->dfs_last_access_min == 0) continue;
+            // Reuse the hash cached at registration: these replica records are
+            // copies of the ones owned by the same ObjectMetadata, so the
+            // cached value is still the right one for this key.
             if (!dfs_heat_sketch_->Remove(
-                    key_hash, static_cast<double>(dfs->dfs_heat),
+                    dfs->dfs_key_hash, static_cast<double>(dfs->dfs_heat),
                     static_cast<mooncake::tool::DecayingDdSketch::Timestamp>(
                         dfs->dfs_last_access_min))) {
                 LOG(WARNING) << "DFS promotion: Remove rejected on free for "
@@ -7462,8 +7463,6 @@ uint64_t MasterService::DfsHeatKeyHash(const std::string& scoped_key) {
 void MasterService::RemoveRegisteredDfsSamples(ObjectMetadata& metadata) {
     if (!dfs_promotion_enabled_ || dfs_heat_sketch_ == nullptr) return;
     if (!metadata.tenant_id.IsDefault()) return;  // DFS promotion: default tenant only.
-    const uint64_t key_hash =
-        DfsHeatKeyHash(metadata.tenant_id.MakeScopedKey(metadata.user_key));
     while (true) {
         Replica* dfs = metadata.GetFirstReplica([](const Replica& replica) {
             if (!replica.is_dfs_replica() || !replica.is_completed()) return false;
@@ -7472,6 +7471,8 @@ void MasterService::RemoveRegisteredDfsSamples(ObjectMetadata& metadata) {
         });
         if (dfs == nullptr) return;
         auto* d = dfs->dfs_data();
+        // A registered member always carries the hash cached at registration.
+        const uint64_t key_hash = d->dfs_key_hash;
         if (!dfs_heat_sketch_->Remove(
                 key_hash, static_cast<double>(d->dfs_heat),
                 static_cast<mooncake::tool::DecayingDdSketch::Timestamp>(
@@ -7481,6 +7482,7 @@ void MasterService::RemoveRegisteredDfsSamples(ObjectMetadata& metadata) {
         }
         d->dfs_heat = 0.0f;
         d->dfs_last_access_min = 0;
+        d->dfs_key_hash = 0;
     }
 }
 
@@ -7508,8 +7510,6 @@ void MasterService::ReconcileDfsHeat(ObjectMetadata& metadata,
     DfsReplicaData* const dfs = top->dfs_data();
     if (dfs == nullptr) return;
     using Timestamp = mooncake::tool::DecayingDdSketch::Timestamp;
-    const uint64_t key_hash =
-        DfsHeatKeyHash(metadata.tenant_id.MakeScopedKey(metadata.user_key));
     if (dfs->dfs_last_access_min == 0) {
         // Not a member yet. A read hit registers heat=1 (design: Add on first
         // DFS-served access); every other transition registers heat=0 so the
@@ -7517,6 +7517,12 @@ void MasterService::ReconcileDfsHeat(ObjectMetadata& metadata,
         // replica was just evicted while a COMPLETE DFS replica stayed, or a
         // new DFS generation was committed with no MEMORY replica yet).
         const double heat = access_hit ? 1.0 : 0.0;
+        // Hash the scoped key once and cache it on the replica: this runs on
+        // the read-hit path, so rebuilding the scoped string per access would
+        // cost a heap allocation plus a full FNV-1a pass over the key for a
+        // value that never changes.
+        const uint64_t key_hash =
+            DfsHeatKeyHash(metadata.tenant_id.MakeScopedKey(metadata.user_key));
         if (!dfs_heat_sketch_->Add(key_hash, heat, now_min)) {
             LOG(WARNING) << "DFS promotion: Add rejected for key="
                          << metadata.user_key << " heat=" << heat;
@@ -7524,9 +7530,12 @@ void MasterService::ReconcileDfsHeat(ObjectMetadata& metadata,
         }
         dfs->dfs_heat = static_cast<float>(heat);
         dfs->dfs_last_access_min = static_cast<uint32_t>(now_min);
+        dfs->dfs_key_hash = key_hash;
         return;
     }
     if (!access_hit) return;  // Already a registered member; nothing changed.
+    // Registered member: reuse the hash cached when the sample was registered.
+    const uint64_t key_hash = dfs->dfs_key_hash;
 
     // Read hit on a registered member: decay the stored heat, then add 1.
     const uint64_t last = dfs->dfs_last_access_min;
@@ -7551,6 +7560,22 @@ void MasterService::ReconcileDfsHeat(ObjectMetadata& metadata,
 void MasterService::ReconcileDfsHeatOnRead(const ObjectIdentity& object_id) {
     if (!dfs_promotion_enabled_ || dfs_heat_sketch_ == nullptr) return;
     const uint64_t now_min = DfsNowEpochMin();
+    // The in-flight cap is a *global* property: while the queue is saturated no
+    // key can be admitted, so resolve it before taking the shard lock and skip
+    // the admission attempt outright when it holds. That keeps the RW critical
+    // section down to the heat update alone, instead of also paying for a
+    // threshold lookup, the per-key gates and candidate bookkeeping to reach a
+    // verdict that is already known.
+    //
+    // Heat sampling still runs: the sketch — not the queue — decides admission
+    // once space frees up, and freezing the samples while the queue is full
+    // would let every key decay away and stall admission long after the backlog
+    // drained. The flag is sampled once outside the lock, so a queue that
+    // drains in between costs one missed attempt, which the next read hit
+    // retries for free; TryAdmitDfsPromotion re-checks the cap authoritatively.
+    const bool admission_possible =
+        dfs_promotion_in_flight_.load(std::memory_order_relaxed) <
+        dfs_promotion_queue_limit_;
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) return;
     ObjectMetadata& metadata = accessor.Get();
@@ -7560,6 +7585,7 @@ void MasterService::ReconcileDfsHeatOnRead(const ObjectIdentity& object_id) {
     // DFS-served with a live sample are eligible; ReconcileDfsHeat above
     // already handled every active-leave / membership transition, so a
     // registered sample here implies the object is DFS-served.
+    if (!admission_possible) return;
     Replica* const top = metadata.GetFirstReplica(&Replica::fn_is_completed);
     if (top == nullptr || !top->is_dfs_replica()) return;
     DfsReplicaData* const dfs = top->dfs_data();
@@ -7741,7 +7767,13 @@ MasterService::DfsAdmissionResult MasterService::TryAdmitDfsPromotion(
     if (dfs_promotion_in_flight_.load(std::memory_order_relaxed) >=
         dfs_promotion_queue_limit_) {
         MasterMetricManager::instance().inc_dfs_promotion_rejected_cap();
-        record_or_backoff(DfsAdmissionResult::kQueueCapRejected);
+        // Deliberately no candidate bookkeeping: the cap is a property of the
+        // global queue, not of this key. The key is not colder, its source is
+        // not broken and waiting changes nothing about it, so a candidate entry
+        // could only consume one of the kDfsPromotionCandidateLimit slots that
+        // genuinely retryable keys need, and make the retry sweep spend a shard
+        // lock re-testing a verdict that is already known. Re-admission happens
+        // for free on the next read hit once the queue drains.
         return DfsAdmissionResult::kQueueCapRejected;
     }
     // Source availability: the copy source must be the top COMPLETE DFS
@@ -8019,6 +8051,17 @@ size_t MasterService::RunDfsPromotionCandidateRetry(size_t max_shards_to_scan) {
     size_t admitted = 0;
     {
         std::shared_lock<std::shared_mutex> snap_lock(snapshot_mutex_);
+        // The cap is global, so while it is saturated not one of the collected
+        // candidates can be admitted: skip the admission pass instead of paying
+        // a shard lock per candidate for a verdict that is already known. The
+        // collection pass above still ran, so candidate TTL / retry-budget
+        // reclamation keeps working while the backlog drains. The skipped
+        // candidates are not lost — they stay in the table and are picked up by
+        // the next sweep that runs with room in the queue.
+        if (dfs_promotion_in_flight_.load(std::memory_order_relaxed) >=
+            dfs_promotion_queue_limit_) {
+            return 0;
+        }
         for (const auto& object_id : due_candidates) {
             MetadataAccessorRW accessor(this, object_id);
             if (!accessor.Exists()) {
@@ -8337,6 +8380,76 @@ void MasterService::RunDfsPromotionReconcileScanForTesting() {
     RunDfsPromotionReconcileScan();
 }
 
+bool MasterService::NeedsDfsHeatRepair(const ObjectMetadata& metadata) const {
+    // Mirrors the write branches of ReconcileDfsHeat(access_hit=false):
+    //   * no COMPLETE replica at all, or COMPLETE DFS with no dfs_data
+    //     -> ReconcileDfsHeat returns without writing;
+    //   * top COMPLETE replica is not DFS-served
+    //     -> RemoveRegisteredDfsSamples (the object just left the collection);
+    //   * DFS-served but dfs_last_access_min == 0
+    //     -> Add(0.0) and register the membership stamp;
+    //   * DFS-served and already registered
+    //     -> `if (!access_hit) return;`, a pure no-op.
+    // Only the middle two can write, so only they justify an exclusive lock.
+    const Replica* const top =
+        metadata.GetFirstReplica(&Replica::fn_is_completed);
+    if (top == nullptr) return false;
+    if (!top->is_dfs_replica()) return true;
+    const DfsReplicaData* const dfs = top->dfs_data();
+    return dfs != nullptr && dfs->dfs_last_access_min == 0;
+}
+
+size_t MasterService::ReconcileDfsShard(const size_t shard_idx,
+                                        const size_t budget,
+                                        const uint64_t now_min) {
+    // The sweep exists to repair samples that a missed structural hook left
+    // inconsistent, but on a healthy shard every object is already a
+    // registered member and ReconcileDfsHeat(access_hit=false) returns at
+    // `if (!access_hit) return`. Probing under the shared lock and upgrading
+    // only when something actually needs writing keeps a no-op sweep from
+    // taking the shard exclusively -- which would otherwise stall every reader
+    // and writer hashing to that shard for the duration of the traversal.
+    std::vector<std::string> needs_repair;
+    size_t visited = 0;
+    {
+        MetadataShardAccessorRO shard(this, shard_idx);
+        for (const auto& tenant_entry : shard->tenants) {
+            if (!tenant_entry.first.IsDefault()) continue;
+            for (const auto& metadata_entry : tenant_entry.second.metadata) {
+                const ObjectMetadata& metadata = metadata_entry.second;
+                if (!metadata.HasReplica(&Replica::fn_is_dfs_replica)) continue;
+                ++visited;
+                if (NeedsDfsHeatRepair(metadata)) {
+                    needs_repair.push_back(metadata.user_key);
+                }
+                if (visited >= budget) break;
+            }
+            if (visited >= budget) break;
+        }
+    }
+    // `needs_repair` is bounded by `budget`, so the exclusive section below is
+    // bounded too.
+    if (needs_repair.empty()) return visited;
+    // Re-take the shard exclusively and replay the reconcile. Every object is
+    // re-looked-up instead of reusing the probes: anything may have happened
+    // between the two locks, and ReconcileDfsHeat re-derives the state machine
+    // from scratch, so an object that changed in between is simply a no-op (the
+    // replay is idempotent) and one that only became inconsistent afterwards is
+    // picked up by a later pass -- exactly as the old single-pass sweep did.
+    MetadataShardAccessorRW shard(this, shard_idx);
+    const auto tenant_it = shard->tenants.find(TenantId::Default());
+    if (tenant_it == shard->tenants.end()) return visited;
+    for (const std::string& key : needs_repair) {
+        auto metadata_it = tenant_it->second.metadata.find(key);
+        if (metadata_it == tenant_it->second.metadata.end()) {
+            continue;  // removed between the two locks
+        }
+        // access_hit=false: repair membership state only, never invent heat.
+        ReconcileDfsHeat(metadata_it->second, now_min, /*access_hit=*/false);
+    }
+    return visited;
+}
+
 void MasterService::RunDfsPromotionReconcileScan() {
     if (!dfs_promotion_enabled_ || dfs_heat_sketch_ == nullptr) return;
     const uint64_t now_min = DfsNowEpochMin();
@@ -8362,24 +8475,7 @@ void MasterService::RunDfsPromotionReconcileScan() {
     size_t shard_idx = start_cursor;
     for (size_t shards = 0; shards < kMaxShardsPerPass && visited < batch;
          ++shards) {
-        {
-            MetadataShardAccessorRW shard(this, shard_idx);
-            for (auto& tenant_entry : shard->tenants) {
-                if (!tenant_entry.first.IsDefault()) continue;
-                for (auto& metadata_entry : tenant_entry.second.metadata) {
-                    ObjectMetadata& metadata = metadata_entry.second;
-                    if (!metadata.HasReplica(&Replica::fn_is_dfs_replica)) {
-                        continue;
-                    }
-                    // access_hit=false: repair membership state only, never
-                    // invent heat. ReconcileDfsHeat is idempotent, so an
-                    // already-consistent object is a no-op.
-                    ReconcileDfsHeat(metadata, now_min, /*access_hit=*/false);
-                    if (++visited >= batch) break;
-                }
-                if (visited >= batch) break;
-            }
-        }
+        visited += ReconcileDfsShard(shard_idx, batch - visited, now_min);
         shard_idx = (shard_idx + 1) % kNumShards;
     }
     dfs_promotion_scan_cursor_.store(shard_idx, std::memory_order_relaxed);

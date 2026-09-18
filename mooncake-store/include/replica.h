@@ -266,6 +266,15 @@ struct DfsReplicaData {
     // heat sketch (added and not yet removed/cleared). Clearing it to 0 also
     // means "not registered"; no separate registered flag exists.
     uint32_t dfs_last_access_min = 0;
+    // Cached DfsHeatKeyHash(tenant-scoped key), computed once when the sample
+    // is registered so later hits do not rebuild the scoped string and re-hash
+    // the whole key. The read-hit path used to pay a heap allocation plus a
+    // full FNV-1a pass per access for a value that never changes.
+    //
+    // Valid exactly while dfs_last_access_min != 0 and cleared together with
+    // it, so "registered" is the one and only precondition for reading it.
+    // Never serialized (same contract as the fields above).
+    uint64_t dfs_key_hash = 0;
     // Epoch minute of the last COMPLETED DFS->MEMORY promotion for this
     // replica (0 = never). Drives the per-key anti-thrash cooldown: after a
     // promotion the key is not admitted again until

@@ -1330,6 +1330,16 @@ class MasterService {
             return it != replicas_.end() ? &(*it) : nullptr;
         }
 
+        // Const counterpart of the above: lets the read-only paths inspect a
+        // replica while the owning shard is held under a *shared* lock, without
+        // forcing those paths to take the shard exclusively.
+        const Replica* GetFirstReplica(
+            const std::function<bool(const Replica&)>& pred_fn) const {
+            const auto it =
+                std::find_if(replicas_.begin(), replicas_.end(), pred_fn);
+            return it != replicas_.end() ? &(*it) : nullptr;
+        }
+
         Replica* GetReplicaByID(const ReplicaID& id) {
             return GetFirstReplica(
                 [&id](const Replica& replica) { return replica.id() == id; });
@@ -2982,6 +2992,18 @@ class MasterService {
     // dfs_promotion_scan_cursor_ and replays ReconcileDfsHeat with
     // access_hit=false to repair membership drift left by a missed hook.
     void RunDfsPromotionReconcileScan();
+    // Read-only probe mirroring ReconcileDfsHeat(access_hit=false): returns
+    // true only when replaying the reconcile would actually write -- i.e. the
+    // object stopped being DFS-served while still carrying a registered
+    // sample, or it is DFS-served but its sample was never registered. Every
+    // other state leaves ReconcileDfsHeat without touching metadata.
+    bool NeedsDfsHeatRepair(const ObjectMetadata& metadata) const;
+    // One shard of the self-healing sweep. Probes DFS-holding objects under the
+    // *shared* shard lock and takes the shard exclusively only when at least
+    // one of them actually needs a repair, so sweeping an already-consistent
+    // shard costs no exclusive lock at all. Returns the number of objects
+    // visited (capped at `budget`).
+    size_t ReconcileDfsShard(size_t shard_idx, size_t budget, uint64_t now_min);
     // Test hook: run one self-healing pass with the interval throttle bypassed.
     void RunDfsPromotionReconcileScanForTesting();
     // Ghost census: walks every shard, sums the decayed

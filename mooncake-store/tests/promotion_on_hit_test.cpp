@@ -582,6 +582,17 @@ class PromotionOnHitTest : public ::testing::Test {
             });
     }
 
+    // Drive the real read-hit entry point — what GetReplicaList calls once it
+    // has decided the read was served by DFS — without going through
+    // replica-list construction, so a test can pin the reconcile behaviour
+    // itself (heat sampling + admission attempt) rather than the dfs_served
+    // predicate that decides whether it runs at all.
+    static void ReconcileDfsHeatOnReadForTesting(MasterService* service,
+                                                 const std::string& key) {
+        service->ReconcileDfsHeatOnRead(
+            MasterService::ObjectIdentity{TenantId::Default(), key});
+    }
+
     // Simulate an already-registered sketch member carrying `heat` as of
     // `last_access_min`. The production state machine keeps the metadata and
     // the sketch in lockstep (Add on first membership, Replace on later hits),
@@ -607,6 +618,10 @@ class PromotionOnHitTest : public ::testing::Test {
                         static_cast<double>(heat),
                         static_cast<uint64_t>(last_access_min));
                 }
+                // Mirror the production invariant: a registered member always
+                // carries the hash cached at registration, so the Remove /
+                // Replace paths read it instead of re-hashing the scoped key.
+                data->dfs_key_hash = key_hash;
             }
             data->dfs_heat = heat;
             data->dfs_last_access_min = last_access_min;
@@ -4806,11 +4821,42 @@ TEST_F(PromotionOnHitTest, DfsPromotionAdmissionRejectedAtInFlightCap) {
     EXPECT_EQ(AdmitDfsPromotionResultForTesting(service.get(), "k_dfs_cap"),
               DfsAdmissionResultQueueCap());
     EXPECT_EQ(metrics.get_dfs_promotion_rejected_cap(), rejected_pre + 1);
-    // A cap rejection is transient: the key is recorded as a retry candidate
-    // with its reason so the next sweep can reconsider it.
-    EXPECT_EQ(GetDfsCandidateCountForTesting(service.get(), "k_dfs_cap"), 1u);
-    EXPECT_EQ(GetDfsCandidateReasonForTesting(service.get(), "k_dfs_cap"),
-              DfsCandidateReasonQueueCap());
+    // A cap rejection records *no* candidate. The cap is a property of the
+    // global queue, not of this key: the key is not colder, its source is not
+    // broken and waiting changes nothing about it, so there is no per-key state
+    // for the retry sweep to act on — the next read hit re-attempts admission
+    // for free. Recording one would only spend a kDfsPromotionCandidateLimit
+    // slot that a genuinely retryable key (kLeaseActive, kNoDfsSource, ...)
+    // needs, and make the sweep take a shard lock to re-test a verdict that is
+    // already known.
+    EXPECT_EQ(GetDfsCandidateCountForTesting(service.get(), "k_dfs_cap"), 0u);
+    EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 0u);
+    EXPECT_EQ(GetDfsPromotionTaskTableSizeForTesting(service.get()), 0u);
+}
+
+// A saturated queue must not make the read path pay for an admission attempt it
+// cannot win — but it must also not freeze heat sampling, because the sketch
+// (not the queue) is what decides admission once space frees up.
+TEST_F(PromotionOnHitTest, DfsPromotionReadHitSkipsAdmissionWhileQueueSaturated) {
+    auto service = std::make_unique<MasterService>(MakeDfsPromotionConfig());
+    auto& metrics = MasterMetricManager::instance();
+
+    ASSERT_TRUE(InjectDfsOnlyObject(*service, "k_dfs_sat", 1024));
+    // in_flight (0) >= limit (0) -> the queue is saturated for every key.
+    OverrideDfsPromotionQueueLimitForTesting(service.get(), 0);
+
+    const int64_t cap_pre = metrics.get_dfs_promotion_rejected_cap();
+
+    ReconcileDfsHeatOnReadForTesting(service.get(), "k_dfs_sat");
+
+    // Heat sampling keeps running: the first DFS-served hit registers the key
+    // with heat=1. Freezing the samples while the queue is full would let every
+    // key decay away and stall the channel long after the backlog drained.
+    EXPECT_DOUBLE_EQ(GetDfsHeatForTesting(service.get(), "k_dfs_sat"), 1.0);
+    // The admission attempt is short-circuited before the shard lock, so the
+    // read never reaches the cap gate and is not counted as a cap rejection.
+    EXPECT_EQ(metrics.get_dfs_promotion_rejected_cap(), cap_pre);
+    EXPECT_EQ(GetDfsCandidateCountForTesting(service.get(), "k_dfs_sat"), 0u);
     EXPECT_EQ(GetDfsPromotionInFlightForTesting(service.get()), 0u);
     EXPECT_EQ(GetDfsPromotionTaskTableSizeForTesting(service.get()), 0u);
 }
