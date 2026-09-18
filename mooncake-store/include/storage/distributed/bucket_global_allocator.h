@@ -395,6 +395,9 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
 
     bool CanReserveBucketCreationLocked() const;
     std::optional<BucketCreationReservation> ReserveBucketCreationLocked();
+    void FinishBucketCreationLocked(bool synchronous);
+    void RollbackBucketPublicationLocked(int64_t bucket_id,
+                                         const BucketPtr& bucket);
     size_t EffectiveReadyTargetLocked() const;
     BucketPtr PromoteReadyBucketLocked();
     bool ActiveBucketHasSpaceLocked(uint64_t required,

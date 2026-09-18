@@ -1676,6 +1676,15 @@ TEST(DfsAllocatorConfigTest, DefaultsToShardAndValidatesBucketFields) {
     too_many.max_bucket_count = kMaxBucketId + 1;
     EXPECT_FALSE(too_many.ValidateForBucketAllocator());
 
+    auto capped_ready_pool = bucket;
+    capped_ready_pool.max_bucket_count = 2;
+    capped_ready_pool.ready_bucket_target = 4;
+    EXPECT_TRUE(capped_ready_pool.ValidateForBucketAllocator());
+
+    auto negative_ready_pool = bucket;
+    negative_ready_pool.ready_bucket_target = -1;
+    EXPECT_FALSE(negative_ready_pool.ValidateForBucketAllocator());
+
     const std::string formatted = bucket.FormatStr();
     EXPECT_NE(formatted.find("allocator_type=bucket"), std::string::npos);
     EXPECT_NE(formatted.find("bucket_capacity="), std::string::npos);
