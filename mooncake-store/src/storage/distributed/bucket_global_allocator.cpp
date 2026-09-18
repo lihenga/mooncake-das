@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <sstream>
+#include <system_error>
 #include <tuple>
 #include <unordered_set>
 #include <utility>
@@ -13,6 +14,7 @@
 #include <ylt/struct_pb.hpp>
 
 #include "crc32c.h"
+#include "master_metric_manager.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #ifdef USE_3FS
@@ -26,8 +28,9 @@ namespace {
 constexpr const char* kBucketFilePrefix = "bucket_";
 constexpr const char* kBucketDataSuffix = ".data";
 constexpr const char* kBucketMetaSuffix = ".meta";
+constexpr auto kBucketCreationRetryDelay = std::chrono::seconds(1);
 
-int64_t NowNs() {
+int64_t CurrentTimeNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
@@ -126,12 +129,23 @@ BucketGlobalAllocator::PendingEviction::operator=(
 }
 
 BucketGlobalAllocator::~BucketGlobalAllocator() {
-    if (initialized_.load(std::memory_order_acquire)) {
-        // A clean shutdown must not leave a sealed bucket's metadata unwritten.
-        // The still-active bucket is deliberately left unpersisted: its data is
-        // discarded on the next start, which is the accepted trade-off for
-        // keeping the hot path free of metadata I/O.
-        FlushDirtyMetadata();
+    initialized_.store(false, std::memory_order_release);
+    StopBucketWorkers();
+
+    // A clean shutdown must not leave a sealed bucket's metadata unwritten.
+    // The still-active bucket is deliberately left unpersisted: its data is
+    // discarded on the next start, which is the accepted trade-off for keeping
+    // the hot path free of metadata I/O.
+    FlushDirtyMetadata();
+
+    std::vector<int64_t> ready_bucket_ids;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ready_bucket_ids = DetachReadyBucketsLocked();
+        UpdateBucketPoolMetricsLocked();
+    }
+    for (const int64_t bucket_id : ready_bucket_ids) {
+        DeleteBucketFiles(bucket_id);
     }
     if (fs_adapter_) fs_adapter_->Shutdown();
 }
@@ -168,6 +182,9 @@ tl::expected<void, ErrorCode> BucketGlobalAllocator::Init(
     bucket_capacity_ = config.bucket_capacity;
     alignment_ = config.alignment;
     max_bucket_count_ = config.max_bucket_count;
+    ready_bucket_target_ = static_cast<size_t>(config.ready_bucket_target);
+    bucket_create_concurrency_ =
+        static_cast<size_t>(config.bucket_create_concurrency);
     eviction_enabled_ = config.eviction_enabled;
     eviction_high_watermark_ = config.eviction_high_watermark;
     eviction_low_watermark_ = config.eviction_low_watermark;
@@ -214,6 +231,101 @@ tl::expected<void, ErrorCode> BucketGlobalAllocator::Init(
         return recovered;
     }
 
+    const size_t recovered_bucket_count = buckets_.size();
+    size_t initial_ready_target = 0;
+    ErrorCode initial_creation_error = ErrorCode::OK;
+    if (ready_bucket_target_ > 0) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_bucket_workers_ = false;
+            bucket_creation_retry_after_ =
+                std::chrono::steady_clock::time_point::min();
+            initial_ready_target = EffectiveReadyTargetLocked();
+            initialization_creations_remaining_ = initial_ready_target;
+            UpdateBucketPoolMetricsLocked();
+        }
+
+        try {
+            bucket_create_workers_.reserve(bucket_create_concurrency_);
+            for (size_t i = 0; i < bucket_create_concurrency_; ++i) {
+                bucket_create_workers_.emplace_back(
+                    &BucketGlobalAllocator::BucketCreateWorker, this);
+            }
+        } catch (const std::system_error& e) {
+            LOG(ERROR) << "Failed to start DFS bucket creation workers: "
+                       << e.what();
+            StopBucketWorkers();
+            std::vector<int64_t> ready_bucket_ids;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                ready_bucket_ids = DetachReadyBucketsLocked();
+                UpdateBucketPoolMetricsLocked();
+            }
+            for (const int64_t bucket_id : ready_bucket_ids) {
+                DeleteBucketFiles(bucket_id);
+            }
+            fs_adapter_->Shutdown();
+            fs_adapter_.reset();
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+
+        if (initial_ready_target > 0) {
+            std::unique_lock<std::mutex> lock(mutex_);
+            bucket_pool_cv_.notify_all();
+            bucket_pool_cv_.wait(lock, [this, initial_ready_target] {
+                return stop_bucket_workers_ ||
+                       ready_bucket_ids_.size() >= initial_ready_target ||
+                       (initialization_creations_remaining_ == 0 &&
+                        bucket_creations_in_flight_ == 0);
+            });
+            initialization_creations_remaining_ = 0;
+            if (ready_bucket_ids_.size() < initial_ready_target) {
+                initial_creation_error = last_bucket_creation_error_;
+                if (!ready_bucket_ids_.empty()) {
+                    LOG(WARNING)
+                        << "DFS ready bucket pool initialized below target, "
+                        << "ready_count=" << ready_bucket_ids_.size()
+                        << ", target=" << initial_ready_target
+                        << ", last_error=" << initial_creation_error;
+                }
+            }
+            bucket_pool_cv_.notify_all();
+        }
+
+        if (initial_ready_target > 0) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (ready_bucket_ids_.empty()) {
+                if (initial_creation_error == ErrorCode::OK) {
+                    initial_creation_error = ErrorCode::FILE_WRITE_FAIL;
+                }
+            } else {
+                initial_creation_error = ErrorCode::OK;
+            }
+        }
+    } else {
+        std::lock_guard<std::mutex> lock(mutex_);
+        UpdateBucketPoolMetricsLocked();
+    }
+
+    if (initial_creation_error != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to initialize DFS ready bucket pool, target="
+                   << initial_ready_target
+                   << ", error=" << initial_creation_error;
+        StopBucketWorkers();
+        std::vector<int64_t> ready_bucket_ids;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ready_bucket_ids = DetachReadyBucketsLocked();
+            UpdateBucketPoolMetricsLocked();
+        }
+        for (const int64_t bucket_id : ready_bucket_ids) {
+            DeleteBucketFiles(bucket_id);
+        }
+        fs_adapter_->Shutdown();
+        fs_adapter_.reset();
+        return tl::make_unexpected(initial_creation_error);
+    }
+
     initialized_.store(true, std::memory_order_release);
 
     // Recovery may have rewritten in-memory state (legacy format upgrade,
@@ -221,11 +333,19 @@ tl::expected<void, ErrorCode> BucketGlobalAllocator::Init(
     // next start reads exactly what this process believes.
     const size_t rewritten = FlushDirtyMetadata();
 
+    size_t ready_bucket_count = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ready_bucket_count = ready_bucket_ids_.size();
+    }
     LOG(INFO) << "DFS bucket allocator initialized, fsdir=" << fsdir_
               << ", bucket_capacity=" << bucket_capacity_
               << ", alignment=" << alignment_
               << ", max_bucket_count=" << max_bucket_count_
-              << ", recovered_buckets=" << buckets_.size()
+              << ", ready_bucket_target=" << ready_bucket_target_
+              << ", bucket_create_concurrency=" << bucket_create_concurrency_
+              << ", recovered_buckets=" << recovered_bucket_count
+              << ", ready_buckets=" << ready_bucket_count
               << ", recovered_replicas=" << recovered_replicas_.size()
               << ", rewritten_buckets=" << rewritten;
     return {};
@@ -362,95 +482,295 @@ void BucketGlobalAllocator::DeleteBucketFiles(int64_t bucket_id) {
 
 // === bucket lifecycle ===
 
+size_t BucketGlobalAllocator::EffectiveReadyTargetLocked() const {
+    const size_t ready_count = ready_bucket_ids_.size();
+    const size_t non_ready_count = buckets_.size() - ready_count;
+    if (max_bucket_count_ > 0 &&
+        non_ready_count >= static_cast<size_t>(max_bucket_count_)) {
+        return 0;
+    }
+    const size_t available =
+        max_bucket_count_ > 0
+            ? static_cast<size_t>(max_bucket_count_) - non_ready_count
+            : ready_bucket_target_;
+    return std::min(ready_bucket_target_, available);
+}
+
+bool BucketGlobalAllocator::CanReserveBucketCreationLocked() const {
+    if (stop_bucket_workers_ || next_bucket_id_ > kMaxBucketId) return false;
+    return max_bucket_count_ <= 0 ||
+           buckets_.size() + bucket_creations_in_flight_ <
+               static_cast<size_t>(max_bucket_count_);
+}
+
+std::optional<BucketGlobalAllocator::BucketCreationReservation>
+BucketGlobalAllocator::ReserveBucketCreationLocked() {
+    if (!CanReserveBucketCreationLocked()) return std::nullopt;
+    BucketCreationReservation reservation;
+    reservation.bucket_id = next_bucket_id_++;
+    reservation.generation = next_generation_++;
+    ++bucket_creations_in_flight_;
+    UpdateBucketPoolMetricsLocked();
+    return reservation;
+}
+
+bool BucketGlobalAllocator::ActiveBucketHasSpaceLocked(
+    uint64_t required, BucketPtr* bucket) const {
+    if (active_bucket_id_ < 0) return false;
+    auto it = buckets_.find(active_bucket_id_);
+    if (it == buckets_.end() || it->second->ready || it->second->sealed ||
+        it->second->frozen) {
+        return false;
+    }
+    auto entry_start = CheckedAlignUp(it->second->append_offset, alignment_);
+    if (!entry_start || *entry_start > it->second->capacity ||
+        required > it->second->capacity - *entry_start) {
+        return false;
+    }
+    if (bucket != nullptr) *bucket = it->second;
+    return true;
+}
+
+void BucketGlobalAllocator::RequestRefillLocked(bool urgent) {
+    // One urgent retry may bypass the backoff for each observed failure wave.
+    // A stream of waiting allocations cannot continuously reset the delay.
+    if (urgent &&
+        last_urgent_refill_sequence_ != bucket_creation_failure_sequence_) {
+        last_urgent_refill_sequence_ = bucket_creation_failure_sequence_;
+        bucket_creation_retry_after_ =
+            std::chrono::steady_clock::time_point::min();
+    }
+    bucket_pool_cv_.notify_all();
+}
+
+BucketGlobalAllocator::BucketPtr
+BucketGlobalAllocator::PromoteReadyBucketLocked() {
+    while (!ready_bucket_ids_.empty()) {
+        const int64_t bucket_id = ready_bucket_ids_.front();
+        ready_bucket_ids_.pop_front();
+        auto it = buckets_.find(bucket_id);
+        if (it == buckets_.end() || !it->second->ready) continue;
+
+        SealActiveBucketLocked();
+        it->second->ready = false;
+        active_bucket_id_ = bucket_id;
+        TouchLruLocked(bucket_id, CurrentTimeNs());
+        UpdateBucketPoolMetricsLocked();
+        RequestRefillLocked();
+        return it->second;
+    }
+    UpdateBucketPoolMetricsLocked();
+    return nullptr;
+}
+
+std::vector<int64_t> BucketGlobalAllocator::DetachReadyBucketsLocked() {
+    std::vector<int64_t> bucket_ids;
+    bucket_ids.reserve(ready_bucket_ids_.size());
+    for (const int64_t bucket_id : ready_bucket_ids_) {
+        auto it = buckets_.find(bucket_id);
+        if (it == buckets_.end() || !it->second->ready) continue;
+        bucket_ids.push_back(bucket_id);
+        buckets_.erase(it);
+    }
+    ready_bucket_ids_.clear();
+    return bucket_ids;
+}
+
+void BucketGlobalAllocator::UpdateBucketPoolMetricsLocked() const {
+    MasterMetricManager::instance().set_dfs_bucket_pool_state(
+        ready_bucket_ids_.size(), bucket_creations_in_flight_,
+        static_cast<uint64_t>(ready_bucket_ids_.size()) * bucket_capacity_);
+}
+
+void BucketGlobalAllocator::StopBucketWorkers() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stop_bucket_workers_ = true;
+        initialization_creations_remaining_ = 0;
+        bucket_pool_cv_.notify_all();
+    }
+    for (auto& worker : bucket_create_workers_) {
+        if (worker.joinable()) worker.join();
+    }
+    bucket_create_workers_.clear();
+}
+
+void BucketGlobalAllocator::BucketCreateWorker() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    const auto needs_creation = [this] {
+        return CanReserveBucketCreationLocked() &&
+               ready_bucket_ids_.size() + bucket_creations_in_flight_ <
+                   EffectiveReadyTargetLocked();
+    };
+
+    while (!stop_bucket_workers_) {
+        while (!stop_bucket_workers_ && !needs_creation()) {
+            bucket_pool_cv_.wait(lock);
+        }
+        if (stop_bucket_workers_) break;
+
+        const auto now = std::chrono::steady_clock::now();
+        if (initialization_creations_remaining_ == 0 &&
+            now < bucket_creation_retry_after_) {
+            const auto retry_after = bucket_creation_retry_after_;
+            bucket_pool_cv_.wait_until(
+                lock, retry_after, [this, retry_after, &needs_creation] {
+                    return stop_bucket_workers_ ||
+                           initialization_creations_remaining_ > 0 ||
+                           bucket_creation_retry_after_ < retry_after ||
+                           !needs_creation();
+                });
+            continue;
+        }
+
+        auto reservation = ReserveBucketCreationLocked();
+        if (!reservation) continue;
+        if (initialization_creations_remaining_ > 0) {
+            --initialization_creations_remaining_;
+        }
+
+        lock.unlock();
+        const auto create_started = std::chrono::steady_clock::now();
+        auto preallocated = fs_adapter_->PreallocateFile(
+            BucketDataPath(reservation->bucket_id), bucket_capacity_);
+        const auto create_latency_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - create_started)
+                .count();
+        MasterMetricManager::instance().observe_dfs_bucket_create_latency_us(
+            create_latency_us);
+        lock.lock();
+
+        const bool within_capacity =
+            max_bucket_count_ <= 0 ||
+            buckets_.size() + bucket_creations_in_flight_ <=
+                static_cast<size_t>(max_bucket_count_);
+        const bool within_target =
+            ready_bucket_ids_.size() + bucket_creations_in_flight_ <=
+            EffectiveReadyTargetLocked();
+        const bool publish = preallocated && within_capacity && within_target &&
+                             !stop_bucket_workers_;
+        bool delete_file = false;
+        const char* result = "failure";
+        if (publish) {
+            auto bucket = std::make_shared<BucketState>();
+            bucket->bucket_id = reservation->bucket_id;
+            bucket->creation_generation = reservation->generation;
+            bucket->capacity = bucket_capacity_;
+            bucket->last_access_ns = CurrentTimeNs();
+            bucket->ready = true;
+            buckets_.emplace(bucket->bucket_id, bucket);
+            ready_bucket_ids_.push_back(bucket->bucket_id);
+            bucket_creation_retry_after_ =
+                std::chrono::steady_clock::time_point::min();
+            result = "success";
+        } else if (preallocated) {
+            delete_file = true;
+            result = "discarded";
+        } else {
+            delete_file = true;
+            ++bucket_creation_failure_sequence_;
+            last_bucket_creation_error_ = preallocated.error();
+            bucket_creation_retry_after_ =
+                std::chrono::steady_clock::now() + kBucketCreationRetryDelay;
+        }
+
+        --bucket_creations_in_flight_;
+        const size_t ready_count = ready_bucket_ids_.size();
+        const size_t in_flight = bucket_creations_in_flight_;
+        const int64_t max_bucket_count = max_bucket_count_;
+        UpdateBucketPoolMetricsLocked();
+        bucket_pool_cv_.notify_all();
+        lock.unlock();
+
+        MasterMetricManager::instance().inc_dfs_bucket_create_total(result);
+        if (!preallocated) {
+            LOG(WARNING) << "Failed to precreate DFS bucket, bucket_id="
+                         << reservation->bucket_id
+                         << ", creation_generation=" << reservation->generation
+                         << ", error=" << preallocated.error()
+                         << ", ready_count=" << ready_count
+                         << ", in_flight=" << in_flight
+                         << ", max_bucket_count=" << max_bucket_count;
+        } else if (!publish) {
+            VLOG(1) << "Discarded precreated DFS bucket after state change, "
+                    << "bucket_id=" << reservation->bucket_id
+                    << ", creation_generation=" << reservation->generation;
+        }
+        if (delete_file) DeleteBucketFiles(reservation->bucket_id);
+
+        lock.lock();
+    }
+}
+
 tl::expected<BucketGlobalAllocator::BucketPtr, ErrorCode>
 BucketGlobalAllocator::CreateBucketUnlocked(
     std::unique_lock<std::mutex>& lock) {
-    if (max_bucket_count_ > 0 &&
-        static_cast<int64_t>(buckets_.size()) >= max_bucket_count_) {
-        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-    }
-    if (next_bucket_id_ > kMaxBucketId) {
-        LOG(ERROR) << "DFS bucket id space exhausted, next_bucket_id="
-                   << next_bucket_id_;
-        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-    }
-
-    // Only one thread may be creating a bucket at a time. Without this, N
-    // threads that all find the active bucket full each reserve a *different*
-    // id, then race in the unlocked I/O section below: the last one to relock
-    // wins `active_bucket_id_`, and the losers' buckets are published but
-    // orphaned. Worse, each loser's rollback path can delete files belonging to
-    // an id another thread has already published, which is what made concurrent
-    // Allocate() fail with FILE_NOT_FOUND.
-    //
-    // EnsureActiveBucket guarantees `bucket_creation_in_flight_` is false here:
-    // it waits out an in-flight creation and re-checks the active bucket first,
-    // so a waiter reuses the new bucket instead of creating a redundant one.
-    bucket_creation_in_flight_ = true;
-    // Clears the flag and wakes the next waiter on every exit path.
-    struct CreationGuard {
-        BucketGlobalAllocator* self;
-        ~CreationGuard() {
-            self->bucket_creation_in_flight_ = false;
-            self->bucket_creation_cv_.notify_all();
+    auto reservation = ReserveBucketCreationLocked();
+    if (!reservation) {
+        if (next_bucket_id_ > kMaxBucketId) {
+            LOG(ERROR) << "DFS bucket id space exhausted, next_bucket_id="
+                       << next_bucket_id_;
         }
-    } creation_guard{this};
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+    synchronous_creation_in_flight_ = true;
 
-    const int64_t bucket_id = next_bucket_id_++;
-
-    auto bucket = std::make_shared<BucketState>();
-    bucket->bucket_id = bucket_id;
-    bucket->capacity = bucket_capacity_;
-    bucket->append_offset = 0;
-    bucket->live_bytes = 0;
-    bucket->last_access_ns = NowNs();
-
-    // Only the data file is created here. The bucket's metadata stays in memory
-    // until the bucket is sealed, which is what keeps it down to a single
-    // `.meta` file written once instead of a snapshot plus a growing log.
     lock.unlock();
-    auto prealloc = fs_adapter_->PreallocateFile(BucketDataPath(bucket_id),
-                                                 bucket_capacity_);
+    const auto create_started = std::chrono::steady_clock::now();
+    auto preallocated = fs_adapter_->PreallocateFile(
+        BucketDataPath(reservation->bucket_id), bucket_capacity_);
+    const auto create_latency_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - create_started)
+            .count();
+    MasterMetricManager::instance().observe_dfs_bucket_create_latency_us(
+        create_latency_us);
     lock.lock();
 
-    if (!prealloc) {
-        const ErrorCode error = prealloc.error();
-        LOG(ERROR) << "Failed to create DFS bucket " << bucket_id
-                   << ", error=" << error;
-        // Roll back the id reservation when nothing else claimed it meanwhile,
-        // and remove any partially created files.
-        if (next_bucket_id_ == bucket_id + 1 && !buckets_.count(bucket_id)) {
-            next_bucket_id_ = bucket_id;
+    const bool within_capacity =
+        max_bucket_count_ <= 0 ||
+        buckets_.size() + bucket_creations_in_flight_ <=
+            static_cast<size_t>(max_bucket_count_);
+    const bool publish =
+        preallocated && within_capacity && !stop_bucket_workers_;
+    ErrorCode error = ErrorCode::OK;
+    BucketPtr bucket;
+    if (publish) {
+        bucket = std::make_shared<BucketState>();
+        bucket->bucket_id = reservation->bucket_id;
+        bucket->creation_generation = reservation->generation;
+        bucket->capacity = bucket_capacity_;
+        bucket->last_access_ns = CurrentTimeNs();
+        buckets_.emplace(bucket->bucket_id, bucket);
+        SealActiveBucketLocked();
+        active_bucket_id_ = bucket->bucket_id;
+        TouchLruLocked(bucket->bucket_id, bucket->last_access_ns);
+    } else if (!preallocated) {
+        error = preallocated.error();
+    } else {
+        error = ErrorCode::NO_AVAILABLE_HANDLE;
+    }
+
+    --bucket_creations_in_flight_;
+    synchronous_creation_in_flight_ = false;
+    UpdateBucketPoolMetricsLocked();
+    bucket_pool_cv_.notify_all();
+
+    lock.unlock();
+    MasterMetricManager::instance().inc_dfs_bucket_create_total(
+        publish ? "success" : (preallocated ? "discarded" : "failure"));
+    if (!publish) DeleteBucketFiles(reservation->bucket_id);
+    if (publish) FlushDirtyMetadata();
+    lock.lock();
+
+    if (!publish) {
+        if (!preallocated) {
+            LOG(ERROR) << "Failed to create DFS bucket "
+                       << reservation->bucket_id << ", error=" << error;
         }
-        lock.unlock();
-        DeleteBucketFiles(bucket_id);
-        lock.lock();
         return tl::make_unexpected(error);
     }
-
-    // A concurrent creator may have published this id while we were unlocked.
-    auto existing = buckets_.find(bucket_id);
-    if (existing != buckets_.end()) {
-        LOG(WARNING) << "DFS bucket " << bucket_id
-                     << " was published concurrently; reusing existing state";
-        return existing->second;
-    }
-
-    buckets_.emplace(bucket_id, bucket);
-    // The bucket being replaced will never be appended to again, so this is
-    // where its metadata becomes final and worth writing out.
-    SealActiveBucketLocked();
-    active_bucket_id_ = bucket_id;
-    TouchLruLocked(bucket_id, bucket->last_access_ns);
-
-    // Write the just-sealed bucket's `.meta` before returning. Deferring it to
-    // the maintenance tick would put several sealed buckets at risk of a crash;
-    // doing it here bounds the loss to the single bucket that is still active.
-    // The cost is one metadata write per bucket rollover, off the per-object
-    // path.
-    lock.unlock();
-    FlushDirtyMetadata();
-    lock.lock();
     return bucket;
 }
 
@@ -466,47 +786,115 @@ BucketGlobalAllocator::EnsureActiveBucket(std::unique_lock<std::mutex>& lock,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Each iteration re-checks the active bucket, so a thread that waited for
-    // someone else's creation reuses that bucket instead of adding another. The
-    // bound keeps a pathological interleaving from looping forever; in practice
-    // one wait plus one creation is the worst case.
-    constexpr int kMaxAttempts = 8;
-    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
-        if (active_bucket_id_ >= 0) {
-            auto it = buckets_.find(active_bucket_id_);
-            if (it != buckets_.end() && !it->second->frozen) {
-                auto& bucket = *it->second;
-                auto entry_start =
-                    CheckedAlignUp(bucket.append_offset, alignment_);
-                if (entry_start && *entry_start <= bucket.capacity &&
-                    required <= bucket.capacity - *entry_start) {
-                    return it->second;
-                }
-            }
+    std::optional<std::chrono::steady_clock::time_point> rollover_started;
+    bool pool_exhaustion_recorded = false;
+    const auto observe_rollover = [&rollover_started] {
+        if (!rollover_started) return;
+        const auto latency_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - *rollover_started)
+                .count();
+        MasterMetricManager::instance().observe_dfs_bucket_rollover_latency_us(
+            latency_us);
+    };
+
+    while (true) {
+        BucketPtr active;
+        if (ActiveBucketHasSpaceLocked(required, &active)) {
+            observe_rollover();
+            return active;
         }
-        if (bucket_creation_in_flight_) {
-            // Someone else is already creating one. Wait for it and loop, so we
-            // consume their bucket rather than creating a competing one.
-            bucket_creation_cv_.wait(lock);
+        if (!rollover_started && active_bucket_id_ >= 0) {
+            rollover_started = std::chrono::steady_clock::now();
+        }
+        if (stop_bucket_workers_) {
+            observe_rollover();
+            return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+        }
+
+        if (ready_bucket_target_ == 0) {
+            if (synchronous_creation_in_flight_) {
+                bucket_pool_cv_.wait(lock, [this] {
+                    return stop_bucket_workers_ ||
+                           !synchronous_creation_in_flight_;
+                });
+                continue;
+            }
+            auto created = CreateBucketUnlocked(lock);
+            if (!created) {
+                observe_rollover();
+                return tl::make_unexpected(created.error());
+            }
             continue;
         }
-        auto created = CreateBucketUnlocked(lock);
-        if (!created) {
-            LOG(ERROR) << "DFS EnsureActiveBucket create failed: "
-                       << "attempt=" << attempt
-                       << ", required=" << required
-                       << ", error=" << created.error();
-            return tl::make_unexpected(created.error());
+
+        if (!ready_bucket_ids_.empty()) {
+            auto promoted = PromoteReadyBucketLocked();
+            if (promoted) {
+                // Persist the bucket just sealed by the promotion before the
+                // allocation returns, preserving the existing crash boundary.
+                lock.unlock();
+                FlushDirtyMetadata();
+                lock.lock();
+                continue;
+            }
         }
-        // Loop once more so the freshly created bucket goes through the same
-        // capacity check instead of being trusted blindly.
+
+        if (!CanReserveBucketCreationLocked() &&
+            bucket_creations_in_flight_ == 0) {
+            observe_rollover();
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+
+        if (!pool_exhaustion_recorded) {
+            pool_exhaustion_recorded = true;
+            MasterMetricManager::instance()
+                .inc_dfs_bucket_pool_exhausted_total();
+            LOG_EVERY_N(WARNING, 100)
+                << "DFS ready bucket pool exhausted, ready_count="
+                << ready_bucket_ids_.size()
+                << ", in_flight=" << bucket_creations_in_flight_
+                << ", waiting_allocators=" << waiting_allocators_
+                << ", active_bucket_id=" << active_bucket_id_
+                << ", max_bucket_count=" << max_bucket_count_;
+        }
+
+        const uint64_t failure_sequence = bucket_creation_failure_sequence_;
+        RequestRefillLocked(/*urgent=*/true);
+        ++waiting_allocators_;
+        const auto wait_started = std::chrono::steady_clock::now();
+        bucket_pool_cv_.wait(lock, [this, required, failure_sequence] {
+            return stop_bucket_workers_ ||
+                   ActiveBucketHasSpaceLocked(required) ||
+                   !ready_bucket_ids_.empty() ||
+                   (bucket_creation_failure_sequence_ != failure_sequence &&
+                    bucket_creations_in_flight_ == 0) ||
+                   (!CanReserveBucketCreationLocked() &&
+                    bucket_creations_in_flight_ == 0);
+        });
+        --waiting_allocators_;
+        const auto wait_latency_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - wait_started)
+                .count();
+        MasterMetricManager::instance().observe_dfs_bucket_pool_wait_latency_us(
+            wait_latency_us);
+
+        if (stop_bucket_workers_) {
+            observe_rollover();
+            return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+        }
+        if (ready_bucket_ids_.empty() &&
+            !ActiveBucketHasSpaceLocked(required) &&
+            bucket_creations_in_flight_ == 0 &&
+            bucket_creation_failure_sequence_ != failure_sequence) {
+            const ErrorCode error = last_bucket_creation_error_ == ErrorCode::OK
+                                        ? ErrorCode::FILE_WRITE_FAIL
+                                        : last_bucket_creation_error_;
+            observe_rollover();
+            return tl::make_unexpected(error);
+        }
     }
-    LOG(ERROR) << "DFS EnsureActiveBucket retries exhausted: "
-               << "required=" << required
-               << ", bucket_count=" << buckets_.size()
-               << ", max_bucket_count=" << max_bucket_count_
-               << ", active_bucket_id=" << active_bucket_id_;
-    return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
 }
 
 void BucketGlobalAllocator::TouchLruLocked(int64_t bucket_id, int64_t now_ns) {
@@ -764,7 +1152,7 @@ std::vector<BatchAllocateResult> BucketGlobalAllocator::BatchAllocate(
     // used before a new bucket is created. A bucket boundary can therefore
     // occur only between two objects, never inside one object.
     for (size_t index = 0; index < requests.size(); ++index) {
-        const auto& request = requests[index];            
+        const auto& request = requests[index];
         // Dedup right before the reserve, under the same lock hold. A key can
         // be live either from a prior generation still PENDING in this bucket
         // or from a concurrent batch that reserved it during the previous
@@ -776,7 +1164,7 @@ std::vector<BatchAllocateResult> BucketGlobalAllocator::BatchAllocate(
             ++already_exists_count;
             continue;
         }
-        auto object_layout = 
+        auto object_layout =
             ComputeBucketEntryLayout(0, request.size, alignment_);
         if (!object_layout) {
             // Per-key failure: this key's shape is invalid, but subsequent
@@ -836,7 +1224,7 @@ std::vector<BatchAllocateResult> BucketGlobalAllocator::BatchAllocate(
         results[index].success = true;
         results[index].error = ErrorCode::OK;
         reserved.push_back({index, bucket->bucket_id, bucket});
-        TouchLruLocked(bucket->bucket_id, NowNs());
+        TouchLruLocked(bucket->bucket_id, CurrentTimeNs());
     }
 
     if (reserved.size() + already_exists_count != requests.size()) {
@@ -943,7 +1331,7 @@ void BucketGlobalAllocator::Free(const std::string& key,
 }
 
 size_t BucketGlobalAllocator::FlushDirtyMetadata() {
-    if (!initialized_.load(std::memory_order_acquire)) return 0;
+    if (!fs_adapter_) return 0;
 
     // Snapshot every dirty bucket under the lock, then do the writes without
     // it.
@@ -1018,17 +1406,17 @@ void BucketGlobalAllocator::UpdateAccess(
     // A frozen bucket is mid-eviction; refreshing it would fight the
     // transaction the master is currently resolving.
     if (bucket->frozen) return;
-    TouchLruLocked(bucket->bucket_id, NowNs());
+    TouchLruLocked(bucket->bucket_id, CurrentTimeNs());
 }
 
 uint64_t BucketGlobalAllocator::GetTotalCapacity() const {
     // A fixed denominator: watermarks must not move as buckets come and go,
     // or deleting a bucket would shrink capacity in lockstep with usage and
     // eviction would never converge.
+    std::lock_guard<std::mutex> lock(mutex_);
     if (max_bucket_count_ > 0) {
         return static_cast<uint64_t>(max_bucket_count_) * bucket_capacity_;
     }
-    std::lock_guard<std::mutex> lock(mutex_);
     return static_cast<uint64_t>(buckets_.size()) * bucket_capacity_;
 }
 
@@ -1049,11 +1437,35 @@ uint64_t BucketGlobalAllocator::GetUsedBytes() const {
 }
 
 int64_t BucketGlobalAllocator::SetMaxBucketCount(int64_t new_max_bucket_count) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    int64_t old = max_bucket_count_;
-    max_bucket_count_ = new_max_bucket_count;
+    std::vector<int64_t> removed_ready_buckets;
+    int64_t old = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        old = max_bucket_count_;
+        max_bucket_count_ = new_max_bucket_count;
+
+        while (ready_bucket_ids_.size() > EffectiveReadyTargetLocked()) {
+            const int64_t bucket_id = ready_bucket_ids_.back();
+            ready_bucket_ids_.pop_back();
+            auto it = buckets_.find(bucket_id);
+            if (it == buckets_.end() || !it->second->ready) continue;
+            buckets_.erase(it);
+            removed_ready_buckets.push_back(bucket_id);
+        }
+        if (new_max_bucket_count > old) {
+            bucket_creation_retry_after_ =
+                std::chrono::steady_clock::time_point::min();
+        }
+        UpdateBucketPoolMetricsLocked();
+    }
+
+    for (const int64_t bucket_id : removed_ready_buckets) {
+        DeleteBucketFiles(bucket_id);
+    }
+    bucket_pool_cv_.notify_all();
     LOG(INFO) << "Dynamic max_bucket_count changed from " << old << " to "
-              << new_max_bucket_count;
+              << new_max_bucket_count
+              << ", removed_ready_buckets=" << removed_ready_buckets.size();
     return old;
 }
 
@@ -1258,6 +1670,9 @@ void BucketGlobalAllocator::CommitEviction(PendingEviction&& pending) {
     // space but can no longer produce a dangling read, because the master has
     // already dropped every replica in this bucket.
     DeleteBucketFiles(bucket_id);
+    // The deleted bucket's quota slot is reusable only after its files are no
+    // longer present. Wake both refill workers and allocation waiters now.
+    bucket_pool_cv_.notify_all();
     LOG(INFO) << "Evicted DFS bucket " << bucket_id;
 }
 
@@ -1434,7 +1849,7 @@ tl::expected<void, ErrorCode> BucketGlobalAllocator::RecoverFromDisk() {
         bucket->capacity = snapshot.capacity;
         bucket->append_offset = 0;
         bucket->live_bytes = 0;
-        bucket->last_access_ns = NowNs();
+        bucket->last_access_ns = CurrentTimeNs();
         // Everything on disk was written at seal time, so a recovered bucket is
         // sealed by definition and its `.meta` already matches this state.
         bucket->sealed = true;

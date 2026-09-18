@@ -25,6 +25,7 @@ namespace {
 // can hold a staging buffer of up to kMaxMergedIo, so an unbounded thread
 // count would blow up both the thread and the memory budget.
 constexpr int kMaxBatchReadThreads = 256;
+constexpr int kMaxBucketCreateConcurrency = 8;
 
 // Bound temporary memory and I/O latency while still collapsing the common
 // BatchAllocate output to one read. Larger batches become a few contiguous
@@ -238,6 +239,22 @@ bool DistributedStorageConfig::ValidateForBucketAllocator() const {
                       "bucket_capacity overflows";
         return false;
     }
+    if (ready_bucket_target < 0 || ready_bucket_target > max_bucket_count) {
+        LOG(ERROR) << "DistributedStorageConfig: ready_bucket_target must be "
+                      "in [0, max_bucket_count], ready_bucket_target="
+                   << ready_bucket_target
+                   << ", max_bucket_count=" << max_bucket_count;
+        return false;
+    }
+    if (bucket_create_concurrency < 1 ||
+        bucket_create_concurrency > kMaxBucketCreateConcurrency) {
+        LOG(ERROR)
+            << "DistributedStorageConfig: bucket_create_concurrency must be "
+               "in [1, "
+            << kMaxBucketCreateConcurrency
+            << "], bucket_create_concurrency=" << bucket_create_concurrency;
+        return false;
+    }
     if (batch_read_threads < 1 || batch_read_threads > kMaxBatchReadThreads) {
         LOG(ERROR) << "DistributedStorageConfig: batch_read_threads must be in "
                       "[1, "
@@ -310,6 +327,11 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     config.max_bucket_count = static_cast<int64_t>(
         Environ::GetInt("MOONCAKE_DFS_MAX_BUCKET_COUNT",
                         static_cast<int>(config.max_bucket_count)));
+    config.ready_bucket_target = Environ::GetInt(
+        "MOONCAKE_DFS_READY_BUCKET_COUNT", config.ready_bucket_target);
+    config.bucket_create_concurrency =
+        Environ::GetInt("MOONCAKE_DFS_BUCKET_CREATE_CONCURRENCY",
+                        config.bucket_create_concurrency);
     config.batch_read_threads = Environ::GetInt(
         "MOONCAKE_DFS_BATCH_READ_THREADS", config.batch_read_threads);
     config.batch_read_merge_enabled =
@@ -337,6 +359,8 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", allocator_type=" << ToString(allocator_type)
         << ", bucket_capacity=" << bucket_capacity
         << ", max_bucket_count=" << max_bucket_count
+        << ", ready_bucket_target=" << ready_bucket_target
+        << ", bucket_create_concurrency=" << bucket_create_concurrency
         << ", batch_read_threads=" << batch_read_threads
         << ", batch_read_merge_enabled=" << batch_read_merge_enabled
         << ", direct_read_enabled=" << direct_read_enabled;
