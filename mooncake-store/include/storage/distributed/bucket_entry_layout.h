@@ -14,28 +14,25 @@ namespace mooncake {
  *
  * Every bucket entry is laid out as
  *
- *   entry_start   = AlignUp(previous_entry_end, alignment)
+ *   offset       = AlignUp(previous_entry_end, alignment)
  *   [value bytes][padding]
- *   value_offset  = entry_start
- *   entry_size =
- * value.size()
- *   reserved_size = AlignUp(entry_size, alignment)
+ *   object_size  = value.size()
+ *   aligned_size = AlignUp(object_size, alignment)
  * All code
  * paths (Allocate, BatchAllocate, recovery, BatchWrite, BatchRead and eviction
  * candidate construction) must derive offsets through this helper so a single
- * definition governs the layout. Both the value offset and reserved
+ * definition governs the layout. Both the value offset and aligned
  * size are
  * alignment-aligned, which lets aligned objects be read directly into
  *
  * caller-owned buffers with O_DIRECT.
  */
 struct BucketEntryLayout {
-    uint64_t entry_start = 0;    // aligned start of the whole entry
-    uint64_t value_offset = 0;   // where the value bytes begin
-    uint64_t entry_size = 0;     // value bytes, without padding
-    uint64_t reserved_size = 0;  // entry_size rounded up to `alignment`
+    uint64_t offset = 0;
+    uint64_t object_size = 0;
+    uint64_t aligned_size = 0;
 
-    uint64_t entry_end() const { return entry_start + reserved_size; }
+    uint64_t end() const { return offset + aligned_size; }
 };
 
 /**
@@ -65,7 +62,7 @@ inline std::optional<uint64_t> CheckedAlignUp(uint64_t value,
  * zero, or when any intermediate operation would overflow. Callers are
  *
  * responsible for the separate capacity check
- * (`layout.entry_end() <=
+ * (`layout.end() <=
  * bucket_capacity`).
  */
 inline std::optional<BucketEntryLayout> ComputeBucketEntryLayout(
@@ -82,10 +79,9 @@ inline std::optional<BucketEntryLayout> ComputeBucketEntryLayout(
     if (*reserved_size > kMax - *entry_start) return std::nullopt;
 
     BucketEntryLayout layout;
-    layout.entry_start = *entry_start;
-    layout.value_offset = *entry_start;
-    layout.entry_size = value_size;
-    layout.reserved_size = *reserved_size;
+    layout.offset = *entry_start;
+    layout.object_size = value_size;
+    layout.aligned_size = *reserved_size;
     return layout;
 }
 
@@ -101,7 +97,7 @@ inline std::optional<BucketEntryLayout> RebuildBucketEntryLayout(
     if (!IsValidBucketAlignment(alignment)) return std::nullopt;
     if (entry_start % alignment != 0) return std::nullopt;
     auto layout = ComputeBucketEntryLayout(entry_start, value_size, alignment);
-    if (!layout || layout->entry_start != entry_start) return std::nullopt;
+    if (!layout || layout->offset != entry_start) return std::nullopt;
     return layout;
 }
 
@@ -113,13 +109,13 @@ inline std::optional<BucketEntryLayout> RebuildBucketEntryLayout(
  * field.
  */
 inline DistributedFSDescriptor MakeBucketDescriptor(
-    std::string data_path, const BucketEntryLayout& layout, uint64_t value_size,
+    std::string data_path, const BucketEntryLayout& layout,
     int64_t bucket_id) {
     DistributedFSDescriptor descriptor;
     descriptor.file_path = std::move(data_path);
-    descriptor.offset = layout.value_offset;
-    descriptor.object_size = value_size;
-    descriptor.aligned_size = layout.reserved_size;
+    descriptor.offset = layout.offset;
+    descriptor.object_size = layout.object_size;
+    descriptor.aligned_size = layout.aligned_size;
     descriptor.shard_idx = static_cast<int>(bucket_id);
     return descriptor;
 }

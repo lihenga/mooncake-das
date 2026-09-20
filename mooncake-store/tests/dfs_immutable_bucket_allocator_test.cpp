@@ -26,10 +26,10 @@
 #include "crc32c.h"
 #include "replica.h"
 #include "storage/distributed/bucket_entry_layout.h"
-#include "storage/distributed/bucket_global_allocator.h"
+#include "storage/distributed/immutable_bucket_allocator.h"
 #include "storage/distributed/dfs_global_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
-#include "storage/distributed/global_allocator_interface.h"
+#include "storage/distributed/dfs_allocator_interface.h"
 #include "storage/distributed/posix_fs_adapter.h"
 
 namespace mooncake::test {
@@ -125,14 +125,14 @@ uint64_t EntryStartOf(const DistributedFSDescriptor& desc) {
 
 std::string BucketMetaFile(const TempDir& tmp, int64_t bucket_id) {
     return tmp.file("bucket_" +
-                    BucketGlobalAllocator::FormatBucketId(bucket_id) + ".meta");
+                    ImmutableBucketAllocator::FormatBucketId(bucket_id) + ".meta");
 }
 
 // Seals the current active bucket, which is the only moment its `.meta` file is
 // written. The filler object is sized so that it only fits into an empty
 // bucket, forcing the allocator to roll over instead of appending.
 std::optional<DistributedFSDescriptor> RollOverActiveBucket(
-    BucketGlobalAllocator& alloc, const std::string& filler_key,
+    ImmutableBucketAllocator& alloc, const std::string& filler_key,
     uint64_t bucket_capacity) {
     auto desc = alloc.Allocate(filler_key, bucket_capacity);
     if (!desc) return std::nullopt;
@@ -142,12 +142,12 @@ std::optional<DistributedFSDescriptor> RollOverActiveBucket(
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// BucketGlobalAllocator: allocation
+// ImmutableBucketAllocator: allocation
 // ---------------------------------------------------------------------------
 
-TEST(BucketGlobalAllocatorTest, AllocateReturnsBucketIdAndObjectOffset) {
+TEST(ImmutableBucketAllocatorTest, AllocateReturnsBucketIdAndObjectOffset) {
     TempDir tmp("bucket_alloc");
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
     EXPECT_TRUE(alloc.IsInitialized());
     EXPECT_EQ(alloc.Type(), DfsAllocatorType::BUCKET);
@@ -171,9 +171,9 @@ TEST(BucketGlobalAllocatorTest, AllocateReturnsBucketIdAndObjectOffset) {
     EXPECT_EQ(std::filesystem::file_size(desc->file_path), kBucketCapacity);
 }
 
-TEST(BucketGlobalAllocatorTest, AllocateRejectsInvalidRequests) {
+TEST(ImmutableBucketAllocatorTest, AllocateRejectsInvalidRequests) {
     TempDir tmp("bucket_alloc_invalid");
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
 
     auto empty_key = alloc.Allocate("", 100);
@@ -200,7 +200,7 @@ TEST(BucketGlobalAllocatorTest, AllocateRejectsInvalidRequests) {
 
 std::string BucketDataFile(const TempDir& tmp, int64_t bucket_id) {
     return tmp.file("bucket_" +
-                    BucketGlobalAllocator::FormatBucketId(bucket_id) + ".data");
+                    ImmutableBucketAllocator::FormatBucketId(bucket_id) + ".data");
 }
 
 bool WriteBucketMetadata(const TempDir& tmp, PersistedBucketMetadata snapshot) {
@@ -252,9 +252,9 @@ PersistedBucketMetadata MakeMetadataSnapshot(
     return snapshot;
 }
 
-TEST(BucketGlobalAllocatorTest, KeyLengthDoesNotAffectReservedSize) {
+TEST(ImmutableBucketAllocatorTest, KeyLengthDoesNotAffectReservedSize) {
     TempDir tmp("bucket_key_length");
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
 
     auto short_key = alloc.Allocate("a", 100);
@@ -267,20 +267,20 @@ TEST(BucketGlobalAllocatorTest, KeyLengthDoesNotAffectReservedSize) {
     EXPECT_EQ(long_key->offset, kAlignment);
 }
 
-TEST(BucketGlobalAllocatorTest, UninitializedAllocatorReportsUnavailable) {
-    BucketGlobalAllocator alloc;
+TEST(ImmutableBucketAllocatorTest, UninitializedAllocatorReportsUnavailable) {
+    ImmutableBucketAllocator alloc;
     EXPECT_FALSE(alloc.IsInitialized());
     auto desc = alloc.Allocate("k", 100);
     ASSERT_FALSE(desc.has_value());
     EXPECT_EQ(desc.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
 }
 
-TEST(BucketGlobalAllocatorTest, InitRejectsInvalidConfiguration) {
+TEST(ImmutableBucketAllocatorTest, InitRejectsInvalidConfiguration) {
     TempDir tmp("bucket_init_invalid");
 
     {
         auto config = MakeBucketConfig(tmp.path(), 0, 8);
-        BucketGlobalAllocator alloc;
+        ImmutableBucketAllocator alloc;
         auto result = alloc.Init(config);
         ASSERT_FALSE(result.has_value());
         EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
@@ -288,7 +288,7 @@ TEST(BucketGlobalAllocatorTest, InitRejectsInvalidConfiguration) {
     {
         // max_bucket_count must be > 0: it is the fixed watermark denominator.
         auto config = MakeBucketConfig(tmp.path(), kBucketCapacity, 0);
-        BucketGlobalAllocator alloc;
+        ImmutableBucketAllocator alloc;
         auto result = alloc.Init(config);
         ASSERT_FALSE(result.has_value());
         EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
@@ -296,7 +296,7 @@ TEST(BucketGlobalAllocatorTest, InitRejectsInvalidConfiguration) {
     {
         auto config = MakeBucketConfig(tmp.path(), kBucketCapacity, 8);
         config.alignment = 3000;  // not a power of two
-        BucketGlobalAllocator alloc;
+        ImmutableBucketAllocator alloc;
         auto result = alloc.Init(config);
         ASSERT_FALSE(result.has_value());
         EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
@@ -305,7 +305,7 @@ TEST(BucketGlobalAllocatorTest, InitRejectsInvalidConfiguration) {
         auto config = MakeBucketConfig(tmp.path(), kBucketCapacity, 8);
         config.eviction_low_watermark = 0.95;
         config.eviction_high_watermark = 0.9;
-        BucketGlobalAllocator alloc;
+        ImmutableBucketAllocator alloc;
         auto result = alloc.Init(config);
         ASSERT_FALSE(result.has_value());
         EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
@@ -313,15 +313,15 @@ TEST(BucketGlobalAllocatorTest, InitRejectsInvalidConfiguration) {
     {
         auto config = MakeBucketConfig(tmp.path(), kBucketCapacity, 8);
         config.fs_adapter_type = "nonexistent";
-        BucketGlobalAllocator alloc;
+        ImmutableBucketAllocator alloc;
         auto result = alloc.Init(config);
         ASSERT_FALSE(result.has_value());
     }
 }
 
-TEST(BucketGlobalAllocatorTest, MultipleObjectsShareBucketWithDistinctOffsets) {
+TEST(ImmutableBucketAllocatorTest, MultipleObjectsShareBucketWithDistinctOffsets) {
     TempDir tmp("bucket_multi");
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
 
     std::vector<std::pair<std::string, DistributedFSDescriptor>> allocations;
@@ -345,11 +345,11 @@ TEST(BucketGlobalAllocatorTest, MultipleObjectsShareBucketWithDistinctOffsets) {
     EXPECT_EQ(alloc.GetBucketCount(), 1u);
 }
 
-TEST(BucketGlobalAllocatorTest, BucketRolloverCreatesNewBucket) {
+TEST(ImmutableBucketAllocatorTest, BucketRolloverCreatesNewBucket) {
     TempDir tmp("bucket_rollover");
     // Capacity for exactly two 4096-byte entries.
     const uint64_t capacity = 2 * kAlignment;
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), capacity, 8)));
 
     std::vector<int> bucket_ids;
@@ -367,10 +367,10 @@ TEST(BucketGlobalAllocatorTest, BucketRolloverCreatesNewBucket) {
     EXPECT_EQ(alloc.GetBucketCount(), 3u);
 }
 
-TEST(BucketGlobalAllocatorTest, MaxBucketCountIsEnforced) {
+TEST(ImmutableBucketAllocatorTest, MaxBucketCountIsEnforced) {
     TempDir tmp("bucket_max_count");
     const uint64_t capacity = kAlignment;  // one entry per bucket
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), capacity, 2)));
 
     ASSERT_TRUE(alloc.Allocate("k0", 100).has_value());
@@ -382,12 +382,12 @@ TEST(BucketGlobalAllocatorTest, MaxBucketCountIsEnforced) {
 }
 
 // ---------------------------------------------------------------------------
-// BucketGlobalAllocator: BatchAllocate
+// ImmutableBucketAllocator: BatchAllocate
 // ---------------------------------------------------------------------------
 
-TEST(BucketGlobalAllocatorTest, BatchAllocateIsContiguous) {
+TEST(ImmutableBucketAllocatorTest, BatchAllocateIsContiguous) {
     TempDir tmp("bucket_batch");
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
 
     std::vector<BatchAllocateRequest> requests;
@@ -410,9 +410,9 @@ TEST(BucketGlobalAllocatorTest, BatchAllocateIsContiguous) {
     }
 }
 
-TEST(BucketGlobalAllocatorTest, ConcurrentBatchesDoNotInterleave) {
+TEST(ImmutableBucketAllocatorTest, ConcurrentBatchesDoNotInterleave) {
     TempDir tmp("bucket_batch_concurrent");
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), 4 * 1024 * 1024, 16)));
 
     constexpr int kThreads = 4;
@@ -474,10 +474,10 @@ TEST(BucketGlobalAllocatorTest, ConcurrentBatchesDoNotInterleave) {
     }
 }
 
-TEST(BucketGlobalAllocatorTest, BatchLargerThanBucketSpansBuckets) {
+TEST(ImmutableBucketAllocatorTest, BatchLargerThanBucketSpansBuckets) {
     TempDir tmp("bucket_batch_too_big");
     const uint64_t capacity = 2 * kAlignment;
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), capacity, 8)));
 
     // The batch is larger than one bucket, but each object fits. Pack the first
@@ -496,10 +496,10 @@ TEST(BucketGlobalAllocatorTest, BatchLargerThanBucketSpansBuckets) {
     EXPECT_EQ(EntryStartOf(results[2].descriptor), 0u);
 }
 
-TEST(BucketGlobalAllocatorTest, BatchRollsOverToNewBucketWhenActiveIsFull) {
+TEST(ImmutableBucketAllocatorTest, BatchRollsOverToNewBucketWhenActiveIsFull) {
     TempDir tmp("bucket_batch_rollover");
     const uint64_t capacity = 4 * kAlignment;
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), capacity, 8)));
 
     // Fill three of four slots in bucket 0.
@@ -520,9 +520,9 @@ TEST(BucketGlobalAllocatorTest, BatchRollsOverToNewBucketWhenActiveIsFull) {
     EXPECT_EQ(EntryStartOf(results[1].descriptor), 0u);
 }
 
-TEST(BucketGlobalAllocatorTest, BatchAllocateRejectsBadRequestsAtomically) {
+TEST(ImmutableBucketAllocatorTest, BatchAllocateRejectsBadRequestsAtomically) {
     TempDir tmp("bucket_batch_invalid");
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
 
     // Duplicate keys inside one batch.
@@ -553,12 +553,12 @@ TEST(BucketGlobalAllocatorTest, BatchAllocateRejectsBadRequestsAtomically) {
 }
 
 // ---------------------------------------------------------------------------
-// BucketGlobalAllocator: Free / MarkCommitted
+// ImmutableBucketAllocator: Free / MarkCommitted
 // ---------------------------------------------------------------------------
 
-TEST(BucketGlobalAllocatorTest, FreeTombstonesEntryAndAllowsReuseOfKey) {
+TEST(ImmutableBucketAllocatorTest, FreeTombstonesEntryAndAllowsReuseOfKey) {
     TempDir tmp("bucket_free");
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
 
     auto first = alloc.Allocate("k", 100);
@@ -575,9 +575,9 @@ TEST(BucketGlobalAllocatorTest, FreeTombstonesEntryAndAllowsReuseOfKey) {
     EXPECT_NE(second->offset, first->offset);
 }
 
-TEST(BucketGlobalAllocatorTest, StaleFreeDoesNotDropNewAllocation) {
+TEST(ImmutableBucketAllocatorTest, StaleFreeDoesNotDropNewAllocation) {
     TempDir tmp("bucket_stale_free");
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
 
     auto first = alloc.Allocate("k", 100);
@@ -603,9 +603,9 @@ TEST(BucketGlobalAllocatorTest, StaleFreeDoesNotDropNewAllocation) {
     EXPECT_FALSE(alloc.GetBucketIdForKey("k").has_value());
 }
 
-TEST(BucketGlobalAllocatorTest, MarkCommittedValidatesDescriptorIdentity) {
+TEST(ImmutableBucketAllocatorTest, MarkCommittedValidatesDescriptorIdentity) {
     TempDir tmp("bucket_commit");
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
 
     auto desc = alloc.Allocate("k", 100);
@@ -622,12 +622,12 @@ TEST(BucketGlobalAllocatorTest, MarkCommittedValidatesDescriptorIdentity) {
 }
 
 // ---------------------------------------------------------------------------
-// BucketGlobalAllocator: metadata persistence and recovery
+// ImmutableBucketAllocator: metadata persistence and recovery
 // ---------------------------------------------------------------------------
 
-TEST(BucketGlobalAllocatorTest, MetadataIsPersistedWhenBucketIsSealed) {
+TEST(ImmutableBucketAllocatorTest, MetadataIsPersistedWhenBucketIsSealed) {
     TempDir tmp("bucket_persist");
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
 
     auto desc = alloc.Allocate("persisted", 100);
@@ -653,10 +653,10 @@ TEST(BucketGlobalAllocatorTest, MetadataIsPersistedWhenBucketIsSealed) {
     EXPECT_FALSE(std::filesystem::exists(meta_path + ".log"));
 }
 
-TEST(BucketGlobalAllocatorTest, MetadataRoundTripKeepsEntryGenerationAndKey) {
+TEST(ImmutableBucketAllocatorTest, MetadataRoundTripKeepsEntryGenerationAndKey) {
     TempDir tmp("bucket_metadata_schema");
     {
-        BucketGlobalAllocator alloc;
+        ImmutableBucketAllocator alloc;
         ASSERT_TRUE(
             alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
         auto desc = alloc.Allocate("metadata_key", 100);
@@ -684,14 +684,14 @@ TEST(BucketGlobalAllocatorTest, MetadataRoundTripKeepsEntryGenerationAndKey) {
     EXPECT_GT(snapshot.entries[0].generation, 0u);
 }
 
-TEST(BucketGlobalAllocatorTest, RecoveryRejectsOldMetadataVersion) {
+TEST(ImmutableBucketAllocatorTest, RecoveryRejectsOldMetadataVersion) {
     TempDir tmp("bucket_old_metadata");
     auto old_snapshot =
         MakeMetadataSnapshot(0, "old_key", 0, 7, kBucketMetadataVersion - 1);
     ASSERT_TRUE(CreateBucketDataFile(tmp, 0, kBucketCapacity));
     ASSERT_TRUE(WriteBucketMetadata(tmp, std::move(old_snapshot)));
 
-    BucketGlobalAllocator recovered;
+    ImmutableBucketAllocator recovered;
     ASSERT_TRUE(
         recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
     EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
@@ -699,7 +699,7 @@ TEST(BucketGlobalAllocatorTest, RecoveryRejectsOldMetadataVersion) {
     EXPECT_FALSE(std::filesystem::exists(BucketMetaFile(tmp, 0)));
 }
 
-TEST(BucketGlobalAllocatorTest, RecoveryChoosesLargestEntryGeneration) {
+TEST(ImmutableBucketAllocatorTest, RecoveryChoosesLargestEntryGeneration) {
     TempDir tmp("bucket_duplicate_generation");
     ASSERT_TRUE(CreateBucketDataFile(tmp, 0, kBucketCapacity));
     ASSERT_TRUE(CreateBucketDataFile(tmp, 1, kBucketCapacity));
@@ -708,7 +708,7 @@ TEST(BucketGlobalAllocatorTest, RecoveryChoosesLargestEntryGeneration) {
     ASSERT_TRUE(
         WriteBucketMetadata(tmp, MakeMetadataSnapshot(1, "duplicate", 0, 11)));
 
-    BucketGlobalAllocator recovered;
+    ImmutableBucketAllocator recovered;
     ASSERT_TRUE(
         recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
     auto replicas = recovered.TakeRecoveredReplicas();
@@ -717,7 +717,7 @@ TEST(BucketGlobalAllocatorTest, RecoveryChoosesLargestEntryGeneration) {
     EXPECT_EQ(replicas[0].descriptor.shard_idx, 1);
 }
 
-TEST(BucketGlobalAllocatorTest, RecoveryBreaksGenerationTiesByLocation) {
+TEST(ImmutableBucketAllocatorTest, RecoveryBreaksGenerationTiesByLocation) {
     TempDir tmp("bucket_duplicate_tie");
     ASSERT_TRUE(CreateBucketDataFile(tmp, 0, kBucketCapacity));
     ASSERT_TRUE(CreateBucketDataFile(tmp, 1, kBucketCapacity));
@@ -726,7 +726,7 @@ TEST(BucketGlobalAllocatorTest, RecoveryBreaksGenerationTiesByLocation) {
     ASSERT_TRUE(
         WriteBucketMetadata(tmp, MakeMetadataSnapshot(1, "duplicate", 0, 10)));
 
-    BucketGlobalAllocator recovered;
+    ImmutableBucketAllocator recovered;
     ASSERT_TRUE(
         recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
     auto replicas = recovered.TakeRecoveredReplicas();
@@ -735,11 +735,11 @@ TEST(BucketGlobalAllocatorTest, RecoveryBreaksGenerationTiesByLocation) {
     EXPECT_EQ(replicas[0].descriptor.offset, 0u);
 }
 
-TEST(BucketGlobalAllocatorTest, RecoveryRestoresOnlyCommittedEntries) {
+TEST(ImmutableBucketAllocatorTest, RecoveryRestoresOnlyCommittedEntries) {
     TempDir tmp("bucket_recover");
     DistributedFSDescriptor committed_desc;
     {
-        BucketGlobalAllocator alloc;
+        ImmutableBucketAllocator alloc;
         ASSERT_TRUE(
             alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
         auto committed = alloc.Allocate("committed", 100);
@@ -758,7 +758,7 @@ TEST(BucketGlobalAllocatorTest, RecoveryRestoresOnlyCommittedEntries) {
             RollOverActiveBucket(alloc, "filler", kBucketCapacity).has_value());
     }
 
-    BucketGlobalAllocator recovered;
+    ImmutableBucketAllocator recovered;
     ASSERT_TRUE(
         recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
 
@@ -785,10 +785,10 @@ TEST(BucketGlobalAllocatorTest, RecoveryRestoresOnlyCommittedEntries) {
     EXPECT_NE(fresh->shard_idx, committed_desc.shard_idx);
 }
 
-TEST(BucketGlobalAllocatorTest, RecoveryDoesNotRevivedFreedKeys) {
+TEST(ImmutableBucketAllocatorTest, RecoveryDoesNotRevivedFreedKeys) {
     TempDir tmp("bucket_recover_tombstone");
     {
-        BucketGlobalAllocator alloc;
+        ImmutableBucketAllocator alloc;
         ASSERT_TRUE(
             alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
         auto desc = alloc.Allocate("gone", 100);
@@ -806,17 +806,17 @@ TEST(BucketGlobalAllocatorTest, RecoveryDoesNotRevivedFreedKeys) {
         EXPECT_GE(alloc.FlushDirtyMetadata(), 1u);
     }
 
-    BucketGlobalAllocator recovered;
+    ImmutableBucketAllocator recovered;
     ASSERT_TRUE(
         recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
     EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
     EXPECT_FALSE(recovered.GetBucketIdForKey("gone").has_value());
 }
 
-TEST(BucketGlobalAllocatorTest, DestructorFlushesDeferredTombstones) {
+TEST(ImmutableBucketAllocatorTest, DestructorFlushesDeferredTombstones) {
     TempDir tmp("bucket_dtor_flush");
     {
-        BucketGlobalAllocator alloc;
+        ImmutableBucketAllocator alloc;
         ASSERT_TRUE(
             alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
         auto desc = alloc.Allocate("gone", 100);
@@ -828,16 +828,16 @@ TEST(BucketGlobalAllocatorTest, DestructorFlushesDeferredTombstones) {
         // No explicit flush: a clean shutdown must persist it anyway.
     }
 
-    BucketGlobalAllocator recovered;
+    ImmutableBucketAllocator recovered;
     ASSERT_TRUE(
         recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
     EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
     EXPECT_FALSE(recovered.GetBucketIdForKey("gone").has_value());
 }
 
-TEST(BucketGlobalAllocatorTest, FlushDirtyMetadataIsIdempotent) {
+TEST(ImmutableBucketAllocatorTest, FlushDirtyMetadataIsIdempotent) {
     TempDir tmp("bucket_flush_idempotent");
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
 
     // Nothing dirty yet.
@@ -861,14 +861,14 @@ TEST(BucketGlobalAllocatorTest, FlushDirtyMetadataIsIdempotent) {
     EXPECT_EQ(alloc.FlushDirtyMetadata(), 0u);
 }
 
-TEST(BucketGlobalAllocatorTest, RecoveryRejectsCorruptAndTruncatedMetadata) {
+TEST(ImmutableBucketAllocatorTest, RecoveryRejectsCorruptAndTruncatedMetadata) {
     // Corrupt checksum: the whole bucket is discarded, never partially trusted.
     {
         TempDir tmp("bucket_recover_corrupt");
         std::string meta_path;
         std::string data_path;
         {
-            BucketGlobalAllocator alloc;
+            ImmutableBucketAllocator alloc;
             ASSERT_TRUE(
                 alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
             auto desc = alloc.Allocate("k", 100);
@@ -896,7 +896,7 @@ TEST(BucketGlobalAllocatorTest, RecoveryRejectsCorruptAndTruncatedMetadata) {
             ::close(fd);
         }
 
-        BucketGlobalAllocator recovered;
+        ImmutableBucketAllocator recovered;
         ASSERT_TRUE(
             recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
         EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
@@ -914,7 +914,7 @@ TEST(BucketGlobalAllocatorTest, RecoveryRejectsCorruptAndTruncatedMetadata) {
         std::string meta_path;
         std::string data_path;
         {
-            BucketGlobalAllocator alloc;
+            ImmutableBucketAllocator alloc;
             ASSERT_TRUE(
                 alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
             auto desc = alloc.Allocate("k", 100);
@@ -928,7 +928,7 @@ TEST(BucketGlobalAllocatorTest, RecoveryRejectsCorruptAndTruncatedMetadata) {
         }
         ASSERT_EQ(::truncate(meta_path.c_str(), 3), 0);
 
-        BucketGlobalAllocator recovered;
+        ImmutableBucketAllocator recovered;
         ASSERT_TRUE(
             recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
         EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
@@ -942,7 +942,7 @@ TEST(BucketGlobalAllocatorTest, RecoveryRejectsCorruptAndTruncatedMetadata) {
         TempDir tmp("bucket_recover_no_data");
         std::string data_path;
         {
-            BucketGlobalAllocator alloc;
+            ImmutableBucketAllocator alloc;
             ASSERT_TRUE(
                 alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
             auto desc = alloc.Allocate("k", 100);
@@ -954,7 +954,7 @@ TEST(BucketGlobalAllocatorTest, RecoveryRejectsCorruptAndTruncatedMetadata) {
         }
         std::filesystem::remove(data_path);
 
-        BucketGlobalAllocator recovered;
+        ImmutableBucketAllocator recovered;
         ASSERT_TRUE(
             recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
         EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
@@ -963,11 +963,11 @@ TEST(BucketGlobalAllocatorTest, RecoveryRejectsCorruptAndTruncatedMetadata) {
     }
 }
 
-TEST(BucketGlobalAllocatorTest, NarrowedCapacityDiscardsIncompatibleBuckets) {
+TEST(ImmutableBucketAllocatorTest, NarrowedCapacityDiscardsIncompatibleBuckets) {
     TempDir tmp("bucket_recover_narrowed");
     std::string data_path;
     {
-        BucketGlobalAllocator alloc;
+        ImmutableBucketAllocator alloc;
         ASSERT_TRUE(
             alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
         auto desc = alloc.Allocate("k", 100);
@@ -983,7 +983,7 @@ TEST(BucketGlobalAllocatorTest, NarrowedCapacityDiscardsIncompatibleBuckets) {
     // Restarting with a smaller bucket_capacity makes the persisted metadata
     // incompatible, so the entries inside can no longer be located reliably.
     // Reclaim the bucket rather than keeping unusable bytes around forever.
-    BucketGlobalAllocator recovered;
+    ImmutableBucketAllocator recovered;
     ASSERT_TRUE(
         recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity / 2, 8)));
     EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
@@ -998,10 +998,10 @@ TEST(BucketGlobalAllocatorTest, NarrowedCapacityDiscardsIncompatibleBuckets) {
     EXPECT_GT(desc->shard_idx, 1);
 }
 
-TEST(BucketGlobalAllocatorTest, RecoveryRemovesOrphanDataFiles) {
+TEST(ImmutableBucketAllocatorTest, RecoveryRemovesOrphanDataFiles) {
     TempDir tmp("bucket_recover_orphan");
     const std::string orphan = tmp.file(
-        "bucket_" + BucketGlobalAllocator::FormatBucketId(7) + ".data");
+        "bucket_" + ImmutableBucketAllocator::FormatBucketId(7) + ".data");
     {
         const int fd = ::open(orphan.c_str(), O_CREAT | O_WRONLY, 0644);
         ASSERT_GE(fd, 0);
@@ -1009,7 +1009,7 @@ TEST(BucketGlobalAllocatorTest, RecoveryRemovesOrphanDataFiles) {
     }
     ASSERT_TRUE(std::filesystem::exists(orphan));
 
-    BucketGlobalAllocator recovered;
+    ImmutableBucketAllocator recovered;
     ASSERT_TRUE(
         recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
     // A data file with no valid metadata is unreachable, so it is reclaimed.
@@ -1020,14 +1020,14 @@ TEST(BucketGlobalAllocatorTest, RecoveryRemovesOrphanDataFiles) {
     EXPECT_GT(desc->shard_idx, 7);
 }
 
-TEST(BucketGlobalAllocatorTest, RecoveryContinuesInterruptedEviction) {
+TEST(ImmutableBucketAllocatorTest, RecoveryContinuesInterruptedEviction) {
     TempDir tmp("bucket_recover_evicting");
     // Build a bucket, then rewrite its metadata with the evicting marker set,
     // simulating a crash between the marker and the file deletes.
     std::string meta_path;
     std::string data_path;
     {
-        BucketGlobalAllocator alloc;
+        ImmutableBucketAllocator alloc;
         ASSERT_TRUE(
             alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
         auto desc = alloc.Allocate("k", 100);
@@ -1065,7 +1065,7 @@ TEST(BucketGlobalAllocatorTest, RecoveryContinuesInterruptedEviction) {
         ::close(fd);
     }
 
-    BucketGlobalAllocator recovered;
+    ImmutableBucketAllocator recovered;
     ASSERT_TRUE(
         recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
     // The eviction is finished rather than the entries being resurrected.
@@ -1074,11 +1074,11 @@ TEST(BucketGlobalAllocatorTest, RecoveryContinuesInterruptedEviction) {
     EXPECT_FALSE(std::filesystem::exists(meta_path));
 }
 
-TEST(BucketGlobalAllocatorTest, RecoveryPreservesBucketIdSequence) {
+TEST(ImmutableBucketAllocatorTest, RecoveryPreservesBucketIdSequence) {
     TempDir tmp("bucket_recover_ids");
     const uint64_t capacity = kAlignment;  // one entry per bucket
     {
-        BucketGlobalAllocator alloc;
+        ImmutableBucketAllocator alloc;
         ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), capacity, 8)));
         for (int i = 0; i < 3; ++i) {
             auto desc = alloc.Allocate("k" + std::to_string(i), 100);
@@ -1087,7 +1087,7 @@ TEST(BucketGlobalAllocatorTest, RecoveryPreservesBucketIdSequence) {
         }
     }
 
-    BucketGlobalAllocator recovered;
+    ImmutableBucketAllocator recovered;
     ASSERT_TRUE(recovered.Init(MakeBucketConfig(tmp.path(), capacity, 8)));
     // Buckets 0 and 1 were sealed by the rollovers; bucket 2 was still active
     // at shutdown, so it has no metadata and its data file is reclaimed.
@@ -1095,7 +1095,7 @@ TEST(BucketGlobalAllocatorTest, RecoveryPreservesBucketIdSequence) {
     EXPECT_EQ(recovered.TakeRecoveredReplicas().size(), 2u);
     EXPECT_FALSE(std::filesystem::exists(BucketMetaFile(tmp, 2)));
     EXPECT_FALSE(std::filesystem::exists(tmp.file(
-        "bucket_" + BucketGlobalAllocator::FormatBucketId(2) + ".data")));
+        "bucket_" + ImmutableBucketAllocator::FormatBucketId(2) + ".data")));
 
     // Ids of discarded buckets must not be reused either.
     auto desc = recovered.Allocate("after", 100);
@@ -1104,7 +1104,7 @@ TEST(BucketGlobalAllocatorTest, RecoveryPreservesBucketIdSequence) {
 }
 
 // ---------------------------------------------------------------------------
-// BucketGlobalAllocator: eviction
+// ImmutableBucketAllocator: eviction
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -1121,10 +1121,10 @@ DistributedStorageConfig MakeEvictionConfig(const std::string& fsdir,
 
 }  // namespace
 
-TEST(BucketGlobalAllocatorTest, PrepareEvictionSkipsActiveBucket) {
+TEST(ImmutableBucketAllocatorTest, PrepareEvictionSkipsActiveBucket) {
     TempDir tmp("bucket_evict_active");
     const uint64_t capacity = kAlignment;
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeEvictionConfig(tmp.path(), capacity, 4)));
 
     // Only one bucket exists and it is the active one, so nothing is evictable
@@ -1136,10 +1136,10 @@ TEST(BucketGlobalAllocatorTest, PrepareEvictionSkipsActiveBucket) {
     EXPECT_LT(pending.bucket_id(), 0);
 }
 
-TEST(BucketGlobalAllocatorTest, CommitEvictionDeletesBucketAndFrees) {
+TEST(ImmutableBucketAllocatorTest, CommitEvictionDeletesBucketAndFrees) {
     TempDir tmp("bucket_evict_commit");
     const uint64_t capacity = kAlignment;
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeEvictionConfig(tmp.path(), capacity, 4)));
 
     std::vector<DistributedFSDescriptor> descs;
@@ -1178,10 +1178,10 @@ TEST(BucketGlobalAllocatorTest, CommitEvictionDeletesBucketAndFrees) {
     EXPECT_TRUE(alloc.GetBucketIdForKey("k2").has_value());
 }
 
-TEST(BucketGlobalAllocatorTest, AbortEvictionRestoresBucketUnchanged) {
+TEST(ImmutableBucketAllocatorTest, AbortEvictionRestoresBucketUnchanged) {
     TempDir tmp("bucket_evict_abort");
     const uint64_t capacity = kAlignment;
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeEvictionConfig(tmp.path(), capacity, 4)));
 
     for (int i = 0; i < 3; ++i) {
@@ -1207,10 +1207,10 @@ TEST(BucketGlobalAllocatorTest, AbortEvictionRestoresBucketUnchanged) {
     alloc.AbortEviction(std::move(next));
 }
 
-TEST(BucketGlobalAllocatorTest, UnresolvedPendingEvictionSelfAborts) {
+TEST(ImmutableBucketAllocatorTest, UnresolvedPendingEvictionSelfAborts) {
     TempDir tmp("bucket_evict_dtor");
     const uint64_t capacity = kAlignment;
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeEvictionConfig(tmp.path(), capacity, 4)));
 
     for (int i = 0; i < 3; ++i) {
@@ -1233,10 +1233,10 @@ TEST(BucketGlobalAllocatorTest, UnresolvedPendingEvictionSelfAborts) {
     alloc.AbortEviction(std::move(again));
 }
 
-TEST(BucketGlobalAllocatorTest, CommitAndAbortEvictionAreIdempotent) {
+TEST(ImmutableBucketAllocatorTest, CommitAndAbortEvictionAreIdempotent) {
     TempDir tmp("bucket_evict_idempotent");
     const uint64_t capacity = kAlignment;
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeEvictionConfig(tmp.path(), capacity, 4)));
 
     for (int i = 0; i < 3; ++i) {
@@ -1255,10 +1255,10 @@ TEST(BucketGlobalAllocatorTest, CommitAndAbortEvictionAreIdempotent) {
     EXPECT_EQ(alloc.GetBucketCount(), 2u);
 }
 
-TEST(BucketGlobalAllocatorTest, AllocationFailureEvictionBypassesLowWatermark) {
+TEST(ImmutableBucketAllocatorTest, AllocationFailureEvictionBypassesLowWatermark) {
     TempDir tmp("bucket_evict_allocation_failure");
     constexpr uint64_t capacity = 10 * kAlignment;
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     auto config = MakeEvictionConfig(tmp.path(), capacity, 4);
     config.eviction_high_watermark = 0.9;
     config.eviction_low_watermark = 0.7;
@@ -1291,10 +1291,10 @@ TEST(BucketGlobalAllocatorTest, AllocationFailureEvictionBypassesLowWatermark) {
     EXPECT_TRUE(retry[0].success);
 }
 
-TEST(BucketGlobalAllocatorTest, EvictionCandidatesExcludeFreedKeys) {
+TEST(ImmutableBucketAllocatorTest, EvictionCandidatesExcludeFreedKeys) {
     TempDir tmp("bucket_evict_freed");
     const uint64_t capacity = 2 * kAlignment;
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeEvictionConfig(tmp.path(), capacity, 4)));
 
     // Bucket 0 gets two keys; free one of them.
@@ -1321,10 +1321,10 @@ TEST(BucketGlobalAllocatorTest, EvictionCandidatesExcludeFreedKeys) {
     alloc.AbortEviction(std::move(pending));
 }
 
-TEST(BucketGlobalAllocatorTest, EvictionUsesFixedCapacityDenominator) {
+TEST(ImmutableBucketAllocatorTest, EvictionUsesFixedCapacityDenominator) {
     TempDir tmp("bucket_evict_watermark");
     const uint64_t capacity = kAlignment;
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeEvictionConfig(tmp.path(), capacity, 8)));
 
     // Total capacity stays max_bucket_count * bucket_capacity regardless of how
@@ -1349,10 +1349,10 @@ TEST(BucketGlobalAllocatorTest, EvictionUsesFixedCapacityDenominator) {
     EXPECT_LT(alloc.GetUsedBytes(), used_before);
 }
 
-TEST(BucketGlobalAllocatorTest, EvictionStopsAtLowWatermark) {
+TEST(ImmutableBucketAllocatorTest, EvictionStopsAtLowWatermark) {
     TempDir tmp("bucket_evict_low");
     const uint64_t capacity = kAlignment;
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeEvictionConfig(tmp.path(), capacity, 8)));
 
     // Two of eight buckets used = 25% == low watermark, below high (50%), so
@@ -1365,20 +1365,20 @@ TEST(BucketGlobalAllocatorTest, EvictionStopsAtLowWatermark) {
     EXPECT_TRUE(pending.Empty());
 }
 
-TEST(BucketGlobalAllocatorTest, EvictionDisabledYieldsNoCandidates) {
+TEST(ImmutableBucketAllocatorTest, EvictionDisabledYieldsNoCandidates) {
     TempDir tmp("bucket_evict_disabled");
     const uint64_t capacity = kAlignment;
     auto config = MakeEvictionConfig(tmp.path(), capacity, 2);
     config.eviction_enabled = false;
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(config));
     EXPECT_FALSE(alloc.IsEvictionEnabled());
 }
 
-TEST(BucketGlobalAllocatorTest, ReadableDescriptorSurvivesConcurrentEviction) {
+TEST(ImmutableBucketAllocatorTest, ReadableDescriptorSurvivesConcurrentEviction) {
     TempDir tmp("bucket_evict_inflight");
     const uint64_t capacity = kAlignment;
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeEvictionConfig(tmp.path(), capacity, 4)));
 
     std::vector<DistributedFSDescriptor> descs;
@@ -1399,10 +1399,10 @@ TEST(BucketGlobalAllocatorTest, ReadableDescriptorSurvivesConcurrentEviction) {
     EXPECT_TRUE(std::filesystem::exists(descs[0].file_path));
 }
 
-TEST(BucketGlobalAllocatorTest, MetadataFlushCannotOutliveEvictedBucket) {
+TEST(ImmutableBucketAllocatorTest, MetadataFlushCannotOutliveEvictedBucket) {
     TempDir tmp("bucket_flush_evict_race");
     const uint64_t capacity = kAlignment;
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeEvictionConfig(tmp.path(), capacity, 4)));
 
     auto victim_desc = alloc.Allocate("victim", 100);
@@ -1448,9 +1448,9 @@ TEST(BucketGlobalAllocatorTest, MetadataFlushCannotOutliveEvictedBucket) {
 // Concurrency
 // ---------------------------------------------------------------------------
 
-TEST(BucketGlobalAllocatorTest, ConcurrentAllocateProducesDisjointRegions) {
+TEST(ImmutableBucketAllocatorTest, ConcurrentAllocateProducesDisjointRegions) {
     TempDir tmp("bucket_concurrent_alloc");
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), 4 * 1024 * 1024, 32)));
 
     constexpr int kThreads = 8;
@@ -1504,9 +1504,9 @@ TEST(BucketGlobalAllocatorTest, ConcurrentAllocateProducesDisjointRegions) {
     }
 }
 
-TEST(BucketGlobalAllocatorTest, ConcurrentFreeAndUpdateAccessAreSafe) {
+TEST(ImmutableBucketAllocatorTest, ConcurrentFreeAndUpdateAccessAreSafe) {
     TempDir tmp("bucket_concurrent_free");
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), 1024 * 1024, 16)));
 
     constexpr int kKeys = 64;
@@ -1548,13 +1548,13 @@ TEST(BucketGlobalAllocatorTest, ConcurrentFreeAndUpdateAccessAreSafe) {
 // Polymorphic use through the interface, and SHARD compatibility
 // ---------------------------------------------------------------------------
 
-TEST(GlobalAllocatorInterfaceTest, BothImplementationsWorkPolymorphically) {
+TEST(DfsAllocatorInterfaceTest, BothImplementationsWorkPolymorphically) {
     TempDir bucket_dir("iface_bucket");
     TempDir shard_dir("iface_shard");
 
-    std::vector<std::unique_ptr<GlobalAllocatorInterface>> allocators;
+    std::vector<std::unique_ptr<DfsAllocatorInterface>> allocators;
     {
-        auto bucket = std::make_unique<BucketGlobalAllocator>();
+        auto bucket = std::make_unique<ImmutableBucketAllocator>();
         ASSERT_TRUE(bucket->Init(
             MakeBucketConfig(bucket_dir.path(), kBucketCapacity, 8)));
         allocators.push_back(std::move(bucket));
@@ -1699,16 +1699,15 @@ TEST(BucketEntryLayoutTest, ComputesAlignedEntriesAndRejectsOverflow) {
 
     auto layout = ComputeBucketEntryLayout(0, 100, alignment);
     ASSERT_TRUE(layout.has_value());
-    EXPECT_EQ(layout->entry_start, 0u);
-    EXPECT_EQ(layout->value_offset, 0u);
-    EXPECT_EQ(layout->entry_size, 100u);
-    EXPECT_EQ(layout->reserved_size, alignment);
-    EXPECT_EQ(layout->entry_end(), alignment);
+    EXPECT_EQ(layout->offset, 0u);
+    EXPECT_EQ(layout->object_size, 100u);
+    EXPECT_EQ(layout->aligned_size, alignment);
+    EXPECT_EQ(layout->end(), alignment);
 
     // A non-aligned cursor is rounded up to the next boundary.
     auto next = ComputeBucketEntryLayout(1, 100, alignment);
     ASSERT_TRUE(next.has_value());
-    EXPECT_EQ(next->entry_start, alignment);
+    EXPECT_EQ(next->offset, alignment);
 
     // Invalid inputs.
     EXPECT_FALSE(ComputeBucketEntryLayout(0, 0, alignment).has_value());
@@ -1732,11 +1731,10 @@ TEST(BucketEntryLayoutTest, RebuildMatchesComputeAndRejectsMisalignment) {
     ASSERT_TRUE(computed.has_value());
 
     auto rebuilt =
-        RebuildBucketEntryLayout(computed->entry_start, 200, alignment);
+        RebuildBucketEntryLayout(computed->offset, 200, alignment);
     ASSERT_TRUE(rebuilt.has_value());
-    EXPECT_EQ(rebuilt->entry_start, computed->entry_start);
-    EXPECT_EQ(rebuilt->value_offset, computed->value_offset);
-    EXPECT_EQ(rebuilt->reserved_size, computed->reserved_size);
+    EXPECT_EQ(rebuilt->offset, computed->offset);
+    EXPECT_EQ(rebuilt->aligned_size, computed->aligned_size);
 
     // A recorded entry start that is not aligned indicates corrupt metadata.
     EXPECT_FALSE(RebuildBucketEntryLayout(1, 200, alignment).has_value());
@@ -1748,13 +1746,12 @@ TEST(BucketEntryLayoutTest, DescriptorConstructionIsCentralized) {
     ASSERT_TRUE(layout.has_value());
 
     auto desc =
-        MakeBucketDescriptor("/tmp/bucket_000001.data", *layout, 100, 1);
+        MakeBucketDescriptor("/tmp/bucket_000001.data", *layout, 1);
     EXPECT_EQ(desc.file_path, "/tmp/bucket_000001.data");
-    EXPECT_EQ(desc.offset, layout->value_offset);
+    EXPECT_EQ(desc.offset, layout->offset);
     EXPECT_EQ(desc.object_size, 100u);
-    EXPECT_EQ(desc.aligned_size, layout->reserved_size);
+    EXPECT_EQ(desc.aligned_size, layout->aligned_size);
     EXPECT_EQ(desc.shard_idx, 1);
-    EXPECT_EQ(desc.offset, layout->entry_start);
     EXPECT_EQ(desc.offset % alignment, 0u);
 }
 
@@ -1767,7 +1764,7 @@ TEST(BucketMetadataDurabilityTest, AbruptRestartDropsTheActiveBucket) {
     const pid_t child = ::fork();
     ASSERT_GE(child, 0);
     if (child == 0) {
-        BucketGlobalAllocator alloc;
+        ImmutableBucketAllocator alloc;
         if (!alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8))) {
             ::_exit(10);
         }
@@ -1787,11 +1784,11 @@ TEST(BucketMetadataDurabilityTest, AbruptRestartDropsTheActiveBucket) {
     ASSERT_EQ(WEXITSTATUS(status), 0);
 
     const std::string data_path = tmp.file(
-        "bucket_" + BucketGlobalAllocator::FormatBucketId(0) + ".data");
+        "bucket_" + ImmutableBucketAllocator::FormatBucketId(0) + ".data");
     ASSERT_TRUE(std::filesystem::exists(data_path));
     ASSERT_FALSE(std::filesystem::exists(BucketMetaFile(tmp, 0)));
 
-    BucketGlobalAllocator recovered;
+    ImmutableBucketAllocator recovered;
     ASSERT_TRUE(
         recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
     // Losing the single active bucket is the accepted trade-off for keeping the
@@ -1807,7 +1804,7 @@ TEST(BucketMetadataDurabilityTest, AbruptRestartKeepsSealedBuckets) {
     const pid_t child = ::fork();
     ASSERT_GE(child, 0);
     if (child == 0) {
-        BucketGlobalAllocator alloc;
+        ImmutableBucketAllocator alloc;
         if (!alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8))) {
             ::_exit(20);
         }
@@ -1827,7 +1824,7 @@ TEST(BucketMetadataDurabilityTest, AbruptRestartKeepsSealedBuckets) {
 
     ASSERT_TRUE(std::filesystem::exists(BucketMetaFile(tmp, 0)));
 
-    BucketGlobalAllocator recovered;
+    ImmutableBucketAllocator recovered;
     ASSERT_TRUE(
         recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
     auto replicas = recovered.TakeRecoveredReplicas();
@@ -1839,7 +1836,7 @@ TEST(BucketMetadataDurabilityTest, AbruptRestartKeepsSealedBuckets) {
 TEST(BucketMetadataDurabilityTest, EachBucketOwnsExactlyOneMetadataFile) {
     TempDir tmp("bucket_one_meta_per_bucket");
     const uint64_t capacity = 4 * kAlignment;  // four entries per bucket
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), capacity, 16)));
 
     for (int i = 0; i < 20; ++i) {
@@ -1881,7 +1878,7 @@ TEST(BucketMetadataDurabilityTest, FlushRacesWithConcurrentAllocateAndCommit) {
     constexpr uint64_t kEntriesPerBucket = 8;
     auto config =
         MakeBucketConfig(tmp.path(), kEntriesPerBucket * kAlignment, 64);
-    BucketGlobalAllocator alloc;
+    ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(config));
 
     constexpr int kThreads = 6;
@@ -1918,7 +1915,7 @@ TEST(BucketMetadataDurabilityTest, FlushRacesWithConcurrentAllocateAndCommit) {
     // is still active at this point has no metadata, so at most its entries are
     // missing.
     constexpr size_t kTotal = kThreads * kPerThread;
-    BucketGlobalAllocator recovered;
+    ImmutableBucketAllocator recovered;
     ASSERT_TRUE(recovered.Init(config));
     const size_t restored = recovered.TakeRecoveredReplicas().size();
     EXPECT_GE(restored, kTotal - kEntriesPerBucket);

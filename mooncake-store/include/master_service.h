@@ -74,8 +74,8 @@ class MasterSnapshotCodecTest;  // test fixture, needs private state access
 
 class EtcdOpLogStore;
 class DfsGlobalAllocator;
-class BucketGlobalAllocator;
-class GlobalAllocatorInterface;
+class ImmutableBucketAllocator;
+class DfsAllocatorInterface;
 
 // Forward declarations
 class AllocationStrategy;
@@ -3141,14 +3141,14 @@ class MasterService {
     bool use_disk_replica_{false};
     bool enable_dfs_{false};
     // Chosen by configuration at startup: DfsGlobalAllocator (SHARD, the
-    // default) or BucketGlobalAllocator (BUCKET). The master only ever talks
-    // to it through GlobalAllocatorInterface.
-    std::unique_ptr<GlobalAllocatorInterface> dfs_allocator_;
+    // default) or ImmutableBucketAllocator (BUCKET). The master only ever talks
+    // to it through DfsAllocatorInterface.
+    std::unique_ptr<DfsAllocatorInterface> dfs_allocator_;
     // Non-owning downcast of dfs_allocator_, set only in BUCKET mode. Used for
     // the bucket-specific lifecycle calls (MarkCommitted, two-phase eviction,
     // recovery, deferred metadata flush) that are not part of the common
     // interface.
-    BucketGlobalAllocator* bucket_allocator_{nullptr};
+    ImmutableBucketAllocator* bucket_allocator_{nullptr};
 
     // Segment management
     SegmentManager segment_manager_;

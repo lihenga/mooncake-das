@@ -19,7 +19,7 @@
 
 #include "storage/distributed/bucket_entry_layout.h"
 #include "storage/distributed/fs_adapter.h"
-#include "storage/distributed/global_allocator_interface.h"
+#include "storage/distributed/dfs_allocator_interface.h"
 #include "types.h"
 
 namespace mooncake {
@@ -133,13 +133,13 @@ enum class BucketEntryState : int32_t {
  * or
  * filesystem call ever happens while `mutex_` is held.
  */
-class BucketGlobalAllocator final : public GlobalAllocatorInterface {
+class ImmutableBucketAllocator final : public DfsAllocatorInterface {
    public:
-    BucketGlobalAllocator() = default;
-    ~BucketGlobalAllocator() override;
+    ImmutableBucketAllocator() = default;
+    ~ImmutableBucketAllocator() override;
 
-    BucketGlobalAllocator(const BucketGlobalAllocator&) = delete;
-    BucketGlobalAllocator& operator=(const BucketGlobalAllocator&) = delete;
+    ImmutableBucketAllocator(const ImmutableBucketAllocator&) = delete;
+    ImmutableBucketAllocator& operator=(const ImmutableBucketAllocator&) = delete;
 
     DfsAllocatorType Type() const override { return DfsAllocatorType::BUCKET; }
 
@@ -238,9 +238,9 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
         }
 
        private:
-        friend class BucketGlobalAllocator;
+        friend class ImmutableBucketAllocator;
 
-        BucketGlobalAllocator* owner_ = nullptr;
+        ImmutableBucketAllocator* owner_ = nullptr;
         int64_t bucket_id_ = -1;
         // Keeps the exact BucketState captured by PrepareEviction alive. The
         // allocator compares pointer identity before Commit/Abort can act.
@@ -331,9 +331,6 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
 
     struct BucketState {
         int64_t bucket_id = 0;
-        // In-memory identity reserved together with bucket_id before file I/O.
-        // It is intentionally absent from the descriptor and metadata format.
-        uint64_t creation_generation = 0;
         uint64_t capacity = 0;
         uint64_t append_offset = 0;
         // Bytes reserved by entries that are still live (PENDING or
@@ -363,7 +360,6 @@ class BucketGlobalAllocator final : public GlobalAllocatorInterface {
 
     struct BucketCreationReservation {
         int64_t bucket_id = -1;
-        uint64_t generation = 0;
     };
 
     // --- helpers, called with mutex_ held only where the name says Locked ---
