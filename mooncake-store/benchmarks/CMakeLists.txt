@@ -61,3 +61,7 @@ endif()
 
 add_executable(uring_batch_read_bench uring_batch_read_bench.cpp)
 target_link_libraries(uring_batch_read_bench PRIVATE mooncake_store)
+
+add_executable(dfs_batch_get_replay_bench dfs_batch_get_replay_bench.cpp)
+target_link_libraries(dfs_batch_get_replay_bench PRIVATE mooncake_store
+                                                       gflags::gflags glog::glog)
