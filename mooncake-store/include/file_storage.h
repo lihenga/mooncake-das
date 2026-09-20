@@ -81,6 +81,11 @@ class FileStorage {
         return pinned_restore_arena_allocator_ != nullptr;
     }
 
+    // Allocate request-scoped staging from the fixed-capacity pinned restore
+    // arena. The handle returns its sub-allocation to the arena on destruction.
+    [[nodiscard]] std::optional<BufferHandle> AllocatePinnedStagingBuffer(
+        size_t size, size_t alignment = 1) const;
+
     FileStorageConfig config_;
 
     /**
@@ -212,7 +217,7 @@ class FileStorage {
     std::shared_ptr<Client> client_;
     SsdMetric* ssd_metric_{nullptr};
     std::string local_rpc_addr_;
-    // Pinned memory for GPU staging and SSD-to-GPU restores.
+    // Pinned memory for GPU staging and SSD/DFS-to-GPU restores.
     std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
     PinnedBufferPool::Buffer pinned_restore_arena_;
     std::shared_ptr<ClientBufferAllocator> pinned_restore_arena_allocator_;

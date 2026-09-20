@@ -2,8 +2,8 @@
 
 #include <functional>
 #include <optional>
-#include <vector>
 #include <string>
+#include <vector>
 
 #include "offset_allocator/offset_allocator.h"
 #include "types.h"
@@ -34,7 +34,8 @@ class ClientBufferAllocator
 
     // Create for shared memory
     static std::shared_ptr<ClientBufferAllocator> create(
-        void* addr, size_t size, const std::string& protocol = "");
+        void* addr, size_t size, const std::string& protocol = "",
+        void* device_addr = nullptr);
 
     ~ClientBufferAllocator();
 
@@ -48,16 +49,26 @@ class ClientBufferAllocator
 
     [[nodiscard]] void* getBase() const { return buffer_; }
 
+    [[nodiscard]] void* getDeviceBase() const { return device_buffer_; }
+
     [[nodiscard]] size_t size() const { return buffer_size_; }
 
     [[nodiscard]] std::optional<BufferHandle> allocate(size_t size);
 
+    // Allocate a host view with the requested address alignment. If this
+    // allocator also has a device-visible base, the returned handle exposes
+    // the device alias at the same sub-allocation offset.
+    [[nodiscard]] std::optional<BufferHandle> allocate_aligned(
+        size_t size, size_t alignment);
+
    protected:
     // Constructors accessible to derived classes
-    ClientBufferAllocator(void* addr, size_t size, const std::string& protocol);
+    ClientBufferAllocator(void* addr, size_t size, const std::string& protocol,
+                          void* device_addr = nullptr);
 
     void* buffer_;
     size_t buffer_size_;
+    void* device_buffer_ = nullptr;
     bool use_hugepage_ = false;
 
    private:
