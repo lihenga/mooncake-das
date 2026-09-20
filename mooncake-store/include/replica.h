@@ -253,6 +253,27 @@ struct DistributedFSDescriptor {
 
 struct DfsReplicaData {
     DistributedFSDescriptor descriptor;
+    // In-memory DFS promotion bookkeeping only (never serialized). All
+    // serializers use hand-written field lists, so these members are
+    // intentionally absent from every wire/persistent format.
+    //
+    // dfs_heat is the current decayed access heat (epoch-minute domain), kept
+    // as float to match the quantile library's float bucket weights. Clamped
+    // to max_indexed_value before storing.
+    float dfs_heat = 0.0f;
+    // Last access time in epoch minutes (now_ms / 60000). Invariant:
+    // dfs_last_access_min != 0  <=>  this replica is registered in the DFS
+    // heat sketch (added and not yet removed/cleared). Clearing it to 0 also
+    // means "not registered"; no separate registered flag exists.
+    uint32_t dfs_last_access_min = 0;
+    // Epoch minute of the last COMPLETED DFS->MEMORY promotion for this
+    // replica (0 = never). Drives the per-key anti-thrash cooldown: after a
+    // promotion the key is not admitted again until
+    // dfs_promotion_cooldown_min has elapsed, so a hot object cannot
+    // ping-pong between "promote -> DRAM evict -> promote" and waste
+    // bandwidth. Kept on the DFS replica (rather than in TenantState) so it
+    // is reclaimed with the object and a fresh generation starts clean.
+    uint32_t dfs_last_promoted_min = 0;
 };
 
 struct MemoryDescriptor {
@@ -470,6 +491,17 @@ class Replica {
 
     [[nodiscard]] static bool fn_is_dfs_replica(const Replica& replica) {
         return replica.is_dfs_replica();
+    }
+
+    // DFS promotion heat bookkeeping (dfs_heat/dfs_last_access_min) lives on
+    // DFS replicas only. dfs_data() exposes it for the master reconcile logic;
+    // it returns nullptr for any non-DFS replica. The fields are intentionally
+    // excluded from serialization and default to 0 (see DfsReplicaData above).
+    [[nodiscard]] DfsReplicaData* dfs_data() {
+        return std::get_if<DfsReplicaData>(&data_);
+    }
+    [[nodiscard]] const DfsReplicaData* dfs_data() const {
+        return std::get_if<DfsReplicaData>(&data_);
     }
 
     [[nodiscard]] const DistributedFSDescriptor& get_dfs_descriptor() const {
@@ -753,6 +785,27 @@ class Replica {
     friend class MasterService;  // For MetadataSerializer to access next_id_
     std::atomic<uint32_t> refcnt_{0};
 };
+
+// Promotion task advertised by the master to clients. Carried on both the SSD
+// channel (per-LocalDiskSegment promotion_objects) and the new DFS promotion
+// heartbeat. The optional source_dfs snapshot describes the COMPLETE DFS
+// source replica the executor must read (file_path/offset/size/... via
+// Replica::Descriptor); SSD-channel tasks leave it empty, so existing SSD
+// behavior is unchanged. Defined here (not in types.h) because it references
+// Replica::Descriptor.
+struct PromotionTaskItem {
+    std::string tenant_id;
+    std::string key;
+    int64_t size;
+    // DFS promotion source replica snapshot; unset for SSD-channel tasks.
+    std::optional<Replica::Descriptor> source_dfs;
+
+    bool operator==(const PromotionTaskItem& other) const {
+        return tenant_id == other.tenant_id && key == other.key &&
+               size == other.size;
+    }
+};
+YLT_REFL(PromotionTaskItem, tenant_id, key, size, source_dfs);
 
 inline Replica::Descriptor Replica::get_descriptor() const {
     Replica::Descriptor desc;

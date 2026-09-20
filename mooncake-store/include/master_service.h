@@ -57,6 +57,14 @@ namespace mooncake {
 class MasterSnapshotManager;
 class MasterSnapshotRepository;
 
+namespace tool {
+// DecayingDdSketch is an internal (closed-source) component embedded in this
+// repository at include/decaying_quantile/decaying_ddsketch.hpp. Only the
+// master_service.cpp translation unit includes the real header; the member
+// below is an owning unique_ptr so an incomplete type is sufficient here.
+class DecayingDdSketch;
+}  // namespace tool
+
 namespace ha {
 class SnapshotCatalogStore;
 class MasterSnapshotCodec;
@@ -835,6 +843,20 @@ class MasterService {
         -> tl::expected<std::vector<PromotionTaskItem>, ErrorCode>;
 
     /**
+     * @brief DFS promotion channel heartbeat. A
+     * DFS-capable client polls master for pending DFS promotion work. Each
+     * call pops up to dfs_promotion_max_per_heartbeat_ valid entries from the
+     * global DFS priority queue (stale/cancelled entries are skipped), marks
+     * them claimed for `client_id`, and returns them with the source DFS
+     * replica descriptor so the executor can read the source without another
+     * GetReplicaList round-trip. Unlike the SSD channel the DFS channel has
+     * no per-client binding: any DFS-capable client may claim. Tasks that are
+     * claimed but never acknowledged are reclaimed by the TTL reaper.
+     */
+    auto DfsPromotionObjectHeartbeat(const UUID& client_id)
+        -> tl::expected<std::vector<PromotionTaskItem>, ErrorCode>;
+
+    /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key. Allocates
      * DRAM via the existing AllocationStrategy, optionally biased toward the
      * caller's local memory segment via preferred_segments. The new replica is
@@ -1367,6 +1389,16 @@ class MasterService {
                 std::max(lease_timeout, now + std::chrono::milliseconds(ttl));
         }
 
+        // Release the hard-lease backstop granted at DFS-promotion admission
+        // and used to keep the DFS source safe from capacity eviction. Called
+        // when the in-flight task ends, fails or times out: dropping the lease
+        // lets a later admission of the same key pass the active-lease gate
+        // instead of waiting out the whole task TTL.
+        void ReleaseLease() const {
+            SpinLocker locker(&lock);
+            lease_timeout = std::chrono::system_clock::time_point{};
+        }
+
         bool NeedsReadLeaseRefresh(const uint64_t ttl) const {
             SpinLocker locker(&lock);
             const auto now = std::chrono::system_clock::now();
@@ -1626,6 +1658,23 @@ class MasterService {
         kPushFailed,
     };
 
+    // Result of a single DFS promotion admission attempt: the heat gate plus
+    // the DRAM watermark and queue-capacity gates. Mirrors
+    // PromotionQueueResult but for the DFS heat gate.
+    enum class DfsAdmissionResult {
+        kAdmitted,           // every gate passed; caller decides the enqueue
+        kDisabled,           // feature gate off (defensive; callers pre-check)
+        kBelowThreshold,     // heat < T = max(P90, absolute) — not hot enough
+        kWatermarkRejected,  // DRAM at/above the eviction high watermark
+        kQueueCapRejected,   // DFS in-flight tasks at dfs_promotion_queue_limit_
+        kDupInFlight,        // an SSD/DFS promotion for this key is in flight
+        kMemoryPresent,      // a COMPLETE MEMORY replica already serves the key
+        kNoDfsSource,        // no COMPLETE DFS replica usable as copy source
+        kHardPinned,         // object is hard pinned
+        kLeaseActive,        // a writer lease is active — retry once it settles
+        kCooling,            // anti-thrash cooldown not elapsed yet (risk 7)
+    };
+
     enum class PromotionCandidateReason {
         kWatermark,
         kQueueCap,
@@ -1648,6 +1697,75 @@ class MasterService {
         // consumption; reset only when a genuinely new chain starts (fresh
         // insert with 0, e.g. after a give-up or a success).
         uint32_t execution_failures{0};
+    };
+
+    // DFS promotion candidate record (Step 4). Kept separate from the SSD
+    // channel's PromotionCandidate because DFS admission is keyed by a float
+    // heat (sketch_score in PromotionCandidate is a uint8_t CMS frequency).
+    // A candidate means the key passed the heat gate but was rejected by a
+    // transient gate (watermark / in-flight cap / busy lease); the periodic
+    // retry sweep (RunDfsPromotionCandidateRetry) re-evaluates it later.
+    struct DfsPromotionCandidate {
+        float heat{0.0f};  // decayed heat that triggered the admission attempt
+        std::chrono::steady_clock::time_point first_seen;
+        std::chrono::steady_clock::time_point last_seen;
+        std::chrono::steady_clock::time_point retry_after;
+        PromotionCandidateReason last_reason{
+            PromotionCandidateReason::kQueueCap};
+        ErrorCode last_error{ErrorCode::OK};
+        uint32_t retry_count{0};
+    };
+
+    // Node of the global DFS promotion priority queue. Carries the
+    // admission-time heat snapshot and a global
+    // monotonically increasing sequence number as tie-breaker. Nodes are
+    // immutable once pushed: cancelled/completed tasks are never physically
+    // removed; a claim pops the top node and cross-checks it against
+    // dfs_promotion_tasks (missing key or mismatched seq => stale, dropped).
+    //
+    // Deliberately lightweight: the COMPLETE DFS source descriptor lives only
+    // on DfsPromotionTaskRecord (the admission-time snapshot the claim path
+    // actually hands to the client), so a node does not carry a second
+    // Descriptor. The old copy duplicated the string file_path on every queued
+    // node and bloated each heap move/copy for nothing.
+    struct DfsQueueNode {
+        std::string tenant_id;
+        std::string key;
+        int64_t size{0};
+        float heat{0.0f};  // dfs_heat snapshot taken at admission
+        uint64_t seq{0};   // global monotonic enqueue order
+    };
+
+    // Priority ordering: max-heap by (heat desc, seq asc). front() is the
+    // hottest task; ties break to the earlier-enqueued task.
+    struct DfsQueueLess {
+        bool operator()(const DfsQueueNode& a, const DfsQueueNode& b) const {
+            if (a.heat != b.heat) return a.heat < b.heat;
+            return a.seq > b.seq;
+        }
+    };
+
+    // DFS-channel in-flight task record. Guarded by
+    // the metadata shard lock alongside dfs_protected_keys. holder == {0, 0}
+    // means the task is still queued waiting for a heartbeat claim; once
+    // claimed it is stamped with the claiming client and claimed_at so the
+    // TTL reaper can reclaim it.
+    struct DfsPromotionTaskRecord {
+        Replica::Descriptor source_dfs;  // snapshot taken at admission
+        uint64_t seq{0};
+        int64_t size{0};
+        UUID holder{0, 0};
+        std::chrono::steady_clock::time_point enqueued_at;
+        std::chrono::steady_clock::time_point claimed_at;
+        // Set by PromotionAllocStart once a PROCESSING MEMORY replica has been
+        // staged; 0 while the task is still queued (or after a failure/reap).
+        // Mirrors PromotionTask::alloc_id so NotifyPromotionSuccess can commit
+        // exactly the replica this task staged.
+        ReplicaID alloc_id{0};
+        // Quota charged by PromotionAllocStart; settled or released by the
+        // terminal Notify/reaper path. Mirrors
+        // PromotionTask::pending_quota_charge_bytes.
+        uint64_t pending_quota_charge_bytes{0};
     };
 
     // NotifyPromotionSuccess should commit, so a concurrent Put on the
@@ -1694,6 +1812,22 @@ class MasterService {
         std::unordered_map<std::string, PromotionTask> promotion_tasks;
         std::unordered_map<std::string, PromotionCandidate>
             promotion_candidates;
+        // DFS channel admission candidates. DFS-served objects only;
+        // always empty when dfs_promotion_enabled_ is false.
+        std::unordered_map<std::string, DfsPromotionCandidate>
+            dfs_promotion_candidates;
+        // Keys whose DFS replica is the source of an in-flight DFS promotion
+        // and must be protected from DFS capacity eviction. Guarded by the
+        // same shard lock as the rest of TenantState.
+        std::unordered_set<std::string> dfs_protected_keys;
+        // DFS-channel in-flight tasks. A record is inserted at admission
+        // (state: queued, holder unset) and updated to claimed when a
+        // heartbeat dispatches it; erased on completion / failure / TTL
+        // reclamation. The per-key dedup gates (SSD + DFS) both check this
+        // table so the two channels never run two MEMORY promotions for the
+        // same key.
+        std::unordered_map<std::string, DfsPromotionTaskRecord>
+            dfs_promotion_tasks;
 
         std::unordered_map<std::string, DynamicReplicaPending>
             dynamic_replication_pending;
@@ -1709,6 +1843,9 @@ class MasterService {
             return metadata.empty() && processing_keys.empty() &&
                    replication_tasks.empty() && offloading_tasks.empty() &&
                    promotion_tasks.empty() && promotion_candidates.empty() &&
+                   dfs_promotion_candidates.empty() &&
+                   dfs_protected_keys.empty() &&
+                   dfs_promotion_tasks.empty() &&
                    dynamic_replication_pending.empty() &&
                    dynamic_replication_leases.empty() &&
                    dynamic_replication_cooldowns.empty() &&
@@ -2176,6 +2313,23 @@ class MasterService {
             MasterMetricManager::instance().dec_promotion_in_flight();
             MasterMetricManager::instance().inc_promotion_cancelled();
         }
+        // DFS channel: drop the global task record too, otherwise it outlives
+        // the object and the reaper later operates on a dangling key. The
+        // staged PROCESSING MEMORY replica (if any) is reclaimed by the
+        // caller's metadata teardown (FreeDfsReplicas / EraseMetadata), so
+        // only the record, source protection, in-flight count and reserved
+        // quota need releasing here.
+        auto dfs_it = tenant_state.dfs_promotion_tasks.find(key);
+        if (dfs_it != tenant_state.dfs_promotion_tasks.end()) {
+            ReleaseTenantQuota(
+                GetBoundTenantQuotaHandle(tenant_state),
+                std::exchange(dfs_it->second.pending_quota_charge_bytes, 0));
+            tenant_state.dfs_protected_keys.erase(key);
+            tenant_state.dfs_promotion_tasks.erase(dfs_it);
+            dfs_promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+            MasterMetricManager::instance().dec_dfs_promotion_in_flight();
+            MasterMetricManager::instance().inc_dfs_promotion_cancelled();
+        }
     }
     void CancelPromotionTaskForRemovedReplicas(
         TenantState& tenant_state, ObjectMetadata& metadata,
@@ -2632,6 +2786,242 @@ class MasterService {
         std::string target_segment;
         std::string target_domain;
     };
+    // DFS -> MEMORY promotion channel. Unlike the LOCAL_DISK channel this is
+    // an independent opt-in (DfsPromotionConfig) with no offload dependency.
+    // When enabled, DFS replica reads decay a per-replica heat sampled into
+    // dfs_heat_sketch_; the hottest DFS-only keys are copied back into MEMORY.
+    // The knobs below are parsed copies of config.dfs_promotion consumed by
+    // the reconcile / threshold / queue stages. Fixed sketch mapping internals
+    // (accuracy / range / shard_count) live as constants in master_service.cpp.
+    bool dfs_promotion_enabled_{false};
+    double dfs_promotion_threshold_quantile_{0.90};
+    double dfs_promotion_absolute_hot_threshold_{2.0};
+    uint64_t dfs_promotion_half_life_min_{60};
+    uint32_t dfs_promotion_threshold_refresh_min_{1};
+    double dfs_promotion_min_total_weight_{100.0};
+    uint32_t dfs_promotion_queue_limit_{10000};
+    uint32_t dfs_promotion_max_per_heartbeat_{1};
+    uint32_t dfs_promotion_scan_interval_min_{1};
+    uint32_t dfs_promotion_scan_batch_{256};
+    uint32_t dfs_promotion_task_ttl_min_{10};
+    // Per-key anti-thrash cooldown: after a completed
+    // promotion the key is not re-admitted until this many epoch minutes have
+    // passed. Compared against DfsReplicaData::dfs_last_promoted_min so the
+    // state is reclaimed with the DFS replica and a new generation starts
+    // with a clean cooldown. 0 disables the cooldown.
+    uint32_t dfs_promotion_cooldown_min_{10};
+    // Background reconcile self-healing scan: a slow
+    // cursor walks the metadata shards and replays
+    // ReconcileDfsHeat(access_hit=false) on every object that still holds a
+    // DFS replica, repairing samples that a missed structural hook left
+    // inconsistent with the live collection state (missed Add(0) on a
+    // MEMORY->DFS transition, stale sample after a MEMORY take-over, ...).
+    // Throttled by dfs_promotion_scan_interval_min_; at most
+    // dfs_promotion_scan_batch_ objects are revisited per pass, and the cursor
+    // resumes at the next shard so a full sweep eventually covers everything.
+    std::atomic<uint64_t> dfs_promotion_next_scan_min_{0};
+    std::atomic<size_t> dfs_promotion_scan_cursor_{0};
+    // Master-side decayed heat sketch over DFS-served replicas. Constructed
+    // only when dfs_promotion_enabled_ is true; every sampling/reconcile point
+    // checks the enable flag first, so disabled configs never touch it.
+    std::unique_ptr<mooncake::tool::DecayingDdSketch> dfs_heat_sketch_;
+
+    // DFS promotion decision/state: everything needed to turn a decayed
+    // access-heat estimate into an admit / reject decision.
+    //
+    // Admission threshold cache: the heat gate compares
+    // against T = max(P90, dfs_promotion_absolute_hot_threshold_), where P90
+    // comes from dfs_heat_sketch_->GetQuantile(quantile, now_min). Everything
+    // is an atomic scalar so the read-hit admission path never blocks on the
+    // sketch; a stale entry is refreshed by the first caller after
+    // dfs_promotion_threshold_refresh_min_ epoch-minutes (CAS-guarded) and by
+    // the periodic maintenance tick. When the sketch has too few samples
+    // (total weight < dfs_promotion_min_total_weight_) only the absolute floor
+    // is trusted, so a single early access never trips admission.
+    std::atomic<double> dfs_threshold_cache_{0.0};  // cached T
+    std::atomic<uint64_t> dfs_threshold_cached_at_min_{0};  // epoch min cached
+    // True when the last threshold refresh degraded to the absolute floor
+    // because the sketch total weight was below
+    // dfs_promotion_min_total_weight_ (cold start / sparse window). It lets a
+    // below-threshold admission rejection be attributed to the low-weight path
+    // (dfs_promotion_rejected_low_weight) instead of the frequency path
+    // (dfs_promotion_rejected_frequency) without re-querying the sketch on the
+    // hot admission path.
+    std::atomic<bool> dfs_threshold_low_weight_{false};
+    // Global bookkeeping for the DFS candidate list (mirrors
+    // promotion_candidate_count_ / promotion_retry_cursor_ but is owned by the
+    // DFS channel). In-flight counter is written by the task lifecycle
+    // (admission, claim, completion) and read by the cap gate here.
+    std::atomic<uint64_t> dfs_promotion_candidate_count_{0};
+    std::atomic<size_t> dfs_promotion_retry_cursor_{0};
+    // Round-robin cursor used by the TTL reaper to spread the scan over
+    // a few maintenance ticks instead of walking all shards every second.
+    std::atomic<size_t> dfs_promotion_reap_cursor_{0};
+    std::atomic<uint32_t> dfs_promotion_in_flight_{0};
+    static constexpr size_t kDfsPromotionCandidateLimit = 20000;
+
+    // ---- DFS promotion global queue & dispatch. ----
+    // Next global enqueue sequence number; incremented under the queue mutex.
+    uint64_t dfs_promotion_next_seq_{0}
+        GUARDED_BY(dfs_promotion_queue_mutex_);
+    // Global DFS promotion priority queue (max-heap on the admission-time
+    // heat snapshot; see DfsQueueLess). Physical size may exceed the logical
+    // in-flight count when tasks are cancelled/completed without a claim;
+    // DfsPromotionMaintenance rebuilds it when it outgrows
+    // dfs_promotion_queue_limit_, which caps how many stale nodes may pile
+    // up ahead of the next claim.
+    //
+    // Backed by a plain vector with explicit std::push_heap/std::pop_heap
+    // rather than std::priority_queue so the claim path can std::move the
+    // winning node out; priority_queue::top() is const-only and forced a copy
+    // on every heartbeat dispatch.
+    std::vector<DfsQueueNode> dfs_promotion_queue_
+        GUARDED_BY(dfs_promotion_queue_mutex_);
+    // Serializes enqueue / claim-pop / rebuild. Never held while acquiring a
+    // metadata shard lock: the admission path already holds the shard lock
+    // (order shard -> queue), so pop-first-then-validate keeps the queue
+    // mutex acquisition short and deadlock-free.
+    mutable std::mutex dfs_promotion_queue_mutex_;
+
+    // ---- DFS promotion heat reconcile. ----
+    // Every reconcile helper must be called while the caller holds the shard
+    // exclusive lock for the object; dfs_heat_sketch_ is internally locked, so
+    // only the per-object metadata fields need that protection.
+    // DfsHeatKeyHash() is stable per (tenant, key) and is used only to pick a
+    // sketch shard, so cross-key hash mixing is acceptable.
+    static uint64_t DfsNowEpochMin();
+    static uint64_t DfsHeatKeyHash(const std::string& scoped_key);
+    // Unified collection-state machine entry: reconciles the
+    // DFS-served membership of `metadata` against the sketch. access_hit=true
+    // is the GetReplicaList read-hit path (decay +1); access_hit=false covers
+    // every structural transition (MEMORY completed, MEMORY evicted, etc.).
+    void ReconcileDfsHeat(ObjectMetadata& metadata, uint64_t now_min,
+                          bool access_hit);
+    // Remove (and zero) every registered COMPLETE DFS sample still present in
+    // `metadata`; used right before a DFS replica is erased/destroyed and for
+    // the "active leave" transition.
+    void RemoveRegisteredDfsSamples(ObjectMetadata& metadata);
+    // Read-hit wrapper: re-acquires the object under RW after the RO accessor
+    // in GetReplicaList was released, then reconciles with access_hit=true.
+    void ReconcileDfsHeatOnRead(const ObjectIdentity& object_id);
+
+    // ---- DFS promotion admission layer: heat gate, threshold cache and the
+    // per-key gates that decide whether a hit may be queued. ----
+    // All helpers must be called while the caller holds the object's shard
+    // lock (they only touch TenantState/dfs_protected_keys and the internally
+    // locked sketch). The heat gate and the refresh of the cached threshold
+    // are free (atomic loads); a stale threshold is refreshed by the first
+    // caller after the refresh period via a CAS so concurrent read hits never
+    // pile into a sketch quantile query.
+    // Returns T = max(P90, absolute) for epoch minute `now_min`, refreshing
+    // the cache in place when it is stale (see members above).
+    double GetDfsHeatThreshold(uint64_t now_min);
+    void RefreshDfsHeatThreshold(uint64_t now_min);
+    // Full admission attempt; gate order mirrors TryPushPromotionQueue
+    // (heat gate, then DRAM watermark, then queue capacity).
+    // On a transient rejection with backoff_on_transient=true
+    // the DFS candidate is backed off (retry-sweep path); otherwise it is
+    // (re)recorded with retry_after=now so the sweep re-evaluates it promptly
+    // (primary read-hit path). Returns kAdmitted when every gate passed;
+    // the function then snapshots the DFS source, registers the in-flight
+    // record and enqueues the task via EnqueueDfsPromotionTask before
+    // returning.
+    DfsAdmissionResult TryAdmitDfsPromotion(TenantState& tenant_state,
+                                            ObjectMetadata& metadata,
+                                            double heat, uint64_t now_min,
+                                            bool backoff_on_transient);
+    // DFS candidate list bookkeeping (mirrors the SSD channel helpers but
+    // stores a float heat; see DfsPromotionCandidate).
+    void RecordOrUpdateDfsCandidate(TenantState& tenant_state,
+                                    const std::string& key, float heat,
+                                    PromotionCandidateReason reason,
+                                    ErrorCode last_error);
+    void EraseDfsCandidate(TenantState& tenant_state, const std::string& key);
+    void EraseDfsCandidate(const ObjectIdentity& object_id);
+    void DecrementDfsCandidateCount();
+    void BackoffDfsCandidate(TenantState& tenant_state, const std::string& key,
+                             DfsAdmissionResult result);
+    // Periodic retry sweep over due DFS candidates (mirrors
+    // RunPromotionCandidateRetry).
+    size_t RunDfsPromotionCandidateRetry(size_t max_shards_to_scan);
+    size_t RunDfsPromotionCandidateRetry();
+    size_t RunDfsPromotionCandidateRetryForTesting();
+    // DFS source protection against DFS capacity eviction: while an in-flight
+    // task is copying it, its source replica must not be reclaimed, so the
+    // per-tenant dfs_protected_keys set rejects that key as an eviction
+    // candidate. The task lifecycle adds the key on admission and removes it
+    // when the promoted MEMORY replica completes or the task terminates.
+    void ProtectDfsSource(const ObjectIdentity& object_id);
+    void UnprotectDfsSource(const ObjectIdentity& object_id);
+    // Admission success wiring: snapshot the COMPLETE
+    // DFS source descriptor into the queue node, register the per-key record
+    // in tenant_state.dfs_promotion_tasks, bump dfs_promotion_in_flight_,
+    // protect the source key from DFS capacity eviction (dfs_protected_keys
+    // insertion + lease refresh on `metadata`) and push the node onto the
+    // global priority queue. Must be called while the caller holds the object
+    // shard lock (same requirement as TryAdmitDfsPromotion).
+    void EnqueueDfsPromotionTask(TenantState& tenant_state,
+                                 ObjectMetadata& metadata, float heat);
+    // Heartbeat claim loop: pops up to max_tasks valid queue
+    // nodes, validating each against the task table (missing key or seq
+    // mismatch => stale/cancelled, dropped and not re-enqueued), marks the
+    // surviving ones claimed for `client_id`, and appends the resulting
+    // PromotionTaskItem (carrying the source DFS descriptor) to `out`.
+    // Returns the number of tasks actually claimed.
+    size_t ClaimDfsPromotionTasks(const UUID& client_id, size_t max_tasks,
+                                  std::vector<PromotionTaskItem>& out);
+    // Task reaper, called from DfsPromotionMaintenance: reclaims tasks
+    // whose enqueued/claimed age exceeds dfs_promotion_task_ttl_min_ (erasing
+    // the record, unprotecting the source key, decrementing
+    // dfs_promotion_in_flight_) and rebuilds the physical queue from the
+    // surviving task tables when it outgrows dfs_promotion_queue_limit_.
+    void ReapDfsPromotionTasks();
+    // Background reconcile self-healing pass: throttled
+    // by dfs_promotion_scan_interval_min_, walks at most
+    // dfs_promotion_scan_batch_ DFS-holding objects starting from
+    // dfs_promotion_scan_cursor_ and replays ReconcileDfsHeat with
+    // access_hit=false to repair membership drift left by a missed hook.
+    void RunDfsPromotionReconcileScan();
+    // Test hook: run one self-healing pass with the interval throttle bypassed.
+    void RunDfsPromotionReconcileScanForTesting();
+    // Ghost census: walks every shard, sums the decayed
+    // weight of the DFS samples still reachable from live objects, and
+    // publishes it next to the sketch's own total weight. A persistent gap is
+    // the ghost signal (samples that outlived their objects). Runs once per
+    // completed sweep.
+    void UpdateDfsPromotionGhostMetrics(uint64_t now_min);
+    // Test hook: force one ghost census immediately.
+    void UpdateDfsPromotionGhostMetricsForTesting();
+    // Periodic maintenance tick for the DFS channel: refresh the threshold
+    // cache (even with no reads), retry due candidates, run the task reaper
+    // (TTL reclamation + queue rebuild) and advance the reconcile
+    // self-healing scan.
+    void DfsPromotionMaintenance();
+
+    // DFS-channel terminal handlers, reached from NotifyPromotionSuccess /
+    // NotifyPromotionFailure when the key has no SSD promotion task, i.e. the
+    // in-flight task belongs to the DFS channel. Declared here (not in the
+    // public RPC section) because the
+    // parameter types are private nested types resolved only after this
+    // point. The caller holds the shard lock via the accessor, so these run
+    // on the already-resolved metadata/tenant_state.
+    //
+    // Success commits the staged PROCESSING MEMORY replica (alloc_id),
+    // settles the reserved quota, releases the DFS source protection + lease
+    // backstop, drops the task record and decrements dfs_promotion_in_flight_.
+    // Failure erases the staged replica, aborts the reserved quota and
+    // releases the same bookkeeping; the DFS source is left untouched so the
+    // object stays DFS-served and can be retried on a later hit.
+    auto NotifyDfsPromotionSuccess(const UUID& client_id,
+                                   const ObjectIdentity& object_id,
+                                   ObjectMetadata& metadata,
+                                   TenantState& tenant_state)
+        -> tl::expected<void, ErrorCode>;
+    auto NotifyDfsPromotionFailure(const UUID& client_id,
+                                   const ObjectIdentity& object_id,
+                                   ObjectMetadata& metadata,
+                                   TenantState& tenant_state)
+        -> tl::expected<void, ErrorCode>;
 
     DynamicReplicationMode dynamic_replication_mode_{
         DynamicReplicationMode::kOff};

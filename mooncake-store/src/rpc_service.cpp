@@ -1656,6 +1656,13 @@ WrappedMasterService::PromotionObjectHeartbeat(const UUID& client_id) {
     return master_service_.PromotionObjectHeartbeat(client_id);
 }
 
+tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
+WrappedMasterService::DfsPromotionObjectHeartbeat(const UUID& client_id) {
+    ScopedVLogTimer timer(1, "DfsPromotionObjectHeartbeat");
+    timer.LogRequest("action=dfs_promotion_object_heartbeat");
+    return master_service_.DfsPromotionObjectHeartbeat(client_id);
+}
+
 tl::expected<PromotionAllocStartResponse, ErrorCode>
 WrappedMasterService::PromotionAllocStart(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
@@ -1846,6 +1853,9 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::PromotionObjectHeartbeat>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::DfsPromotionObjectHeartbeat>(
         &wrapped_master_service);
     server
         .register_handler<&mooncake::WrappedMasterService::PromotionAllocStart>(
