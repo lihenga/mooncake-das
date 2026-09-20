@@ -5624,7 +5624,12 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                 ErrorCode::INVALID_PARAMS);
                         }
                     }
+                }
 
+                const bool has_bucket_dfs_replica =
+                    bucket_allocator_ != nullptr &&
+                    metadata.HasReplica(&Replica::fn_is_dfs_replica);
+                if (metadata.size == slice_length && !has_bucket_dfs_replica) {
                     metadata.client_id = client_id;
                     metadata.put_start_time = now;
 
@@ -5658,8 +5663,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     return replica_list;
                 }
 
-                // --- Case C: different size — discard old replicas and
-                // reallocate
+                // --- Case C: different size or bucket DFS — reallocate
                 // --- Old buffers cannot be reused.  Move them to
                 // discarded_replicas_ for delayed release (readers may still
                 // hold descriptors without refcnt), then allocate fresh buffers
