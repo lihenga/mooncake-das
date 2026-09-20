@@ -11,7 +11,7 @@
 
 #include "environ.h"
 #include "storage/distributed/bucket_entry_layout.h"
-#include "storage/distributed/bucket_global_allocator.h"
+#include "storage/distributed/immutable_bucket_allocator.h"
 #include "storage/distributed/dfs_global_allocator.h"
 #include "thread_pool.h"
 #include "types.h"
@@ -71,14 +71,14 @@ bool IsBucketDescriptorRangeValid(const DistributedFSDescriptor& desc,
     auto layout = RebuildBucketEntryLayout(desc.offset, desc.object_size,
                                            config.alignment);
     if (!layout) return false;
-    if (layout->value_offset != desc.offset) return false;
-    if (layout->reserved_size != desc.aligned_size) return false;
-    if (layout->entry_end() > config.bucket_capacity) return false;
+    if (layout->offset != desc.offset) return false;
+    if (layout->aligned_size != desc.aligned_size) return false;
+    if (layout->end() > config.bucket_capacity) return false;
 
     constexpr uint64_t kMaxFileOffset =
         static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
-    return layout->entry_start <= kMaxFileOffset &&
-           layout->reserved_size <= kMaxFileOffset - layout->entry_start;
+    return layout->offset <= kMaxFileOffset &&
+           layout->aligned_size <= kMaxFileOffset - layout->offset;
 }
 
 /**

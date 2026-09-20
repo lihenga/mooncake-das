@@ -11,7 +11,7 @@
 #include "fs_adapter.h"
 #include "replica.h"
 #include "storage/distributed/object_storage_adapter.h"
-#include "storage/distributed/global_allocator_interface.h"
+#include "storage/distributed/dfs_allocator_interface.h"
 #include "storage_backend.h"
 
 namespace mooncake {
