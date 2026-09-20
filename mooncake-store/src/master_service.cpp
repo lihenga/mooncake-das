@@ -52,7 +52,7 @@
 #include "ha/snapshot/snapshot_logger.h"
 #include "utils/zstd_util.h"
 #include "utils/file_util.h"
-#include "storage/distributed/bucket_global_allocator.h"
+#include "storage/distributed/immutable_bucket_allocator.h"
 #include "storage/distributed/dfs_global_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "random.h"
@@ -659,7 +659,7 @@ void MasterService::InitDfsAllocatorFromEnvironment(
 
     bucket_allocator_ = nullptr;
     if (dfs_config.allocator_type == DfsAllocatorType::BUCKET) {
-        auto bucket_allocator = std::make_unique<BucketGlobalAllocator>();
+        auto bucket_allocator = std::make_unique<ImmutableBucketAllocator>();
         bucket_allocator_ = bucket_allocator.get();
         dfs_allocator_ = std::move(bucket_allocator);
     } else {
@@ -8527,7 +8527,7 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
 
         auto matches_candidate =
             [](const Replica& replica,
-               const GlobalAllocatorInterface::EvictionCandidate& candidate) {
+               const DfsAllocatorInterface::EvictionCandidate& candidate) {
                 if (!replica.is_dfs_replica()) return false;
                 const auto& desc = replica.get_dfs_descriptor();
                 // Field-by-field match against the descriptor the allocator

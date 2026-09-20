@@ -15,7 +15,7 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     uds_transport.cpp
     storage/distributed/distributed_storage_backend.cpp
     storage/distributed/posix_fs_adapter.cpp
-    storage/distributed/bucket_global_allocator.cpp
+    storage/distributed/immutable_bucket_allocator.cpp
     utils/file_util.cpp)
 
 set(MOONCAKE_STORE_MASTER_SOURCES

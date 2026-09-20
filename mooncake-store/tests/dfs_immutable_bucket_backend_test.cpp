@@ -17,7 +17,7 @@
 
 #include "replica.h"
 #include "storage/distributed/bucket_entry_layout.h"
-#include "storage/distributed/bucket_global_allocator.h"
+#include "storage/distributed/immutable_bucket_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #include "storage_backend.h"
@@ -202,7 +202,7 @@ class DfsBucketBackendTest : public ::testing::Test {
         tmp_ = std::make_unique<BucketTempDir>("dfs_bucket_backend");
         config_ = MakeBucketConfig(tmp_->path());
 
-        allocator_ = std::make_unique<BucketGlobalAllocator>();
+        allocator_ = std::make_unique<ImmutableBucketAllocator>();
         ASSERT_TRUE(allocator_->Init(config_).has_value());
 
         FileStorageConfig file_config;
@@ -250,7 +250,7 @@ class DfsBucketBackendTest : public ::testing::Test {
 
     std::unique_ptr<BucketTempDir> tmp_;
     DistributedStorageConfig config_;
-    std::unique_ptr<BucketGlobalAllocator> allocator_;
+    std::unique_ptr<ImmutableBucketAllocator> allocator_;
     std::shared_ptr<DistributedStorageBackend> backend_;
     FaultyPosixFsAdapter* adapter_ = nullptr;
 };
@@ -421,7 +421,7 @@ TEST_F(DfsBucketBackendTest, LargeBucketIdIsAddressable) {
     config.shard_count = 1;
     config.shard_capacity = kAlignment;
 
-    BucketGlobalAllocator allocator;
+    ImmutableBucketAllocator allocator;
     ASSERT_TRUE(allocator.Init(config).has_value());
 
     FileStorageConfig file_config;
@@ -467,7 +467,7 @@ TEST_F(DfsBucketBackendTest, RejectsDescriptorOutsideDfsRoot) {
     // any file is opened, even if it names a plausible bucket file.
     auto escaped = desc;
     escaped.file_path = tmp_->path() + "/../bucket_" +
-                        BucketGlobalAllocator::FormatBucketId(0) + ".data";
+                        ImmutableBucketAllocator::FormatBucketId(0) + ".data";
     std::string out(value.size(), '\0');
     std::vector<Slice> slices{{out.data(), out.size()}};
     auto results = backend_->BatchRead({{key, escaped, slices}});
@@ -484,7 +484,7 @@ TEST_F(DfsBucketBackendTest, RejectsMismatchedBucketFileName) {
     // The path must name the bucket the descriptor claims.
     auto wrong_name = desc;
     wrong_name.file_path = tmp_->file(
-        "bucket_" + BucketGlobalAllocator::FormatBucketId(99) + ".data");
+        "bucket_" + ImmutableBucketAllocator::FormatBucketId(99) + ".data");
     std::string out(value.size(), '\0');
     std::vector<Slice> slices{{out.data(), out.size()}};
     auto results = backend_->BatchRead({{key, wrong_name, slices}});
@@ -671,7 +671,7 @@ TEST_F(DfsBucketBackendTest, ObjectsSurviveAcrossBucketRollover) {
     config.bucket_capacity = 2 * kAlignment;
     config.max_bucket_count = 16;
 
-    BucketGlobalAllocator allocator;
+    ImmutableBucketAllocator allocator;
     ASSERT_TRUE(allocator.Init(config).has_value());
 
     FileStorageConfig file_config;
@@ -775,7 +775,7 @@ TEST_F(DfsBucketBackendTest, ReadAfterAllocatorRecoveryReturnsSameBytes) {
     ASSERT_TRUE(backend->Init().has_value());
 
     {
-        BucketGlobalAllocator allocator;
+        ImmutableBucketAllocator allocator;
         ASSERT_TRUE(allocator.Init(config).has_value());
         for (size_t i = 0; i < keys.size(); ++i) {
             auto desc = allocator.Allocate(keys[i], values[i].size());
@@ -793,7 +793,7 @@ TEST_F(DfsBucketBackendTest, ReadAfterAllocatorRecoveryReturnsSameBytes) {
                         .has_value());
     }
 
-    BucketGlobalAllocator recovered;
+    ImmutableBucketAllocator recovered;
     ASSERT_TRUE(recovered.Init(config).has_value());
     auto replicas = recovered.TakeRecoveredReplicas();
     ASSERT_EQ(replicas.size(), keys.size());
