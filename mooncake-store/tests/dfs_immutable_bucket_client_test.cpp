@@ -420,13 +420,23 @@ TEST_F(DfsBucketClientTest, UpsertKeepsSynchronousDfsSemantics) {
     ASSERT_TRUE(writer_->Put(key, initial_slices, DfsConfig()).has_value());
     ASSERT_TRUE(WaitForDfsReplica(key));
     ExpectDfsValue(key, initial);
+    auto initial_query = QueryDfsOnly(key);
+    ASSERT_TRUE(initial_query.has_value());
+    const auto initial_descriptor =
+        initial_query->replicas[0].get_dfs_descriptor();
 
     // Upsert stays synchronous, so the new value is readable as soon as it
-    // returns.
+    // returns, but it must use a newly appended range.
     std::string updated(4096, 'V');
     std::vector<Slice> updated_slices{{updated.data(), updated.size()}};
     ASSERT_TRUE(writer_->Upsert(key, updated_slices, DfsConfig()).has_value());
     ExpectDfsValue(key, updated);
+    auto updated_query = QueryDfsOnly(key);
+    ASSERT_TRUE(updated_query.has_value());
+    const auto& updated_descriptor =
+        updated_query->replicas[0].get_dfs_descriptor();
+    EXPECT_TRUE(updated_descriptor.file_path != initial_descriptor.file_path ||
+                updated_descriptor.offset != initial_descriptor.offset);
 }
 
 TEST_F(DfsBucketClientTest, BatchUpsertKeepsSynchronousDfsSemantics) {
