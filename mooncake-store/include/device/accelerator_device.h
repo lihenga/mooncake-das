@@ -71,7 +71,9 @@ class AcceleratorDevice {
     // with a native scatter-copy primitive or a suitable batch kernel can
     // override it to reduce host submission overhead.
     virtual bool CopyFromHostBatchAsync(std::span<const HostCopyRange> ranges,
-                                        void* stream) const {
+                                        void* stream,
+                                        bool* used_batch_kernel = nullptr) const {
+        if (used_batch_kernel) *used_batch_kernel = false;
         bool success = true;
         for (const auto& range : ranges) {
             // Keep attempting the remaining ranges. A backend failure for one

@@ -118,13 +118,18 @@ class PinnedBufferPool {
         return AllocPinnedOnly(capacity, mapped);
     }
 
-    // Never falls back to pageable memory.
-    static Buffer AllocatePinned(size_t size) {
+    // Never falls back to pageable memory. When mapped is true, allocation
+    // succeeds only if the accelerator also provides a device-visible alias.
+    static Buffer AllocatePinned(size_t size, bool mapped = false) {
         auto accelerators =
             device::GetAcceleratorRegistry().RuntimeAccelerators();
         for (auto* accelerator : accelerators.Devices()) {
-            auto host = accelerator->AllocatePinnedHost(size);
-            if (host.addr) return Buffer(std::move(host));
+            auto host = mapped ? accelerator->AllocateMappedPinnedHost(size)
+                               : accelerator->AllocatePinnedHost(size);
+            if (host.addr && (!mapped || host.device_addr)) {
+                return Buffer(std::move(host));
+            }
+            host.reset();
         }
         return {};
     }

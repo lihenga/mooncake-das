@@ -1,7 +1,9 @@
 #include "client_buffer.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <vector>
 #include <sys/mman.h>  // For shm_open, mmap, munmap
 #include <sys/stat.h>  // For S_IRUSR, S_IWUSR
@@ -24,9 +26,9 @@ std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
 }
 
 std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
-    void* addr, size_t size, const std::string& protocol) {
+    void* addr, size_t size, const std::string& protocol, void* device_addr) {
     return std::shared_ptr<ClientBufferAllocator>(
-        new ClientBufferAllocator(addr, size, protocol));
+        new ClientBufferAllocator(addr, size, protocol, device_addr));
 }
 
 ClientBufferAllocator::ClientBufferAllocator(size_t size,
@@ -66,10 +68,13 @@ ClientBufferAllocator::ClientBufferAllocator(size_t size,
 }
 
 ClientBufferAllocator::ClientBufferAllocator(void* addr, size_t size,
-                                             const std::string& protocol)
-    : buffer_size_(size), protocol(protocol) {
-    buffer_ = addr;
-    is_external_memory_ = true;
+                                             const std::string& protocol,
+                                             void* device_addr)
+    : buffer_(addr),
+      buffer_size_(size),
+      device_buffer_(device_addr),
+      protocol(protocol),
+      is_external_memory_(true) {
     allocator_ = mooncake::offset_allocator::OffsetAllocator::create(
         reinterpret_cast<uint64_t>(buffer_), size);
 }
@@ -96,6 +101,37 @@ std::optional<BufferHandle> ClientBufferAllocator::allocate(size_t size) {
 
     return std::make_optional<BufferHandle>(shared_from_this(),
                                             std::move(*handle));
+}
+
+std::optional<BufferHandle> ClientBufferAllocator::allocate_aligned(
+    size_t size, size_t alignment) {
+    if (size == 0 || alignment == 0) {
+        return std::nullopt;
+    }
+
+    auto allocation = allocate(size);
+    if (!allocation) return std::nullopt;
+
+    const auto address = reinterpret_cast<uintptr_t>(allocation->ptr());
+    if (address % alignment == 0) return allocation;
+
+    allocation.reset();
+    if (size > std::numeric_limits<size_t>::max() - (alignment - 1)) {
+        return std::nullopt;
+    }
+    allocation = allocate(size + alignment - 1);
+    if (!allocation) return std::nullopt;
+
+    auto owner = std::make_shared<BufferHandle>(std::move(allocation.value()));
+    auto* host_base = static_cast<char*>(owner->ptr());
+    const size_t remainder = reinterpret_cast<uintptr_t>(host_base) % alignment;
+    const size_t offset = remainder == 0 ? 0 : alignment - remainder;
+    void* device_ptr = owner->device_ptr();
+    if (device_ptr) {
+        device_ptr = static_cast<char*>(device_ptr) + offset;
+    }
+    return BufferHandle(
+        host_base + offset, size, [owner]() { (void)owner; }, device_ptr);
 }
 
 BufferHandle::BufferHandle(
@@ -127,7 +163,13 @@ size_t BufferHandle::size() const {
 }
 
 void* BufferHandle::device_ptr() const {
-    return view_ptr_ ? view_device_ptr_ : nullptr;
+    if (view_ptr_) return view_device_ptr_;
+    if (!allocator_ || !allocator_->getDeviceBase() || !handle_.ptr()) {
+        return nullptr;
+    }
+    const auto offset = static_cast<char*>(handle_.ptr()) -
+                        static_cast<char*>(allocator_->getBase());
+    return static_cast<char*>(allocator_->getDeviceBase()) + offset;
 }
 
 // Utility functions for buffer and slice management

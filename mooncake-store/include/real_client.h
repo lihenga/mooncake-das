@@ -21,7 +21,6 @@
 #include "client_service.h"
 #include "client_buffer.h"
 #include "device/cuda_ipc_buffer_handle.h"
-#include "pinned_buffer_pool.h"
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
@@ -1103,7 +1102,6 @@ class RealClient : public PyClient {
     class DfsAsyncScatterContext;
     mutable std::shared_mutex dfs_read_lifecycle_mutex_;
     bool dfs_read_shutting_down_ = false;
-    std::shared_ptr<PinnedBufferPool> dfs_pinned_buffer_pool_;
     std::unique_ptr<DfsH2dStreamPool> dfs_h2d_stream_pool_;
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
