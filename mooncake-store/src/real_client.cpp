@@ -486,6 +486,23 @@ inline const Replica::Descriptor *SelectCompleteMemoryReplica(
     return first_memory;
 }
 
+inline const Replica::Descriptor *SelectSessionReplica(
+    const std::vector<Replica::Descriptor> &replicas,
+    const std::unordered_set<std::string> &local_endpoints) {
+    if (const auto *memory =
+            SelectCompleteMemoryReplica(replicas, local_endpoints)) {
+        return memory;
+    }
+
+    for (const auto &replica : replicas) {
+        if (replica.status == ReplicaStatus::COMPLETE &&
+            replica.is_dfs_replica()) {
+            return &replica;
+        }
+    }
+    return nullptr;
+}
+
 inline bool HasMemoryReplica(const std::vector<Replica::Descriptor> &replicas) {
     for (const auto &r : replicas) {
         if (r.is_memory_replica()) {
@@ -6153,6 +6170,13 @@ RealClient::batch_get_session_start_with_sources(
 
     // Master interaction only here: query replicas + lease.
     const auto query_results = client_->BatchQuery(keys);
+    if (query_results.size() != keys.size()) {
+        LOG(ERROR) << "Session query result size mismatch: expected="
+                   << keys.size() << ", got=" << query_results.size();
+        return {std::vector<int>(keys.size(),
+                                 static_cast<int>(toInt(ErrorCode::RPC_FAIL))),
+                std::move(sources)};
+    }
     auto local_endpoints = client_->GetLocalEndpoints();
     const bool record_access = client_->MetricsEnabled();
 
@@ -6167,7 +6191,7 @@ RealClient::batch_get_session_start_with_sources(
             continue;
         }
 
-        auto query_result = query_results[i].value();
+        const auto &query_result = query_results[i].value();
         if (query_result.IsLeaseExpired()) {
             results[i] = static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
             get_sessions_.erase(keys[i]);
@@ -6175,9 +6199,10 @@ RealClient::batch_get_session_start_with_sources(
         }
 
         const auto *replica =
-            SelectBestReplica(query_result.replicas, local_endpoints);
+            SelectSessionReplica(query_result.replicas, local_endpoints);
         if (!replica) {
-            LOG(ERROR) << "No usable replica for key: " << keys[i];
+            LOG(ERROR) << "No supported complete session replica for key: "
+                       << keys[i];
             results[i] = static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
             get_sessions_.erase(keys[i]);
             continue;
@@ -6199,6 +6224,304 @@ void RealClient::record_prefetched_tokens(uint64_t tokens) {
     }
 }
 
+bool RealClient::validate_session_range_batch_arguments(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<void *>> &all_buffers,
+    const std::vector<std::vector<size_t>> &all_sizes,
+    const std::vector<std::vector<size_t>> &all_src_offsets) const {
+    if (client_ && keys.size() == all_buffers.size() &&
+        keys.size() == all_sizes.size() &&
+        keys.size() == all_src_offsets.size()) {
+        return true;
+    }
+    LOG(ERROR) << "Invalid get ranges args";
+    return false;
+}
+
+std::vector<SessionRangeReadRequest>
+RealClient::prepare_session_range_read_requests(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<void *>> &all_buffers,
+    const std::vector<std::vector<size_t>> &all_sizes,
+    const std::vector<std::vector<size_t>> &all_src_offsets,
+    std::vector<int> &results, SessionRangeReadContext &context) {
+    std::vector<SessionRangeReadRequest> requests;
+    requests.reserve(keys.size());
+    if (context.record_access) {
+        context.access_sources.resize(keys.size());
+    }
+
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    if (session_cache_enabled()) {
+        for (auto it = get_session_object_cache_.begin();
+             it != get_session_object_cache_.end();) {
+            if (get_sessions_.find(it->first) == get_sessions_.end()) {
+                ++context.cache_evicted_count;
+                client_->ObserveDirectSessionCacheEviction();
+                it = get_session_object_cache_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    context.cache_gc_done = std::chrono::steady_clock::now();
+
+    auto now = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto &buffers = all_buffers[i];
+        const auto &sizes = all_sizes[i];
+        const auto &offsets = all_src_offsets[i];
+        if (buffers.size() != sizes.size() ||
+            buffers.size() != offsets.size()) {
+            continue;
+        }
+
+        auto session_it = get_sessions_.find(keys[i]);
+        if (session_it == get_sessions_.end()) {
+            continue;
+        }
+        if (session_it->second.replicas.size() != 1) {
+            results[i] = static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
+            continue;
+        }
+
+        const auto &replica = session_it->second.replicas.front();
+        if (context.record_access) {
+            context.access_sources[i] = DirectSourceForReplica(replica);
+        }
+        if (session_it->second.IsLeaseExpired(now)) {
+            if (context.record_access) {
+                const std::string source = DirectSourceForReplica(replica);
+                if (source != "unknown") {
+                    auto [record_it, inserted] =
+                        get_session_access_records_.try_emplace(
+                            keys[i],
+                            GetSessionAccessRecord{source, false, 0, {}});
+                    record_it->second.success = false;
+                }
+            }
+            get_sessions_.erase(session_it);
+            results[i] = static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+            continue;
+        }
+
+        uint64_t replica_limit = 0;
+        if (replica.is_memory_replica()) {
+            replica_limit =
+                replica.get_memory_descriptor().buffer_descriptor.size_;
+        } else if (replica.is_dfs_replica()) {
+            replica_limit = calculate_total_size(replica);
+        }
+        if (replica.is_memory_replica() || replica.is_dfs_replica()) {
+            bool overflow = false;
+            for (size_t j = 0; j < buffers.size(); ++j) {
+                if (is_object_range_overflow(offsets[j], sizes[j],
+                                             replica_limit)) {
+                    overflow = true;
+                    break;
+                }
+            }
+            if (overflow) {
+                results[i] = static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+                continue;
+            }
+        }
+
+        results[i] = 0;
+        requests.push_back(SessionRangeReadRequest{
+            keys[i], i, replica, session_it->second,
+            std::vector<void *>(buffers.begin(), buffers.end()),
+            std::vector<size_t>(sizes.begin(), sizes.end()),
+            std::vector<size_t>(offsets.begin(), offsets.end()),
+            session_it->second.lease_timeout});
+    }
+    return requests;
+}
+
+SessionRangeReadPlan RealClient::classify_session_range_read_requests(
+    std::vector<SessionRangeReadRequest> requests,
+    std::vector<int> &results) const {
+    SessionRangeReadPlan plan;
+    plan.memory_requests.reserve(requests.size());
+    plan.dfs_requests.reserve(requests.size());
+    for (auto &request : requests) {
+        if (request.replica.is_memory_replica()) {
+            plan.memory_requests.push_back(std::move(request));
+        } else if (request.replica.is_dfs_replica()) {
+            plan.dfs_requests.push_back(std::move(request));
+        } else {
+            results[request.original_idx] =
+                static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
+        }
+    }
+    return plan;
+}
+
+void RealClient::execute_session_memory_range_reads(
+    const std::vector<SessionRangeReadRequest> &requests,
+    std::vector<int> &results) {
+    if (requests.empty()) {
+        return;
+    }
+
+    std::vector<Replica::Descriptor> replicas;
+    std::vector<std::vector<Slice>> slices;
+    std::vector<std::vector<uint64_t>> src_offsets;
+    replicas.reserve(requests.size());
+    slices.reserve(requests.size());
+    src_offsets.reserve(requests.size());
+    for (const auto &request : requests) {
+        replicas.push_back(request.replica);
+        std::vector<Slice> entry_slices;
+        std::vector<uint64_t> entry_offsets;
+        entry_slices.reserve(request.buffers.size());
+        entry_offsets.reserve(request.src_offsets.size());
+        for (size_t i = 0; i < request.buffers.size(); ++i) {
+            entry_slices.emplace_back(
+                Slice{request.buffers[i], request.sizes[i]});
+            entry_offsets.push_back(
+                static_cast<uint64_t>(request.src_offsets[i]));
+        }
+        slices.push_back(std::move(entry_slices));
+        src_offsets.push_back(std::move(entry_offsets));
+    }
+
+    const auto transfer =
+        client_->BatchTransferReadRanges(replicas, slices, src_offsets);
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    const auto now = std::chrono::steady_clock::now();
+    if (transfer.size() != requests.size()) {
+        LOG(ERROR) << "Session memory range result size mismatch: expected="
+                   << requests.size() << ", got=" << transfer.size();
+    }
+    const size_t completed = std::min(transfer.size(), requests.size());
+    for (size_t i = 0; i < completed; ++i) {
+        const auto &request = requests[i];
+        if (transfer[i]) {
+            if (now >= request.lease_deadline) {
+                results[request.original_idx] =
+                    static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+                get_sessions_.erase(request.key);
+            } else {
+                results[request.original_idx] =
+                    static_cast<int>(transfer[i].value());
+            }
+        } else {
+            results[request.original_idx] =
+                static_cast<int>(toInt(transfer[i].error()));
+        }
+    }
+    for (size_t i = completed; i < requests.size(); ++i) {
+        results[requests[i].original_idx] =
+            static_cast<int>(toInt(ErrorCode::INTERNAL_ERROR));
+    }
+}
+
+void RealClient::record_session_range_accesses(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<void *>> &all_buffers,
+    const std::vector<std::vector<size_t>> &all_sizes,
+    const std::vector<std::vector<size_t>> &all_src_offsets,
+    const std::vector<int> &results, const SessionRangeReadContext &context) {
+    if (!context.record_access) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto session_it = get_sessions_.find(keys[i]);
+        if (session_it == get_sessions_.end()) {
+            auto record_it = get_session_access_records_.find(keys[i]);
+            if (record_it != get_session_access_records_.end()) {
+                record_it->second.success = false;
+            }
+            if (results[i] ==
+                    static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED)) &&
+                context.access_sources[i] != "unknown") {
+                auto [insert_it, inserted] =
+                    get_session_access_records_.try_emplace(
+                        keys[i], GetSessionAccessRecord{
+                                     context.access_sources[i], false, 0, {}});
+                insert_it->second.success = false;
+            }
+            continue;
+        }
+        if (session_it->second.replicas.empty() ||
+            all_buffers[i].size() != all_sizes[i].size() ||
+            all_buffers[i].size() != all_src_offsets[i].size()) {
+            continue;
+        }
+
+        const std::string source =
+            DirectSourceForReplica(session_it->second.replicas.front());
+        if (source == "unknown") {
+            continue;
+        }
+
+        auto [record_it, inserted] = get_session_access_records_.try_emplace(
+            keys[i], GetSessionAccessRecord{source, true, 0, {}});
+        auto &record = record_it->second;
+        if (!inserted && record.source != source) {
+            record.success = false;
+        }
+        uint64_t expected_bytes = 0;
+        for (size_t size : all_sizes[i]) {
+            expected_bytes += size;
+        }
+        const bool range_success =
+            results[i] >= 0 &&
+            static_cast<uint64_t>(results[i]) == expected_bytes;
+        record.success = record.success && range_success;
+        if (range_success) {
+            for (size_t j = 0; j < all_sizes[i].size(); ++j) {
+                const auto range =
+                    std::make_pair(static_cast<uint64_t>(all_src_offsets[i][j]),
+                                   static_cast<uint64_t>(all_sizes[i][j]));
+                if (record.ranges.insert(range).second) {
+                    record.bytes += all_sizes[i][j];
+                }
+            }
+        }
+    }
+}
+
+void RealClient::trace_session_range_reads(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<size_t>> &all_sizes, size_t memory_read_count,
+    size_t dfs_read_count, const SessionRangeReadContext &context) const {
+    if (context.trace_id == 0) {
+        return;
+    }
+
+    uint64_t total_bytes = 0;
+    uint64_t total_ranges = 0;
+    for (const auto &sizes : all_sizes) {
+        for (size_t size : sizes) {
+            total_bytes += size;
+            ++total_ranges;
+        }
+    }
+    auto elapsed_us = [](const auto &start, const auto &end) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(end -
+                                                                     start)
+            .count();
+    };
+    LOG(INFO) << "batch_get_into_multi_buffer_ranges: trace_id="
+              << context.trace_id << ", keys=" << keys.size()
+              << ", total_ranges=" << total_ranges
+              << ", total_bytes=" << total_bytes
+              << ", mem_reads=" << memory_read_count
+              << ", cache_evicted=" << context.cache_evicted_count
+              << ", dfs_reads=" << dfs_read_count << ", gc_us="
+              << elapsed_us(context.timing_start, context.cache_gc_done)
+              << ", session_mem_us="
+              << elapsed_us(context.cache_gc_done, context.memory_done)
+              << ", disk_access_us="
+              << elapsed_us(context.memory_done, context.access_done)
+              << ", total_us="
+              << elapsed_us(context.timing_start, context.access_done);
+}
+
 std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
@@ -6206,297 +6529,31 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     const std::vector<std::vector<size_t>> &all_src_offsets) {
     std::vector<int> results(
         keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
-    if (!client_ || keys.size() != all_buffers.size() ||
-        keys.size() != all_sizes.size() ||
-        keys.size() != all_src_offsets.size()) {
-        LOG(ERROR) << "Invalid get ranges args";
+    if (!validate_session_range_batch_arguments(keys, all_buffers, all_sizes,
+                                                all_src_offsets)) {
         return results;
     }
-    const auto timing_start = std::chrono::steady_clock::now();
-    const bool trace_enabled = dfs_read_trace_enabled();
-    const uint64_t trace_id = trace_enabled ? NextDfsReadTraceId() : 0;
-    const bool record_access = client_->MetricsEnabled();
 
-    // No Master RPC here: use cached QueryResult from session start.
-    // RealClient owns session state (lease/overflow checks, replica lookup);
-    // the actual parallel transfer is delegated to Client.
-    std::vector<Replica::Descriptor> replicas;
-    std::vector<std::vector<Slice>> slices;
-    std::vector<std::vector<uint64_t>> src_offsets;
-    std::vector<size_t> idx_map;  // batch entry -> original key index
-    std::vector<std::chrono::steady_clock::time_point> lease_deadlines;
-    std::vector<std::string> access_sources;
-    if (record_access) {
-        access_sources.resize(keys.size());
-    }
+    SessionRangeReadContext context;
+    context.timing_start = std::chrono::steady_clock::now();
+    context.cache_gc_done = context.timing_start;
+    context.trace_id =
+        dfs_read_trace_enabled() ? NextDfsReadTraceId() : uint64_t{0};
+    context.record_access = client_->MetricsEnabled();
 
-    // Non-memory replicas: handled via temp buffer + scatter fallback.
-    std::vector<NonMemReadEntry> non_mem_entries;
-
-    size_t cache_evicted_count = 0;
-    auto t_gc_done = timing_start;
-
-    {
-        std::lock_guard<std::mutex> lock(session_mutex_);
-        // GC: remove cache entries whose session has been erased
-        if (session_cache_enabled()) {
-            for (auto it = get_session_object_cache_.begin();
-                 it != get_session_object_cache_.end();) {
-                if (get_sessions_.find(it->first) == get_sessions_.end()) {
-                    ++cache_evicted_count;
-                    client_->ObserveDirectSessionCacheEviction();
-                    it = get_session_object_cache_.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-        }
-        t_gc_done = std::chrono::steady_clock::now();
-
-        auto now = std::chrono::steady_clock::now();
-        for (size_t i = 0; i < keys.size(); ++i) {
-            const auto &buffers = all_buffers[i];
-            const auto &sizes = all_sizes[i];
-            const auto &offsets = all_src_offsets[i];
-            if (buffers.size() != sizes.size() ||
-                buffers.size() != offsets.size()) {
-                continue;
-            }
-            auto it = get_sessions_.find(keys[i]);
-            if (it == get_sessions_.end()) {
-                continue;
-            }
-            if (record_access) {
-                access_sources[i] =
-                    DirectSourceForReplica(it->second.replicas.front());
-            }
-            if (it->second.IsLeaseExpired(now)) {
-                if (record_access) {
-                    const std::string source =
-                        DirectSourceForReplica(it->second.replicas.front());
-                    if (source != "unknown") {
-                        auto [record_it, inserted] =
-                            get_session_access_records_.try_emplace(
-                                keys[i],
-                                GetSessionAccessRecord{source, false, 0, {}});
-                        record_it->second.success = false;
-                    }
-                }
-                get_sessions_.erase(it);
-                results[i] = static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
-                continue;
-            }
-            // start cached a single replica via FilterQueryResult.
-            const auto &replica = it->second.replicas.front();
-
-            // Reset initial INVALID_PARAMS; will be set to actual
-            // transferred bytes or error during read/scatter phase.
-            results[i] = 0;
-            if (replica.is_memory_replica()) {
-                // Fast path: memory replicas use BatchTransferReadRanges.
-                const size_t replica_limit =
-                    replica.get_memory_descriptor().buffer_descriptor.size_;
-                bool overflow = false;
-                std::vector<Slice> entry_slices;
-                std::vector<uint64_t> entry_offsets;
-                entry_slices.reserve(buffers.size());
-                entry_offsets.reserve(buffers.size());
-                for (size_t j = 0; j < buffers.size(); ++j) {
-                    if (is_object_range_overflow(offsets[j], sizes[j],
-                                                 replica_limit)) {
-                        overflow = true;
-                        break;
-                    }
-                    entry_slices.emplace_back(Slice{buffers[j], sizes[j]});
-                    entry_offsets.push_back(static_cast<uint64_t>(offsets[j]));
-                }
-                if (overflow) {
-                    results[i] =
-                        static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
-                    continue;
-                }
-                replicas.push_back(replica);
-                slices.push_back(std::move(entry_slices));
-                src_offsets.push_back(std::move(entry_offsets));
-                idx_map.push_back(i);
-                lease_deadlines.push_back(it->second.lease_timeout);
-            } else {
-                // Non-memory replica: validate ranges, collect for fallback.
-                const uint64_t total_size = calculate_total_size(replica);
-                bool overflow = false;
-                for (size_t j = 0; j < buffers.size(); ++j) {
-                    if (is_object_range_overflow(offsets[j], sizes[j],
-                                                 total_size)) {
-                        overflow = true;
-                        break;
-                    }
-                }
-                if (overflow) {
-                    results[i] =
-                        static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
-                    continue;
-                }
-                non_mem_entries.push_back(NonMemReadEntry{
-                    keys[i], i, replica, it->second,
-                    std::vector<void *>(buffers.begin(), buffers.end()),
-                    std::vector<size_t>(sizes.begin(), sizes.end()),
-                    std::vector<size_t>(offsets.begin(), offsets.end()),
-                    it->second.lease_timeout});
-            }
-        }
-    }
-
-    size_t mem_count = replicas.size();
-    size_t local_disk_count = 0;
-    size_t dfs_count = 0;
-    // 1. Memory replicas: fast scatter path via BatchTransferReadRanges.
-    if (!replicas.empty()) {
-        auto transfer =
-            client_->BatchTransferReadRanges(replicas, slices, src_offsets);
-
-        // Merge results; drop sessions whose lease expired during the wait.
-        {
-            std::lock_guard<std::mutex> lock(session_mutex_);
-            const auto now = std::chrono::steady_clock::now();
-            for (size_t k = 0; k < transfer.size(); ++k) {
-                const size_t i = idx_map[k];
-                if (transfer[k]) {
-                    if (now >= lease_deadlines[k]) {
-                        results[i] =
-                            static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
-                        get_sessions_.erase(keys[i]);
-                    } else {
-                        results[i] = static_cast<int>(transfer[k].value());
-                    }
-                } else {
-                    results[i] = static_cast<int>(toInt(transfer[k].error()));
-                }
-            }
-        }
-    }
-    const auto t_mem_done = std::chrono::steady_clock::now();
-    // 2. Non-memory replicas: batch by endpoint/type, temp buffer + scatter.
-    // Group LOCAL_DISK entries by endpoint for batch RPC.
-    std::unordered_map<std::string, std::vector<NonMemReadEntry *>>
-        local_disk_by_endpoint;
-    std::vector<NonMemReadEntry *> dfs_entries;
-
-    for (auto &entry : non_mem_entries) {
-        const auto &replica = entry.replica;
-        if (replica.is_local_disk_replica()) {
-            const auto &endpoint =
-                replica.get_local_disk_descriptor().transport_endpoint;
-            local_disk_by_endpoint[endpoint].push_back(&entry);
-            ++local_disk_count;
-        } else {
-            // DISK or DFS
-            dfs_entries.push_back(&entry);
-            ++dfs_count;
-        }
-    }
-
-    process_session_local_disk_reads(local_disk_by_endpoint, results);
-
-    // DISK/DFS: batch via client_->BatchGet.
-    if (!dfs_entries.empty()) {
-        process_session_disk_dfs_reads(dfs_entries, results, trace_id);
-    }
-
-    // Accumulate one logical access per key across all layer/range calls.
-    // Bytes are emitted at session end so layer-wise loading reports the full
-    // request payload instead of only the first layer's ranges.
-    if (record_access) {
-        std::lock_guard<std::mutex> lock(session_mutex_);
-        for (size_t i = 0; i < keys.size(); ++i) {
-            auto session_it = get_sessions_.find(keys[i]);
-            if (session_it == get_sessions_.end()) {
-                // A prior range may have succeeded before this call caused
-                // lease expiry or another failure to remove the session.
-                // Preserve that logical access as failed instead of silently
-                // emitting it as a success at session end.
-                auto record_it = get_session_access_records_.find(keys[i]);
-                if (record_it != get_session_access_records_.end()) {
-                    record_it->second.success = false;
-                }
-                if (results[i] ==
-                        static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED)) &&
-                    access_sources[i] != "unknown") {
-                    auto [record_it, inserted] =
-                        get_session_access_records_.try_emplace(
-                            keys[i], GetSessionAccessRecord{
-                                         access_sources[i], false, 0, {}});
-                    record_it->second.success = false;
-                }
-                continue;
-            }
-            if (session_it->second.replicas.empty() ||
-                all_buffers[i].size() != all_sizes[i].size() ||
-                all_buffers[i].size() != all_src_offsets[i].size()) {
-                continue;
-            }
-
-            const std::string source =
-                DirectSourceForReplica(session_it->second.replicas.front());
-            if (source == "unknown") {
-                continue;
-            }
-
-            auto [record_it, inserted] =
-                get_session_access_records_.try_emplace(
-                    keys[i], GetSessionAccessRecord{source, true, 0, {}});
-            auto &record = record_it->second;
-            if (!inserted && record.source != source) {
-                record.success = false;
-            }
-            uint64_t expected_bytes = 0;
-            for (size_t size : all_sizes[i]) {
-                expected_bytes += size;
-            }
-            const bool range_success =
-                results[i] >= 0 &&
-                static_cast<uint64_t>(results[i]) == expected_bytes;
-            record.success = record.success && range_success;
-            if (range_success) {
-                for (size_t j = 0; j < all_sizes[i].size(); ++j) {
-                    const auto range = std::make_pair(
-                        static_cast<uint64_t>(all_src_offsets[i][j]),
-                        static_cast<uint64_t>(all_sizes[i][j]));
-                    if (record.ranges.insert(range).second) {
-                        record.bytes += all_sizes[i][j];
-                    }
-                }
-            }
-        }
-    }
-    const auto t_access_done = std::chrono::steady_clock::now();
-
-    auto elapsed_us = [](const auto &a, const auto &b) {
-        return std::chrono::duration_cast<std::chrono::microseconds>(b - a)
-            .count();
-    };
-    if (trace_enabled) {
-        uint64_t total_bytes = 0;
-        uint64_t total_ranges = 0;
-        for (size_t i = 0; i < all_sizes.size(); ++i) {
-            for (size_t size : all_sizes[i]) {
-                total_bytes += size;
-                total_ranges++;
-            }
-        }
-        LOG(INFO) << "batch_get_into_multi_buffer_ranges: trace_id=" << trace_id
-                  << ", keys=" << keys.size()
-                  << ", total_ranges=" << total_ranges
-                  << ", total_bytes=" << total_bytes
-                  << ", mem_reads=" << mem_count
-                  << ", cache_evicted=" << cache_evicted_count
-                  << ", local_disk_reads=" << local_disk_count
-                  << ", dfs_reads=" << dfs_count
-                  << ", gc_us=" << elapsed_us(timing_start, t_gc_done)
-                  << ", session_mem_us=" << elapsed_us(t_gc_done, t_mem_done)
-                  << ", disk_access_us=" << elapsed_us(t_mem_done, t_access_done)
-                  << ", total_us=" << elapsed_us(timing_start, t_access_done);
-    }
-
+    auto requests = prepare_session_range_read_requests(
+        keys, all_buffers, all_sizes, all_src_offsets, results, context);
+    auto plan =
+        classify_session_range_read_requests(std::move(requests), results);
+    execute_session_memory_range_reads(plan.memory_requests, results);
+    context.memory_done = std::chrono::steady_clock::now();
+    execute_session_dfs_range_reads(plan.dfs_requests, results,
+                                    context.trace_id);
+    record_session_range_accesses(keys, all_buffers, all_sizes, all_src_offsets,
+                                  results, context);
+    context.access_done = std::chrono::steady_clock::now();
+    trace_session_range_reads(keys, all_sizes, plan.memory_requests.size(),
+                              plan.dfs_requests.size(), context);
     return results;
 }
 
@@ -6540,134 +6597,19 @@ int RealClient::batch_get_session_end(const std::vector<std::string> &keys) {
     return 0;
 }
 
-void RealClient::scatter_cached_entries(std::vector<NonMemReadEntry *> &entries,
-                                        std::vector<int> &results) {
-    if (!session_cache_enabled()) {
-        return;  // all entries remain as miss
-    }
-    std::vector<NonMemReadEntry *> miss_entries;
-    for (auto *entry_ptr : entries) {
-        auto &entry = *entry_ptr;
-        std::shared_ptr<BufferHandle> cached_handle;
-        {
-            std::lock_guard<std::mutex> lock(session_mutex_);
-            auto cache_it = get_session_object_cache_.find(entry.key);
-            if (cache_it != get_session_object_cache_.end()) {
-                cached_handle = cache_it->second.buffer_handle;
-            }
-        }
-        if (cached_handle) {
-            client_->ObserveDirectSessionCache(true);
-            if (results[entry.original_idx] != 0) continue;
-            scatter_non_mem_result(entry, cached_handle->ptr(), results,
-                                   session_mutex_, get_sessions_,
-                                   get_session_object_cache_);
-            continue;
-        }
-        client_->ObserveDirectSessionCache(false);
-        miss_entries.push_back(entry_ptr);
-    }
-    entries = std::move(miss_entries);
-}
-
-void RealClient::store_in_cache_and_scatter(
-    NonMemReadEntry &entry, std::shared_ptr<BufferHandle> shared_handle,
-    std::vector<int> &results) {
-    const uint64_t total_size = calculate_total_size(entry.replica);
-    if (session_cache_enabled()) {
-        std::lock_guard<std::mutex> lock(session_mutex_);
-        if (get_sessions_.find(entry.key) != get_sessions_.end()) {
-            get_session_object_cache_.insert_or_assign(
-                entry.key, SessionCachedObject{shared_handle, total_size});
-        }
-    }
-    scatter_non_mem_result(entry, shared_handle->ptr(), results, session_mutex_,
-                           get_sessions_, get_session_object_cache_);
-}
-
-void RealClient::process_session_local_disk_reads(
-    std::unordered_map<std::string, std::vector<NonMemReadEntry *>>
-        &local_disk_by_endpoint,
-    std::vector<int> &results) {
-    for (auto &[endpoint, ep_entries] : local_disk_by_endpoint) {
-        // 1. Cache hit: scatter directly from cached buffer
-        scatter_cached_entries(ep_entries, results);
-
-        // 2. Cache miss: allocate + I/O + cache + scatter
-        std::unordered_map<std::string, std::vector<Slice>> miss_objects;
-        std::unordered_map<std::string, std::unique_ptr<BufferHandle>>
-            miss_handles;
-
-        for (auto *entry_ptr : ep_entries) {
-            auto &entry = *entry_ptr;
-            const uint64_t total_size = calculate_total_size(entry.replica);
-
-            if (!client_buffer_allocator_) {
-                LOG(ERROR) << "Client buffer allocator not provided, "
-                           << "key: " << entry.key;
-                results[entry.original_idx] =
-                    static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
-                continue;
-            }
-
-            auto alloc_result = client_buffer_allocator_->allocate(total_size);
-            if (!alloc_result) {
-                LOG(WARNING) << "Cache allocation failed for key: " << entry.key
-                             << ", falling back to non-cached I/O";
-                results[entry.original_idx] =
-                    static_cast<int>(toInt(ErrorCode::NO_AVAILABLE_HANDLE));
-                continue;
-            }
-
-            auto handle =
-                std::make_unique<BufferHandle>(std::move(*alloc_result));
-            std::vector<Slice> tmp_slices;
-            tmp_slices.emplace_back(Slice{handle->ptr(), total_size});
-            miss_objects.emplace(entry.key, std::move(tmp_slices));
-            miss_handles.emplace(entry.key, std::move(handle));
-        }
-
-        if (miss_objects.empty()) continue;
-
-        const auto io_start = std::chrono::steady_clock::now();
-        auto read_result =
-            batch_get_into_offload_object_internal(endpoint, miss_objects);
-        const double io_duration =
-            std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                          io_start)
-                .count();
-        client_->ObserveDirectIo(
-            "read", DirectStorageMetricSource(ReplicaType::LOCAL_DISK),
-            read_result.has_value(),
-            read_result ? SumSliceBytes(miss_objects) : 0, io_duration);
-
-        for (auto *entry_ptr : ep_entries) {
-            auto &entry = *entry_ptr;
-            if (results[entry.original_idx] != 0) continue;
-
-            auto handle_it = miss_handles.find(entry.key);
-            if (handle_it == miss_handles.end()) continue;
-
-            if (!read_result) {
-                LOG(ERROR) << "LOCAL_DISK read failed for key: " << entry.key
-                           << " error: " << toString(read_result.error());
-                results[entry.original_idx] =
-                    static_cast<int>(toInt(read_result.error()));
-                continue;
-            }
-
-            // Store in cache + scatter (unique_ptr converts to shared_ptr)
-            store_in_cache_and_scatter(
-                entry,
-                std::shared_ptr<BufferHandle>(std::move(handle_it->second)),
-                results);
-        }
-    }
-}
-
-void RealClient::process_session_disk_dfs_reads(
-    std::vector<NonMemReadEntry *> &entries, std::vector<int> &results,
+void RealClient::execute_session_dfs_range_reads(
+    std::vector<SessionRangeReadRequest> &requests, std::vector<int> &results,
     uint64_t trace_id) {
+    if (requests.empty()) {
+        return;
+    }
+
+    std::vector<SessionRangeReadRequest *> entries;
+    entries.reserve(requests.size());
+    for (auto &request : requests) {
+        entries.push_back(&request);
+    }
+
     std::shared_lock<std::shared_mutex> dfs_read_lock(
         dfs_read_lifecycle_mutex_);
     if (closed_.load(std::memory_order_acquire) ||
@@ -6696,7 +6638,7 @@ void RealClient::process_session_disk_dfs_reads(
     std::chrono::steady_clock::time_point t_scatter_sync_start = timing_start;
     std::chrono::steady_clock::time_point t_scatter_sync_done = timing_start;
     struct PendingScatterResult {
-        NonMemReadEntry *entry;
+        SessionRangeReadRequest *entry;
         size_t transferred;
     };
     std::vector<PendingScatterResult> pending_scatter_results;
@@ -6707,7 +6649,7 @@ void RealClient::process_session_disk_dfs_reads(
     DfsAsyncScatterContext async_scatter(*this, *dfs_h2d_stream_pool_,
                                          trace_enabled);
 
-    auto valid_source_handle = [](const NonMemReadEntry *entry,
+    auto valid_source_handle = [](const SessionRangeReadRequest *entry,
                                   const std::shared_ptr<BufferHandle> &handle) {
         const uint64_t total_size = calculate_total_size(entry->replica);
         return handle && handle->ptr() &&
@@ -6715,7 +6657,7 @@ void RealClient::process_session_disk_dfs_reads(
                static_cast<size_t>(total_size) <= handle->size();
     };
 
-    auto queue_scatter = [&](NonMemReadEntry *entry,
+    auto queue_scatter = [&](SessionRangeReadRequest *entry,
                              const std::shared_ptr<BufferHandle> &handle) {
         size_t transferred = 0;
         for (size_t j = 0; j < entry->sizes.size(); ++j) {
@@ -6737,23 +6679,23 @@ void RealClient::process_session_disk_dfs_reads(
     };
 
     auto cache_and_queue_scatter =
-        [&](NonMemReadEntry *entry,
+        [&](SessionRangeReadRequest *entry,
             const std::shared_ptr<BufferHandle> &handle) {
-        const uint64_t total_size = calculate_total_size(entry->replica);
-        if (session_cache_enabled()) {
-            std::lock_guard<std::mutex> lock(session_mutex_);
-            if (get_sessions_.find(entry->key) != get_sessions_.end()) {
-                get_session_object_cache_.insert_or_assign(
-                    entry->key, SessionCachedObject{handle, total_size});
+            const uint64_t total_size = calculate_total_size(entry->replica);
+            if (session_cache_enabled()) {
+                std::lock_guard<std::mutex> lock(session_mutex_);
+                if (get_sessions_.find(entry->key) != get_sessions_.end()) {
+                    get_session_object_cache_.insert_or_assign(
+                        entry->key, SessionCachedObject{handle, total_size});
+                }
             }
-        }
-        queue_scatter(entry, handle);
-    };
+            queue_scatter(entry, handle);
+        };
 
     // Cache hits participate in the same copy plan as newly read objects. A
     // local shared handle pins the arena even if session end evicts the entry.
     if (session_cache_enabled()) {
-        std::vector<NonMemReadEntry *> miss_entries;
+        std::vector<SessionRangeReadRequest *> miss_entries;
         miss_entries.reserve(entries.size());
         for (auto *entry : entries) {
             std::shared_ptr<BufferHandle> cached_handle;
@@ -6798,7 +6740,7 @@ void RealClient::process_session_disk_dfs_reads(
         disk_temp_handles;
 
     struct ArenaView {
-        NonMemReadEntry *entry;
+        SessionRangeReadRequest *entry;
         size_t offset;
         size_t size;
     };
@@ -6922,7 +6864,7 @@ void RealClient::process_session_disk_dfs_reads(
             dfs_read_bytes, io_duration);
 
         // Build key -> entry map for O(1) lookup
-        std::unordered_map<std::string, NonMemReadEntry *> entry_map;
+        std::unordered_map<std::string, SessionRangeReadRequest *> entry_map;
         for (auto *entry_ptr : entries) {
             entry_map[entry_ptr->key] = entry_ptr;
         }
@@ -6961,7 +6903,7 @@ void RealClient::process_session_disk_dfs_reads(
             if (map_it == entry_map.end()) {
                 continue;
             }
-            NonMemReadEntry *entry = map_it->second;
+            SessionRangeReadRequest *entry = map_it->second;
             std::shared_ptr<BufferHandle> handle = std::move(handle_it->second);
             if (!valid_source_handle(entry, handle)) {
                 LOG(ERROR) << "DFS read buffer is smaller than the replica, "
@@ -7030,50 +6972,43 @@ void RealClient::process_session_disk_dfs_reads(
             read_amplification = static_cast<double>(dfs_read_bytes) /
                                  static_cast<double>(dfs_requested_bytes);
         }
-        LOG(INFO) << "process_session_disk_dfs_reads: trace_id=" << trace_id
-                  << ", entries=" << entries.size()
-                  << ", input_entries=" << input_entries
-                  << ", session_cache_hits=" << session_cache_hits
-                  << ", dfs_batch_entries=" << disk_batch_keys.size()
-                  << ", cache_hit_us="
-                  << elapsed_us(timing_start, t_cache_hit_done)
-                  << ", alloc_us="
-                  << elapsed_us(t_cache_hit_done, t_alloc_done)
-                  << ", dfs_read_us=" << elapsed_us(t_alloc_done, t_io_done)
-                  << ", scatter_us=" << scatter_us
-                  << ", total_us=" << elapsed_us(timing_start, t_end)
-                  << ", arena_requested_bytes=" << arena_size
-                  << ", arena_capacity=" << arena_capacity
-                  << ", arena_pool_hit=" << arena_pool_hit
-                  << ", dfs_read_success=" << dfs_read_success
-                  << ", dfs_read_bytes=" << dfs_read_bytes
-                  << ", dfs_requested_bytes=" << dfs_requested_bytes
-                  << ", scatter_ranges=" << scatter_ranges
-                  << ", scatter_merged_ranges=" << scatter_merged_ranges
-                  << ", scatter_bytes=" << scatter_bytes
-                  << ", read_amplification=" << read_amplification
-                  << ", pointer_query_count="
-                  << async_scatter.pointer_query_count()
-                  << ", pointer_cache_hits="
-                  << async_scatter.pointer_cache_hits()
-                  << ", pointer_query_us=" << async_scatter.pointer_query_us()
-                  << ", region_cache_hits="
-                  << async_scatter.region_cache_hits()
-                  << ", region_cache_misses="
-                  << async_scatter.region_cache_misses()
-                  << ", unregistered_pointer_queries="
-                  << async_scatter.unregistered_pointer_queries()
-                  << ", host_copy_ops=" << async_scatter.host_copy_ops()
-                  << ", device_copy_ops=" << async_scatter.device_copy_ops()
-                  << ", host_copy_ranges="
-                  << async_scatter.host_copy_ranges()
-                  << ", device_copy_ranges="
-                  << async_scatter.device_copy_ranges()
-                  << ", scatter_plan_us=" << scatter_plan_us
-                  << ", scatter_submit_us=" << scatter_submit_us
-                  << ", scatter_sync_us=" << scatter_sync_us
-                  << ", scatter_finalize_us=" << scatter_finalize_us
-                  << ", scatter_GBps=" << scatter_gbps;
+        LOG(INFO)
+            << "execute_session_dfs_range_reads: trace_id=" << trace_id
+            << ", entries=" << entries.size()
+            << ", input_entries=" << input_entries
+            << ", session_cache_hits=" << session_cache_hits
+            << ", dfs_batch_entries=" << disk_batch_keys.size()
+            << ", cache_hit_us=" << elapsed_us(timing_start, t_cache_hit_done)
+            << ", alloc_us=" << elapsed_us(t_cache_hit_done, t_alloc_done)
+            << ", dfs_read_us=" << elapsed_us(t_alloc_done, t_io_done)
+            << ", scatter_us=" << scatter_us
+            << ", total_us=" << elapsed_us(timing_start, t_end)
+            << ", arena_requested_bytes=" << arena_size
+            << ", arena_capacity=" << arena_capacity
+            << ", arena_pool_hit=" << arena_pool_hit
+            << ", dfs_read_success=" << dfs_read_success
+            << ", dfs_read_bytes=" << dfs_read_bytes
+            << ", dfs_requested_bytes=" << dfs_requested_bytes
+            << ", scatter_ranges=" << scatter_ranges
+            << ", scatter_merged_ranges=" << scatter_merged_ranges
+            << ", scatter_bytes=" << scatter_bytes
+            << ", read_amplification=" << read_amplification
+            << ", pointer_query_count=" << async_scatter.pointer_query_count()
+            << ", pointer_cache_hits=" << async_scatter.pointer_cache_hits()
+            << ", pointer_query_us=" << async_scatter.pointer_query_us()
+            << ", region_cache_hits=" << async_scatter.region_cache_hits()
+            << ", region_cache_misses=" << async_scatter.region_cache_misses()
+            << ", unregistered_pointer_queries="
+            << async_scatter.unregistered_pointer_queries()
+            << ", host_copy_ops=" << async_scatter.host_copy_ops()
+            << ", device_copy_ops=" << async_scatter.device_copy_ops()
+            << ", host_copy_ranges=" << async_scatter.host_copy_ranges()
+            << ", device_copy_ranges=" << async_scatter.device_copy_ranges()
+            << ", scatter_plan_us=" << scatter_plan_us
+            << ", scatter_submit_us=" << scatter_submit_us
+            << ", scatter_sync_us=" << scatter_sync_us
+            << ", scatter_finalize_us=" << scatter_finalize_us
+            << ", scatter_GBps=" << scatter_gbps;
     }
 }
 
