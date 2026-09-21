@@ -52,8 +52,32 @@ struct SessionRangeReadRequest {
     std::chrono::steady_clock::time_point lease_deadline;
 };
 
+using NonMemReadEntry = SessionRangeReadRequest;
+
+inline void scatter_non_mem_result(
+    const NonMemReadEntry &entry, const void *tmp_base,
+    std::vector<int> &results) {
+    for (size_t j = 0; j < entry.buffers.size(); ++j) {
+        const void *src =
+            static_cast<const char *>(tmp_base) + entry.src_offsets[j];
+        if (auto r = scatter_host_to_maybe_device(
+                entry.buffers[j], src, entry.sizes[j],
+                "session non-mem range read, key: " + entry.key);
+            !r) {
+            results[entry.original_idx] = static_cast<int>(toInt(r.error()));
+            return;
+        }
+    }
+    size_t transferred = 0;
+    for (size_t size : entry.sizes) {
+        transferred += size;
+    }
+    results[entry.original_idx] = static_cast<int>(transferred);
+}
+
 struct SessionRangeReadPlan {
     std::vector<SessionRangeReadRequest> memory_requests;
+    std::vector<SessionRangeReadRequest> local_disk_requests;
     std::vector<SessionRangeReadRequest> dfs_requests;
 };
 
@@ -73,6 +97,7 @@ struct SessionRangeReadContext {
 struct SessionCachedObject {
     std::shared_ptr<BufferHandle> buffer_handle;  // RAII temp buffer
     uint64_t total_size;                          // object size in bytes
+    bool prefetched = false;  // populated by waiting-queue host prefetch
 };
 
 class RealClient;
@@ -299,8 +324,18 @@ class RealClient : public PyClient {
     std::vector<int> batch_get_session_start(
         const std::vector<std::string> &keys) override;
 
+    std::vector<int> batch_get_session_refresh(
+        const std::vector<std::string> &keys) override;
+
     std::pair<std::vector<int>, std::vector<std::string>>
     batch_get_session_start_with_sources(
+        const std::vector<std::string> &keys) override;
+
+    // Synchronously populate the pinned object cache for DFS-backed active
+    // get sessions. A successful DFS status means the complete cached bytes
+    // still belong to a live session with a compatible selected replica when
+    // this call returns. Non-DFS entries remain for the ordinary range-get.
+    std::vector<int> batch_get_session_prefetch(
         const std::vector<std::string> &keys) override;
 
     void record_prefetched_tokens(uint64_t tokens) override;
@@ -334,9 +369,20 @@ class RealClient : public PyClient {
         const std::vector<SessionRangeReadRequest> &requests,
         std::vector<int> &results);
 
+    void process_session_local_disk_reads(
+        std::unordered_map<std::string, std::vector<NonMemReadEntry *>>
+            &local_disk_by_endpoint,
+        std::vector<int> &results);
+
+    void process_session_disk_dfs_reads(std::vector<NonMemReadEntry *> &entries,
+                                        std::vector<int> &results,
+                                        uint64_t trace_id,
+                                        bool prefetch_only = false);
+
     void execute_session_dfs_range_reads(
         std::vector<SessionRangeReadRequest> &requests,
-        std::vector<int> &results, uint64_t trace_id);
+        std::vector<int> &results, uint64_t trace_id,
+        bool prefetch_only = false);
 
     void record_session_range_accesses(
         const std::vector<std::string> &keys,
