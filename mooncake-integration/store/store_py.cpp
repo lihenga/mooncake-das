@@ -3039,7 +3039,8 @@ PYBIND11_MODULE(store, m) {
             "create_read_plan",
             [](MooncakeStorePyWrapper &self,
                std::vector<mooncake::ReadLayout> layouts, int num_groups,
-               bool reuse_ranges, py::object buffer_owners, bool page_wise) {
+               bool reuse_ranges, py::object buffer_owners, bool page_wise,
+               bool borrowed_sessions) {
                 if (!self.is_client_initialized())
                     throw std::runtime_error("Client is not initialized");
                 std::shared_ptr<mooncake::ReadPlan> plan;
@@ -3047,16 +3048,19 @@ PYBIND11_MODULE(store, m) {
                     py::gil_scoped_release release;
                     plan = std::make_shared<mooncake::ReadPlan>(
                         self.store_, std::move(layouts), num_groups, reuse_ranges,
-                        page_wise);
+                        page_wise, borrowed_sessions);
                 }
                 auto object = py::cast(plan);
                 object.attr("_buffer_owners") = std::move(buffer_owners);
                 return object;
             }, py::arg("layouts"), py::arg("num_groups"),
             py::arg("reuse_ranges") = false, py::arg("buffer_owners") = py::none(),
-            py::arg("page_wise") = false, py::keep_alive<0, 1>(),
+            py::arg("page_wise") = false, py::arg("borrowed_sessions") = false,
+            py::keep_alive<0, 1>(),
             "Create ordered range reads; retain registered destination memory "
-            "until run completes. No concurrent legacy sessions on these keys.")
+            "until run completes. By default the plan starts and ends get "
+            "sessions; borrowed_sessions=True requires the caller to keep "
+            "sessions for all keys active until run completes.")
         .def(
             "batch_get_session_start",
             [](MooncakeStorePyWrapper &self,
@@ -3070,6 +3074,21 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("keys"),
             "Start a get session: query replicas once and cache them")
+        .def(
+            "batch_get_session_refresh",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int>{};
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_get_session_refresh(keys);
+            },
+            py::arg("keys"),
+            "Refresh leases for active get sessions while preserving cached "
+            "session objects; incompatible refreshed replicas fail and "
+            "invalidate that session")
         .def(
             "batch_get_session_start_with_sources",
             [](MooncakeStorePyWrapper &self,
@@ -3085,6 +3104,23 @@ PYBIND11_MODULE(store, m) {
             py::arg("keys"),
             "Start get sessions and return each result with its selected "
             "source")
+        .def(
+            "batch_get_session_prefetch",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int>{};
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_get_session_prefetch(keys);
+            },
+            py::arg("keys"),
+            "Synchronously read DFS objects in active get sessions into "
+            "Mooncake's pinned host pool without copying to caller buffers. "
+            "A successful DFS status means the complete object bytes remain "
+            "owned by a compatible active session; non-DFS entries use the "
+            "ordinary range-get path. Returns per-key status.")
         .def(
             "record_prefetched_tokens",
             [](MooncakeStorePyWrapper &self, uint64_t tokens) {

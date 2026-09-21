@@ -78,6 +78,7 @@ struct ReadPlan::Impl {
     int groups;
     bool reuse;
     bool page_wise;
+    bool borrowed_sessions;
     uint64_t built_count = 0, refreshed_count = 0;
     std::mutex mutex;
     std::condition_variable cv;
@@ -104,12 +105,13 @@ struct ReadPlan::Impl {
 
    public:
     Impl(std::shared_ptr<PyClient> c, std::vector<Pool> p, int n,
-         bool reuse_ranges, bool page_wise_mode)
+         bool reuse_ranges, bool page_wise_mode, bool borrowed_session_mode)
         : client(std::move(c)),
           layouts(std::move(p)),
           groups(n),
           reuse(reuse_ranges),
-          page_wise(page_wise_mode) {
+          page_wise(page_wise_mode),
+          borrowed_sessions(borrowed_session_mode) {
         if (!client) throw std::invalid_argument("read plan requires a client");
         if (n <= 0) throw std::invalid_argument("num_groups must be positive");
         if (reuse && page_wise)
@@ -424,7 +426,7 @@ struct ReadPlan::Impl {
                     if (seen.insert(key).second) session.push_back(key);
             }
             reservation = std::make_unique<ActiveKeys>(client.get(), session);
-            {
+            if (!borrowed_sessions) {
                 started = true;
                 auto result = client->batch_get_session_start(session);
                 if (result.size() != session.size() ||
@@ -494,7 +496,7 @@ struct ReadPlan::Impl {
         } catch (...) {
             error = std::current_exception();
         }
-        if (started) {
+        if (started && !borrowed_sessions) {
             try {
                 if (client->batch_get_session_end(session) != 0)
                     throw std::runtime_error(
@@ -531,9 +533,10 @@ struct ReadPlan::Impl {
 };
 ReadPlan::ReadPlan(std::shared_ptr<PyClient> client,
                    std::vector<ReadLayout> layouts, int groups, bool reuse,
-                   bool page_wise)
+                   bool page_wise, bool borrowed_sessions)
     : impl_(std::make_unique<Impl>(std::move(client), std::move(layouts),
-                                   groups, reuse, page_wise)) {}
+                                   groups, reuse, page_wise,
+                                   borrowed_sessions)) {}
 ReadPlan::~ReadPlan() = default;
 void ReadPlan::run() { impl_->run(); }
 void ReadPlan::wait(int group) { impl_->wait(group); }

@@ -19,14 +19,16 @@ using ReadLayout = std::tuple<std::vector<std::string>, std::vector<size_t>,
 
 // One-shot ordered range reads. Owns a strong client reference, not raw
 // destination memory. Keep destination allocations registered/alive and do not
-// close the client until run() ends. Do not mix legacy sessions on these keys
-// with a plan. Concurrent plans on the same client with overlapping keys fail
-// explicitly.
+// close the client until run() ends. By default, a plan starts and ends get
+// sessions for its keys. Borrowed-session mode skips that ownership: the caller
+// must keep an active get session for every key until run() ends and must not
+// end those sessions concurrently. Concurrent plans on the same client with
+// overlapping keys fail explicitly in either mode.
 class ReadPlan {
    public:
     ReadPlan(std::shared_ptr<PyClient> client, std::vector<ReadLayout> layouts,
              int num_groups, bool reuse_ranges = false,
-             bool page_wise = false);
+             bool page_wise = false, bool borrowed_sessions = false);
     ~ReadPlan();
     ReadPlan(const ReadPlan&) = delete;
     ReadPlan& operator=(const ReadPlan&) = delete;
