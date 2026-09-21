@@ -1084,6 +1084,7 @@ void DistributedStorageBackend::ExecuteSingleReadTask(
             error = ErrorCode::FILE_READ_FAIL;
             break;
         }
+        if (read_io_size_observer_) read_io_size_observer_(*read_result);
         uint64_t advanced = *read_result;
         done += advanced;
         while (advanced != 0 && index < iovs.size()) {
@@ -1176,6 +1177,7 @@ void DistributedStorageBackend::ExecuteMergedReadTask(
                 error = ErrorCode::FILE_READ_FAIL;
                 break;
             }
+            if (read_io_size_observer_) read_io_size_observer_(*read_result);
             uint64_t advanced = *read_result;
             done += advanced;
             while (advanced != 0 && index < iovs.size()) {

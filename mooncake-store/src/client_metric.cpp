@@ -72,6 +72,9 @@ ClientMetric::ClientMetric(uint64_t interval_seconds,
       transfer_operation_metric(labels),
       direct_storage_metric(labels),
       ssd_metric(labels),
+      dfs_read_io_size_bytes("mooncake_dfs_read_io_size_bytes",
+                             "Distribution of final DFS read task sizes in bytes",
+                             kDfsReadIoSizeBucket, labels),
       should_stop_metrics_thread_(false),
       metrics_interval_seconds_(interval_seconds),
       bandwidth_reporting_enabled_(bandwidth_reporting_enabled),
@@ -118,6 +121,7 @@ void ClientMetric::serialize(std::string& str) {
     transfer_operation_metric.serialize(str);
     direct_storage_metric.serialize(str);
     ssd_metric.serialize(str);
+    dfs_read_io_size_bytes.serialize(str);
 }
 
 std::string ClientMetric::summary_metrics() {

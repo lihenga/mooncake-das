@@ -681,6 +681,10 @@ class Client {
         }
     }
 
+    void ObserveDfsReadIoSize(uint64_t bytes) {
+        if (metrics_ != nullptr) metrics_->ObserveDfsReadIoSize(bytes);
+    }
+
     void ObserveDirectIo(const std::string& operation,
                          const std::string& source, bool success,
                          uint64_t bytes, double duration_seconds) {

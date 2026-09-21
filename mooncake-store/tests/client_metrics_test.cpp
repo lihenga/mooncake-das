@@ -269,6 +269,23 @@ TEST_F(ClientMetricsTest, CompareWithSerializedMetrics) {
                 summary.find("No data") != std::string::npos);
 }
 
+TEST_F(ClientMetricsTest, DfsReadIoSizeHistogramUses128KiBBuckets) {
+    ClientMetric metrics;
+    metrics.ObserveDfsReadIoSize(128 * 1024);
+    metrics.ObserveDfsReadIoSize(200 * 1024);
+    metrics.ObserveDfsReadIoSize(4 * 1024 * 1024);
+
+    std::string serialized;
+    metrics.serialize(serialized);
+
+    EXPECT_NE(serialized.find("mooncake_dfs_read_io_size_bytes_bucket"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("le=\"131072.000000\"} 1"), std::string::npos);
+    EXPECT_NE(serialized.find("le=\"262144.000000\"} 2"), std::string::npos);
+    EXPECT_NE(serialized.find("mooncake_dfs_read_io_size_bytes_count 3"),
+              std::string::npos);
+}
+
 TEST_F(ClientMetricsTest, HybridHistogramSerializesEachLabelOnce) {
     ylt::metric::hybrid_histogram_1t histogram(
         "request_latency", "Request latency", {10.0, 20.0}, {}, {"route"});

@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -118,6 +119,10 @@ class DistributedStorageBackend : public StorageBackendInterface {
     }
 
     tl::expected<void, ErrorCode> Init() override;
+
+    void SetReadIoSizeObserver(std::function<void(uint64_t)> observer) {
+        read_io_size_observer_ = std::move(observer);
+    }
 
     tl::expected<int64_t, ErrorCode> BatchOffload(
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
@@ -295,6 +300,7 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::unordered_map<int64_t, std::shared_ptr<OpenFileHandle>>
         bucket_id_direct_cache_;
     std::unique_ptr<ThreadPool> batch_read_pool_;
+    std::function<void(uint64_t)> read_io_size_observer_;
 
     bool initialized_ = false;
 };

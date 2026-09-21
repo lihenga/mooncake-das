@@ -475,6 +475,7 @@ Client::Client(const std::string& local_hostname,
 }
 
 Client::~Client() {
+    if (dfs_storage_backend_) dfs_storage_backend_->SetReadIoSizeObserver({});
     // Stop accepting new asynchronous DFS writes and wait for the queued ones.
     // They report their result through master_client_ and write through
     // dfs_storage_backend_, so they must not outlive this object.
@@ -4162,6 +4163,13 @@ tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
 
 void Client::SetDfsStorageBackend(
     std::shared_ptr<DistributedStorageBackend> backend) {
+    if (dfs_storage_backend_ && dfs_storage_backend_ != backend) {
+        dfs_storage_backend_->SetReadIoSizeObserver({});
+    }
+    if (backend && Environ::GetBool("MC_STORE_DFS_READ_IO_SIZE_METRIC", false)) {
+        backend->SetReadIoSizeObserver(
+            [this](uint64_t bytes) { ObserveDfsReadIoSize(bytes); });
+    }
     dfs_storage_backend_ = std::move(backend);
     EnsureStorageControlPlaneStarted();
 }

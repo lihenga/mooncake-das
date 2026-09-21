@@ -748,12 +748,24 @@ struct SsdMetric {
     }
 };
 
+inline const std::vector<double> kDfsReadIoSizeBucket = [] {
+    std::vector<double> buckets;
+    constexpr uint64_t kBucketWidth = 128ULL * 1024;
+    constexpr uint64_t kMaxBucket = 4ULL * 1024 * 1024;
+    for (uint64_t size = kBucketWidth; size <= kMaxBucket;
+         size += kBucketWidth) {
+        buckets.push_back(static_cast<double>(size));
+    }
+    return buckets;
+}();
+
 struct ClientMetric {
     TransferMetric transfer_metric;
     MasterClientMetric master_client_metric;
     TransferOperationMetric transfer_operation_metric;
     DirectStorageMetric direct_storage_metric;
     SsdMetric ssd_metric;
+    ylt::metric::histogram_t dfs_read_io_size_bytes;
 
     /**
      * @brief Creates a ClientMetric instance based on environment variables
@@ -798,6 +810,10 @@ struct ClientMetric {
                          uint64_t bytes, double duration_seconds) {
         direct_storage_metric.ObserveIo(operation, source, success, bytes,
                                         duration_seconds);
+    }
+
+    void ObserveDfsReadIoSize(uint64_t bytes) {
+        dfs_read_io_size_bytes.observe(bytes);
     }
 
     void serialize(std::string& str);
