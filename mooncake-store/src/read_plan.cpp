@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <array>
 #include <condition_variable>
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -16,6 +17,8 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstdio>
+#include <glog/logging.h>
+#include "utils.h"
 namespace mooncake {
 namespace {
 // Scoped reservations protect plans sharing the legacy client's key-indexed
@@ -70,6 +73,12 @@ size_t address(const Item &i, size_t row) {
     checked_add(p, i[2]);
     checked_add(i[3], i[2]);
     return p;
+}
+
+int64_t elapsed_us(std::chrono::steady_clock::time_point start,
+                   std::chrono::steady_clock::time_point end) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+        .count();
 }
 }  // namespace
 struct ReadPlan::Impl {
@@ -413,6 +422,16 @@ struct ReadPlan::Impl {
             if (running) throw std::runtime_error("plan may only run once");
             running = true;
         }
+        const bool trace_enabled = dfs_read_trace_enabled();
+        const auto plan_started = trace_enabled
+                                      ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
+        auto session_keys_done = plan_started;
+        auto reservation_done = plan_started;
+        auto session_start_done = plan_started;
+        auto execution_done = plan_started;
+        auto session_end_done = plan_started;
+        std::string mode = "sequential";
         std::vector<std::string> session;
         bool started = false;
         std::exception_ptr error;
@@ -423,7 +442,9 @@ struct ReadPlan::Impl {
                 for (const auto &key : std::get<0>(p))
                     if (seen.insert(key).second) session.push_back(key);
             }
+            if (trace_enabled) session_keys_done = std::chrono::steady_clock::now();
             reservation = std::make_unique<ActiveKeys>(client.get(), session);
+            if (trace_enabled) reservation_done = std::chrono::steady_clock::now();
             {
                 started = true;
                 auto result = client->batch_get_session_start(session);
@@ -433,6 +454,7 @@ struct ReadPlan::Impl {
                     throw std::runtime_error(
                         "Mooncake read plan session start failed");
             }
+            if (trace_enabled) session_start_done = std::chrono::steady_clock::now();
             const char *enabled = std::getenv("MOONCAKE_READ_PLAN_PIPELINE");
             const bool requested = enabled && std::string(enabled) == "1";
             const bool pipeline =
@@ -449,22 +471,55 @@ struct ReadPlan::Impl {
                         int(pipeline), groups, session.size());
             }
             if (page_wise) {
+                mode = "page_wise";
+                const auto build_started = trace_enabled
+                                               ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
                 // One batch_get carries every group's ranges per key; readiness
                 // is published only after the single transfer succeeds.
                 auto r = build_all();
                 ++built_count;
+                const auto build_done = trace_enabled
+                                            ? std::chrono::steady_clock::now()
+                                            : std::chrono::steady_clock::time_point{};
+                auto read_done = build_done;
+                auto check_done = build_done;
                 if (!r.keys.empty()) {
                     auto result = client->batch_get_into_multi_buffer_ranges(
                         r.keys, r.addresses, r.sizes, r.offsets);
+                    read_done = trace_enabled ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{};
                     check(r, result, -1);
+                    check_done = trace_enabled ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
+                }
+                if (trace_enabled) {
+                    LOG(INFO) << "ReadPlan: mode=page_wise, keys=" << r.keys.size()
+                              << ", build_us=" << elapsed_us(build_started, build_done)
+                              << ", batch_get_us=" << elapsed_us(build_done, read_done)
+                              << ", check_us=" << elapsed_us(read_done, check_done);
                 }
             } else if (pipeline) {
+                mode = "pipeline";
+                const auto pipeline_started = trace_enabled
+                                                  ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
                 run_pipelined();
+                if (trace_enabled) {
+                    LOG(INFO) << "ReadPlan: mode=pipeline, groups=" << groups
+                              << ", execute_us="
+                              << elapsed_us(pipeline_started,
+                                            std::chrono::steady_clock::now());
+                }
             } else {
                 std::map<std::vector<size_t>, Ranges> cached_ranges;
                 for (int group = 0; group < groups; ++group) {
+                    const auto build_started = trace_enabled
+                                                   ? std::chrono::steady_clock::now()
+                                                   : std::chrono::steady_clock::time_point{};
                     Ranges fresh;
                     Ranges *selected = nullptr;
+                    bool refreshed = false;
                     if (reuse) {
                         auto [it, inserted] =
                             cached_ranges.try_emplace(signature(group));
@@ -474,6 +529,7 @@ struct ReadPlan::Impl {
                         } else {
                             refresh(it->second, group);
                             ++refreshed_count;
+                            refreshed = true;
                         }
                         selected = &it->second;
                     } else {
@@ -482,17 +538,48 @@ struct ReadPlan::Impl {
                         ++built_count;
                     }
                     auto &r = *selected;
+                    const auto build_done = trace_enabled
+                                                ? std::chrono::steady_clock::now()
+                                                : std::chrono::steady_clock::time_point{};
+                    auto read_done = build_done;
+                    auto check_done = build_done;
                     if (!r.keys.empty()) {
                         auto result = client->batch_get_into_multi_buffer_ranges(
                             r.keys, r.addresses, r.sizes, r.offsets);
+                        read_done = trace_enabled
+                                        ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
                         check(r, result, group);
+                        check_done = trace_enabled
+                                         ? std::chrono::steady_clock::now()
+                                         : std::chrono::steady_clock::time_point{};
+                    }
+                    if (trace_enabled) {
+                        LOG(INFO) << "ReadPlan: mode=sequential, group=" << group
+                                  << ", keys=" << r.keys.size()
+                                  << ", range_mode="
+                                  << (refreshed ? "refresh" : "build")
+                                  << ", range_us="
+                                  << elapsed_us(build_started, build_done)
+                                  << ", batch_get_us="
+                                  << elapsed_us(build_done, read_done)
+                                  << ", check_us="
+                                  << elapsed_us(read_done, check_done);
                     }
                     if (group < groups - 1)
                         mark(group);  // Final readiness includes session cleanup.
                 }
             }
+            if (trace_enabled) execution_done = std::chrono::steady_clock::now();
         } catch (...) {
             error = std::current_exception();
+            if (trace_enabled) {
+                const auto now = std::chrono::steady_clock::now();
+                if (session_keys_done == plan_started) session_keys_done = now;
+                if (reservation_done == plan_started) reservation_done = now;
+                if (session_start_done == plan_started) session_start_done = now;
+                if (execution_done == plan_started) execution_done = now;
+            }
         }
         if (started) {
             try {
@@ -503,7 +590,27 @@ struct ReadPlan::Impl {
                 if (!error) error = std::current_exception();
             }
         }
+        if (trace_enabled) session_end_done = std::chrono::steady_clock::now();
         reservation.reset();
+        if (trace_enabled) {
+            const auto finished_at = std::chrono::steady_clock::now();
+            LOG(INFO) << "ReadPlan: mode=" << mode
+                      << ", groups=" << groups << ", session_keys="
+                      << session.size() << ", session_keys_us="
+                      << elapsed_us(plan_started, session_keys_done)
+                      << ", reserve_us="
+                      << elapsed_us(session_keys_done, reservation_done)
+                      << ", session_start_us="
+                      << elapsed_us(reservation_done, session_start_done)
+                      << ", execute_us="
+                      << elapsed_us(session_start_done, execution_done)
+                      << ", session_end_us="
+                      << elapsed_us(execution_done, session_end_done)
+                      << ", release_us="
+                      << elapsed_us(session_end_done, finished_at)
+                      << ", total_us=" << elapsed_us(plan_started, finished_at)
+                      << ", success=" << !error;
+        }
         finish(error);
         if (error) std::rethrow_exception(error);
     }
