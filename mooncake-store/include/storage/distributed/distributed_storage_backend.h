@@ -224,7 +224,7 @@ class DistributedStorageBackend : public StorageBackendInterface {
         const std::vector<DfsWriteRequest>& requests);
 
     tl::expected<std::shared_ptr<OpenFileHandle>, ErrorCode> GetOrOpenBucket(
-        const std::string& path);
+        int64_t bucket_id);
 
     /**
      * @brief Open/cache the direct (page-cache-bypassing) read handle for a
@@ -232,7 +232,7 @@ class DistributedStorageBackend : public StorageBackendInterface {
      * read path; callers then fall back to the regular handle.
      */
     tl::expected<std::shared_ptr<OpenFileHandle>, ErrorCode>
-    GetOrOpenBucketDirect(const std::string& path);
+    GetOrOpenBucketDirect(int64_t bucket_id);
 
     /**
      * @brief One contiguous read scheduled as a single task.
@@ -287,12 +287,13 @@ class DistributedStorageBackend : public StorageBackendInterface {
     DistributedStorageMode storage_mode_ = DistributedStorageMode::kFileSystem;
 
     mutable std::mutex bucket_cache_mutex_;
-    std::unordered_map<std::string, std::shared_ptr<OpenFileHandle>>
-        bucket_cache_;
-    // Direct read handles for bucket data files, keyed by canonical path.
-    // Guarded by bucket_cache_mutex_ alongside bucket_cache_.
-    std::unordered_map<std::string, std::shared_ptr<OpenFileHandle>>
-        bucket_direct_cache_;
+    // bucket id -> handle. The int key replaces a string-keyed lookup so the
+    // common PrepareReadTasks path avoids a hash + lock per request.
+    // Guarded by bucket_cache_mutex_.
+    std::unordered_map<int64_t, std::shared_ptr<OpenFileHandle>>
+        bucket_id_cache_;
+    std::unordered_map<int64_t, std::shared_ptr<OpenFileHandle>>
+        bucket_id_direct_cache_;
     std::unique_ptr<ThreadPool> batch_read_pool_;
 
     bool initialized_ = false;
