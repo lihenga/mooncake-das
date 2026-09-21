@@ -37,6 +37,9 @@ class RealClient;
 std::optional<size_t> GetTransportRegistrationLimit(
     const std::string& protocol);
 
+void DumpKeysToFile(const char* tag, uint64_t batch_id,
+                    const std::vector<std::string>& keys);
+
 /**
  * @brief Result of a query operation containing replica information and lease
  * timeout

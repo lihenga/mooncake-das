@@ -1,3 +1,6 @@
+#include <fcntl.h>
+#include <unistd.h>
+
 #include "client_service.h"
 
 #include <boost/algorithm/string.hpp>
@@ -50,6 +53,34 @@
 #include "storage/distributed/distributed_storage_backend.h"
 
 namespace mooncake {
+
+void DumpKeysToFile(const char* tag, uint64_t batch_id,
+                    const std::vector<std::string>& keys) {
+    static const std::string dump_path = [] {
+        const char* val = std::getenv("MOONCAKE_DFS_KEY_DUMP");
+        return val ? std::string(val) : std::string{};
+    }();
+    if (dump_path.empty()) return;
+    static std::mutex dump_mutex;
+    std::lock_guard<std::mutex> lock(dump_mutex);
+    int fd = ::open(dump_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    std::string line;
+    line.reserve(32 + keys.size() * 80);
+    line.append(tag);
+    line.push_back(' ');
+    line.append(std::to_string(static_cast<int64_t>(::getpid())));
+    line.append(" ");
+    line.append(std::to_string(batch_id));
+    for (const auto& key : keys) {
+        line.push_back(' ');
+        line.append(key);
+    }
+    line.push_back('\n');
+    ssize_t n = ::write(fd, line.data(), line.size());
+    (void)n;
+    ::close(fd);
+}
 
 std::optional<size_t> GetTransportRegistrationLimit(
     const std::string& protocol) {
@@ -3580,6 +3611,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
+    static std::atomic<uint64_t> write_batch_id{0};
+    DumpKeysToFile("batch_set", write_batch_id.fetch_add(
+                                      1, std::memory_order_relaxed),
+                   keys);
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
     ComputeBatchObjectChecksums(ops);
     if (client_cfg.prefer_alloc_in_same_node) {

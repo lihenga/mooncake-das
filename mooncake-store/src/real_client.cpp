@@ -118,37 +118,6 @@ uint64_t NextDfsReadTraceId() {
     }
 }
 
-// Append one line per batch: "tag pid key1 key2 ..." to a sidecar file.
-// Enabled only when MOONCAKE_DFS_KEY_DUMP is set to a file path; otherwise
-// a no-op so production builds pay nothing.
-void DumpKeysToFile(const char *tag, uint64_t batch_id,
-                    const std::vector<std::string> &keys) {
-    static const std::string dump_path = [] {
-        const char *val = std::getenv("MOONCAKE_DFS_KEY_DUMP");
-        return val ? std::string(val) : std::string{};
-    }();
-    if (dump_path.empty()) return;
-    static std::mutex dump_mutex;
-    std::lock_guard<std::mutex> lock(dump_mutex);
-    int fd = ::open(dump_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (fd < 0) return;
-    std::string line;
-    line.reserve(32 + keys.size() * 80);
-    line.append(tag);
-    line.push_back(' ');
-    line.append(std::to_string(static_cast<int64_t>(::getpid())));
-    line.append(" ");
-    line.append(std::to_string(batch_id));
-    for (const auto &key : keys) {
-        line.push_back(' ');
-        line.append(key);
-    }
-    line.push_back('\n');
-    ssize_t n = ::write(fd, line.data(), line.size());
-    (void)n;
-    ::close(fd);
-}
-
 size_t DivideRoundUp(size_t value, size_t divisor) {
     return value / divisor + (value % divisor != 0);
 }
@@ -337,9 +306,6 @@ std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
     const ReplicateConfig &config,
     const std::shared_ptr<ClientBufferAllocator> &allocator,
     bool stage_nonlocal, BatchWriteMethod write) {
-    static std::atomic<uint64_t> write_batch_id{0};
-    DumpKeysToFile("batch_set", write_batch_id.fetch_add(1,
-                   std::memory_order_relaxed), keys);
     if (!client) {
         LOG(ERROR) << "Client is not initialized";
         return std::vector<tl::expected<void, ErrorCode>>(
