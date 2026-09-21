@@ -18,6 +18,8 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <ctime>
+#include <filesystem>
 #include <iomanip>
 #include <limits>
 #ifdef USE_NOF
@@ -27,6 +29,7 @@
 #include <ranges>
 #include <span>
 #include <sched.h>
+#include <sstream>
 #include <thread>
 #include <set>
 #include <utility>
@@ -54,30 +57,92 @@
 
 namespace mooncake {
 
-void DumpKeysToFile(const char* tag, uint64_t batch_id,
-                    const std::vector<std::string>& keys) {
-    static const std::string dump_path = [] {
+namespace {
+
+std::string GetDfsDumpPath() {
+    static const std::string dump_dir = [] {
         const char* val = std::getenv("MOONCAKE_DFS_KEY_DUMP");
         return val ? std::string(val) : std::string{};
     }();
-    if (dump_path.empty()) return;
+    if (dump_dir.empty()) return {};
+
+    std::error_code ec;
+    std::filesystem::create_directories(dump_dir, ec);
+    if (ec) return {};
+    return (std::filesystem::path(dump_dir) /
+            (std::to_string(static_cast<int64_t>(::getpid())) + ".log"))
+        .string();
+}
+
+std::string CurrentTimeMillis() {
+    const auto now = std::chrono::system_clock::now();
+    const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  now.time_since_epoch()) %
+                              1000;
+    const std::time_t time = std::chrono::system_clock::to_time_t(now);
+    std::tm local_time{};
+    localtime_r(&time, &local_time);
+
+    std::ostringstream timestamp;
+    timestamp << std::put_time(&local_time, "%Y-%m-%dT%H:%M:%S") << "."
+              << std::setfill('0') << std::setw(3) << milliseconds.count();
+    return timestamp.str();
+}
+
+int OpenDfsDumpFile() {
+    const std::string path = GetDfsDumpPath();
+    if (path.empty()) return -1;
+    return ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+}
+
+}  // namespace
+
+void DumpKeysToFile(const char* tag, uint64_t batch_id,
+                    const std::vector<std::string>& keys) {
     static std::mutex dump_mutex;
     std::lock_guard<std::mutex> lock(dump_mutex);
-    int fd = ::open(dump_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    const int fd = OpenDfsDumpFile();
     if (fd < 0) return;
-    std::string line;
-    line.reserve(32 + keys.size() * 80);
-    line.append(tag);
-    line.push_back(' ');
-    line.append(std::to_string(static_cast<int64_t>(::getpid())));
-    line.append(" ");
-    line.append(std::to_string(batch_id));
-    for (const auto& key : keys) {
-        line.push_back(' ');
-        line.append(key);
+
+    std::string line = CurrentTimeMillis() + "," + std::string(tag) + "," +
+                       std::to_string(static_cast<int64_t>(::getpid())) + "," +
+                       std::to_string(batch_id) + ",";
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (i != 0) line.push_back(' ');
+        line.append(keys[i]);
     }
     line.push_back('\n');
-    ssize_t n = ::write(fd, line.data(), line.size());
+    const ssize_t n = ::write(fd, line.data(), line.size());
+    (void)n;
+    ::close(fd);
+}
+
+void DumpDfsReplicasToFile(
+    const char* tag, uint64_t batch_id, const std::vector<std::string>& keys,
+    const std::vector<DistributedFSDescriptor>& descriptors) {
+    static std::mutex dump_mutex;
+    std::lock_guard<std::mutex> lock(dump_mutex);
+    const int fd = OpenDfsDumpFile();
+    if (fd < 0) return;
+
+    const size_t count = std::min(keys.size(), descriptors.size());
+    std::string line = CurrentTimeMillis() + "," + std::string(tag) + "," +
+                       std::to_string(static_cast<int64_t>(::getpid())) + "," +
+                       std::to_string(batch_id) + ",";
+    for (size_t i = 0; i < count; ++i) {
+        if (i != 0) line.push_back(' ');
+        line.append(keys[i]);
+        line.push_back(',');
+        line.append(std::to_string(descriptors[i].shard_idx));
+        line.push_back(',');
+        line.append(std::to_string(descriptors[i].offset));
+        line.push_back(',');
+        line.append(std::to_string(descriptors[i].object_size));
+        line.push_back(',');
+        line.append(std::to_string(descriptors[i].aligned_size));
+    }
+    line.push_back('\n');
+    const ssize_t n = ::write(fd, line.data(), line.size());
     (void)n;
     ::close(fd);
 }

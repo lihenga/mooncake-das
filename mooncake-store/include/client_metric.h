@@ -750,10 +750,16 @@ struct SsdMetric {
 
 inline const std::vector<double> kDfsReadIoSizeBucket = [] {
     std::vector<double> buckets;
-    constexpr uint64_t kBucketWidth = 128ULL * 1024;
+    constexpr uint64_t kSmallBucketWidth = 8ULL * 1024;
+    constexpr uint64_t kSmallBucketMax = 128ULL * 1024;
+    constexpr uint64_t kLargeBucketWidth = 128ULL * 1024;
     constexpr uint64_t kMaxBucket = 4ULL * 1024 * 1024;
-    for (uint64_t size = kBucketWidth; size <= kMaxBucket;
-         size += kBucketWidth) {
+    for (uint64_t size = kSmallBucketWidth; size <= kSmallBucketMax;
+         size += kSmallBucketWidth) {
+        buckets.push_back(static_cast<double>(size));
+    }
+    for (uint64_t size = kSmallBucketMax + kLargeBucketWidth;
+         size <= kMaxBucket; size += kLargeBucketWidth) {
         buckets.push_back(static_cast<double>(size));
     }
     return buckets;

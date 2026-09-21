@@ -269,8 +269,10 @@ TEST_F(ClientMetricsTest, CompareWithSerializedMetrics) {
                 summary.find("No data") != std::string::npos);
 }
 
-TEST_F(ClientMetricsTest, DfsReadIoSizeHistogramUses128KiBBuckets) {
+TEST_F(ClientMetricsTest, DfsReadIoSizeHistogramUsesFineGrainedSmallBuckets) {
     ClientMetric metrics;
+    metrics.ObserveDfsReadIoSize(8 * 1024);
+    metrics.ObserveDfsReadIoSize(12 * 1024);
     metrics.ObserveDfsReadIoSize(128 * 1024);
     metrics.ObserveDfsReadIoSize(200 * 1024);
     metrics.ObserveDfsReadIoSize(4 * 1024 * 1024);
@@ -280,9 +282,13 @@ TEST_F(ClientMetricsTest, DfsReadIoSizeHistogramUses128KiBBuckets) {
 
     EXPECT_NE(serialized.find("mooncake_dfs_read_io_size_bytes_bucket"),
               std::string::npos);
-    EXPECT_NE(serialized.find("le=\"131072.000000\"} 1"), std::string::npos);
-    EXPECT_NE(serialized.find("le=\"262144.000000\"} 2"), std::string::npos);
-    EXPECT_NE(serialized.find("mooncake_dfs_read_io_size_bytes_count 3"),
+    EXPECT_NE(serialized.find("le=\"8192.000000\"} 1"), std::string::npos);
+    EXPECT_NE(serialized.find("le=\"16384.000000\"} 2"), std::string::npos);
+    EXPECT_NE(serialized.find("le=\"131072.000000\"} 3"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("le=\"262144.000000\"} 4"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("mooncake_dfs_read_io_size_bytes_count 5"),
               std::string::npos);
 }
 

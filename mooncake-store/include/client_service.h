@@ -40,6 +40,10 @@ std::optional<size_t> GetTransportRegistrationLimit(
 void DumpKeysToFile(const char* tag, uint64_t batch_id,
                     const std::vector<std::string>& keys);
 
+void DumpDfsReplicasToFile(
+    const char* tag, uint64_t batch_id, const std::vector<std::string>& keys,
+    const std::vector<DistributedFSDescriptor>& descriptors);
+
 /**
  * @brief Result of a query operation containing replica information and lease
  * timeout

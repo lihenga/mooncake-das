@@ -11,6 +11,7 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -73,26 +74,42 @@ std::vector<std::vector<std::string>> LoadBatches() {
     if (!input) throw std::runtime_error("cannot open key dump: " + FLAGS_key_dump);
 
     std::vector<std::vector<std::string>> batches;
-    std::string tag;
-    while (input >> tag) {
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty()) continue;
+        std::string tag;
         std::string pid;
         std::string batch_id;
-        if (!(input >> pid >> batch_id)) {
-            throw std::runtime_error("malformed key dump line");
+        std::string keys_field;
+        if (line.find(',') != std::string::npos) {
+            std::vector<std::string> fields;
+            size_t begin = 0;
+            while (begin <= line.size()) {
+                const size_t end = line.find(',', begin);
+                fields.push_back(line.substr(begin, end - begin));
+                if (end == std::string::npos) break;
+                begin = end + 1;
+            }
+            if (fields.size() < 5) {
+                throw std::runtime_error("malformed key dump line");
+            }
+            tag = fields[1];
+            pid = fields[2];
+            batch_id = fields[3];
+            keys_field = fields[4];
+        } else {
+            std::istringstream stream(line);
+            if (!(stream >> tag >> pid >> batch_id)) {
+                throw std::runtime_error("malformed key dump line");
+            }
+            std::getline(stream, keys_field);
         }
-        std::string line;
-        std::getline(input, line);
         if (tag != "batch_get") continue;
 
         std::vector<std::string> keys;
-        size_t begin = 0;
-        while (begin < line.size()) {
-            begin = line.find_first_not_of(' ', begin);
-            if (begin == std::string::npos) break;
-            const size_t end = line.find(' ', begin);
-            keys.push_back(line.substr(begin, end - begin));
-            begin = end == std::string::npos ? line.size() : end + 1;
-        }
+        std::istringstream key_stream(keys_field);
+        std::string key;
+        while (key_stream >> key) keys.push_back(std::move(key));
         if (!keys.empty()) batches.push_back(std::move(keys));
         if (FLAGS_max_source_batches != 0 &&
             batches.size() >= FLAGS_max_source_batches) {

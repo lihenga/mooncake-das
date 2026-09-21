@@ -6217,8 +6217,9 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     const uint64_t trace_id = trace_enabled ? NextDfsReadTraceId() : 0;
     const bool record_access = client_->MetricsEnabled();
     static std::atomic<uint64_t> read_batch_id{0};
-    DumpKeysToFile("batch_get", read_batch_id.fetch_add(1,
-                   std::memory_order_relaxed), keys);
+    const uint64_t batch_id =
+        read_batch_id.fetch_add(1, std::memory_order_relaxed);
+    DumpKeysToFile("batch_get", batch_id, keys);
 
     // No Master RPC here: use cached QueryResult from session start.
     // RealClient owns session state (lease/overflow checks, replica lookup);
@@ -6235,6 +6236,8 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
 
     // Non-memory replicas: handled via temp buffer + scatter fallback.
     std::vector<NonMemReadEntry> non_mem_entries;
+    std::vector<std::string> dfs_dump_keys;
+    std::vector<DistributedFSDescriptor> dfs_dump_descriptors;
 
     size_t cache_evicted_count = 0;
     auto t_gc_done = timing_start;
@@ -6291,6 +6294,10 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
             }
             // start cached a single replica via FilterQueryResult.
             const auto &replica = it->second.replicas.front();
+            if (replica.is_dfs_replica()) {
+                dfs_dump_keys.push_back(keys[i]);
+                dfs_dump_descriptors.push_back(replica.get_dfs_descriptor());
+            }
 
             // Reset initial INVALID_PARAMS; will be set to actual
             // transferred bytes or error during read/scatter phase.
@@ -6348,6 +6355,9 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
             }
         }
     }
+
+    DumpDfsReplicasToFile("batch_get_dfs", batch_id, dfs_dump_keys,
+                          dfs_dump_descriptors);
 
     size_t mem_count = replicas.size();
     size_t local_disk_count = 0;
