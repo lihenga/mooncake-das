@@ -32,6 +32,10 @@ constexpr int kMaxBucketCreateConcurrency = 8;
 // reads rather than one read per object.
 constexpr uint64_t kMaxMergedIo = 4ULL * 1024 * 1024;
 
+// Must match the constants in bucket_global_allocator.cpp.
+constexpr const char* kBucketFilePrefix = "bucket_";
+constexpr const char* kBucketDataSuffix = ".data";
+
 bool IsDfsDescriptorRangeValid(const DistributedFSDescriptor& desc,
                                const DistributedStorageConfig& config) {
     if (config.alignment == 0 || desc.object_size == 0 ||
@@ -89,33 +93,6 @@ std::string CanonicalizePath(const std::string& path) {
     auto canonical = std::filesystem::weakly_canonical(path, ec);
     if (ec) return {};
     return canonical.lexically_normal().string();
-}
-
-/**
- * @brief True when `canonical_path` lies inside `canonical_root`.
- */
-bool IsPathWithinRoot(const std::string& canonical_path,
-                      const std::string& canonical_root) {
-    if (canonical_path.empty() || canonical_root.empty()) return false;
-    const std::filesystem::path path(canonical_path);
-    const std::filesystem::path root(canonical_root);
-    auto path_it = path.begin();
-    for (auto root_it = root.begin(); root_it != root.end(); ++root_it) {
-        if (path_it == path.end() || *path_it != *root_it) return false;
-        ++path_it;
-    }
-    // Require at least one component below the root so the root directory
-    // itself is never accepted as a data file.
-    return path_it != path.end();
-}
-
-/**
- * @brief Check that `path` is the bucket data file of `bucket_id`.
- */
-bool MatchesBucketDataFileName(const std::string& path, int64_t bucket_id) {
-    const std::string expected =
-        "bucket_" + ImmutableBucketAllocator::FormatBucketId(bucket_id) + ".data";
-    return std::filesystem::path(path).filename().string() == expected;
 }
 
 }  // namespace
@@ -403,8 +380,8 @@ DistributedStorageBackend::~DistributedStorageBackend() {
     // closes its own fd in its destructor via the adapter pointer it holds.
     {
         std::lock_guard<std::mutex> lock(bucket_cache_mutex_);
-        bucket_cache_.clear();
-        bucket_direct_cache_.clear();
+        bucket_id_cache_.clear();
+        bucket_id_direct_cache_.clear();
     }
     batch_read_pool_.reset();
     if (fs_adapter_) fs_adapter_->Shutdown();
@@ -484,13 +461,16 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
 
 tl::expected<std::shared_ptr<DistributedStorageBackend::OpenFileHandle>,
              ErrorCode>
-DistributedStorageBackend::GetOrOpenBucket(const std::string& path) {
+DistributedStorageBackend::GetOrOpenBucket(int64_t bucket_id) {
     {
         std::lock_guard<std::mutex> lock(bucket_cache_mutex_);
-        auto it = bucket_cache_.find(path);
-        if (it != bucket_cache_.end()) return it->second;
+        auto it = bucket_id_cache_.find(bucket_id);
+        if (it != bucket_id_cache_.end()) return it->second;
     }
 
+    const std::string path = canonical_root_dir_ + "/" + kBucketFilePrefix +
+                             ImmutableBucketAllocator::FormatBucketId(bucket_id) +
+                             kBucketDataSuffix;
     auto fd_result = fs_adapter_->OpenFile(path);
     if (!fd_result) {
         LOG(ERROR) << "Failed to open DFS bucket file " << path << ": "
@@ -506,20 +486,23 @@ DistributedStorageBackend::GetOrOpenBucket(const std::string& path) {
     std::lock_guard<std::mutex> lock(bucket_cache_mutex_);
     // Another thread may have populated the cache while we were opening; keep
     // the winner and let our handle close its own fd on destruction.
-    auto [it, inserted] = bucket_cache_.emplace(path, handle);
+    auto [it, inserted] = bucket_id_cache_.emplace(bucket_id, handle);
     (void)inserted;
     return it->second;
 }
 
 tl::expected<std::shared_ptr<DistributedStorageBackend::OpenFileHandle>,
              ErrorCode>
-DistributedStorageBackend::GetOrOpenBucketDirect(const std::string& path) {
+DistributedStorageBackend::GetOrOpenBucketDirect(int64_t bucket_id) {
     {
         std::lock_guard<std::mutex> lock(bucket_cache_mutex_);
-        auto it = bucket_direct_cache_.find(path);
-        if (it != bucket_direct_cache_.end()) return it->second;
+        auto it = bucket_id_direct_cache_.find(bucket_id);
+        if (it != bucket_id_direct_cache_.end()) return it->second;
     }
 
+    const std::string path = canonical_root_dir_ + "/" + kBucketFilePrefix +
+                             ImmutableBucketAllocator::FormatBucketId(bucket_id) +
+                             kBucketDataSuffix;
     auto fd_result = fs_adapter_->OpenFileDirect(path);
     if (!fd_result) {
         if (fd_result.error() != ErrorCode::NOT_SUPPORTED) {
@@ -538,7 +521,7 @@ DistributedStorageBackend::GetOrOpenBucketDirect(const std::string& path) {
     std::lock_guard<std::mutex> lock(bucket_cache_mutex_);
     // Another thread may have populated the cache while we were opening; keep
     // the winner and let our handle close its own fd on destruction.
-    auto [it, inserted] = bucket_direct_cache_.emplace(path, handle);
+    auto [it, inserted] = bucket_id_direct_cache_.emplace(bucket_id, handle);
     (void)inserted;
     return it->second;
 }
@@ -590,27 +573,13 @@ DistributedStorageBackend::ResolveTarget(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    const std::string canonical = CanonicalizePath(descriptor.file_path);
-    if (canonical.empty() ||
-        !IsPathWithinRoot(canonical, canonical_root_dir_)) {
-        LOG(ERROR) << "DFS bucket path " << descriptor.file_path << " for key "
-                   << key << " resolves outside the configured DFS root "
-                   << canonical_root_dir_;
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    if (!MatchesBucketDataFileName(canonical, descriptor.shard_idx)) {
-        LOG(ERROR) << "DFS bucket path " << descriptor.file_path << " for key "
-                   << key << " does not name bucket " << descriptor.shard_idx;
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    auto handle = read_only ? GetOrOpenBucketDirect(canonical)
-                            : GetOrOpenBucket(canonical);
+    auto handle = read_only ? GetOrOpenBucketDirect(descriptor.shard_idx)
+                            : GetOrOpenBucket(descriptor.shard_idx);
     if (!handle && read_only) {
         if (handle.error() != ErrorCode::NOT_SUPPORTED) {
             return tl::make_unexpected(handle.error());
         }
-        handle = GetOrOpenBucket(canonical);
+        handle = GetOrOpenBucket(descriptor.shard_idx);
         read_only = false;
     }
     if (!handle) return tl::make_unexpected(handle.error());
