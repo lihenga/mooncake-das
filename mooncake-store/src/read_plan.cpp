@@ -16,6 +16,8 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstdio>
+#include <iterator>
+#include <unordered_map>
 namespace mooncake {
 namespace {
 // Scoped reservations protect plans sharing the legacy client's key-indexed
@@ -59,6 +61,54 @@ struct Ranges {
     std::vector<std::vector<void *>> addresses;
     std::vector<std::vector<size_t>> sizes, offsets;
 };
+
+// ReadLayout instances are independent descriptions of destination memory, so
+// the same object key may legitimately appear in more than one layout.  The
+// range API represents that as one key with multiple destination ranges.  Keep
+// the first-seen key order and merge all later ranges into that entry.
+Ranges merge_ranges_by_key(Ranges input) {
+    if (input.keys.size() != input.addresses.size() ||
+        input.keys.size() != input.sizes.size() ||
+        input.keys.size() != input.offsets.size()) {
+        throw std::runtime_error("read plan range vector size mismatch");
+    }
+
+    Ranges output;
+    output.keys.reserve(input.keys.size());
+    output.addresses.reserve(input.addresses.size());
+    output.sizes.reserve(input.sizes.size());
+    output.offsets.reserve(input.offsets.size());
+    std::unordered_map<std::string, size_t> key_indices;
+    key_indices.reserve(input.keys.size());
+
+    for (size_t i = 0; i < input.keys.size(); ++i) {
+        auto [it, inserted] =
+            key_indices.emplace(input.keys[i], output.keys.size());
+        if (inserted) {
+            output.keys.push_back(std::move(input.keys[i]));
+            output.addresses.push_back(std::move(input.addresses[i]));
+            output.sizes.push_back(std::move(input.sizes[i]));
+            output.offsets.push_back(std::move(input.offsets[i]));
+            continue;
+        }
+
+        const size_t index = it->second;
+        output.addresses[index].insert(
+            output.addresses[index].end(),
+            std::make_move_iterator(input.addresses[i].begin()),
+            std::make_move_iterator(input.addresses[i].end()));
+        output.sizes[index].insert(
+            output.sizes[index].end(),
+            std::make_move_iterator(input.sizes[i].begin()),
+            std::make_move_iterator(input.sizes[i].end()));
+        output.offsets[index].insert(
+            output.offsets[index].end(),
+            std::make_move_iterator(input.offsets[i].begin()),
+            std::make_move_iterator(input.offsets[i].end()));
+    }
+    return output;
+}
+
 size_t checked_add(size_t a, size_t b) {
     if (b > SIZE_MAX - a) throw std::overflow_error("range overflow");
     return a + b;
@@ -176,7 +226,7 @@ struct ReadPlan::Impl {
                     }
             }
         }
-        return out;
+        return merge_ranges_by_key(std::move(out));
     }
     // Aggregate every group's components into one range per key. This is the
     // page-wise path: a single batch_get reads all layers of every page,
@@ -234,7 +284,7 @@ struct ReadPlan::Impl {
                 }
             }
         }
-        return out;
+        return merge_ranges_by_key(std::move(out));
     }
     std::vector<size_t> signature(int group) const {
         std::vector<size_t> out;
@@ -244,32 +294,67 @@ struct ReadPlan::Impl {
         return out;
     }
     void refresh(Ranges &out, int group) const {
-        size_t k = 0;
+        std::unordered_map<std::string, size_t> key_indices;
+        key_indices.reserve(out.keys.size());
+        for (size_t i = 0; i < out.keys.size(); ++i) {
+            if (!key_indices.emplace(out.keys[i], i).second)
+                throw std::runtime_error("reused ranges contain duplicate key");
+        }
+        std::vector<size_t> range_indices(out.keys.size(), 0);
+
+        auto find_output = [&](const std::string &key, size_t count) {
+            auto it = key_indices.find(key);
+            if (it == key_indices.end())
+                throw std::runtime_error("reused range key mismatch");
+            const size_t index = it->second;
+            const size_t begin = range_indices[index];
+            if (begin > out.addresses[index].size() ||
+                count > out.addresses[index].size() - begin ||
+                out.addresses[index].size() != out.sizes[index].size() ||
+                out.addresses[index].size() != out.offsets[index].size()) {
+                throw std::runtime_error("reused range shape mismatch");
+            }
+            range_indices[index] += count;
+            return std::pair<size_t, size_t>{index, begin};
+        };
+
         for (const auto &[keys, rows, packed, layout] : layouts) {
             const auto &items = layout[group];
             if (items.empty()) continue;
+            size_t key_index = 0;
             for (auto row : rows) {
                 if (packed) {
+                    if (key_index >= keys.size())
+                        throw std::runtime_error("reused range key mismatch");
+                    const auto [index, begin] =
+                        find_output(keys[key_index++], items.size());
                     for (size_t j = 0; j < items.size(); ++j) {
                         const auto &i = items[j];
-                        out.addresses[k][j] =
+                        out.addresses[index][begin + j] =
                             reinterpret_cast<void *>(address(i, row));
-                        out.sizes[k][j] = i[2];
-                        out.offsets[k][j] = i[3];
+                        out.sizes[index][begin + j] = i[2];
+                        out.offsets[index][begin + j] = i[3];
                     }
-                    ++k;
-                } else
+                } else {
                     for (const auto &i : items) {
-                        out.addresses[k][0] =
+                        if (key_index >= keys.size())
+                            throw std::runtime_error(
+                                "reused range key mismatch");
+                        const auto [index, begin] =
+                            find_output(keys[key_index++], 1);
+                        out.addresses[index][begin] =
                             reinterpret_cast<void *>(address(i, row));
-                        out.sizes[k][0] = i[2];
-                        out.offsets[k][0] = i[3];
-                        ++k;
+                        out.sizes[index][begin] = i[2];
+                        out.offsets[index][begin] = i[3];
                     }
+                }
             }
+            if (key_index != keys.size())
+                throw std::runtime_error("reused range key mismatch");
         }
-        if (k != out.keys.size())
-            throw std::runtime_error("reused range shape mismatch");
+        for (size_t i = 0; i < out.keys.size(); ++i)
+            if (range_indices[i] != out.addresses[i].size())
+                throw std::runtime_error("reused range shape mismatch");
     }
     void check(const Ranges &r, const std::vector<int> &results, int group) {
         if (results.size() != r.keys.size())
