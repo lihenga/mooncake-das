@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <thread>
 #include <stop_token>
+#include <future>
 
 #include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
@@ -6422,10 +6423,10 @@ void RealClient::trace_session_range_reads(
               << ", cache_evicted=" << context.cache_evicted_count
               << ", dfs_reads=" << dfs_read_count << ", gc_us="
               << elapsed_us(context.timing_start, context.cache_gc_done)
-              << ", session_mem_us="
-              << elapsed_us(context.cache_gc_done, context.memory_done)
-              << ", disk_access_us="
-              << elapsed_us(context.memory_done, context.access_done)
+              << ", mem_us="
+              << elapsed_us(context.memory_start, context.memory_done)
+              << ", dfs_us="
+              << elapsed_us(context.dfs_start, context.dfs_done)
               << ", total_us="
               << elapsed_us(context.timing_start, context.access_done);
 }
@@ -6453,10 +6454,47 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         keys, all_buffers, all_sizes, all_src_offsets, results, context);
     auto plan =
         classify_session_range_read_requests(std::move(requests), results);
-    execute_session_memory_range_reads(plan.memory_requests, results);
-    context.memory_done = std::chrono::steady_clock::now();
-    execute_session_dfs_range_reads(plan.dfs_requests, results,
-                                    context.trace_id);
+
+    // Memory and DFS reads operate on disjoint key sets and neither long-running
+    // call (BatchTransferReadRanges / BatchGet) holds session_mutex_, so they
+    // can run concurrently without serializing on that lock. Skip thread launch
+    // when one side is empty.
+    const bool has_memory = !plan.memory_requests.empty();
+    const bool has_dfs = !plan.dfs_requests.empty();
+    context.memory_start = std::chrono::steady_clock::now();
+    context.dfs_start = context.memory_start;
+
+    if (has_memory && has_dfs) {
+        // Capture each phase's own end instant so mem_us/dfs_us reflect actual
+        // per-phase duration rather than the shared join point. mem_end is
+        // written by the async thread and read after get(), which establishes a
+        // happens-before edge, so the access is race-free.
+        std::chrono::steady_clock::time_point mem_end;
+        std::future<void> mem_future = std::async(
+            std::launch::async, [this, &plan, &results, &mem_end] {
+                execute_session_memory_range_reads(plan.memory_requests, results);
+                mem_end = std::chrono::steady_clock::now();
+            });
+        context.dfs_start = std::chrono::steady_clock::now();
+        execute_session_dfs_range_reads(plan.dfs_requests, results,
+                                        context.trace_id);
+        context.dfs_done = std::chrono::steady_clock::now();
+        mem_future.get();
+        context.memory_done = mem_end;
+    } else if (has_memory) {
+        execute_session_memory_range_reads(plan.memory_requests, results);
+        context.memory_done = std::chrono::steady_clock::now();
+        context.dfs_done = context.dfs_start;
+    } else if (has_dfs) {
+        context.dfs_start = std::chrono::steady_clock::now();
+        execute_session_dfs_range_reads(plan.dfs_requests, results,
+                                        context.trace_id);
+        context.dfs_done = std::chrono::steady_clock::now();
+        context.memory_done = context.memory_start;
+    } else {
+        context.memory_done = context.memory_start;
+        context.dfs_done = context.memory_start;
+    }
     record_session_range_accesses(keys, all_buffers, all_sizes, all_src_offsets,
                                   results, context);
     context.access_done = std::chrono::steady_clock::now();

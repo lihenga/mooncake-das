@@ -64,7 +64,12 @@ struct SessionRangeReadContext {
     std::vector<std::string> access_sources;
     std::chrono::steady_clock::time_point timing_start;
     std::chrono::steady_clock::time_point cache_gc_done;
+    // Memory and DFS reads run concurrently; each phase is timed
+    // independently since the two no longer share a serial boundary.
+    std::chrono::steady_clock::time_point memory_start;
     std::chrono::steady_clock::time_point memory_done;
+    std::chrono::steady_clock::time_point dfs_start;
+    std::chrono::steady_clock::time_point dfs_done;
     std::chrono::steady_clock::time_point access_done;
 };
 
