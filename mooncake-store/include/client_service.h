@@ -921,6 +921,8 @@ class Client {
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
 
+    struct AsyncDfsWriteContext;
+
     /**
      * @brief Perform the DFS writes for a batch.
      *
@@ -935,9 +937,13 @@ class Client {
      * @param allow_async Set to false to force the synchronous path even in
      *        BUCKET mode. Used by the upsert paths, whose finalize RPCs act on
      *        ReplicaType::ALL and would collide with a deferred completion.
+     * @param staged_context Optional BUCKET payload staged while non-DFS
+     *        transfers were in flight.
      */
-    void SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert = false,
-                         bool allow_async = true);
+    void SubmitDfsWrites(
+        std::vector<PutOperation>& ops, bool is_upsert = false,
+        bool allow_async = true,
+        std::shared_ptr<AsyncDfsWriteContext> staged_context = nullptr);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
     void StartBatchUpsert(std::vector<PutOperation>& ops,
                           const ReplicateConfig& config);
@@ -966,11 +972,14 @@ class Client {
         std::vector<std::string> keys;
         std::vector<DistributedFSDescriptor> descriptors;
         std::vector<std::vector<Slice>> slices;
+        std::vector<size_t> op_indices;
+        std::vector<size_t> write_indices;
         std::vector<PinnedBufferPool::Buffer> staging;
         std::vector<std::vector<char>> host_staging;
         std::shared_ptr<DistributedStorageBackend> backend;
         std::shared_ptr<PinnedBufferPool> pinned_pool;
         bool is_upsert = false;
+        bool staging_succeeded = true;
 
         ~AsyncDfsWriteContext();
     };
@@ -983,6 +992,11 @@ class Client {
     bool StageDfsWriteData(
         AsyncDfsWriteContext& context,
         const std::vector<const std::vector<Slice>*>& slice_lists);
+
+    // Stage BUCKET payloads after transfer submission so the copy overlaps
+    // with the outstanding MEMORY/NoF transfers.
+    std::shared_ptr<AsyncDfsWriteContext> PrepareAsyncDfsWrites(
+        std::vector<PutOperation>& ops);
 
     /**
      * @brief Run one staged DFS write batch and report the outcome to master.

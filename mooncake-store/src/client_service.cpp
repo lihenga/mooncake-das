@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <limits>
+#include <numeric>
 #ifdef USE_NOF
 #include <numa.h>
 #endif
@@ -2825,8 +2826,8 @@ bool Client::StageDfsWriteData(
 
 void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
     std::vector<DfsWriteRequest> requests;
-    requests.reserve(context->keys.size());
-    for (size_t i = 0; i < context->keys.size(); ++i) {
+    requests.reserve(context->write_indices.size());
+    for (const size_t i : context->write_indices) {
         requests.push_back(DfsWriteRequest{
             context->keys[i], context->descriptors[i], context->slices[i]});
     }
@@ -2865,7 +2866,7 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
     // The RPCs are idempotent on the master side, so a bounded retry is safe.
     constexpr int kMaxCompletionAttempts = 3;
     for (size_t i = 0; i < outcomes.size(); ++i) {
-        const auto& key = context->keys[i];
+        const auto& key = context->keys[context->write_indices[i]];
         const bool succeeded = outcomes[i] == ErrorCode::OK;
         if (!succeeded) {
             LOG(ERROR) << "Async DFS write failed for key " << key
@@ -2909,8 +2910,55 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
     }
 }
 
+std::shared_ptr<Client::AsyncDfsWriteContext> Client::PrepareAsyncDfsWrites(
+    std::vector<PutOperation>& ops) {
+    auto backend = dfs_storage_backend_;
+    if (!backend ||
+        backend->GetAllocatorType() != DfsAllocatorType::BUCKET) {
+        return nullptr;
+    }
+
+    auto context = std::make_shared<AsyncDfsWriteContext>();
+    context->backend = std::move(backend);
+    context->pinned_pool = pinned_buffer_pool_;
+
+    std::vector<const std::vector<Slice>*> slice_lists;
+    for (size_t i = 0; i < ops.size(); ++i) {
+        auto& op = ops[i];
+        if (op.IsResolved() ||
+            op.transfer_summary.allocated_dfs_replicas == 0 ||
+            !HasExpectedReplicaAllocation(op.ToReplicateConfig(),
+                                          op.transfer_summary)) {
+            continue;
+        }
+
+        auto dfs_it = std::find_if(op.replicas.begin(), op.replicas.end(),
+                                   [](const Replica::Descriptor& replica) {
+                                       return replica.is_dfs_replica();
+                                   });
+        if (dfs_it == op.replicas.end()) {
+            op.transfer_summary.RecordFailure(ReplicaType::DFS,
+                                              ErrorCode::INVALID_REPLICA);
+            op.AppendFailureContext("Allocated DFS replica has no descriptor");
+            continue;
+        }
+
+        context->keys.push_back(op.key);
+        context->descriptors.push_back(dfs_it->get_dfs_descriptor());
+        context->op_indices.push_back(i);
+        slice_lists.push_back(&op.slices);
+    }
+
+    if (context->keys.empty()) return context;
+
+    context->staging_succeeded = StageDfsWriteData(*context, slice_lists);
+    return context;
+}
+
 void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
-                             bool allow_async) {
+                             bool allow_async,
+                             std::shared_ptr<AsyncDfsWriteContext>
+                                 staged_context) {
     std::vector<std::string> keys;
     std::vector<const std::vector<Slice>*> slice_lists;
     std::vector<DistributedFSDescriptor> descriptors;
@@ -2987,29 +3035,58 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
         return;
     }
 
-    auto context = std::make_shared<AsyncDfsWriteContext>();
-    context->keys = keys;
-    context->descriptors = descriptors;
-    context->backend = std::move(backend);
-    context->pinned_pool = pinned_buffer_pool_;
-    context->is_upsert = is_upsert;
-
-    // Copy all payload bytes before returning, so the task never touches the
-    // caller's memory. A staging failure is reported synchronously.
-    if (!StageDfsWriteData(*context, slice_lists)) {
-        for (const size_t index : op_indices) {
-            auto& op = ops[index];
-            op.transfer_summary.RecordFailure(ReplicaType::DFS,
-                                              ErrorCode::TRANSFER_FAIL);
-            op.AppendFailureContext("Failed to stage DFS write data");
+    auto context = std::move(staged_context);
+    if (context) {
+        op_indices.clear();
+        for (size_t i = 0; i < context->op_indices.size(); ++i) {
+            const size_t op_index = context->op_indices[i];
+            auto& op = ops[op_index];
+            if (op.IsResolved() ||
+                !NonDfsTransfersSucceeded(op.transfer_summary)) {
+                continue;
+            }
+            context->write_indices.push_back(i);
+            op_indices.push_back(op_index);
         }
-        return;
+        if (op_indices.empty()) return;
+        if (!context->staging_succeeded) {
+            for (const size_t index : op_indices) {
+                auto& op = ops[index];
+                op.transfer_summary.RecordFailure(ReplicaType::DFS,
+                                                  ErrorCode::TRANSFER_FAIL);
+                op.AppendFailureContext("Failed to stage DFS write data");
+            }
+            return;
+        }
+    } else {
+        context = std::make_shared<AsyncDfsWriteContext>();
+        context->keys = keys;
+        context->descriptors = descriptors;
+        context->backend = std::move(backend);
+        context->pinned_pool = pinned_buffer_pool_;
+        context->is_upsert = is_upsert;
+
+        // Copy all payload bytes before returning, so the task never touches
+        // the caller's memory. A staging failure is reported synchronously.
+        if (!StageDfsWriteData(*context, slice_lists)) {
+            for (const size_t index : op_indices) {
+                auto& op = ops[index];
+                op.transfer_summary.RecordFailure(ReplicaType::DFS,
+                                                  ErrorCode::TRANSFER_FAIL);
+                op.AppendFailureContext("Failed to stage DFS write data");
+            }
+            return;
+        }
+        context->write_indices.resize(context->keys.size());
+        std::iota(context->write_indices.begin(),
+                  context->write_indices.end(), 0);
     }
 
     {
         std::lock_guard<std::mutex> lock(dfs_inflight_mutex_);
         if (dfs_writes_shutting_down_.load(std::memory_order_acquire)) {
-            LOG(ERROR) << "Client is shutting down; refusing " << keys.size()
+            LOG(ERROR) << "Client is shutting down; refusing "
+                       << op_indices.size()
                        << " async DFS writes";
             for (const size_t index : op_indices) {
                 auto& op = ops[index];
@@ -3522,6 +3599,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
                     << " transfers for key " << merged_ops.back().key;
         }
     }
+    std::shared_ptr<AsyncDfsWriteContext> dfs_context;
+    if (!is_upsert) {
+        dfs_context = PrepareAsyncDfsWrites(ops);
+    }
     WaitForTransfers(merged_ops);
     for (auto& op : merged_ops) {
         auto& memory_descriptor = op.replicas[0].get_memory_descriptor();
@@ -3549,7 +3630,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
         op.failure_context = seg_to_ops.at(seg).failure_context;
     }
     // Puts may write asynchronously in bucket mode.
-    SubmitDfsWrites(ops, /*is_upsert=*/false, /*allow_async=*/true);
+    SubmitDfsWrites(ops, /*is_upsert=*/false, /*allow_async=*/true,
+                    std::move(dfs_context));
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
                   .count();
@@ -3595,8 +3677,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
 
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
+    auto dfs_context = PrepareAsyncDfsWrites(ops);
     WaitForTransfers(ops);
-    SubmitDfsWrites(ops);
+    SubmitDfsWrites(ops, /*is_upsert=*/false, /*allow_async=*/true,
+                    std::move(dfs_context));
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
                   .count();
