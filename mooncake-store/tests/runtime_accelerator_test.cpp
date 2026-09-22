@@ -1,5 +1,6 @@
 #include "device/runtime_accelerator.h"
 
+#include <array>
 #include <cstring>
 
 #include <gtest/gtest.h>
@@ -108,6 +109,24 @@ TEST(RuntimeAcceleratorTest, CopyFromHostUsesHostToDeviceCopy) {
     EXPECT_STREQ(dst, src);
     EXPECT_EQ(device.current_device_id(), 4);
     EXPECT_EQ(device.last_direction(), CopyDirection::kHostToDevice);
+}
+
+TEST(AcceleratorDeviceTest, CopyToHostBatchUsesDeviceToHostCopy) {
+    char first_source[] = "abc";
+    char second_source[] = "def";
+    char first_destination[sizeof(first_source)] = {};
+    char second_destination[sizeof(second_source)] = {};
+    FakeAcceleratorDevice device(AcceleratorVendor::kNvidia, first_source, 2);
+    const std::array<DeviceCopyRange, 2> ranges = {{
+        {first_destination, first_source, sizeof(first_source), nullptr},
+        {second_destination, second_source, sizeof(second_source), nullptr},
+    }};
+
+    EXPECT_TRUE(device.CopyToHostBatch(ranges));
+
+    EXPECT_STREQ(first_destination, first_source);
+    EXPECT_STREQ(second_destination, second_source);
+    EXPECT_EQ(device.last_direction(), CopyDirection::kDeviceToHost);
 }
 
 }  // namespace

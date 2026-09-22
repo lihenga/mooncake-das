@@ -48,6 +48,14 @@ struct HostCopyRange {
     const void* src_device = nullptr;
 };
 
+struct DeviceCopyRange {
+    void* dst = nullptr;
+    const void* src = nullptr;
+    size_t size = 0;
+    // Device-visible alias for the mapped host destination.
+    void* dst_device = nullptr;
+};
+
 class AcceleratorDevice {
    public:
     virtual ~AcceleratorDevice() = default;
@@ -81,6 +89,14 @@ class AcceleratorDevice {
             // submission with an ambiguous partial result.
             success = CopyFromHostAsync(range.dst, range.src, range.size,
                                         stream) && success;
+        }
+        return success;
+    }
+    virtual bool CopyToHostBatch(std::span<const DeviceCopyRange> ranges) const {
+        bool success = true;
+        for (const auto& range : ranges) {
+            success = Copy(range.dst, range.src, range.size,
+                           CopyDirection::kDeviceToHost) && success;
         }
         return success;
     }

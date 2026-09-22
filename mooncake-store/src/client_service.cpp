@@ -2758,26 +2758,32 @@ Client::AsyncDfsWriteContext::~AsyncDfsWriteContext() {
 bool Client::StageDfsWriteData(
     AsyncDfsWriteContext& context,
     const std::vector<const std::vector<Slice>*>& slice_lists) {
+    struct DeviceSlice {
+        size_t key_index;
+        size_t slice_index;
+        const Slice* slice;
+        const device::AcceleratorDevice* device;
+        device::PointerInfo info;
+        size_t offset;
+    };
+
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
-
     context.slices.resize(slice_lists.size());
-    // Reserve up front so the vectors never reallocate: the Slice pointers we
-    // publish below point into these buffers.
-    size_t total_slices = 0;
-    for (const auto* slices : slice_lists) {
-        if (slices != nullptr) total_slices += slices->size();
-    }
-    context.staging.reserve(total_slices);
-    context.host_staging.reserve(total_slices);
 
+    size_t total_slices = 0;
+    size_t gpu_staging_size = 0;
+    std::vector<DeviceSlice> device_slices;
     for (size_t i = 0; i < slice_lists.size(); ++i) {
-        if (slice_lists[i] == nullptr) {
+        const auto* slices = slice_lists[i];
+        if (slices == nullptr) {
             LOG(ERROR) << "Missing slices for async DFS write of key "
                        << context.keys[i];
             return false;
         }
-        for (const auto& slice : *slice_lists[i]) {
+        total_slices += slices->size();
+        for (size_t slice_index = 0; slice_index < slices->size(); ++slice_index) {
+            const auto& slice = (*slices)[slice_index];
             if (slice.size == 0) continue;
             if (slice.ptr == nullptr) {
                 LOG(ERROR) << "Null slice for async DFS write of key "
@@ -2788,37 +2794,99 @@ bool Client::StageDfsWriteData(
             device::PointerInfo info{};
             auto* device =
                 runtime_accelerator.FindDeviceForPointer(slice.ptr, &info);
-            if (device != nullptr) {
-                // GPU source: the D2H copy must complete now, while the
-                // caller's device buffer is still guaranteed to be alive.
-                device->SetContext(info.device_id);
-                auto buffer = pinned_buffer_pool_->Acquire(slice.size);
-                if (buffer.data == nullptr) {
-                    LOG(ERROR) << "Failed to acquire pinned staging buffer for "
-                                  "async DFS write of key "
-                               << context.keys[i];
-                    return false;
+            if (device == nullptr) continue;
+            if (slice.size > std::numeric_limits<size_t>::max() -
+                                 gpu_staging_size) {
+                LOG(ERROR) << "GPU staging size overflow for async DFS write";
+                return false;
+            }
+            device_slices.push_back(
+                DeviceSlice{i, slice_index, &slice, device, info, gpu_staging_size});
+            gpu_staging_size += slice.size;
+        }
+    }
+
+    // Reserve up front so the Slice pointers published below remain valid.
+    context.staging.reserve(gpu_staging_size == 0 ? 0 : 1);
+    context.host_staging.reserve(total_slices);
+
+    for (size_t i = 0; i < slice_lists.size(); ++i) {
+        context.slices[i].reserve(slice_lists[i]->size());
+    }
+
+    PinnedBufferPool::Buffer gpu_staging;
+    if (gpu_staging_size != 0) {
+        gpu_staging = pinned_buffer_pool_->AcquirePinned(
+            gpu_staging_size, nullptr, /*mapped=*/true);
+        if (gpu_staging.data == nullptr || gpu_staging.device_data == nullptr) {
+            gpu_staging = pinned_buffer_pool_->Acquire(gpu_staging_size);
+        }
+        if (gpu_staging.data == nullptr ||
+            gpu_staging.capacity < gpu_staging_size) {
+            LOG(ERROR) << "Failed to acquire staging buffer for async DFS write";
+            return false;
+        }
+
+        std::vector<bool> copied(device_slices.size());
+        for (size_t i = 0; i < device_slices.size(); ++i) {
+            if (copied[i]) continue;
+
+            const auto& first = device_slices[i];
+            first.device->SetContext(first.info.device_id);
+            std::vector<device::DeviceCopyRange> ranges;
+            for (size_t j = i; j < device_slices.size(); ++j) {
+                const auto& staged = device_slices[j];
+                if (staged.device != first.device ||
+                    staged.info.device_id != first.info.device_id) {
+                    continue;
                 }
-                if (!device->Copy(buffer.data, slice.ptr, slice.size,
-                                  device::CopyDirection::kDeviceToHost)) {
-                    LOG(ERROR) << "DFS D2H staging failed for key "
-                               << context.keys[i];
-                    pinned_buffer_pool_->Release(std::move(buffer));
-                    return false;
-                }
-                context.slices[i].push_back(Slice{buffer.data, slice.size});
-                context.staging.push_back(std::move(buffer));
+                ranges.push_back(device::DeviceCopyRange{
+                    gpu_staging.data + staged.offset, staged.slice->ptr,
+                    staged.slice->size,
+                    gpu_staging.device_data
+                        ? static_cast<char*>(gpu_staging.device_data) + staged.offset
+                        : nullptr});
+                copied[j] = true;
+            }
+            if (!first.device->CopyToHostBatch(ranges)) {
+                LOG(ERROR) << "DFS D2H staging failed for key "
+                           << context.keys[first.key_index];
+                pinned_buffer_pool_->Release(std::move(gpu_staging));
+                return false;
+            }
+        }
+    }
+
+    std::vector<std::vector<const DeviceSlice*>> device_slice_lookup(
+        slice_lists.size());
+    for (size_t i = 0; i < slice_lists.size(); ++i) {
+        device_slice_lookup[i].resize(slice_lists[i]->size());
+    }
+    for (const auto& staged : device_slices) {
+        device_slice_lookup[staged.key_index][staged.slice_index] = &staged;
+    }
+
+    for (size_t i = 0; i < slice_lists.size(); ++i) {
+        const auto& slices = *slice_lists[i];
+        for (size_t slice_index = 0; slice_index < slices.size(); ++slice_index) {
+            const auto& slice = slices[slice_index];
+            if (slice.size == 0) continue;
+            if (const auto* staged = device_slice_lookup[i][slice_index]) {
+                context.slices[i].push_back(
+                    Slice{gpu_staging.data + staged->offset, slice.size});
                 continue;
             }
 
-            // Host source: still copy. The caller may free or overwrite its
-            // buffer as soon as BatchPut returns, so referencing it from the
-            // background task would be a use-after-free.
+            // The background task must not reference caller-owned memory.
             context.host_staging.emplace_back(slice.size);
             auto& owned = context.host_staging.back();
             std::memcpy(owned.data(), slice.ptr, slice.size);
             context.slices[i].push_back(Slice{owned.data(), owned.size()});
         }
+    }
+
+    if (gpu_staging.data != nullptr) {
+        context.staging.push_back(std::move(gpu_staging));
     }
     return true;
 }

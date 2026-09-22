@@ -79,6 +79,79 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
     }
 
 #if defined(USE_HYGON)
+    bool CopyToHostBatch(std::span<const DeviceCopyRange> ranges) const override {
+        constexpr size_t kKernelMinRanges = 32;
+        if (ranges.size() < kKernelMinRanges) {
+            return AcceleratorDevice::CopyToHostBatch(ranges);
+        }
+
+        for (const auto& range : ranges) {
+            if (!range.dst || !range.src || range.size == 0 ||
+                !range.dst_device) {
+                return AcceleratorDevice::CopyToHostBatch(ranges);
+            }
+        }
+
+        hipFunction_t function = nullptr;
+        if (!LoadD2HCopyFunction(CurrentDeviceId(), &function)) {
+            return AcceleratorDevice::CopyToHostBatch(ranges);
+        }
+
+        struct DeviceRange {
+            uint64_t dst_addr;
+            uint64_t src_addr;
+            uint64_t size;
+        };
+        if (ranges.size() > std::numeric_limits<size_t>::max() /
+                                sizeof(DeviceRange) ||
+            ranges.size() > std::numeric_limits<unsigned int>::max()) {
+            return AcceleratorDevice::CopyToHostBatch(ranges);
+        }
+
+        const size_t descriptor_bytes = ranges.size() * sizeof(DeviceRange);
+        void* host_descriptors = nullptr;
+        if (hipHostMalloc(&host_descriptors, descriptor_bytes,
+                          hipHostMallocMapped) != hipSuccess) {
+            hipGetLastError();
+            return AcceleratorDevice::CopyToHostBatch(ranges);
+        }
+        auto* descriptors = static_cast<DeviceRange*>(host_descriptors);
+        for (size_t i = 0; i < ranges.size(); ++i) {
+            descriptors[i] = DeviceRange{
+                reinterpret_cast<uint64_t>(ranges[i].dst_device),
+                reinterpret_cast<uint64_t>(ranges[i].src), ranges[i].size};
+        }
+
+        void* device_descriptors = nullptr;
+        if (hipHostGetDevicePointer(&device_descriptors, host_descriptors, 0) !=
+            hipSuccess) {
+            hipGetLastError();
+            hipHostFree(host_descriptors);
+            return AcceleratorDevice::CopyToHostBatch(ranges);
+        }
+
+        uint64_t range_count = ranges.size();
+        void* args[] = {&device_descriptors, &range_count};
+        constexpr unsigned int kThreads = 256;
+        hipStream_t stream = nullptr;
+        if (hipStreamCreate(&stream) != hipSuccess) {
+            hipGetLastError();
+            hipHostFree(host_descriptors);
+            return AcceleratorDevice::CopyToHostBatch(ranges);
+        }
+        const hipError_t launch_result = hipModuleLaunchKernel(
+            function, static_cast<unsigned int>(ranges.size()), 1, 1, kThreads,
+            1, 1, 0, stream, args, nullptr);
+        const bool success =
+            launch_result == hipSuccess && hipStreamSynchronize(stream) == hipSuccess;
+        if (!success) hipGetLastError();
+        hipStreamDestroy(stream);
+        hipHostFree(host_descriptors);
+        return success ? true : AcceleratorDevice::CopyToHostBatch(ranges);
+    }
+#endif
+
+#if defined(USE_HYGON)
     bool CopyFromHostBatchAsync(std::span<const HostCopyRange> ranges,
                                 void* stream,
                                 bool* used_batch_kernel = nullptr) const
@@ -232,7 +305,10 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
     ~HipAcceleratorDevice() override {
 #if defined(USE_HYGON)
         std::lock_guard<std::mutex> lock(module_mutex_);
-        for (const auto &[_, module] : copy_modules_) {
+        for (const auto& [_, module] : copy_modules_) {
+            hipModuleUnload(module);
+        }
+        for (const auto& [_, module] : d2h_copy_modules_) {
             hipModuleUnload(module);
         }
         {
@@ -253,6 +329,37 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
             return std::string(directory) + "/mc_copy_kernel.co";
         }
         return "/usr/local/lib/python3.10/dist-packages/mooncake/mc_copy_kernel.co";
+    }
+
+    bool LoadD2HCopyFunction(int device_id, hipFunction_t* function) const {
+        if (device_id < 0) return false;
+        std::lock_guard<std::mutex> lock(module_mutex_);
+        auto it = d2h_copy_functions_.find(device_id);
+        if (it != d2h_copy_functions_.end()) {
+            *function = it->second;
+            return true;
+        }
+
+        const std::string path = CopyKernelPath();
+        std::ifstream kernel_file(path);
+        if (!kernel_file.good()) return false;
+
+        hipModule_t module = nullptr;
+        if (hipModuleLoad(&module, path.c_str()) != hipSuccess) {
+            hipGetLastError();
+            return false;
+        }
+        hipFunction_t loaded_function = nullptr;
+        if (hipModuleGetFunction(&loaded_function, module,
+                                 "MCStoreD2HScatterKernel") != hipSuccess) {
+            hipGetLastError();
+            hipModuleUnload(module);
+            return false;
+        }
+        d2h_copy_modules_.emplace(device_id, module);
+        d2h_copy_functions_.emplace(device_id, loaded_function);
+        *function = loaded_function;
+        return true;
     }
 
     bool LoadCopyFunction(int device_id, hipFunction_t *function) const {
@@ -290,6 +397,8 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
     mutable std::mutex descriptor_mutex_;
     mutable std::unordered_map<int, hipModule_t> copy_modules_;
     mutable std::unordered_map<int, hipFunction_t> copy_functions_;
+    mutable std::unordered_map<int, hipModule_t> d2h_copy_modules_;
+    mutable std::unordered_map<int, hipFunction_t> d2h_copy_functions_;
     mutable std::unordered_map<void *, std::vector<void *>>
         pending_descriptors_;
 #endif
