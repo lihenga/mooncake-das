@@ -20,6 +20,7 @@
 #include "pyclient.h"
 #include "client_service.h"
 #include "client_buffer.h"
+#include "pinned_buffer_pool.h"
 #include "device/cuda_ipc_buffer_handle.h"
 #include "mutex.h"
 #include "utils.h"
@@ -34,13 +35,6 @@
 
 namespace mooncake {
 
-// Session-level object cache for DFS reads to avoid
-// repeated I/O on the same key within a session.
-// Enabled by default; set MC_STORE_ENABLE_SESSION_CACHE to
-// "0", "false", or "off" to disable; unset or any other value
-// enables the cache.
-bool session_cache_enabled();
-
 struct SessionRangeReadRequest {
     std::string key;
     size_t original_idx;
@@ -54,26 +48,11 @@ struct SessionRangeReadRequest {
 
 using NonMemReadEntry = SessionRangeReadRequest;
 
-inline void scatter_non_mem_result(
-    const NonMemReadEntry &entry, const void *tmp_base,
-    std::vector<int> &results) {
-    for (size_t j = 0; j < entry.buffers.size(); ++j) {
-        const void *src =
-            static_cast<const char *>(tmp_base) + entry.src_offsets[j];
-        if (auto r = scatter_host_to_maybe_device(
-                entry.buffers[j], src, entry.sizes[j],
-                "session non-mem range read, key: " + entry.key);
-            !r) {
-            results[entry.original_idx] = static_cast<int>(toInt(r.error()));
-            return;
-        }
-    }
-    size_t transferred = 0;
-    for (size_t size : entry.sizes) {
-        transferred += size;
-    }
-    results[entry.original_idx] = static_cast<int>(transferred);
-}
+// Full-object pinned buffer populated only by waiting-queue prefetch.
+struct PrefetchedSessionBuffer {
+    std::shared_ptr<BufferHandle> buffer_handle;
+    uint64_t total_size;  // object size in bytes
+};
 
 struct SessionRangeReadPlan {
     std::vector<SessionRangeReadRequest> memory_requests;
@@ -90,14 +69,6 @@ struct SessionRangeReadContext {
     std::chrono::steady_clock::time_point cache_gc_done;
     std::chrono::steady_clock::time_point memory_done;
     std::chrono::steady_clock::time_point access_done;
-};
-
-// Session-level object cache for DFS reads to avoid
-// repeated I/O on the same key within a session.
-struct SessionCachedObject {
-    std::shared_ptr<BufferHandle> buffer_handle;  // RAII temp buffer
-    uint64_t total_size;                          // object size in bytes
-    bool prefetched = false;  // populated by waiting-queue host prefetch
 };
 
 class RealClient;
@@ -331,8 +302,8 @@ class RealClient : public PyClient {
     batch_get_session_start_with_sources(
         const std::vector<std::string> &keys) override;
 
-    // Synchronously populate the pinned object cache for DFS-backed active
-    // get sessions. A successful DFS status means the complete cached bytes
+    // Synchronously populate the prefetch buffer for DFS-backed active get
+    // sessions. A successful DFS status means the complete buffered bytes
     // still belong to a live session with a compatible selected replica when
     // this call returns. Non-DFS entries remain for the ordinary range-get.
     std::vector<int> batch_get_session_prefetch(
@@ -397,6 +368,11 @@ class RealClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         size_t memory_read_count, size_t dfs_read_count,
         const SessionRangeReadContext &context) const;
+
+    // Scatter a local-disk read buffer without retaining it across requests.
+    void scatter_read_result(NonMemReadEntry &entry,
+                             std::shared_ptr<BufferHandle> handle,
+                             std::vector<int> &results);
 
     std::vector<int> batch_put_session_start(
         const std::vector<std::string> &keys, const std::vector<size_t> &sizes,
@@ -1140,14 +1116,19 @@ class RealClient : public PyClient {
         get_session_access_records_;
     std::unordered_map<std::string, PutSessionEntry> put_sessions_;
 
-    // Per-key object cache for DFS reads within a get session.
-    // Populated lazily on first range-get; released at session end.
-    std::unordered_map<std::string, SessionCachedObject>
-        get_session_object_cache_;
+    // Per-key full-object buffers populated only by waiting-queue prefetch.
+    // Consumed by the admitted request's DFS range-get and released at the
+    // get session's end.
+    std::unordered_map<std::string, PrefetchedSessionBuffer>
+        get_session_prefetch_cache_;
     class DfsH2dStreamPool;
     class DfsAsyncScatterContext;
     mutable std::shared_mutex dfs_read_lifecycle_mutex_;
     bool dfs_read_shutting_down_ = false;
+    // Waiting-queue prefetch buffers outlive the read that populated them.
+    // Keep them out of FileStorage's fixed restore arena, which is request
+    // scoped and also used by ordinary DFS reads.
+    std::shared_ptr<PinnedBufferPool> dfs_prefetch_pinned_buffer_pool_;
     std::unique_ptr<DfsH2dStreamPool> dfs_h2d_stream_pool_;
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
