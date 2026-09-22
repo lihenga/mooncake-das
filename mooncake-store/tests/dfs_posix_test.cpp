@@ -825,20 +825,8 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
    public:
     void FailWriteCall(int call) { fail_write_call_ = call; }
     void FailReadCall(int call) { fail_read_call_ = call; }
-    // BatchWrite/BatchRead resume across a partial transfer instead of
-    // reporting it as a failure, because pwritev/preadv may legitimately stop
-    // early. Injecting a single short call therefore no longer produces an
-    // error - the retry finishes the transfer. These make every call in
-    // [first, last] short so one key's transfer can never complete, which is
-    // what a genuinely stuck file exhibits, while later keys still succeed.
-    void ShortWriteCallRange(int first, int last) {
-        short_write_call_ = first;
-        short_write_last_ = last;
-    }
-    void ShortReadCallRange(int first, int last) {
-        short_read_call_ = first;
-        short_read_last_ = last;
-    }
+    void ShortWriteCall(int call) { short_write_call_ = call; }
+    void ShortReadCall(int call) { short_read_call_ = call; }
     int WriteCallCount() const { return write_calls_.load(); }
     int ReadCallCount() const { return read_calls_.load(); }
 
@@ -849,8 +837,7 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
         if (call == fail_write_call_) {
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
-        if (short_write_call_ > 0 && call >= short_write_call_ &&
-            call <= short_write_last_) {
+        if (call == short_write_call_) {
             size_t total_size = 0;
             for (int i = 0; i < iovcnt; ++i) {
                 total_size += iov[i].iov_len;
@@ -866,8 +853,7 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
         if (call == fail_read_call_) {
             return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
         }
-        if (short_read_call_ > 0 && call >= short_read_call_ &&
-            call <= short_read_last_) {
+        if (call == short_read_call_) {
             size_t total_size = 0;
             for (int i = 0; i < iovcnt; ++i) {
                 total_size += iov[i].iov_len;
@@ -882,10 +868,8 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     std::atomic<int> read_calls_{0};
     int fail_write_call_ = -1;
     int short_write_call_ = -1;
-    int short_write_last_ = -1;
     int fail_read_call_ = -1;
     int short_read_call_ = -1;
-    int short_read_last_ = -1;
 };
 
 TEST_F(DfsBackendTest, BatchWriteUsesExplicitDescriptors) {
@@ -941,11 +925,7 @@ TEST_F(DfsBackendTest, BatchWritePreservesPerKeyWriteErrors) {
         file_config, distributed_config, std::move(adapter));
     ASSERT_TRUE(backend->Init().has_value());
     controlled_adapter->FailWriteCall(2);
-    // BatchWrite resumes a partial write, so a one-shot short call is just
-    // retried to completion. Keep calls 3-4 short instead: call 3 writes all
-    // but one byte, call 4 is asked for that byte and returns 0, which the
-    // backend reports as a hard failure.
-    controlled_adapter->ShortWriteCallRange(3, 4);
+    controlled_adapter->ShortWriteCall(3);
 
     AlignedBuffer write_buf(4096);
     ASSERT_NE(write_buf.data(), nullptr);
@@ -1031,9 +1011,6 @@ TEST_F(DfsBackendTest, BatchReadPreservesPerKeyErrors) {
     distributed_config.shard_count = 4;
     distributed_config.shard_capacity = 64 * 1024 * 1024;
     distributed_config.alignment = 4096;
-    // This test injects failures into the ordinary ReadAt path. Direct-I/O
-    // selection and fallback have dedicated coverage below.
-    distributed_config.direct_read_enabled = false;
 
     auto adapter = std::make_unique<ControlledPosixFsAdapter>();
     auto* controlled_adapter = adapter.get();
@@ -1057,11 +1034,7 @@ TEST_F(DfsBackendTest, BatchReadPreservesPerKeyErrors) {
     }
 
     controlled_adapter->FailReadCall(2);
-    // Same as the write case: BatchRead resumes a partial read, so keep calls
-    // 3-4 short. Call 3 returns all but one byte and call 4 returns 0 (EOF),
-    // which the backend reports as FILE_READ_FAIL. Call 5 belongs to "ok_3",
-    // which must still succeed.
-    controlled_adapter->ShortReadCallRange(3, 4);
+    controlled_adapter->ShortReadCall(3);
     AlignedBuffer out0(4096), out1(4096), out2(4096), out3(4096);
     std::vector<DfsReadRequest> reads{
         {"ok_0", writes[0].descriptor, {{out0.data(), out0.size()}}},

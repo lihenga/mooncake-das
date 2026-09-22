@@ -11,7 +11,7 @@
 #include "fs_adapter.h"
 #include "replica.h"
 #include "storage/distributed/object_storage_adapter.h"
-#include "storage/distributed/global_allocator_interface.h"
+#include "storage/distributed/dfs_allocator_interface.h"
 #include "storage_backend.h"
 
 namespace mooncake {
@@ -160,9 +160,6 @@ class DistributedStorageBackend : public StorageBackendInterface {
     struct ShardFile {
         std::string path;
         int fd = -1;
-        // Optional direct (page-cache-bypassing) read handle for the same
-        // file; -1 when the adapter does not support direct reads.
-        int direct_fd = -1;
         std::mutex mutex;
     };
 
@@ -219,6 +216,9 @@ class DistributedStorageBackend : public StorageBackendInterface {
 
     std::vector<tl::expected<void, ErrorCode>> BatchWriteShard(
         const std::vector<DfsWriteRequest>& requests);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchReadShard(
+        const std::vector<DfsReadRequest>& requests);
 
     std::vector<tl::expected<void, ErrorCode>> BatchWriteBucket(
         const std::vector<DfsWriteRequest>& requests);

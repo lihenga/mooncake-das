@@ -52,7 +52,7 @@
 #include "ha/snapshot/snapshot_logger.h"
 #include "utils/zstd_util.h"
 #include "utils/file_util.h"
-#include "storage/distributed/bucket_global_allocator.h"
+#include "storage/distributed/immutable_bucket_allocator.h"
 #include "storage/distributed/dfs_global_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "random.h"
@@ -586,7 +586,7 @@ void MasterService::InitDfsAllocatorFromEnvironment(
 
     bucket_allocator_ = nullptr;
     if (dfs_config.allocator_type == DfsAllocatorType::BUCKET) {
-        auto bucket_allocator = std::make_unique<BucketGlobalAllocator>();
+        auto bucket_allocator = std::make_unique<ImmutableBucketAllocator>();
         bucket_allocator_ = bucket_allocator.get();
         dfs_allocator_ = std::move(bucket_allocator);
     } else {
@@ -5488,7 +5488,12 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                 ErrorCode::INVALID_PARAMS);
                         }
                     }
+                }
 
+                const bool has_bucket_dfs_replica =
+                    bucket_allocator_ != nullptr &&
+                    metadata.HasReplica(&Replica::fn_is_dfs_replica);
+                if (metadata.size == slice_length && !has_bucket_dfs_replica) {
                     metadata.client_id = client_id;
                     metadata.put_start_time = now;
 
@@ -5522,8 +5527,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     return replica_list;
                 }
 
-                // --- Case C: different size — discard old replicas and
-                // reallocate
+                // --- Case C: different size or bucket DFS — reallocate
                 // --- Old buffers cannot be reused.  Move them to
                 // discarded_replicas_ for delayed release (readers may still
                 // hold descriptors without refcnt), then allocate fresh buffers
@@ -7378,7 +7382,7 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
 
         auto matches_candidate =
             [](const Replica& replica,
-               const GlobalAllocatorInterface::EvictionCandidate& candidate) {
+               const DfsAllocatorInterface::EvictionCandidate& candidate) {
                 if (!replica.is_dfs_replica()) return false;
                 const auto& desc = replica.get_dfs_descriptor();
                 // Field-by-field match against the descriptor the allocator

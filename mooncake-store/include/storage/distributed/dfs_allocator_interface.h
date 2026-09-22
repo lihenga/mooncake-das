@@ -23,7 +23,7 @@ struct DistributedStorageConfig;
  * of preallocated shard files whose space is handed out by an OffsetAllocator
  * and reclaimed per key.
  *
- * BUCKET uses BucketGlobalAllocator: a dynamic set of append-only bucket
+ * BUCKET uses ImmutableBucketAllocator: a dynamic set of append-only bucket
  * files with persisted `.meta` sidecars, whole-bucket LRU eviction and
  * restart recovery.
  */
@@ -82,7 +82,7 @@ struct BatchAllocateResult {
  * Note that BUCKET mode reuses `shard_idx` as the bucket id, so consumers
  * must not assume `shard_idx < shard_count`.
  */
-class GlobalAllocatorInterface {
+class DfsAllocatorInterface {
    public:
     /**
      * @brief A single allocation selected for eviction.
@@ -98,7 +98,7 @@ class GlobalAllocatorInterface {
         DistributedFSDescriptor descriptor;
     };
 
-    virtual ~GlobalAllocatorInterface() = default;
+    virtual ~DfsAllocatorInterface() = default;
 
     virtual DfsAllocatorType Type() const = 0;
 
