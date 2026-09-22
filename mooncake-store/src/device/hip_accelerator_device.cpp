@@ -80,11 +80,12 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
 
 #if defined(USE_HYGON)
     bool CopyFromHostBatchAsync(std::span<const HostCopyRange> ranges,
-                                void* stream) const override {
-        const char *enable = std::getenv("MC_STORE_DFS_H2D_KERNEL");
+                                void* stream,
+                                bool* used_batch_kernel = nullptr) const
+        override {
+        if (used_batch_kernel) *used_batch_kernel = false;
         constexpr size_t kKernelMinRanges = 32;
-        if ((!enable || enable[0] != '1' || enable[1] != '\0') ||
-            ranges.size() < kKernelMinRanges) {
+        if (ranges.size() < kKernelMinRanges) {
             return AcceleratorDevice::CopyFromHostBatchAsync(ranges, stream);
         }
 
@@ -158,6 +159,7 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
             pending_descriptors_[static_cast<void *>(hip_stream)].push_back(
                 host_descriptors);
         }
+        if (used_batch_kernel) *used_batch_kernel = true;
         return true;
     }
 #endif

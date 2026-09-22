@@ -21,7 +21,6 @@
 #include "client_service.h"
 #include "client_buffer.h"
 #include "device/cuda_ipc_buffer_handle.h"
-#include "pinned_buffer_pool.h"
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
@@ -33,18 +32,16 @@
 #include <ylt/coro_io/coro_io.hpp>
 #include <async_simple/coro/Lazy.h>
 
-#include "scatter_utils.h"
-
 namespace mooncake {
 
-// Session-level object cache for non-memory reads to avoid
+// Session-level object cache for DFS reads to avoid
 // repeated I/O on the same key within a session.
 // Enabled by default; set MC_STORE_ENABLE_SESSION_CACHE to
 // "0", "false", or "off" to disable; unset or any other value
 // enables the cache.
 bool session_cache_enabled();
 
-struct NonMemReadEntry {
+struct SessionRangeReadRequest {
     std::string key;
     size_t original_idx;
     Replica::Descriptor replica;
@@ -55,35 +52,28 @@ struct NonMemReadEntry {
     std::chrono::steady_clock::time_point lease_deadline;
 };
 
-// Session-level object cache for non-memory reads to avoid
+struct SessionRangeReadPlan {
+    std::vector<SessionRangeReadRequest> memory_requests;
+    std::vector<SessionRangeReadRequest> dfs_requests;
+};
+
+struct SessionRangeReadContext {
+    bool record_access{false};
+    uint64_t trace_id{0};
+    size_t cache_evicted_count{0};
+    std::vector<std::string> access_sources;
+    std::chrono::steady_clock::time_point timing_start;
+    std::chrono::steady_clock::time_point cache_gc_done;
+    std::chrono::steady_clock::time_point memory_done;
+    std::chrono::steady_clock::time_point access_done;
+};
+
+// Session-level object cache for DFS reads to avoid
 // repeated I/O on the same key within a session.
 struct SessionCachedObject {
     std::shared_ptr<BufferHandle> buffer_handle;  // RAII temp buffer
     uint64_t total_size;                          // object size in bytes
 };
-
-inline void scatter_non_mem_result(
-    const NonMemReadEntry &entry, const void *tmp_base,
-    std::vector<int> &results, std::mutex &session_mutex,
-    std::unordered_map<std::string, QueryResult> &sessions,
-    std::unordered_map<std::string, SessionCachedObject> &session_cache) {
-    for (size_t j = 0; j < entry.buffers.size(); ++j) {
-        const void *src =
-            static_cast<const char *>(tmp_base) + entry.src_offsets[j];
-        if (auto r = scatter_host_to_maybe_device(
-                entry.buffers[j], src, entry.sizes[j],
-                "session non-mem range read, key: " + entry.key);
-            !r) {
-            results[entry.original_idx] = static_cast<int>(toInt(r.error()));
-            return;
-        }
-    }
-    size_t transferred = 0;
-    for (size_t j = 0; j < entry.sizes.size(); ++j) {
-        transferred += entry.sizes[j];
-    }
-    results[entry.original_idx] = static_cast<int>(transferred);
-}
 
 class RealClient;
 class RegisteredPinnedRegion;
@@ -323,24 +313,44 @@ class RealClient : public PyClient {
 
     int batch_get_session_end(const std::vector<std::string> &keys) override;
 
-    void process_session_local_disk_reads(
-        std::unordered_map<std::string, std::vector<NonMemReadEntry *>>
-            &local_disk_by_endpoint,
+    bool validate_session_range_batch_arguments(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::vector<size_t>> &all_src_offsets) const;
+
+    std::vector<SessionRangeReadRequest> prepare_session_range_read_requests(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::vector<size_t>> &all_src_offsets,
+        std::vector<int> &results, SessionRangeReadContext &context);
+
+    SessionRangeReadPlan classify_session_range_read_requests(
+        std::vector<SessionRangeReadRequest> requests,
+        std::vector<int> &results) const;
+
+    void execute_session_memory_range_reads(
+        const std::vector<SessionRangeReadRequest> &requests,
         std::vector<int> &results);
 
-    void process_session_disk_dfs_reads(std::vector<NonMemReadEntry *> &entries,
-                                        std::vector<int> &results,
-                                        uint64_t trace_id);
+    void execute_session_dfs_range_reads(
+        std::vector<SessionRangeReadRequest> &requests,
+        std::vector<int> &results, uint64_t trace_id);
 
-    // Helper: scatter cached entries, return miss entries via
-    // move-out parameter
-    void scatter_cached_entries(std::vector<NonMemReadEntry *> &entries,
-                                std::vector<int> &results);
+    void record_session_range_accesses(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::vector<size_t>> &all_src_offsets,
+        const std::vector<int> &results,
+        const SessionRangeReadContext &context);
 
-    // Helper: store buffer in cache and scatter to target
-    void store_in_cache_and_scatter(NonMemReadEntry &entry,
-                                    std::shared_ptr<BufferHandle> handle,
-                                    std::vector<int> &results);
+    void trace_session_range_reads(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        size_t memory_read_count, size_t dfs_read_count,
+        const SessionRangeReadContext &context) const;
 
     std::vector<int> batch_put_session_start(
         const std::vector<std::string> &keys, const std::vector<size_t> &sizes,
@@ -1057,8 +1067,9 @@ class RealClient : public PyClient {
     std::optional<WritableBufferRegion> local_buffer_region_;
 
     // KV transfer sessions (process-local; not shared with DummyClient).
-    // get_sessions_ stores a FilterQueryResult'd QueryResult (single complete
-    // memory replica + lease); ranges only compare lease locally (no Master).
+    // get_sessions_ stores a FilterQueryResult'd QueryResult (one complete
+    // MEMORY or DFS replica plus its lease). Range reads only compare the
+    // lease locally and do not query the Master again.
     // Put sessions track writable + inflight so end/revoke can seal the
     // session and wait for outstanding range writes before finalize/free.
     struct PutSessionEntry {
@@ -1083,7 +1094,7 @@ class RealClient : public PyClient {
         get_session_access_records_;
     std::unordered_map<std::string, PutSessionEntry> put_sessions_;
 
-    // Per-key object cache for non-memory reads within a get session.
+    // Per-key object cache for DFS reads within a get session.
     // Populated lazily on first range-get; released at session end.
     std::unordered_map<std::string, SessionCachedObject>
         get_session_object_cache_;
@@ -1091,7 +1102,6 @@ class RealClient : public PyClient {
     class DfsAsyncScatterContext;
     mutable std::shared_mutex dfs_read_lifecycle_mutex_;
     bool dfs_read_shutting_down_ = false;
-    std::shared_ptr<PinnedBufferPool> dfs_pinned_buffer_pool_;
     std::unique_ptr<DfsH2dStreamPool> dfs_h2d_stream_pool_;
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.

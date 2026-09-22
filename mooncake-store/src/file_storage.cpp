@@ -20,6 +20,14 @@ namespace mooncake {
 
 namespace {
 
+bool UseMappedPinnedRestoreArena() {
+#if defined(USE_HYGON)
+    return true;
+#else
+    return false;
+#endif
+}
+
 std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
     const std::vector<std::string>& storage_keys,
     const std::vector<StorageObjectMetadata>& metadatas) {
@@ -64,15 +72,24 @@ FileStorage::FileStorage(const FileStorageConfig& config,
             LOG(WARNING)
                 << "Pinned SSD restore is disabled: local memcpy unavailable";
         } else {
-            auto buffer = PinnedBufferPool::AllocatePinned(
-                static_cast<size_t>(config.pinned_restore_arena_size));
+            const size_t arena_size =
+                static_cast<size_t>(config.pinned_restore_arena_size);
+            const bool mapped_requested = UseMappedPinnedRestoreArena();
+            auto buffer =
+                PinnedBufferPool::AllocatePinned(arena_size, mapped_requested);
+            if (!buffer.data && mapped_requested) {
+                LOG(WARNING) << "Mapped pinned restore arena is unavailable; "
+                                "falling back to ordinary pinned memory";
+                buffer = PinnedBufferPool::AllocatePinned(arena_size);
+            }
             if (buffer.pinned_host.addr) {
                 pinned_restore_arena_ = std::move(buffer);
                 pinned_restore_arena_allocator_ = ClientBufferAllocator::create(
                     pinned_restore_arena_.data, pinned_restore_arena_.capacity,
-                    client->GetProtocol());
+                    client->GetProtocol(), pinned_restore_arena_.device_data);
                 LOG(INFO) << "Initialized pinned SSD restore arena, size="
-                          << pinned_restore_arena_.capacity;
+                          << pinned_restore_arena_.capacity
+                          << ", mapped=" << pinned_restore_arena_.mapped;
             } else {
                 LOG(WARNING) << "Failed to allocate pinned SSD restore arena";
             }
@@ -126,6 +143,12 @@ FileStorage::~FileStorage() {
     if (client_buffer_gc_thread_.joinable()) {
         client_buffer_gc_thread_.join();
     }
+}
+
+std::optional<BufferHandle> FileStorage::AllocatePinnedStagingBuffer(
+    size_t size, size_t alignment) const {
+    if (!pinned_restore_arena_allocator_) return std::nullopt;
+    return pinned_restore_arena_allocator_->allocate_aligned(size, alignment);
 }
 
 tl::expected<void, ErrorCode> FileStorage::Init() {

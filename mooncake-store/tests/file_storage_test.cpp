@@ -81,9 +81,9 @@ class FileStorageTest : public ::testing::Test {
     }
 
     void SetPinnedRestoreArena(FileStorage& fileStorage, void* address,
-                               size_t size) {
+                               size_t size, void* device_address = nullptr) {
         fileStorage.pinned_restore_arena_allocator_ =
-            ClientBufferAllocator::create(address, size);
+            ClientBufferAllocator::create(address, size, "", device_address);
     }
 
     tl::expected<void, ErrorCode> FileStorageBatchLoad(
@@ -323,6 +323,27 @@ TEST_F(FileStorageTest, BatchGetUsesPinnedArenaAndFallsBackWhenFull) {
                         sizes[i]),
             batch_data.at(keys[i]));
     }
+}
+
+TEST_F(FileStorageTest, PinnedStagingAllocationIsAlignedWithMappedAlias) {
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    constexpr size_t kAlignment = 4096;
+    std::vector<char> host(3 * kAlignment);
+    std::vector<char> device_alias(host.size());
+    void* host_base = host.data() + 1;
+    void* device_base = device_alias.data() + 1;
+    SetPinnedRestoreArena(fileStorage, host_base, host.size() - 1, device_base);
+
+    auto allocation = fileStorage.AllocatePinnedStagingBuffer(1024, kAlignment);
+    ASSERT_TRUE(allocation.has_value());
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(allocation->ptr()) % kAlignment, 0);
+    const auto offset =
+        static_cast<char*>(allocation->ptr()) - static_cast<char*>(host_base);
+    EXPECT_EQ(allocation->device_ptr(),
+              static_cast<char*>(device_base) + offset);
 }
 
 TEST_F(FileStorageTest, AllocateBatchAvoidsDirectIoPaddingForPosixReads) {
