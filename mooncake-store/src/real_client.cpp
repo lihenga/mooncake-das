@@ -6415,6 +6415,21 @@ void RealClient::trace_session_range_reads(
                                                                      start)
             .count();
     };
+    auto nonnegative_elapsed_us = [&](const auto &start, const auto &end) {
+        return std::max<int64_t>(0, elapsed_us(start, end));
+    };
+    const auto mem_start_us = elapsed_us(context.timing_start,
+                                         context.memory_start);
+    const auto mem_done_us = elapsed_us(context.timing_start,
+                                        context.memory_done);
+    const auto dfs_start_us = elapsed_us(context.timing_start,
+                                         context.dfs_start);
+    const auto dfs_done_us = elapsed_us(context.timing_start,
+                                        context.dfs_done);
+    const auto mem_wait_after_dfs_us =
+        nonnegative_elapsed_us(context.dfs_done, context.memory_done);
+    const auto post_dfs_us =
+        nonnegative_elapsed_us(context.dfs_done, context.access_done);
     LOG(INFO) << "batch_get_into_multi_buffer_ranges: trace_id="
               << context.trace_id << ", keys=" << keys.size()
               << ", total_ranges=" << total_ranges
@@ -6423,7 +6438,12 @@ void RealClient::trace_session_range_reads(
               << ", cache_evicted=" << context.cache_evicted_count
               << ", dfs_reads=" << dfs_read_count << ", gc_us="
               << elapsed_us(context.timing_start, context.cache_gc_done)
-              << ", mem_us="
+              << ", mem_start_us=" << mem_start_us
+              << ", mem_done_us=" << mem_done_us
+              << ", dfs_start_us=" << dfs_start_us
+              << ", dfs_done_us=" << dfs_done_us
+              << ", mem_wait_after_dfs_us=" << mem_wait_after_dfs_us
+              << ", post_dfs_us=" << post_dfs_us << ", mem_us="
               << elapsed_us(context.memory_start, context.memory_done)
               << ", dfs_us="
               << elapsed_us(context.dfs_start, context.dfs_done)
