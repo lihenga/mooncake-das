@@ -6529,6 +6529,43 @@ void RealClient::execute_session_dfs_range_reads(
         return;
     }
 
+    // BatchGet stores destination slices and temporary handles by key. Reject
+    // duplicate entries defensively: callers must represent multiple ranges as
+    // one key with multiple buffers, otherwise key-indexed state is ambiguous.
+    std::unordered_map<std::string, size_t> entry_counts;
+    entry_counts.reserve(entries.size());
+    for (const auto *entry : entries) ++entry_counts[entry->key];
+    if (std::any_of(entry_counts.begin(), entry_counts.end(),
+                    [](const auto &item) { return item.second > 1; })) {
+        size_t duplicate_keys = 0;
+        size_t duplicate_entries = 0;
+        std::string first_duplicate_key;
+        for (const auto &[key, count] : entry_counts) {
+            if (count <= 1) continue;
+            if (first_duplicate_key.empty()) first_duplicate_key = key;
+            ++duplicate_keys;
+            duplicate_entries += count;
+        }
+        LOG(ERROR) << "Duplicate keys in DFS range batch; merge ranges under "
+                      "one key: duplicate_keys="
+                   << duplicate_keys
+                   << ", duplicate_entries=" << duplicate_entries
+                   << ", first_key=" << first_duplicate_key;
+
+        std::vector<NonMemReadEntry *> unique_entries;
+        unique_entries.reserve(entries.size());
+        for (auto *entry : entries) {
+            if (entry_counts[entry->key] == 1) {
+                unique_entries.push_back(entry);
+                continue;
+            }
+            results[entry->original_idx] =
+                static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+        }
+        entries = std::move(unique_entries);
+        if (entries.empty()) return;
+    }
+
     const auto timing_start = std::chrono::steady_clock::now();
     const bool trace_enabled = trace_id != 0;
     const size_t input_entries = entries.size();
@@ -6826,10 +6863,19 @@ void RealClient::execute_session_dfs_range_reads(
             }
             SessionRangeReadRequest *entry = map_it->second;
             std::shared_ptr<BufferHandle> handle = std::move(handle_it->second);
-            if (!valid_source_handle(entry, handle)) {
+            const uint64_t replica_size = calculate_total_size(entry->replica);
+            if (!handle || !handle->ptr()) {
+                LOG(ERROR) << "DFS read buffer handle is null, key: " << key;
+                results[entry->original_idx] =
+                    static_cast<int>(toInt(ErrorCode::INTERNAL_ERROR));
+                continue;
+            }
+            if (replica_size > std::numeric_limits<size_t>::max() ||
+                static_cast<size_t>(replica_size) > handle->size()) {
                 LOG(ERROR) << "DFS read buffer is smaller than the replica, "
                               "key: "
-                           << key;
+                           << key << ", buffer_size: " << handle->size()
+                           << ", replica_size: " << replica_size;
                 results[entry->original_idx] =
                     static_cast<int>(toInt(ErrorCode::INTERNAL_ERROR));
                 continue;
