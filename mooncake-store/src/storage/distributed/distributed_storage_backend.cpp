@@ -32,7 +32,7 @@ constexpr int kMaxBucketCreateConcurrency = 8;
 // reads rather than one read per object.
 constexpr uint64_t kMaxMergedIo = 4ULL * 1024 * 1024;
 
-// Must match the constants in bucket_global_allocator.cpp.
+// Must match the constants in immutable_bucket_allocator.cpp.
 constexpr const char* kBucketFilePrefix = "bucket_";
 constexpr const char* kBucketDataSuffix = ".data";
 
@@ -469,7 +469,7 @@ DistributedStorageBackend::GetOrOpenBucket(int64_t bucket_id) {
     }
 
     const std::string path = canonical_root_dir_ + "/" + kBucketFilePrefix +
-                             BucketGlobalAllocator::FormatBucketId(bucket_id) +
+                             ImmutableBucketAllocator::FormatBucketId(bucket_id) +
                              kBucketDataSuffix;
     auto fd_result = fs_adapter_->OpenFile(path);
     if (!fd_result) {
@@ -501,7 +501,7 @@ DistributedStorageBackend::GetOrOpenBucketDirect(int64_t bucket_id) {
     }
 
     const std::string path = canonical_root_dir_ + "/" + kBucketFilePrefix +
-                             BucketGlobalAllocator::FormatBucketId(bucket_id) +
+                             ImmutableBucketAllocator::FormatBucketId(bucket_id) +
                              kBucketDataSuffix;
     auto fd_result = fs_adapter_->OpenFileDirect(path);
     if (!fd_result) {
