@@ -6552,8 +6552,8 @@ void RealClient::execute_session_dfs_range_reads(
                    << ", duplicate_entries=" << duplicate_entries
                    << ", first_key=" << first_duplicate_key;
 
-        std::vector<NonMemReadEntry *> unique_entries;
-        unique_entries.reserve(entries.size());
+        auto unique_entries = entries;
+        unique_entries.clear();
         for (auto *entry : entries) {
             if (entry_counts[entry->key] == 1) {
                 unique_entries.push_back(entry);
