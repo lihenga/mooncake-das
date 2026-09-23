@@ -7183,6 +7183,12 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     context.trace_id =
         dfs_read_trace_enabled() ? NextDfsReadTraceId() : uint64_t{0};
     context.record_access = client_->MetricsEnabled();
+    if (context.trace_id != 0) {
+        LOG(INFO) << "batch_get_into_multi_buffer_ranges_begin: trace_id="
+                  << context.trace_id << ", pid=" << ::getpid()
+                  << ", client_id=" << client_->getClientId()
+                  << ", keys=" << keys.size();
+    }
 
     auto requests = prepare_session_range_read_requests(
         keys, all_buffers, all_sizes, all_src_offsets, results, context);
