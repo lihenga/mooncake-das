@@ -317,13 +317,21 @@ class PyClient {
                 std::vector<std::string>(keys.size(), "unknown")};
     }
 
-    // Read DFS session objects into Mooncake's pinned host pool without
-    // copying them to caller buffers. Non-DFS keys succeed without preloading;
-    // a later batch_get_into_multi_buffer_ranges() call remains authoritative.
+    // Read DFS session objects into Mooncake's dedicated prefetch arena
+    // without copying them to caller buffers. Non-DFS keys succeed without
+    // preloading; a later batch_get_into_multi_buffer_ranges() call remains
+    // authoritative.
     virtual std::vector<int> batch_get_session_prefetch(
         const std::vector<std::string> &keys) {
         return std::vector<int>(
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    // Whether batch_get_session_prefetch() has a staging arena for DFS reads.
+    virtual bool dfs_prefetch_arena_available() const { return false; }
+
+    virtual std::string dfs_prefetch_arena_status() const {
+        return "unsupported";
     }
 
     virtual void record_prefetched_tokens(uint64_t /*tokens*/) {}

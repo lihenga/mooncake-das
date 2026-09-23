@@ -3117,10 +3117,28 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("keys"),
             "Synchronously read DFS objects in active get sessions into "
-            "Mooncake's pinned host pool without copying to caller buffers. "
-            "A successful DFS status means the complete object bytes remain "
-            "owned by a compatible active session; non-DFS entries use the "
-            "ordinary range-get path. Returns per-key status.")
+            "Mooncake's dedicated prefetch arena without copying to caller "
+            "buffers. A successful DFS status means the complete object bytes "
+            "remain owned by a compatible active session; non-DFS entries use "
+            "the ordinary range-get path. Returns per-key status.")
+        .def(
+            "dfs_prefetch_arena_available",
+            [](MooncakeStorePyWrapper &self) {
+                if (!self.is_client_initialized()) return false;
+                return self.store_->dfs_prefetch_arena_available();
+            },
+            "Whether batch_get_session_prefetch has a DFS staging arena "
+            "(MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES). When false every DFS "
+            "prefetch read fails, so callers should not submit prefetches.")
+        .def(
+            "dfs_prefetch_arena_status",
+            [](MooncakeStorePyWrapper &self) {
+                if (!self.is_client_initialized()) {
+                    return std::string("client not initialized");
+                }
+                return self.store_->dfs_prefetch_arena_status();
+            },
+            "\"ready\" or the reason the DFS prefetch arena is unavailable.")
         .def(
             "record_prefetched_tokens",
             [](MooncakeStorePyWrapper &self, uint64_t tokens) {

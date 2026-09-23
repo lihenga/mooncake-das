@@ -600,35 +600,6 @@ size_t DfsH2dStreamCount() {
     return static_cast<size_t>(parsed);
 }
 
-size_t PrefetchPinnedPoolMaxCachedBytes() {
-    constexpr size_t kDefaultBytes = 512ULL * 1024 * 1024;
-    const char *value = std::getenv("MC_STORE_DFS_PINNED_POOL_BYTES");
-    if (!value || value[0] == '\0') return kDefaultBytes;
-
-    errno = 0;
-    char *end = nullptr;
-    const unsigned long long parsed = std::strtoull(value, &end, 10);
-    const bool digits_only =
-        std::all_of(value, value + std::strlen(value), [](unsigned char c) {
-            return std::isdigit(c) != 0;
-        });
-    if (!digits_only || errno != 0 || end == value || *end != '\0' ||
-        parsed > std::numeric_limits<size_t>::max()) {
-        LOG(WARNING) << "Invalid MC_STORE_DFS_PINNED_POOL_BYTES='" << value
-                     << "', using " << kDefaultBytes;
-        return kDefaultBytes;
-    }
-    return static_cast<size_t>(parsed);
-}
-
-bool UseMappedPrefetchPinnedArena() {
-#if defined(USE_HYGON)
-    return true;
-#else
-    return false;
-#endif
-}
-
 bool AlignUp(size_t value, size_t alignment, size_t *aligned) {
     const size_t remainder = value % alignment;
     if (remainder == 0) {
@@ -641,57 +612,9 @@ bool AlignUp(size_t value, size_t alignment, size_t *aligned) {
     return true;
 }
 
-struct PrefetchPinnedArenaBacking {
-    std::shared_ptr<PinnedBufferPool> pool;
-    PinnedBufferPool::Buffer buffer;
-
-    ~PrefetchPinnedArenaBacking() {
-        if (pool) pool->Release(std::move(buffer));
-    }
-};
-
-std::shared_ptr<BufferHandle> AcquirePrefetchPinnedArena(
-    const std::shared_ptr<PinnedBufferPool> &pool, size_t size,
-    size_t alignment) {
-    if (!pool || size == 0 || alignment == 0 ||
-        size > std::numeric_limits<size_t>::max() - (alignment - 1)) {
-        return nullptr;
-    }
-
-    const size_t padded_size = size + alignment - 1;
-    auto backing = std::make_shared<PrefetchPinnedArenaBacking>();
-    backing->pool = pool;
-    backing->buffer = pool->AcquirePinned(
-        padded_size, nullptr, UseMappedPrefetchPinnedArena());
-    if (!backing->buffer.data && UseMappedPrefetchPinnedArena()) {
-        // Mapped pinned memory enables the HYGON batched H2D kernel, but the
-        // ordinary pinned-DMA path remains a valid fallback.
-        backing->buffer = pool->AcquirePinned(padded_size);
-    }
-    if (!backing->buffer.data || !backing->buffer.pinned_host.addr ||
-        backing->buffer.capacity < padded_size) {
-        return nullptr;
-    }
-
-    const uintptr_t base_address =
-        reinterpret_cast<uintptr_t>(backing->buffer.data);
-    const size_t remainder = base_address % alignment;
-    const size_t offset = remainder == 0 ? 0 : alignment - remainder;
-    if (offset > backing->buffer.capacity - size) return nullptr;
-
-    char *base = backing->buffer.data + offset;
-    void *device_base = backing->buffer.device_data;
-    if (device_base) {
-        device_base = static_cast<char *>(device_base) + offset;
-    }
-    return std::make_shared<BufferHandle>(
-        base, size, [backing]() { (void)backing; }, device_base);
-}
-
-// Removing a prefetched buffer can release pinned host memory.  Keep the
-// shared handle alive until the caller has dropped session_mutex_; otherwise a
-// full pinned-pool cache can make this path call hipHostFree/cudaFreeHost while
-// holding the session lock.
+// Removing a prefetched buffer can return the last reference to its arena
+// region. Keep the shared handle alive until the caller has dropped
+// session_mutex_ so region release and its accounting run outside the lock.
 void DetachPrefetchedSessionBuffer(
     std::unordered_map<std::string, PrefetchedSessionBuffer> &cache,
     const std::string &key,
@@ -1466,17 +1389,18 @@ RealClient::RealClient() {
     mooncake::init_ylt_log_level();
     const char *hp = std::getenv("MC_STORE_USE_HUGEPAGE");
     use_hugepage_ = (hp != nullptr);
-    const size_t pinned_pool_cache_bytes =
-        PrefetchPinnedPoolMaxCachedBytes();
-    dfs_prefetch_pinned_buffer_pool_ =
-        std::make_shared<PinnedBufferPool>(pinned_pool_cache_bytes);
     const size_t h2d_streams_per_device = DfsH2dStreamCount();
     dfs_h2d_stream_pool_ =
         std::make_unique<DfsH2dStreamPool>(h2d_streams_per_device);
-    LOG(INFO) << "DFS staging config: prefetch_pinned_pool_max_idle_cache_bytes="
-              << pinned_pool_cache_bytes
-              << " (allocated lazily; active bytes are bounded by the caller)"
-              << ", h2d_streams_per_device=" << h2d_streams_per_device;
+    LOG(INFO) << "DFS staging config: h2d_streams_per_device="
+              << h2d_streams_per_device;
+    const char *legacy_pool_bytes =
+        std::getenv("MC_STORE_DFS_PINNED_POOL_BYTES");
+    if (legacy_pool_bytes && legacy_pool_bytes[0] != '\0') {
+        LOG(WARNING) << "MC_STORE_DFS_PINNED_POOL_BYTES is deprecated and "
+                        "ignored; DFS prefetch staging now uses the fixed "
+                        "arena sized by MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES";
+    }
 }
 
 RealClient::~RealClient() {
@@ -2135,7 +2059,6 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         }
         get_session_prefetch_cache_.clear();
     }
-    dfs_prefetch_pinned_buffer_pool_.reset();
     if (!client_) {
         // Not initialized or already cleaned; treat as success for idempotence
         return {};
@@ -6448,6 +6371,104 @@ std::vector<int> RealClient::batch_get_session_refresh(
     return results;
 }
 
+bool RealClient::dfs_prefetch_arena_available() const {
+    return file_storage_ && file_storage_->HasPinnedPrefetchArena();
+}
+
+std::string RealClient::dfs_prefetch_arena_status() const {
+    if (!file_storage_) {
+        return "unavailable: no FileStorage (SSD offload disabled)";
+    }
+    return file_storage_->PinnedPrefetchArenaStatus();
+}
+
+std::shared_ptr<BufferHandle> RealClient::AllocatePrefetchArenaRegion(
+    size_t size, size_t alignment) {
+    auto stats = prefetch_arena_stats_;
+    if (!dfs_prefetch_arena_available()) {
+        stats->alloc_fail.fetch_add(1, std::memory_order_relaxed);
+        if (!stats->unavailable_logged.exchange(true)) {
+            LOG(WARNING) << "DFS prefetch staging arena unavailable ("
+                         << dfs_prefetch_arena_status()
+                         << "); waiting-queue DFS prefetch reads will fail";
+        }
+        return nullptr;
+    }
+
+    auto allocation =
+        file_storage_->AllocatePinnedPrefetchBuffer(size, alignment);
+    const auto report = file_storage_->PinnedPrefetchArenaReport();
+    const uint64_t capacity = file_storage_->PinnedPrefetchArenaCapacity();
+    const uint64_t occupied =
+        capacity > report.totalFreeSpace ? capacity - report.totalFreeSpace : 0;
+    std::shared_ptr<BufferHandle> region;
+    if (!allocation) {
+        const uint64_t failures =
+            stats->alloc_fail.fetch_add(1, std::memory_order_relaxed) + 1;
+        LOG_EVERY_N(WARNING, 64)
+            << "DFS prefetch arena exhausted: request_bytes=" << size
+            << ", occupied_bytes=" << occupied
+            << ", free_bytes=" << report.totalFreeSpace
+            << ", largest_free_region_lower_bound=" << report.largestFreeRegion
+            << ", capacity=" << capacity << ", failures=" << failures;
+    } else {
+        stats->alloc_ok.fetch_add(1, std::memory_order_relaxed);
+        stats->requested_bytes_in_use.fetch_add(size,
+                                                std::memory_order_relaxed);
+        uint64_t peak =
+            stats->occupied_bytes_observed_peak.load(std::memory_order_relaxed);
+        while (occupied > peak &&
+               !stats->occupied_bytes_observed_peak.compare_exchange_weak(
+                   peak, occupied, std::memory_order_relaxed)) {
+        }
+        // The root region is shared by every key view of this read. Its
+        // deleter runs after the last view is gone: returning the region to
+        // the arena first, then the accounting. Only the stats object is
+        // captured, so release never depends on FileStorage lifetime.
+        region = std::shared_ptr<BufferHandle>(
+            new BufferHandle(std::move(*allocation)),
+            [stats, size](BufferHandle *handle) {
+                delete handle;
+                stats->requested_bytes_in_use.fetch_sub(
+                    size, std::memory_order_relaxed);
+            });
+    }
+    uint64_t largest_min =
+        stats->largest_free_region_min.load(std::memory_order_relaxed);
+    while (
+        report.largestFreeRegion < largest_min &&
+        !stats->largest_free_region_min.compare_exchange_weak(
+            largest_min, report.largestFreeRegion, std::memory_order_relaxed)) {
+    }
+
+    // Always-on summary, at most every 30 s while prefetch is active.
+    constexpr int64_t kSummaryIntervalNs = 30LL * 1000 * 1000 * 1000;
+    const int64_t now_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    int64_t last_ns = stats->last_summary_ns.load(std::memory_order_relaxed);
+    if (now_ns - last_ns >= kSummaryIntervalNs &&
+        stats->last_summary_ns.compare_exchange_strong(
+            last_ns, now_ns, std::memory_order_relaxed)) {
+        LOG(INFO)
+            << "DFS prefetch arena summary: capacity=" << capacity
+            << ", alloc_ok=" << stats->alloc_ok.load(std::memory_order_relaxed)
+            << ", alloc_fail="
+            << stats->alloc_fail.load(std::memory_order_relaxed)
+            << ", requested_bytes_in_use="
+            << stats->requested_bytes_in_use.load(std::memory_order_relaxed)
+            << ", occupied_bytes=" << occupied
+            << ", occupied_bytes_observed_peak="
+            << stats->occupied_bytes_observed_peak.load(
+                   std::memory_order_relaxed)
+            << ", largest_free_region_lower_bound=" << report.largestFreeRegion
+            << ", largest_free_region_min="
+            << stats->largest_free_region_min.load(std::memory_order_relaxed);
+    }
+    return region;
+}
+
 std::vector<int> RealClient::batch_get_session_prefetch(
     const std::vector<std::string> &keys) {
     std::vector<int> results(
@@ -6515,7 +6536,9 @@ std::vector<int> RealClient::batch_get_session_prefetch(
         // This call blocks only its caller. SGLang submits it from a bounded
         // background prefetch worker, while scheduler admission waits for the
         // prefetch to reach READY on every rank before consuming the session.
-        process_session_disk_dfs_reads(dfs_entries, results, 0,
+        const uint64_t trace_id =
+            dfs_read_trace_enabled() ? NextDfsReadTraceId() : uint64_t{0};
+        process_session_disk_dfs_reads(dfs_entries, results, trace_id,
                                        /*prefetch_only=*/true);
     }
 
@@ -7306,16 +7329,18 @@ void RealClient::execute_session_dfs_range_reads(
     }
 
     std::shared_ptr<BufferHandle> arena;
+    bool prefetch_arena_used = false;
+    bool prefetch_arena_alloc_fail = false;
     if (!arena_views.empty()) {
         if (prefetch_only) {
-            // Prefetch buffers remain pinned in get_session_prefetch_cache_
-            // until the session ends. They must not consume FileStorage's
-            // request-scoped restore arena used by ordinary DFS reads.
-            arena = AcquirePrefetchPinnedArena(
-                dfs_prefetch_pinned_buffer_pool_, arena_size, dfs_alignment);
-        }
-
-        if (!arena && !prefetch_only) {
+            // Prefetch buffers remain in get_session_prefetch_cache_ until the
+            // session ends, so they come only from the dedicated prefetch
+            // arena: never the request-scoped restore arena and never a
+            // runtime pinned allocation.
+            arena = AllocatePrefetchArenaRegion(arena_size, dfs_alignment);
+            prefetch_arena_used = arena != nullptr;
+            prefetch_arena_alloc_fail = arena == nullptr;
+        } else {
             std::optional<BufferHandle> allocation;
             if (file_storage_) {
                 allocation = file_storage_->AllocatePinnedStagingBuffer(
@@ -7334,10 +7359,14 @@ void RealClient::execute_session_dfs_range_reads(
             arena_capacity = arena->size();
         }
         if (!arena) {
-            LOG(ERROR) << "DFS staging arena allocation failed, size: "
-                       << arena_size << ", pinned_restore_available="
-                       << (file_storage_ &&
-                           file_storage_->HasPinnedRestoreArena());
+            // Prefetch failures are reported (rate-limited) by
+            // AllocatePrefetchArenaRegion.
+            if (!prefetch_only) {
+                LOG(ERROR) << "DFS staging arena allocation failed, size: "
+                           << arena_size << ", pinned_restore_available="
+                           << (file_storage_ &&
+                               file_storage_->HasPinnedRestoreArena());
+            }
             for (const auto &view : arena_views) {
                 results[view.entry->original_idx] =
                     static_cast<int>(toInt(ErrorCode::NO_AVAILABLE_HANDLE));
@@ -7548,6 +7577,9 @@ void RealClient::execute_session_dfs_range_reads(
             << ", arena_requested_bytes=" << arena_size
             << ", arena_capacity=" << arena_capacity
             << ", pinned_restore_arena_used=" << pinned_restore_arena_used
+            << ", prefetch_only=" << prefetch_only
+            << ", prefetch_arena_used=" << prefetch_arena_used
+            << ", prefetch_arena_alloc_fail=" << prefetch_arena_alloc_fail
             << ", dfs_read_success=" << dfs_read_success
             << ", dfs_read_bytes=" << dfs_read_bytes
             << ", dfs_requested_bytes=" << dfs_requested_bytes
