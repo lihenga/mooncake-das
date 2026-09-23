@@ -20,7 +20,6 @@
 #include "pyclient.h"
 #include "client_service.h"
 #include "client_buffer.h"
-#include "pinned_buffer_pool.h"
 #include "device/cuda_ipc_buffer_handle.h"
 #include "mutex.h"
 #include "utils.h"
@@ -308,6 +307,14 @@ class RealClient : public PyClient {
     // this call returns. Non-DFS entries remain for the ordinary range-get.
     std::vector<int> batch_get_session_prefetch(
         const std::vector<std::string> &keys) override;
+
+    // Whether waiting-queue DFS prefetch has a staging arena. Callers should
+    // not submit prefetches when this is false: every DFS staging allocation
+    // would fail.
+    bool dfs_prefetch_arena_available() const override;
+
+    // "ready" or the reason the prefetch arena is unavailable.
+    std::string dfs_prefetch_arena_status() const override;
 
     void record_prefetched_tokens(uint64_t tokens) override;
 
@@ -1126,9 +1133,28 @@ class RealClient : public PyClient {
     mutable std::shared_mutex dfs_read_lifecycle_mutex_;
     bool dfs_read_shutting_down_ = false;
     // Waiting-queue prefetch buffers outlive the read that populated them.
-    // Keep them out of FileStorage's fixed restore arena, which is request
-    // scoped and also used by ordinary DFS reads.
-    std::shared_ptr<PinnedBufferPool> dfs_prefetch_pinned_buffer_pool_;
+    // They come only from FileStorage's dedicated prefetch arena, never from
+    // the request-scoped restore arena or a runtime pinned allocation.
+    struct PrefetchArenaStats {
+        std::atomic<uint64_t> alloc_ok{0};
+        std::atomic<uint64_t> alloc_fail{0};
+        // Requested bytes of live root regions; released after the region
+        // has been returned to the arena.
+        std::atomic<uint64_t> requested_bytes_in_use{0};
+        // Arena occupancy (capacity - free, including alignment and bin
+        // rounding) observed right after allocations; not an exact peak.
+        std::atomic<uint64_t> occupied_bytes_observed_peak{0};
+        // Minimum observed conservative lower bound of the largest free
+        // region.
+        std::atomic<uint64_t> largest_free_region_min{UINT64_MAX};
+        std::atomic<int64_t> last_summary_ns{0};
+        std::atomic<bool> unavailable_logged{false};
+    };
+    // Shared with region deleters so accounting never touches FileStorage.
+    std::shared_ptr<PrefetchArenaStats> prefetch_arena_stats_ =
+        std::make_shared<PrefetchArenaStats>();
+    std::shared_ptr<BufferHandle> AllocatePrefetchArenaRegion(size_t size,
+                                                              size_t alignment);
     std::unique_ptr<DfsH2dStreamPool> dfs_h2d_stream_pool_;
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
