@@ -5994,21 +5994,85 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchEvictDiskReplica(
 
 std::vector<tl::expected<void, ErrorCode>>
 MasterService::BatchInvalidateDfsBuckets(
-    const UUID& client_id, const std::vector<int64_t>& bucket_ids,
+    const UUID& client_id, const std::vector<DfsMissingFileReport>& reports,
     const TenantId& tenant_id) {
     (void)client_id;
     assert(tenant_id.IsValid());
     std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(bucket_ids.size());
-    for (const int64_t bucket_id : bucket_ids) {
-        if (RunBucketDfsEvictionInternal(/*force_one=*/false, bucket_id,
-                                         tenant_id)) {
-            results.emplace_back();
-        } else {
-            results.emplace_back(tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+    results.reserve(reports.size());
+    if (bucket_allocator_ == nullptr || !tenant_id.IsDefault()) {
+        results.assign(reports.size(),
+                       tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+        return results;
+    }
+
+    std::unordered_set<int64_t> bucket_ids;
+    for (const auto& report : reports) {
+        const auto& descriptor = report.descriptor;
+        bool matched = false;
+        if (!report.key.empty() && descriptor.shard_idx >= 0) {
+            const size_t shard_idx =
+                getMetadataShardIndex(tenant_id, report.key);
+            std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+            SharedMutexLocker shard_lock(&metadata_shards_[shard_idx].mutex);
+            auto tenant_it = metadata_shards_[shard_idx].tenants.find(tenant_id);
+            if (tenant_it != metadata_shards_[shard_idx].tenants.end()) {
+                auto metadata_it = tenant_it->second.metadata.find(report.key);
+                if (metadata_it != tenant_it->second.metadata.end()) {
+                    matched = metadata_it->second.HasReplica(
+                        [&](const Replica& replica) {
+                            if (!replica.is_dfs_replica() ||
+                                !replica.is_completed()) {
+                                return false;
+                            }
+                            const auto& current =
+                                replica.get_dfs_descriptor();
+                            return current.file_path == descriptor.file_path &&
+                                   current.offset == descriptor.offset &&
+                                   current.object_size ==
+                                       descriptor.object_size &&
+                                   current.aligned_size ==
+                                       descriptor.aligned_size &&
+                                   current.shard_idx == descriptor.shard_idx;
+                        });
+                }
+            }
         }
+        if (!matched) {
+            results.emplace_back(tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+        if (!bucket_allocator_->HasBucket(descriptor.shard_idx)) {
+            results.emplace_back(tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+        bucket_ids.insert(descriptor.shard_idx);
+        results.emplace_back();
+    }
+
+    if (!bucket_ids.empty()) {
+        std::lock_guard<std::mutex> lock(invalidated_dfs_buckets_mutex_);
+        invalidated_dfs_buckets_.insert(bucket_ids.begin(), bucket_ids.end());
     }
     return results;
+}
+
+void MasterService::ProcessInvalidatedDfsBuckets() {
+    std::unordered_set<int64_t> pending;
+    {
+        std::lock_guard<std::mutex> lock(invalidated_dfs_buckets_mutex_);
+        pending.swap(invalidated_dfs_buckets_);
+    }
+    for (const int64_t bucket_id : pending) {
+        if (!RunBucketDfsEvictionInternal(/*force_one=*/false, bucket_id)) {
+            if (bucket_allocator_ != nullptr &&
+                bucket_allocator_->HasBucket(bucket_id)) {
+                std::lock_guard<std::mutex> lock(
+                    invalidated_dfs_buckets_mutex_);
+                invalidated_dfs_buckets_.insert(bucket_id);
+            }
+        }
+    }
 }
 
 tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
@@ -8502,8 +8566,7 @@ bool MasterService::TryRecoverDfsSpaceAfterAllocationFailure() {
 }
 
 bool MasterService::RunBucketDfsEvictionInternal(
-    bool force_one, std::optional<int64_t> invalidated_bucket_id,
-    const TenantId& tenant_id) {
+    bool force_one, std::optional<int64_t> invalidated_bucket_id) {
     if (bucket_allocator_ == nullptr) return false;
     const bool invalidating_missing_bucket = invalidated_bucket_id.has_value();
 
@@ -8512,6 +8575,7 @@ bool MasterService::RunBucketDfsEvictionInternal(
     // make those tombstones durable.
     bucket_allocator_->FlushDirtyMetadata();
 
+    const TenantId tenant_id = TenantId::Default();
     // Buckets already inspected in this cycle. Bounds the scan when every
     // remaining bucket keeps getting rejected.
     std::set<int64_t> attempted;
@@ -11089,6 +11153,7 @@ void MasterService::EvictionThreadFunc() {
 #endif
 
         if (dfs_allocator_ && dfs_allocator_->IsEvictionEnabled()) {
+            ProcessInvalidatedDfsBuckets();
             const auto steady_now = std::chrono::steady_clock::now();
             if (steady_now >= next_dfs_eviction_time) {
                 RunDfsEviction();
@@ -11097,6 +11162,7 @@ void MasterService::EvictionThreadFunc() {
                     dfs_allocator_->GetEvictionCheckInterval();
             }
         } else if (bucket_allocator_ != nullptr && dfs_allocator_) {
+            ProcessInvalidatedDfsBuckets();
             // Even with eviction disabled, deferred bucket tombstones still
             // need a lock-free context in which to become durable.
             const auto steady_now = std::chrono::steady_clock::now();

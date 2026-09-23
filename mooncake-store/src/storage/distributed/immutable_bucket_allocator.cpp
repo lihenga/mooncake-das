@@ -1575,6 +1575,11 @@ ImmutableBucketAllocator::PrepareInvalidation(int64_t bucket_id) {
     return PrepareInvalidationInternal(bucket_id);
 }
 
+bool ImmutableBucketAllocator::HasBucket(int64_t bucket_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return buckets_.contains(bucket_id);
+}
+
 ImmutableBucketAllocator::PendingEviction
 ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
     PendingEviction pending;
@@ -1588,6 +1593,7 @@ ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
         if (bucket_it == buckets_.end() || bucket_it->second->frozen) {
             return pending;
         }
+        const bool was_active = active_bucket_id_ == bucket_id;
         const BucketPtr& victim = bucket_it->second;
         const bool has_pending = std::any_of(
             victim->entries.begin(), victim->entries.end(), [](const auto& item) {
@@ -1620,6 +1626,10 @@ ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
         if (!victim->sealed) {
             victim->sealed = true;
             victim->meta_dirty = true;
+        }
+        if (was_active) {
+            active_bucket_id_ = -1;
+            RequestRefillLocked(/*urgent=*/true);
         }
         pending.owner_ = this;
         pending.bucket_id_ = bucket_id;

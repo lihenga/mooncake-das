@@ -1376,12 +1376,12 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchEvictDiskReplica(
 
 std::vector<tl::expected<void, ErrorCode>>
 MasterClient::BatchInvalidateDfsBuckets(
-    const std::vector<int64_t>& bucket_ids) {
+    const std::vector<DfsMissingFileReport>& reports) {
     ScopedVLogTimer timer(1, "MasterClient::BatchInvalidateDfsBuckets");
-    timer.LogRequest("bucket_count=", bucket_ids.size());
+    timer.LogRequest("report_count=", reports.size());
     auto results = invoke_batch_rpc<
         &WrappedMasterService::BatchInvalidateDfsBuckets, void>(
-        bucket_ids.size(), client_id_, bucket_ids, tenant_id_.value());
+        reports.size(), client_id_, reports, tenant_id_.value());
     timer.LogResponse("result=", results.size(), " operations");
     return results;
 }

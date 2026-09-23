@@ -1319,17 +1319,18 @@ tl::expected<void, ErrorCode> WrappedMasterService::EvictDiskReplica(
 
 std::vector<tl::expected<void, ErrorCode>>
 WrappedMasterService::BatchInvalidateDfsBuckets(
-    const UUID& client_id, const std::vector<int64_t>& bucket_ids,
+    const UUID& client_id,
+    const std::vector<DfsMissingFileReport>& reports,
     const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "BatchInvalidateDfsBuckets");
     timer.LogRequest("client_id=", client_id,
-                     ", bucket_count=", bucket_ids.size());
+                     ", report_count=", reports.size());
     auto results = WithRequestTenantBatch(
         master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
                                                : TenantId::kDefaultValue,
-        bucket_ids.size(), [&](const TenantId& resolved_tenant_id) {
+        reports.size(), [&](const TenantId& resolved_tenant_id) {
             return master_service_.BatchInvalidateDfsBuckets(
-                client_id, bucket_ids, resolved_tenant_id);
+                client_id, reports, resolved_tenant_id);
         });
     size_t failure_count = 0;
     for (const auto& result : results) {

@@ -269,6 +269,8 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
      */
     PendingEviction PrepareInvalidation(int64_t bucket_id);
 
+    bool HasBucket(int64_t bucket_id) const;
+
     /**
      * @brief Accept the eviction: drop the bucket and delete its files.
      * Must only be called once the master has removed every candidate replica.

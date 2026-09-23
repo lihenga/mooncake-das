@@ -689,7 +689,8 @@ class MasterClient {
                           ReplicaType replica_type);
 
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>>
-    BatchInvalidateDfsBuckets(const std::vector<int64_t>& bucket_ids);
+    BatchInvalidateDfsBuckets(
+        const std::vector<DfsMissingFileReport>& reports);
 
    private:
     /**
