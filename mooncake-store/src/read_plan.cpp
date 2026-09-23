@@ -16,6 +16,8 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstdio>
+#include <unistd.h>
+#include "utils.h"
 namespace mooncake {
 namespace {
 // Scoped reservations protect plans sharing the legacy client's key-indexed
@@ -415,6 +417,13 @@ struct ReadPlan::Impl {
             if (running) throw std::runtime_error("plan may only run once");
             running = true;
         }
+        const bool trace_enabled = dfs_read_trace_enabled();
+        if (trace_enabled)
+            std::fprintf(stderr,
+                         "read_plan_run_begin: pid=%d, plan=%p, groups=%d, "
+                         "page_wise=%d, borrowed_sessions=%d, layouts=%zu\n",
+                         int(::getpid()), static_cast<void *>(this), groups,
+                         int(page_wise), int(borrowed_sessions), layouts.size());
         std::vector<std::string> session;
         bool started = false;
         std::exception_ptr error;
@@ -507,6 +516,10 @@ struct ReadPlan::Impl {
         }
         reservation.reset();
         finish(error);
+        if (trace_enabled)
+            std::fprintf(stderr,
+                         "read_plan_run_end: pid=%d, plan=%p, success=%d\n",
+                         int(::getpid()), static_cast<void *>(this), int(!error));
         if (error) std::rethrow_exception(error);
     }
     void run() { run_impl(); }
