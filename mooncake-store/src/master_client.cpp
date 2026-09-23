@@ -340,6 +340,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchEvictDiskReplica> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::InvalidateDfsReplica> {
+    static constexpr const char* value = "InvalidateDfsReplica";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::PollRemoveAll> {
     static constexpr const char* value = "PollRemoveAll";
 };
@@ -1366,6 +1371,17 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchEvictDiskReplica(
         invoke_batch_rpc<&WrappedMasterService::BatchEvictDiskReplica, void>(
             keys.size(), client_id_, keys, tenant_id, replica_type);
     timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::InvalidateDfsReplica(
+    const std::string& key, const DistributedFSDescriptor& descriptor) {
+    ScopedVLogTimer timer(1, "MasterClient::InvalidateDfsReplica");
+    timer.LogRequest("key=", key, ", shard_idx=", descriptor.shard_idx,
+                     ", offset=", descriptor.offset);
+    auto result = invoke_rpc<&WrappedMasterService::InvalidateDfsReplica, void>(
+        client_id_, key, tenant_id_.value(), descriptor);
+    timer.LogResponseExpected(result);
     return result;
 }
 

@@ -688,6 +688,9 @@ class MasterClient {
                           const std::string& tenant_id,
                           ReplicaType replica_type);
 
+    [[nodiscard]] tl::expected<void, ErrorCode> InvalidateDfsReplica(
+        const std::string& key, const DistributedFSDescriptor& descriptor);
+
    private:
     /**
      * @brief Generic RPC invocation helper for single-result operations

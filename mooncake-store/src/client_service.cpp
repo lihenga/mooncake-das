@@ -1779,6 +1779,18 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 const size_t index = dfs_read_indices[i];
                 const auto& request = dfs_read_requests[i];
                 if (!dfs_results[i]) {
+                    if (dfs_results[i].error() == ErrorCode::FILE_NOT_FOUND) {
+                        auto invalidate_result =
+                            master_client_.InvalidateDfsReplica(
+                                request.key, request.descriptor);
+                        if (!invalidate_result) {
+                            LOG(WARNING)
+                                << "Failed to invalidate missing DFS replica "
+                                   "for key: "
+                                << request.key << ", error: "
+                                << toString(invalidate_result.error());
+                        }
+                    }
                     results[index] = tl::unexpected(dfs_results[i].error());
                     continue;
                 }
@@ -3752,6 +3764,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchEvictDiskReplica(
     const std::vector<std::string>& keys, const std::string& tenant_id,
     ReplicaType replica_type) {
     return master_client_.BatchEvictDiskReplica(keys, tenant_id, replica_type);
+}
+
+tl::expected<void, ErrorCode> Client::InvalidateDfsReplica(
+    const std::string& key, const DistributedFSDescriptor& descriptor) {
+    return master_client_.InvalidateDfsReplica(key, descriptor);
 }
 
 std::vector<int> Client::GetNicNumaNodes() const {

@@ -346,6 +346,11 @@ class WrappedMasterService {
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id, ReplicaType replica_type);
 
+    tl::expected<void, ErrorCode> InvalidateDfsReplica(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id,
+        const DistributedFSDescriptor& descriptor);
+
     bool KvEventsEnabled() const;
     KvEventPublisher::Stats GetKvEventStats() const;
 

@@ -1317,6 +1317,29 @@ tl::expected<void, ErrorCode> WrappedMasterService::EvictDiskReplica(
         });
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::InvalidateDfsReplica(
+    const UUID& client_id, const std::string& key, const std::string& tenant_id,
+    const DistributedFSDescriptor& descriptor) {
+    return execute_rpc(
+        "InvalidateDfsReplica",
+        [&] {
+            return WithRequestTenant(
+                master_service_.IsTenantQuotaEnabled()
+                    ? std::string_view(tenant_id)
+                    : TenantId::kDefaultValue,
+                [&](const TenantId& resolved_tenant_id) {
+                    return master_service_.InvalidateDfsReplica(
+                        client_id, key, resolved_tenant_id, descriptor);
+                });
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", shard_idx=", descriptor.shard_idx,
+                             ", offset=", descriptor.offset);
+        },
+        [] {}, [] {});
+}
+
 std::vector<tl::expected<void, ErrorCode>>
 WrappedMasterService::BatchEvictDiskReplica(
     const UUID& client_id, const std::vector<std::string>& keys,
@@ -1891,6 +1914,9 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::BatchEvictDiskReplica>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::InvalidateDfsReplica>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PollRemoveAll>(
         &wrapped_master_service);

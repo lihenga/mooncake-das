@@ -5992,6 +5992,73 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchEvictDiskReplica(
     return results;
 }
 
+tl::expected<void, ErrorCode> MasterService::InvalidateDfsReplica(
+    const UUID& client_id, const std::string& key, const TenantId& tenant_id,
+    const DistributedFSDescriptor& descriptor) {
+    (void)client_id;
+    const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    MetadataAccessorRW accessor(this, object_id);
+    if (!accessor.Exists()) {
+        return {};
+    }
+
+    auto& metadata = accessor.Get();
+    auto matches = [&descriptor](const Replica& replica) {
+        if (!replica.is_dfs_replica() || !replica.is_completed()) return false;
+        const auto& current = replica.get_dfs_descriptor();
+        return current.file_path == descriptor.file_path &&
+               current.offset == descriptor.offset &&
+               current.object_size == descriptor.object_size &&
+               current.aligned_size == descriptor.aligned_size &&
+               current.shard_idx == descriptor.shard_idx;
+    };
+    if (!metadata.HasReplica(matches)) {
+        return {};
+    }
+
+    auto remaining = BuildRemainingReplicaDescriptors(metadata, matches);
+    if (enable_oplog_ && ordered_oplog_writer_) {
+        auto reservation = ReserveBatchOpLogSlot();
+        if (!reservation) return tl::make_unexpected(reservation.error());
+        std::vector<ReplicaID> removed_ids;
+        metadata.VisitReplicas(matches, [&removed_ids](Replica& replica) {
+            removed_ids.push_back(replica.id());
+            replica.mark_removed();
+        });
+        tl::expected<OpLogEntry, ErrorCode> persist_result;
+        if (remaining.empty()) {
+            persist_result = AppendReservedOpLogWithDurableFinalize(
+                std::move(reservation.value()), OpType::REMOVE,
+                metadata.tenant_id.value(), key, {},
+                [this, removed_ids = std::move(removed_ids)](
+                    const OpLogEntry& durable_entry) {
+                    FinalizeRemovedReplicasAfterDurable(
+                        durable_entry, removed_ids, QuotaEraseMode::kFull);
+                });
+        } else {
+            persist_result = AppendReservedOpLogWithDurableFinalize(
+                std::move(reservation.value()), OpType::PUT_END,
+                metadata.tenant_id.value(), key,
+                SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
+                                                                remaining),
+                [this, removed_ids = std::move(removed_ids)](
+                    const OpLogEntry& durable_entry) {
+                    FinalizeRemovedReplicasAfterDurable(
+                        durable_entry, removed_ids, QuotaEraseMode::kFull);
+                });
+        }
+        if (!persist_result) return tl::make_unexpected(persist_result.error());
+        return {};
+    }
+
+    EraseReplicasWithCacheTotalAccounting(metadata, matches);
+    if (!metadata.IsValid()) {
+        PublishKvRemoved(key, metadata, object_id.tenant_id);
+        accessor.Erase();
+    }
+    return {};
+}
+
 tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
     const std::string& src_segment,

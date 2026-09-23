@@ -636,6 +636,16 @@ class MasterService {
         const TenantId& tenant_id, ReplicaType replica_type);
 
     /**
+     * @brief Invalidate one DFS replica after its physical file is missing.
+     * The descriptor is matched exactly so a stale read cannot remove a newer
+     * generation for the same key.
+     */
+    auto InvalidateDfsReplica(
+        const UUID& client_id, const std::string& key,
+        const TenantId& tenant_id, const DistributedFSDescriptor& descriptor)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
      * @brief Start a copy operation
      *
      * This will allocate replica buffers to copy to.
