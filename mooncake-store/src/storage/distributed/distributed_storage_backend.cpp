@@ -32,6 +32,14 @@ constexpr int kMaxBucketCreateConcurrency = 8;
 // reads rather than one read per object.
 constexpr uint64_t kMaxMergedIo = 4ULL * 1024 * 1024;
 
+struct MergedReadScratch {
+    std::vector<char> sink;
+    std::vector<iovec> iovs;
+    std::vector<iovec> pending;
+};
+
+thread_local MergedReadScratch merged_read_scratch;
+
 // Must match the constants in immutable_bucket_allocator.cpp.
 constexpr const char* kBucketFilePrefix = "bucket_";
 constexpr const char* kBucketDataSuffix = ".data";
@@ -1109,85 +1117,94 @@ void DistributedStorageBackend::ExecuteMergedReadTask(
     const ReadTask& task, const std::vector<DfsReadRequest>& requests,
     std::vector<tl::expected<void, ErrorCode>>& results) {
     if (task.entries.empty()) return;
-    // Build a single scatter-read iovec chain directly into the caller's
-    // slices. When the session path supplies aligned slices (length ==
-    // aligned_size, address aligned), each iovec already covers the value
-    // plus trailing padding and O_DIRECT goes through the zero-bounce path.
-    // Other paths may pass unaligned, object_size-only slices; a small sink
-    // buffer absorbs the on-disk padding so the disk range stays contiguous.
-    const uint64_t alignment = distributed_config_.alignment;
-    std::vector<char> sink(alignment == 0 ? 1 : alignment);
-    std::vector<iovec> iovs;
-    iovs.reserve(task.entries.size() * 2);
+    // Reuse worker-local storage. Determine the full padding size before adding
+    // pointers into sink so later growth cannot invalidate existing iovecs.
+    auto& scratch = merged_read_scratch;
+    uint64_t total_padding = 0;
     for (const auto& entry : task.entries) {
         const auto& request = requests[entry.request_index];
         const uint64_t reserved = IsBucketMode()
-                                       ? request.descriptor.aligned_size
-                                       : request.descriptor.object_size;
+                                      ? request.descriptor.aligned_size
+                                      : request.descriptor.object_size;
+        uint64_t covered = 0;
+        for (const auto& slice : request.slices) {
+            if (covered >= reserved) break;
+            covered += std::min<uint64_t>(slice.size, reserved - covered);
+        }
+        if (covered < reserved) total_padding += reserved - covered;
+    }
+
+    scratch.sink.resize(static_cast<size_t>(total_padding));
+    scratch.iovs.clear();
+    scratch.iovs.reserve(task.entries.size() * 2);
+    size_t sink_offset = 0;
+    for (const auto& entry : task.entries) {
+        const auto& request = requests[entry.request_index];
+        const uint64_t reserved = IsBucketMode()
+                                      ? request.descriptor.aligned_size
+                                      : request.descriptor.object_size;
         uint64_t collected = 0;
         for (const auto& slice : request.slices) {
             if (collected >= reserved) break;
             const uint64_t size =
                 std::min<uint64_t>(slice.size, reserved - collected);
             if (size != 0) {
-                iovs.push_back({slice.ptr, static_cast<size_t>(size)});
+                scratch.iovs.push_back({slice.ptr, static_cast<size_t>(size)});
                 collected += size;
             }
         }
         if (collected < reserved) {
-            iovs.push_back(
-                {sink.data(), static_cast<size_t>(reserved - collected)});
+            const size_t padding = static_cast<size_t>(reserved - collected);
+            scratch.iovs.push_back({scratch.sink.data() + sink_offset, padding});
+            sink_offset += padding;
         }
     }
 
     constexpr size_t kMaxIovChunk = 1024;
+    scratch.pending.clear();
+    scratch.pending.reserve(kMaxIovChunk);
     ErrorCode error = ErrorCode::OK;
     uint64_t done = 0;
     size_t index = 0;
     uint64_t iov_consumed = 0;
-    {
-        std::unique_lock<std::mutex> target_lock;
-        if (task.target.mutex != nullptr) {
-            target_lock = std::unique_lock<std::mutex>(*task.target.mutex);
+    while (done < task.total_size && index < scratch.iovs.size()) {
+        scratch.pending.clear();
+        scratch.pending.push_back(
+            {static_cast<char*>(scratch.iovs[index].iov_base) + iov_consumed,
+             scratch.iovs[index].iov_len - iov_consumed});
+        for (size_t j = index + 1;
+             j < scratch.iovs.size() && scratch.pending.size() < kMaxIovChunk;
+             ++j) {
+            scratch.pending.push_back(scratch.iovs[j]);
         }
-        while (done < task.total_size && index < iovs.size()) {
-            std::vector<iovec> pending;
-            pending.push_back(
-                {static_cast<char*>(iovs[index].iov_base) + iov_consumed,
-                 iovs[index].iov_len - iov_consumed});
-            for (size_t j = index + 1;
-                 j < iovs.size() && pending.size() < kMaxIovChunk; ++j) {
-                pending.push_back(iovs[j]);
-            }
-            auto read_result = task.direct_read
-                                   ? fs_adapter_->DirectReadAt(
-                                         task.target.fd, pending.data(),
-                                         static_cast<int>(pending.size()),
-                                         static_cast<int64_t>(task.io_offset + done))
-                                   : fs_adapter_->ReadAt(
-                                         task.target.fd, pending.data(),
-                                         static_cast<int>(pending.size()),
-                                         static_cast<int64_t>(task.io_offset + done));
-            if (!read_result) {
-                error = read_result.error();
-                break;
-            }
-            if (*read_result == 0) {
-                error = ErrorCode::FILE_READ_FAIL;
-                break;
-            }
-            uint64_t advanced = *read_result;
-            done += advanced;
-            while (advanced != 0 && index < iovs.size()) {
-                const uint64_t available = iovs[index].iov_len - iov_consumed;
-                const uint64_t step =
-                    std::min<uint64_t>(advanced, available);
-                iov_consumed += step;
-                advanced -= step;
-                if (iov_consumed == iovs[index].iov_len) {
-                    ++index;
-                    iov_consumed = 0;
-                }
+        auto read_result = task.direct_read
+                               ? fs_adapter_->DirectReadAt(
+                                     task.target.fd, scratch.pending.data(),
+                                     static_cast<int>(scratch.pending.size()),
+                                     static_cast<int64_t>(task.io_offset + done))
+                               : fs_adapter_->ReadAt(
+                                     task.target.fd, scratch.pending.data(),
+                                     static_cast<int>(scratch.pending.size()),
+                                     static_cast<int64_t>(task.io_offset + done));
+        if (!read_result) {
+            error = read_result.error();
+            break;
+        }
+        if (*read_result == 0) {
+            error = ErrorCode::FILE_READ_FAIL;
+            break;
+        }
+        uint64_t advanced = *read_result;
+        done += advanced;
+        while (advanced != 0 && index < scratch.iovs.size()) {
+            const uint64_t available =
+                scratch.iovs[index].iov_len - iov_consumed;
+            const uint64_t step = std::min<uint64_t>(advanced, available);
+            iov_consumed += step;
+            advanced -= step;
+            if (iov_consumed == scratch.iovs[index].iov_len) {
+                ++index;
+                iov_consumed = 0;
             }
         }
     }
@@ -1212,53 +1229,58 @@ void DistributedStorageBackend::ExecuteReadTasks(
         return;
     }
 
+    const size_t worker_count = std::min<size_t>(
+        static_cast<size_t>(distributed_config_.batch_read_threads), tasks.size());
+    std::atomic<size_t> next_task{0};
     std::mutex completion_mutex;
     std::condition_variable completion_cv;
-    size_t pending_tasks = 0;
-    auto mark_done = [&completion_mutex, &completion_cv, &pending_tasks]() {
+    size_t pending_workers = 0;
+    auto mark_done = [&completion_mutex, &completion_cv, &pending_workers]() {
         std::lock_guard<std::mutex> lock(completion_mutex);
-        --pending_tasks;
+        --pending_workers;
         completion_cv.notify_one();
     };
 
-    for (const auto& task : tasks) {
+    auto worker_fn = [this, &tasks, &requests, &results, &mark_done,
+                      &next_task]() {
+        while (true) {
+            const size_t task_index =
+                next_task.fetch_add(1, std::memory_order_relaxed);
+            if (task_index >= tasks.size()) break;
+            try {
+                ExecuteReadTask(tasks[task_index], requests, results);
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "Batch read task failed: " << e.what();
+                for (const auto& entry : tasks[task_index].entries) {
+                    results[entry.request_index] =
+                        tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+            } catch (...) {
+                LOG(ERROR) << "Batch read task failed";
+                for (const auto& entry : tasks[task_index].entries) {
+                    results[entry.request_index] =
+                        tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+            }
+        }
+        mark_done();
+    };
+
+    for (size_t worker = 0; worker < worker_count; ++worker) {
         {
             std::lock_guard<std::mutex> lock(completion_mutex);
-            ++pending_tasks;
+            ++pending_workers;
         }
-        const auto task_copy = task;
         try {
-            batch_read_pool_->enqueue(
-                [this, task_copy, &requests, &results, &mark_done]() {
-                    try {
-                        ExecuteReadTask(task_copy, requests, results);
-                    } catch (const std::exception& e) {
-                        LOG(ERROR) << "Batch read task failed: " << e.what();
-                        for (const auto& entry : task_copy.entries) {
-                            results[entry.request_index] = tl::make_unexpected(
-                                ErrorCode::FILE_READ_FAIL);
-                        }
-                    } catch (...) {
-                        LOG(ERROR) << "Batch read task failed";
-                        for (const auto& entry : task_copy.entries) {
-                            results[entry.request_index] = tl::make_unexpected(
-                                ErrorCode::FILE_READ_FAIL);
-                        }
-                    }
-                    mark_done();
-                });
+            batch_read_pool_->enqueue(worker_fn);
         } catch (const std::exception& e) {
-            LOG(ERROR) << "Failed to enqueue batch read: " << e.what();
-            for (const auto& entry : task_copy.entries) {
-                results[entry.request_index] =
-                    tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-            }
-            mark_done();
+            LOG(ERROR) << "Failed to enqueue batch read worker: " << e.what();
+            worker_fn();
         }
     }
 
     std::unique_lock<std::mutex> lock(completion_mutex);
-    completion_cv.wait(lock, [&pending_tasks] { return pending_tasks == 0; });
+    completion_cv.wait(lock, [&pending_workers] { return pending_workers == 0; });
 }
 
 std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
