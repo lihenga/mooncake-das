@@ -635,15 +635,9 @@ class MasterService {
         const UUID& client_id, const std::vector<std::string>& keys,
         const TenantId& tenant_id, ReplicaType replica_type);
 
-    /**
-     * @brief Invalidate one DFS replica after its physical file is missing.
-     * The descriptor is matched exactly so a stale read cannot remove a newer
-     * generation for the same key.
-     */
-    auto InvalidateDfsReplica(
-        const UUID& client_id, const std::string& key,
-        const TenantId& tenant_id, const DistributedFSDescriptor& descriptor)
-        -> tl::expected<void, ErrorCode>;
+    std::vector<tl::expected<void, ErrorCode>> BatchInvalidateDfsBuckets(
+        const UUID& client_id, const std::vector<int64_t>& bucket_ids,
+        const TenantId& tenant_id);
 
     /**
      * @brief Start a copy operation
@@ -2220,7 +2214,9 @@ class MasterService {
     // are accepted, so a bucket file is never deleted while the master still
     // hands out a descriptor into it.
     void RunBucketDfsEviction();
-    bool RunBucketDfsEvictionInternal(bool force_one);
+    bool RunBucketDfsEvictionInternal(
+        bool force_one, std::optional<int64_t> invalidated_bucket_id = std::nullopt,
+        const TenantId& tenant_id = TenantId::Default());
     bool TryRecoverDfsSpaceAfterAllocationFailure();
     // Shard-mode per-key eviction (unchanged behaviour).
     void RunShardDfsEviction();

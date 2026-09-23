@@ -688,8 +688,8 @@ class MasterClient {
                           const std::string& tenant_id,
                           ReplicaType replica_type);
 
-    [[nodiscard]] tl::expected<void, ErrorCode> InvalidateDfsReplica(
-        const std::string& key, const DistributedFSDescriptor& descriptor);
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>>
+    BatchInvalidateDfsBuckets(const std::vector<int64_t>& bucket_ids);
 
    private:
     /**

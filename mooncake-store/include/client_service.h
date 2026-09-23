@@ -349,12 +349,6 @@ class Client {
         ReplicaType replica_type);
 
     /**
-     * @brief Remove a missing DFS replica if its descriptor still matches.
-     */
-    tl::expected<void, ErrorCode> InvalidateDfsReplica(
-        const std::string& key, const DistributedFSDescriptor& descriptor);
-
-    /**
      * @brief Registers a memory segment to master for allocation
      * @param buffer Memory buffer to register
      * @param size Size of the buffer in bytes

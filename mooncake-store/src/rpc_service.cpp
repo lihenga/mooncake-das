@@ -1317,27 +1317,28 @@ tl::expected<void, ErrorCode> WrappedMasterService::EvictDiskReplica(
         });
 }
 
-tl::expected<void, ErrorCode> WrappedMasterService::InvalidateDfsReplica(
-    const UUID& client_id, const std::string& key, const std::string& tenant_id,
-    const DistributedFSDescriptor& descriptor) {
-    return execute_rpc(
-        "InvalidateDfsReplica",
-        [&] {
-            return WithRequestTenant(
-                master_service_.IsTenantQuotaEnabled()
-                    ? std::string_view(tenant_id)
-                    : TenantId::kDefaultValue,
-                [&](const TenantId& resolved_tenant_id) {
-                    return master_service_.InvalidateDfsReplica(
-                        client_id, key, resolved_tenant_id, descriptor);
-                });
-        },
-        [&](auto& timer) {
-            timer.LogRequest("client_id=", client_id, ", key=", key,
-                             ", shard_idx=", descriptor.shard_idx,
-                             ", offset=", descriptor.offset);
-        },
-        [] {}, [] {});
+std::vector<tl::expected<void, ErrorCode>>
+WrappedMasterService::BatchInvalidateDfsBuckets(
+    const UUID& client_id, const std::vector<int64_t>& bucket_ids,
+    const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "BatchInvalidateDfsBuckets");
+    timer.LogRequest("client_id=", client_id,
+                     ", bucket_count=", bucket_ids.size());
+    auto results = WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        bucket_ids.size(), [&](const TenantId& resolved_tenant_id) {
+            return master_service_.BatchInvalidateDfsBuckets(
+                client_id, bucket_ids, resolved_tenant_id);
+        });
+    size_t failure_count = 0;
+    for (const auto& result : results) {
+        if (!result.has_value()) ++failure_count;
+    }
+    timer.LogResponse("total=", results.size(),
+                      ", success=", results.size() - failure_count,
+                      ", failures=", failure_count);
+    return results;
 }
 
 std::vector<tl::expected<void, ErrorCode>>
@@ -1916,7 +1917,7 @@ void RegisterRpcService(
         &mooncake::WrappedMasterService::BatchEvictDiskReplica>(
         &wrapped_master_service);
     server.register_handler<
-        &mooncake::WrappedMasterService::InvalidateDfsReplica>(
+        &mooncake::WrappedMasterService::BatchInvalidateDfsBuckets>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PollRemoveAll>(
         &wrapped_master_service);

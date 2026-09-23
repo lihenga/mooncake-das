@@ -265,6 +265,11 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     PendingEviction PrepareEvictionForAllocationFailure();
 
     /**
+     * @brief Freeze one specific bucket after its data file is confirmed missing.
+     */
+    PendingEviction PrepareInvalidation(int64_t bucket_id);
+
+    /**
      * @brief Accept the eviction: drop the bucket and delete its files.
      * Must only be called once the master has removed every candidate replica.
      */
@@ -313,6 +318,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     // eviction. The latter bypasses only the watermark gate and still observes
     // active/frozen state plus the master's full validation protocol.
     PendingEviction PrepareEvictionInternal(bool force_one);
+    PendingEviction PrepareInvalidationInternal(int64_t bucket_id);
 
     // Shared implementation of AbortEviction. `demote` distinguishes an
     // explicit master rejection (return the bucket at the warm end so the scan

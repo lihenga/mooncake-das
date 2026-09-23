@@ -5992,71 +5992,23 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchEvictDiskReplica(
     return results;
 }
 
-tl::expected<void, ErrorCode> MasterService::InvalidateDfsReplica(
-    const UUID& client_id, const std::string& key, const TenantId& tenant_id,
-    const DistributedFSDescriptor& descriptor) {
+std::vector<tl::expected<void, ErrorCode>>
+MasterService::BatchInvalidateDfsBuckets(
+    const UUID& client_id, const std::vector<int64_t>& bucket_ids,
+    const TenantId& tenant_id) {
     (void)client_id;
-    const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
-    MetadataAccessorRW accessor(this, object_id);
-    if (!accessor.Exists()) {
-        return {};
-    }
-
-    auto& metadata = accessor.Get();
-    auto matches = [&descriptor](const Replica& replica) {
-        if (!replica.is_dfs_replica() || !replica.is_completed()) return false;
-        const auto& current = replica.get_dfs_descriptor();
-        return current.file_path == descriptor.file_path &&
-               current.offset == descriptor.offset &&
-               current.object_size == descriptor.object_size &&
-               current.aligned_size == descriptor.aligned_size &&
-               current.shard_idx == descriptor.shard_idx;
-    };
-    if (!metadata.HasReplica(matches)) {
-        return {};
-    }
-
-    auto remaining = BuildRemainingReplicaDescriptors(metadata, matches);
-    if (enable_oplog_ && ordered_oplog_writer_) {
-        auto reservation = ReserveBatchOpLogSlot();
-        if (!reservation) return tl::make_unexpected(reservation.error());
-        std::vector<ReplicaID> removed_ids;
-        metadata.VisitReplicas(matches, [&removed_ids](Replica& replica) {
-            removed_ids.push_back(replica.id());
-            replica.mark_removed();
-        });
-        tl::expected<OpLogEntry, ErrorCode> persist_result;
-        if (remaining.empty()) {
-            persist_result = AppendReservedOpLogWithDurableFinalize(
-                std::move(reservation.value()), OpType::REMOVE,
-                metadata.tenant_id.value(), key, {},
-                [this, removed_ids = std::move(removed_ids)](
-                    const OpLogEntry& durable_entry) {
-                    FinalizeRemovedReplicasAfterDurable(
-                        durable_entry, removed_ids, QuotaEraseMode::kFull);
-                });
+    assert(tenant_id.IsValid());
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.reserve(bucket_ids.size());
+    for (const int64_t bucket_id : bucket_ids) {
+        if (RunBucketDfsEvictionInternal(/*force_one=*/false, bucket_id,
+                                         tenant_id)) {
+            results.emplace_back();
         } else {
-            persist_result = AppendReservedOpLogWithDurableFinalize(
-                std::move(reservation.value()), OpType::PUT_END,
-                metadata.tenant_id.value(), key,
-                SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
-                                                                remaining),
-                [this, removed_ids = std::move(removed_ids)](
-                    const OpLogEntry& durable_entry) {
-                    FinalizeRemovedReplicasAfterDurable(
-                        durable_entry, removed_ids, QuotaEraseMode::kFull);
-                });
+            results.emplace_back(tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
         }
-        if (!persist_result) return tl::make_unexpected(persist_result.error());
-        return {};
     }
-
-    EraseReplicasWithCacheTotalAccounting(metadata, matches);
-    if (!metadata.IsValid()) {
-        PublishKvRemoved(key, metadata, object_id.tenant_id);
-        accessor.Erase();
-    }
-    return {};
+    return results;
 }
 
 tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
@@ -8549,24 +8501,30 @@ bool MasterService::TryRecoverDfsSpaceAfterAllocationFailure() {
     return RunBucketDfsEvictionInternal(/*force_one=*/true);
 }
 
-bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
+bool MasterService::RunBucketDfsEvictionInternal(
+    bool force_one, std::optional<int64_t> invalidated_bucket_id,
+    const TenantId& tenant_id) {
     if (bucket_allocator_ == nullptr) return false;
+    const bool invalidating_missing_bucket = invalidated_bucket_id.has_value();
 
     // Free() defers its metadata write so it never fsyncs under a metadata
     // shard lock. This tick holds no master lock, so it is the right place to
     // make those tombstones durable.
     bucket_allocator_->FlushDirtyMetadata();
 
-    const TenantId tenant_id = TenantId::Default();
     // Buckets already inspected in this cycle. Bounds the scan when every
     // remaining bucket keeps getting rejected.
     std::set<int64_t> attempted;
     bool evicted = false;
 
     while (true) {
-        auto pending = force_one
-                           ? bucket_allocator_->PrepareEvictionForAllocationFailure()
-                           : bucket_allocator_->PrepareEviction();
+        auto pending = invalidated_bucket_id.has_value()
+                           ? bucket_allocator_->PrepareInvalidation(
+                                 *invalidated_bucket_id)
+                           : (force_one
+                                  ? bucket_allocator_
+                                        ->PrepareEvictionForAllocationFailure()
+                                  : bucket_allocator_->PrepareEviction());
         // Nothing is evictable right now (below watermark, or every bucket is
         // active/frozen).
         if (pending.bucket_id() < 0) return evicted;
@@ -8582,7 +8540,7 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
             // master to validate, so it can be reclaimed immediately.
             bucket_allocator_->CommitEviction(std::move(pending));
             evicted = true;
-            if (force_one) return true;
+            if (invalidating_missing_bucket || force_one) return true;
             continue;
         }
 
@@ -8644,8 +8602,9 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
                 const bool acceptable =
                     !candidate_is_processing &&
                     !tenant_state.processing_keys.contains(candidate.key) &&
-                    !tenant_state.dfs_protected_keys.contains(candidate.key) &&
-                    !metadata.IsHardPinned() && metadata.IsLeaseExpired(now);
+                    (invalidating_missing_bucket ||
+                     (!tenant_state.dfs_protected_keys.contains(candidate.key) &&
+                      !metadata.IsHardPinned() && metadata.IsLeaseExpired(now)));
                 if (!acceptable) {
                     // Whole-bucket eviction is all-or-nothing: one protected
                     // entry vetoes the bucket, and no metadata was touched.
@@ -8657,6 +8616,7 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
 
         if (!all_accepted) {
             bucket_allocator_->AbortEviction(std::move(pending));
+            if (invalidating_missing_bucket) return false;
             continue;
         }
 
@@ -8726,6 +8686,7 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
         }
         if (!phase2_accepted) {
             bucket_allocator_->AbortEviction(std::move(pending));
+            if (invalidating_missing_bucket) return false;
             continue;
         }
 
@@ -8780,7 +8741,7 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
         // into this bucket, so it is now safe to drop the files.
         bucket_allocator_->CommitEviction(std::move(pending));
         evicted = true;
-        if (force_one) return true;
+        if (invalidating_missing_bucket || force_one) return true;
     }
     return evicted;
 }

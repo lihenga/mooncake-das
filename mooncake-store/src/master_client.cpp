@@ -340,8 +340,8 @@ struct RpcNameTraits<&WrappedMasterService::BatchEvictDiskReplica> {
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::InvalidateDfsReplica> {
-    static constexpr const char* value = "InvalidateDfsReplica";
+struct RpcNameTraits<&WrappedMasterService::BatchInvalidateDfsBuckets> {
+    static constexpr const char* value = "BatchInvalidateDfsBuckets";
 };
 
 template <>
@@ -1374,15 +1374,16 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchEvictDiskReplica(
     return result;
 }
 
-tl::expected<void, ErrorCode> MasterClient::InvalidateDfsReplica(
-    const std::string& key, const DistributedFSDescriptor& descriptor) {
-    ScopedVLogTimer timer(1, "MasterClient::InvalidateDfsReplica");
-    timer.LogRequest("key=", key, ", shard_idx=", descriptor.shard_idx,
-                     ", offset=", descriptor.offset);
-    auto result = invoke_rpc<&WrappedMasterService::InvalidateDfsReplica, void>(
-        client_id_, key, tenant_id_.value(), descriptor);
-    timer.LogResponseExpected(result);
-    return result;
+std::vector<tl::expected<void, ErrorCode>>
+MasterClient::BatchInvalidateDfsBuckets(
+    const std::vector<int64_t>& bucket_ids) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchInvalidateDfsBuckets");
+    timer.LogRequest("bucket_count=", bucket_ids.size());
+    auto results = invoke_batch_rpc<
+        &WrappedMasterService::BatchInvalidateDfsBuckets, void>(
+        bucket_ids.size(), client_id_, bucket_ids, tenant_id_.value());
+    timer.LogResponse("result=", results.size(), " operations");
+    return results;
 }
 
 }  // namespace mooncake

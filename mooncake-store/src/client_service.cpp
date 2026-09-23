@@ -1767,6 +1767,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
     if (!dfs_read_requests.empty()) {
         auto dfs_results = dfs_storage_backend_->BatchRead(dfs_read_requests);
+        std::vector<int64_t> invalidated_bucket_ids;
+        invalidated_bucket_ids.reserve(dfs_read_requests.size());
         if (dfs_results.size() != dfs_read_requests.size()) {
             LOG(ERROR) << "DFS BatchRead response size mismatch: expected "
                        << dfs_read_requests.size() << ", got "
@@ -1780,16 +1782,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 const auto& request = dfs_read_requests[i];
                 if (!dfs_results[i]) {
                     if (dfs_results[i].error() == ErrorCode::FILE_NOT_FOUND) {
-                        auto invalidate_result =
-                            master_client_.InvalidateDfsReplica(
-                                request.key, request.descriptor);
-                        if (!invalidate_result) {
-                            LOG(WARNING)
-                                << "Failed to invalidate missing DFS replica "
-                                   "for key: "
-                                << request.key << ", error: "
-                                << toString(invalidate_result.error());
-                        }
+                        invalidated_bucket_ids.push_back(
+                            request.descriptor.shard_idx);
                     }
                     results[index] = tl::unexpected(dfs_results[i].error());
                     continue;
@@ -1802,6 +1796,33 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                     continue;
                 }
                 results[index] = {};
+            }
+            std::sort(invalidated_bucket_ids.begin(),
+                      invalidated_bucket_ids.end());
+            invalidated_bucket_ids.erase(
+                std::unique(invalidated_bucket_ids.begin(),
+                            invalidated_bucket_ids.end()),
+                invalidated_bucket_ids.end());
+            if (!invalidated_bucket_ids.empty()) {
+                const auto invalidation_results =
+                    master_client_.BatchInvalidateDfsBuckets(
+                        invalidated_bucket_ids);
+                if (invalidation_results.size() !=
+                    invalidated_bucket_ids.size()) {
+                    LOG(WARNING)
+                        << "DFS bucket invalidation response size mismatch: "
+                        << "expected " << invalidated_bucket_ids.size() << ", got "
+                        << invalidation_results.size();
+                }
+                const size_t result_count = std::min(
+                    invalidation_results.size(), invalidated_bucket_ids.size());
+                for (size_t i = 0; i < result_count; ++i) {
+                    if (!invalidation_results[i]) {
+                        LOG(WARNING) << "Failed to invalidate missing DFS bucket: "
+                                     << invalidated_bucket_ids[i] << ", error: "
+                                     << toString(invalidation_results[i].error());
+                    }
+                }
             }
         }
     }
@@ -3764,11 +3785,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchEvictDiskReplica(
     const std::vector<std::string>& keys, const std::string& tenant_id,
     ReplicaType replica_type) {
     return master_client_.BatchEvictDiskReplica(keys, tenant_id, replica_type);
-}
-
-tl::expected<void, ErrorCode> Client::InvalidateDfsReplica(
-    const std::string& key, const DistributedFSDescriptor& descriptor) {
-    return master_client_.InvalidateDfsReplica(key, descriptor);
 }
 
 std::vector<int> Client::GetNicNumaNodes() const {
