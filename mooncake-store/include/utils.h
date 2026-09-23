@@ -476,10 +476,11 @@ std::vector<int> getFreeTcpPorts(int count);
 
 int64_t time_gen();
 
-// Gates the verbose per-batch timing logs on the DFS read path (alloc/read
-// split, scatter range/byte totals, backend BatchRead/ReadFully). Off by
-// default so the hot path pays nothing; set MC_STORE_DFS_READ_TRACE=1 (or
-// true/on) to enable. Read once and cached, so the per-batch cost is one load.
+// Gates batch-level timing logs for DFS-backed get sessions and reads
+// (metadata/lock timing, alloc/read split, scatter range/byte totals, and
+// backend BatchRead/ReadFully). Off by default; set MC_STORE_DFS_READ_TRACE=1
+// (or true/on) to enable. Read once and cached, so the per-batch cost is one
+// load.
 bool dfs_read_trace_enabled();
 
 // Helper: Get integer from environment variable, fallback to default

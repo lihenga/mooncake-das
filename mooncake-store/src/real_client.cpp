@@ -88,6 +88,44 @@ uint64_t NextDfsReadTraceId() {
     }
 }
 
+int64_t TraceElapsedUs(std::chrono::steady_clock::time_point start,
+                       std::chrono::steady_clock::time_point end) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+        .count();
+}
+
+class TraceMutexLock {
+   public:
+    TraceMutexLock(std::mutex &mutex, bool enabled, int64_t &wait_us,
+                   int64_t &hold_us)
+        : enabled_(enabled),
+          wait_us_(wait_us),
+          hold_us_(hold_us),
+          wait_start_(enabled ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{}),
+          lock_(mutex) {
+        if (enabled_) {
+            hold_start_ = std::chrono::steady_clock::now();
+            wait_us_ += TraceElapsedUs(wait_start_, hold_start_);
+        }
+    }
+
+    ~TraceMutexLock() {
+        if (enabled_) {
+            hold_us_ += TraceElapsedUs(hold_start_,
+                                       std::chrono::steady_clock::now());
+        }
+    }
+
+   private:
+    bool enabled_;
+    int64_t &wait_us_;
+    int64_t &hold_us_;
+    std::chrono::steady_clock::time_point wait_start_;
+    std::chrono::steady_clock::time_point hold_start_;
+    std::unique_lock<std::mutex> lock_;
+};
+
 size_t DivideRoundUp(size_t value, size_t divisor) {
     return value / divisor + (value % divisor != 0);
 }
@@ -759,9 +797,20 @@ class RealClient::DfsH2dStreamPool {
     }
 
     std::unique_ptr<Lease> Acquire(
-        const device::AcceleratorDevice *accelerator, int32_t device_id) {
+        const device::AcceleratorDevice *accelerator, int32_t device_id,
+        int64_t *lock_wait_us) {
         std::shared_ptr<DeviceState> state;
+        const auto map_lock_wait_start =
+            lock_wait_us ? std::chrono::steady_clock::now()
+                         : std::chrono::steady_clock::time_point{};
         std::unique_lock<std::mutex> lock(mutex_);
+        const auto map_lock_acquired =
+            lock_wait_us ? std::chrono::steady_clock::now()
+                         : std::chrono::steady_clock::time_point{};
+        if (lock_wait_us) {
+            *lock_wait_us +=
+                TraceElapsedUs(map_lock_wait_start, map_lock_acquired);
+        }
         if (shutting_down_) return nullptr;
         DeviceKey key{accelerator, device_id};
         auto [it, inserted] = states_.try_emplace(key);
@@ -773,7 +822,14 @@ class RealClient::DfsH2dStreamPool {
 
         // Keep the map lock until this lease owns the device state. Shutdown
         // can then swap and destroy states only after every lease is returned.
+        const auto state_lock_wait_start =
+            lock_wait_us ? std::chrono::steady_clock::now()
+                         : std::chrono::steady_clock::time_point{};
         std::unique_lock<std::mutex> state_lock(state->mutex);
+        if (lock_wait_us) {
+            *lock_wait_us += TraceElapsedUs(
+                state_lock_wait_start, std::chrono::steady_clock::now());
+        }
         lock.unlock();
         state->device->SetContext(state->device_id);
         if (!state->initialized) {
@@ -868,6 +924,7 @@ class RealClient::DfsAsyncScatterContext {
         std::unique_ptr<DfsH2dStreamPool::Lease> lease;
         std::vector<std::vector<size_t>> operations_by_stream;
         std::vector<uint8_t> used_streams;
+        std::chrono::steady_clock::time_point lease_started;
     };
 
    public:
@@ -972,8 +1029,20 @@ class RealClient::DfsAsyncScatterContext {
         active_devices_.reserve(device_operations.size());
         for (const auto &[target, operation_indices] : device_operations) {
             ActiveDevice active;
-            active.lease =
-                stream_pool_.Acquire(target.device, target.device_id);
+            const auto lease_acquire_start =
+                collect_metrics_ ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
+            active.lease = stream_pool_.Acquire(
+                target.device, target.device_id,
+                collect_metrics_ ? &device_lease_wait_us_ : nullptr);
+            const auto lease_started =
+                collect_metrics_ ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
+            if (collect_metrics_) {
+                device_lease_acquire_us_ +=
+                    TraceElapsedUs(lease_acquire_start, lease_started);
+                if (active.lease) ++device_lease_count_;
+            }
             if (!active.lease) {
                 for (size_t operation_index : operation_indices) {
                     MarkFailed(operation_index);
@@ -982,6 +1051,9 @@ class RealClient::DfsAsyncScatterContext {
             }
 
             const auto &streams = active.lease->streams();
+            if (collect_metrics_) {
+                device_lease_streams_available_ += streams.size();
+            }
             if (streams.empty()) {
                 for (size_t operation_index : operation_indices) {
                     const auto &operation = operations_[operation_index];
@@ -991,11 +1063,17 @@ class RealClient::DfsAsyncScatterContext {
                         MarkFailed(operation_index);
                     }
                 }
+                if (collect_metrics_) {
+                    device_lease_hold_us_ +=
+                        TraceElapsedUs(lease_started,
+                                       std::chrono::steady_clock::now());
+                }
                 continue;
             }
 
             active.operations_by_stream.resize(streams.size());
             active.used_streams.resize(streams.size());
+            active.lease_started = lease_started;
             active_devices_.push_back(std::move(active));
             auto &owned_active = active_devices_.back();
             size_t next_stream = 0;
@@ -1010,6 +1088,10 @@ class RealClient::DfsAsyncScatterContext {
                     stream_it->second = next_stream++ % streams.size();
                 }
                 const size_t stream_index = stream_it->second;
+                if (!owned_active.used_streams[stream_index] &&
+                    collect_metrics_) {
+                    ++h2d_streams_used_;
+                }
                 owned_active.used_streams[stream_index] = true;
                 owned_active.operations_by_stream[stream_index].push_back(
                     operation_index);
@@ -1073,6 +1155,13 @@ class RealClient::DfsAsyncScatterContext {
                 }
             }
         }
+        if (collect_metrics_) {
+            const auto leases_released = std::chrono::steady_clock::now();
+            for (const auto &active : active_devices_) {
+                device_lease_hold_us_ +=
+                    TraceElapsedUs(active.lease_started, leases_released);
+            }
+        }
         active_devices_.clear();
         synchronized_ = true;
         return failed_results_.empty();
@@ -1102,6 +1191,16 @@ class RealClient::DfsAsyncScatterContext {
     size_t host_copy_ranges() const { return host_copy_ranges_; }
     size_t device_copy_ranges() const { return device_copy_ranges_; }
     size_t h2d_kernel_batches() const { return h2d_kernel_batches_; }
+    size_t device_lease_count() const { return device_lease_count_; }
+    int64_t device_lease_acquire_us() const {
+        return device_lease_acquire_us_;
+    }
+    int64_t device_lease_wait_us() const { return device_lease_wait_us_; }
+    int64_t device_lease_hold_us() const { return device_lease_hold_us_; }
+    size_t h2d_streams_used() const { return h2d_streams_used_; }
+    size_t device_lease_streams_available() const {
+        return device_lease_streams_available_;
+    }
 
    private:
     static bool IsUsableRegion(const RealClient::WritableBufferRegion &region) {
@@ -1188,6 +1287,12 @@ class RealClient::DfsAsyncScatterContext {
     size_t host_copy_ranges_ = 0;
     size_t device_copy_ranges_ = 0;
     size_t h2d_kernel_batches_ = 0;
+    size_t device_lease_count_ = 0;
+    int64_t device_lease_acquire_us_ = 0;
+    int64_t device_lease_wait_us_ = 0;
+    int64_t device_lease_hold_us_ = 0;
+    size_t h2d_streams_used_ = 0;
+    size_t device_lease_streams_available_ = 0;
 };
 
 PyClient::~PyClient() {}
@@ -6247,58 +6352,106 @@ RealClient::batch_get_session_start_with_sources(
         return {{}, {}};
     }
 
+    const bool trace_enabled = dfs_read_trace_enabled();
+    const uint64_t trace_id =
+        trace_enabled ? NextDfsReadTraceId() : uint64_t{0};
+    const auto trace_start = trace_enabled ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
+
     // Master interaction only here: query replicas + lease.
+    const auto metadata_start = trace_enabled ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{};
     const auto query_results = client_->BatchQuery(keys);
+    const auto metadata_done = trace_enabled ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::time_point{};
     if (query_results.size() != keys.size()) {
         LOG(ERROR) << "Session query result size mismatch: expected="
                    << keys.size() << ", got=" << query_results.size();
+        if (trace_enabled) {
+            LOG(INFO) << "batch_get_session_start: trace_id=" << trace_id
+                      << ", pid=" << ::getpid()
+                      << ", client_id=" << client_->getClientId()
+                      << ", keys=" << keys.size()
+                      << ", query_results=" << query_results.size()
+                      << ", outcome=query_size_mismatch, metadata_us="
+                      << TraceElapsedUs(metadata_start, metadata_done)
+                      << ", total_us="
+                      << TraceElapsedUs(trace_start,
+                                        std::chrono::steady_clock::now());
+        }
         return {std::vector<int>(keys.size(),
                                  static_cast<int>(toInt(ErrorCode::RPC_FAIL))),
                 std::move(sources)};
     }
+    const auto endpoint_start = trace_enabled ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{};
     auto local_endpoints = client_->GetLocalEndpoints();
+    const auto endpoint_done = trace_enabled ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::time_point{};
     const bool record_access = client_->MetricsEnabled();
 
     std::vector<std::shared_ptr<BufferHandle>> detached_prefetch_buffers;
     detached_prefetch_buffers.reserve(keys.size());
-    std::lock_guard<std::mutex> lock(session_mutex_);
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (record_access) {
-            get_session_access_records_.erase(keys[i]);
-        }
-        // A get session owns its prefetch buffer. Starting a new lease must
-        // not inherit pinned bytes from an older lookup of the same key.
-        DetachPrefetchedSessionBuffer(get_session_prefetch_cache_, keys[i],
-                                      detached_prefetch_buffers);
-        if (!query_results[i]) {
-            results[i] = static_cast<int>(toInt(query_results[i].error()));
-            get_sessions_.erase(keys[i]);
-            continue;
-        }
+    int64_t session_lock_wait_us = 0;
+    int64_t session_lock_hold_us = 0;
+    {
+        TraceMutexLock lock(session_mutex_, trace_enabled, session_lock_wait_us,
+                            session_lock_hold_us);
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (record_access) {
+                get_session_access_records_.erase(keys[i]);
+            }
+            // A get session owns its prefetch buffer. Starting a new lease must
+            // not inherit pinned bytes from an older lookup of the same key.
+            DetachPrefetchedSessionBuffer(get_session_prefetch_cache_, keys[i],
+                                          detached_prefetch_buffers);
+            if (!query_results[i]) {
+                results[i] = static_cast<int>(toInt(query_results[i].error()));
+                get_sessions_.erase(keys[i]);
+                continue;
+            }
 
-        const auto &query_result = query_results[i].value();
-        if (query_result.IsLeaseExpired()) {
-            results[i] = static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
-            get_sessions_.erase(keys[i]);
-            continue;
-        }
+            const auto &query_result = query_results[i].value();
+            if (query_result.IsLeaseExpired()) {
+                results[i] = static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+                get_sessions_.erase(keys[i]);
+                continue;
+            }
 
-        const auto *replica =
-            SelectSessionReplica(query_result.replicas, local_endpoints);
-        if (!replica) {
-            LOG(ERROR) << "No supported complete session replica for key: "
-                       << keys[i];
-            results[i] = static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
-            get_sessions_.erase(keys[i]);
-            continue;
-        }
+            const auto *replica =
+                SelectSessionReplica(query_result.replicas, local_endpoints);
+            if (!replica) {
+                LOG(ERROR) << "No supported complete session replica for key: "
+                           << keys[i];
+                results[i] = static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
+                get_sessions_.erase(keys[i]);
+                continue;
+            }
 
-        // QueryResult members are const: erase + emplace (no operator=).
-        get_sessions_.erase(keys[i]);
-        get_sessions_.emplace(keys[i],
-                              FilterQueryResult(query_result, *replica));
-        sources[i] = DirectSourceForReplica(*replica);
-        results[i] = 0;
+            // QueryResult members are const: erase + emplace (no operator=).
+            get_sessions_.erase(keys[i]);
+            get_sessions_.emplace(keys[i],
+                                  FilterQueryResult(query_result, *replica));
+            sources[i] = DirectSourceForReplica(*replica);
+            results[i] = 0;
+        }
+    }
+    if (trace_enabled) {
+        const auto started = static_cast<size_t>(std::count(results.begin(),
+                                                            results.end(), 0));
+        LOG(INFO) << "batch_get_session_start: trace_id=" << trace_id
+                  << ", pid=" << ::getpid()
+                  << ", client_id=" << client_->getClientId()
+                  << ", keys=" << keys.size() << ", started=" << started
+                  << ", metadata_us="
+                  << TraceElapsedUs(metadata_start, metadata_done)
+                  << ", local_endpoints_us="
+                  << TraceElapsedUs(endpoint_start, endpoint_done)
+                  << ", session_lock_wait_us=" << session_lock_wait_us
+                  << ", session_lock_hold_us=" << session_lock_hold_us
+                  << ", total_us="
+                  << TraceElapsedUs(trace_start,
+                                    std::chrono::steady_clock::now());
     }
     return {std::move(results), std::move(sources)};
 }
@@ -6313,6 +6466,12 @@ std::vector<int> RealClient::batch_get_session_refresh(
     }
     if (keys.empty()) return {};
 
+    const bool trace_enabled = dfs_read_trace_enabled();
+    const uint64_t trace_id =
+        trace_enabled ? NextDfsReadTraceId() : uint64_t{0};
+    const auto trace_start = trace_enabled ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
+
     struct PendingRefresh {
         std::string key;
         size_t result_index;
@@ -6326,8 +6485,11 @@ std::vector<int> RealClient::batch_get_session_refresh(
     std::unordered_map<std::string, size_t> first_index_by_key;
     first_index_by_key.reserve(keys.size());
 
+    int64_t session_lock_wait_us = 0;
+    int64_t session_lock_hold_us = 0;
     {
-        std::lock_guard<std::mutex> lock(session_mutex_);
+        TraceMutexLock lock(session_mutex_, trace_enabled, session_lock_wait_us,
+                            session_lock_hold_us);
         for (size_t i = 0; i < keys.size(); ++i) {
             const auto [first_it, inserted] =
                 first_index_by_key.emplace(keys[i], i);
@@ -6350,6 +6512,8 @@ std::vector<int> RealClient::batch_get_session_refresh(
         }
     }
 
+    int64_t metadata_us = 0;
+    int64_t local_endpoints_us = 0;
     if (!pending.empty()) {
         std::vector<std::string> query_keys;
         query_keys.reserve(pending.size());
@@ -6357,8 +6521,24 @@ std::vector<int> RealClient::batch_get_session_refresh(
 
         // Unlike batch_get_session_start, this fresh metadata query is only
         // committed after checking that the existing session is unchanged.
+        const auto metadata_start = trace_enabled
+                                        ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
         const auto fresh_queries = client_->BatchQuery(query_keys);
+        const auto metadata_done = trace_enabled
+                                       ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point{};
+        if (trace_enabled) {
+            metadata_us = TraceElapsedUs(metadata_start, metadata_done);
+        }
+        const auto endpoint_start = trace_enabled
+                                        ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
         const auto local_endpoints = client_->GetLocalEndpoints();
+        if (trace_enabled) {
+            local_endpoints_us = TraceElapsedUs(
+                endpoint_start, std::chrono::steady_clock::now());
+        }
         for (size_t i = 0; i < pending.size(); ++i) {
             const auto &entry = pending[i];
             ErrorCode refresh_error = ErrorCode::OK;
@@ -6385,7 +6565,8 @@ std::vector<int> RealClient::batch_get_session_refresh(
                 }
             }
 
-            std::lock_guard<std::mutex> lock(session_mutex_);
+            TraceMutexLock lock(session_mutex_, trace_enabled,
+                                session_lock_wait_us, session_lock_hold_us);
             auto current = get_sessions_.find(entry.key);
             if (current == get_sessions_.end() ||
                 !SameGetSessionSnapshot(current->second,
@@ -6445,6 +6626,22 @@ std::vector<int> RealClient::batch_get_session_refresh(
             results[i] = results[duplicate_of[i]];
         }
     }
+    if (trace_enabled) {
+        const auto refreshed = static_cast<size_t>(std::count(results.begin(),
+                                                               results.end(), 0));
+        LOG(INFO) << "batch_get_session_refresh: trace_id=" << trace_id
+                  << ", pid=" << ::getpid()
+                  << ", client_id=" << client_->getClientId()
+                  << ", keys=" << keys.size() << ", pending=" << pending.size()
+                  << ", refreshed=" << refreshed
+                  << ", metadata_us=" << metadata_us
+                  << ", local_endpoints_us=" << local_endpoints_us
+                  << ", session_lock_wait_us=" << session_lock_wait_us
+                  << ", session_lock_hold_us=" << session_lock_hold_us
+                  << ", total_us="
+                  << TraceElapsedUs(trace_start,
+                                    std::chrono::steady_clock::now());
+    }
     return results;
 }
 
@@ -6458,6 +6655,14 @@ std::vector<int> RealClient::batch_get_session_prefetch(
     }
     if (keys.empty()) return {};
 
+    const bool trace_enabled = dfs_read_trace_enabled();
+    const uint64_t trace_id =
+        trace_enabled ? NextDfsReadTraceId() : uint64_t{0};
+    const auto trace_start = trace_enabled ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
+    int64_t session_lock_wait_us = 0;
+    int64_t session_lock_hold_us = 0;
+
     auto now = std::chrono::steady_clock::now();
     std::vector<std::shared_ptr<BufferHandle>> detached_prefetch_buffers;
     detached_prefetch_buffers.reserve(keys.size());
@@ -6467,8 +6672,13 @@ std::vector<int> RealClient::batch_get_session_prefetch(
     std::unordered_map<std::string, size_t> first_index_by_key;
     first_index_by_key.reserve(keys.size());
 
+    const auto session_lookup_start = trace_enabled
+                                          ? std::chrono::steady_clock::now()
+                                          : std::chrono::steady_clock::time_point{};
+    size_t session_entries = 0;
     {
-        std::lock_guard<std::mutex> lock(session_mutex_);
+        TraceMutexLock lock(session_mutex_, trace_enabled, session_lock_wait_us,
+                            session_lock_hold_us);
         for (size_t i = 0; i < keys.size(); ++i) {
             const auto [first_it, inserted] =
                 first_index_by_key.emplace(keys[i], i);
@@ -6479,6 +6689,7 @@ std::vector<int> RealClient::batch_get_session_prefetch(
 
             auto session_it = get_sessions_.find(keys[i]);
             if (session_it == get_sessions_.end()) continue;
+            ++session_entries;
             if (session_it->second.IsLeaseExpired(now)) {
                 results[i] =
                     static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
@@ -6507,23 +6718,34 @@ std::vector<int> RealClient::batch_get_session_prefetch(
                 session_it->second.lease_timeout});
         }
     }
+    const auto session_lookup_done = trace_enabled
+                                         ? std::chrono::steady_clock::now()
+                                         : std::chrono::steady_clock::time_point{};
 
     std::vector<NonMemReadEntry *> dfs_entries;
     dfs_entries.reserve(entries.size());
     for (auto &entry : entries) dfs_entries.push_back(&entry);
+    const auto dfs_read_start = trace_enabled ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{};
     if (!dfs_entries.empty()) {
         // This call blocks only its caller. SGLang submits it from a bounded
         // background prefetch worker, while scheduler admission waits for the
         // prefetch to reach READY on every rank before consuming the session.
-        process_session_disk_dfs_reads(dfs_entries, results, 0,
+        process_session_disk_dfs_reads(dfs_entries, results, trace_id,
                                        /*prefetch_only=*/true);
     }
+    const auto dfs_read_done = trace_enabled ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::time_point{};
 
     // A concurrent session end or lease expiry can retire the buffer while
     // the DFS read is in progress. Never report READY unless the session
     // still owns a complete object view when this method returns.
+    const auto completion_validation_start =
+        trace_enabled ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
     {
-        std::lock_guard<std::mutex> lock(session_mutex_);
+        TraceMutexLock lock(session_mutex_, trace_enabled, session_lock_wait_us,
+                            session_lock_hold_us);
         auto completed_at = std::chrono::steady_clock::now();
         for (const auto &entry : entries) {
             const size_t i = entry.original_idx;
@@ -6581,6 +6803,35 @@ std::vector<int> RealClient::batch_get_session_prefetch(
             results[i] = results[duplicate_of[i]];
         }
     }
+    if (trace_enabled) {
+        const size_t ready = static_cast<size_t>(
+            std::count(results.begin(), results.end(), 0));
+        size_t dfs_ready = 0;
+        for (const auto &entry : entries) {
+            if (results[entry.original_idx] == 0) ++dfs_ready;
+        }
+        LOG(INFO) << "batch_get_session_prefetch: trace_id=" << trace_id
+                  << ", pid=" << ::getpid()
+                  << ", client_id=" << client_->getClientId()
+                  << ", keys=" << keys.size()
+                  << ", unique_keys=" << first_index_by_key.size()
+                  << ", session_keys=" << session_entries
+                  << ", dfs_entries=" << entries.size()
+                  << ", dfs_ready=" << dfs_ready << ", ready=" << ready
+                  << ", failed=" << (keys.size() - ready)
+                  << ", session_lookup_us="
+                  << TraceElapsedUs(session_lookup_start, session_lookup_done)
+                  << ", dfs_read_us="
+                  << TraceElapsedUs(dfs_read_start, dfs_read_done)
+                  << ", completion_validation_us="
+                  << TraceElapsedUs(completion_validation_start,
+                                    std::chrono::steady_clock::now())
+                  << ", session_lock_wait_us=" << session_lock_wait_us
+                  << ", session_lock_hold_us=" << session_lock_hold_us
+                  << ", total_us="
+                  << TraceElapsedUs(trace_start,
+                                    std::chrono::steady_clock::now());
+    }
     return results;
 }
 
@@ -6619,9 +6870,15 @@ RealClient::prepare_session_range_read_requests(
 
     std::vector<std::shared_ptr<BufferHandle>> detached_prefetch_buffers;
     detached_prefetch_buffers.reserve(keys.size());
-    std::lock_guard<std::mutex> lock(session_mutex_);
+    const bool trace_enabled = context.trace_id != 0;
+    TraceMutexLock lock(session_mutex_, trace_enabled,
+                        context.session_lock_wait_us,
+                        context.session_lock_hold_us);
     // Retire orphaned prefetch buffers if an exceptional session path skipped
     // its normal cleanup.
+    const auto orphan_gc_start = trace_enabled
+                                     ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
     for (auto it = get_session_prefetch_cache_.begin();
          it != get_session_prefetch_cache_.end();) {
         if (get_sessions_.find(it->first) == get_sessions_.end()) {
@@ -6633,6 +6890,10 @@ RealClient::prepare_session_range_read_requests(
         } else {
             ++it;
         }
+    }
+    if (trace_enabled) {
+        context.orphan_gc_us = TraceElapsedUs(
+            orphan_gc_start, std::chrono::steady_clock::now());
     }
     context.cache_gc_done = std::chrono::steady_clock::now();
 
@@ -6884,13 +7145,18 @@ void RealClient::trace_session_range_reads(
             .count();
     };
     LOG(INFO) << "batch_get_into_multi_buffer_ranges: trace_id="
-              << context.trace_id << ", keys=" << keys.size()
+              << context.trace_id << ", pid=" << ::getpid()
+              << ", client_id=" << client_->getClientId()
+              << ", keys=" << keys.size()
               << ", total_ranges=" << total_ranges
               << ", total_bytes=" << total_bytes
               << ", mem_reads=" << memory_read_count
               << ", cache_evicted=" << context.cache_evicted_count
               << ", dfs_reads=" << dfs_read_count << ", gc_us="
               << elapsed_us(context.timing_start, context.cache_gc_done)
+              << ", orphan_gc_us=" << context.orphan_gc_us
+              << ", session_lock_wait_us=" << context.session_lock_wait_us
+              << ", session_lock_hold_us=" << context.session_lock_hold_us
               << ", session_mem_us="
               << elapsed_us(context.cache_gc_done, context.memory_done)
               << ", disk_access_us="
@@ -7087,14 +7353,19 @@ void RealClient::execute_session_dfs_range_reads(
     const bool trace_enabled = trace_id != 0;
     const size_t input_entries = entries.size();
     size_t prefetch_cache_hits = 0;
+    size_t prefetch_cache_misses = 0;
     size_t prefetch_h2d_entries = 0;
     uint64_t prefetch_h2d_bytes = 0;
     size_t fallback_dfs_h2d_entries = 0;
     uint64_t fallback_dfs_h2d_bytes = 0;
+    int64_t session_lock_wait_us = 0;
+    int64_t session_lock_hold_us = 0;
+    int64_t prefetch_pinned_acquire_us = 0;
     std::vector<std::shared_ptr<BufferHandle>> detached_prefetch_buffers;
     detached_prefetch_buffers.reserve(entries.size());
     size_t arena_capacity = 0;
     bool pinned_restore_arena_used = false;
+    bool prefetch_pinned_arena_used = false;
     bool dfs_read_success = false;
     uint64_t dfs_read_bytes = 0;
     uint64_t dfs_requested_bytes = 0;
@@ -7176,7 +7447,8 @@ void RealClient::execute_session_dfs_range_reads(
             const std::shared_ptr<BufferHandle> &handle) {
         bool buffered_for_session = false;
         if (prefetch_only) {
-            std::lock_guard<std::mutex> lock(session_mutex_);
+            TraceMutexLock lock(session_mutex_, trace_enabled,
+                                session_lock_wait_us, session_lock_hold_us);
             if (get_sessions_.find(entry->key) != get_sessions_.end()) {
                 auto cache_it = get_session_prefetch_cache_.find(entry->key);
                 if (cache_it != get_session_prefetch_cache_.end()) {
@@ -7211,13 +7483,17 @@ void RealClient::execute_session_dfs_range_reads(
     for (auto *entry : entries) {
         std::shared_ptr<BufferHandle> cached_handle;
         if (entry->replica.is_dfs_replica()) {
-            std::lock_guard<std::mutex> lock(session_mutex_);
+            TraceMutexLock lock(session_mutex_, trace_enabled,
+                                session_lock_wait_us, session_lock_hold_us);
             auto prefetch_it = get_session_prefetch_cache_.find(entry->key);
             if (prefetch_it != get_session_prefetch_cache_.end()) {
                 cached_handle = prefetch_it->second.buffer_handle;
             }
         }
         if (!cached_handle) {
+            if (entry->replica.is_dfs_replica()) {
+                ++prefetch_cache_misses;
+            }
             client_->ObserveDirectSessionCache(false);
             miss_entries.push_back(entry);
             continue;
@@ -7229,11 +7505,14 @@ void RealClient::execute_session_dfs_range_reads(
                 queue_scatter(entry, cached_handle,
                               /*from_prefetch_cache=*/true);
             } else {
+                ++prefetch_cache_misses;
                 LOG(ERROR) << "DFS prefetch buffer is smaller than the "
                               "replica, key: "
                            << entry->key;
                 {
-                    std::lock_guard<std::mutex> lock(session_mutex_);
+                    TraceMutexLock lock(session_mutex_, trace_enabled,
+                                        session_lock_wait_us,
+                                        session_lock_hold_us);
                     DetachPrefetchedSessionBuffer(
                         get_session_prefetch_cache_, entry->key,
                         detached_prefetch_buffers);
@@ -7311,8 +7590,16 @@ void RealClient::execute_session_dfs_range_reads(
             // Prefetch buffers remain pinned in get_session_prefetch_cache_
             // until the session ends. They must not consume FileStorage's
             // request-scoped restore arena used by ordinary DFS reads.
+            const auto pinned_acquire_start =
+                trace_enabled ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
             arena = AcquirePrefetchPinnedArena(
                 dfs_prefetch_pinned_buffer_pool_, arena_size, dfs_alignment);
+            if (trace_enabled) {
+                prefetch_pinned_acquire_us = TraceElapsedUs(
+                    pinned_acquire_start, std::chrono::steady_clock::now());
+                prefetch_pinned_arena_used = static_cast<bool>(arena);
+            }
         }
 
         if (!arena && !prefetch_only) {
@@ -7532,9 +7819,13 @@ void RealClient::execute_session_dfs_range_reads(
         }
         LOG(INFO)
             << "execute_session_dfs_range_reads: trace_id=" << trace_id
+            << ", pid=" << ::getpid()
+            << ", client_id=" << client_->getClientId()
             << ", entries=" << entries.size()
             << ", input_entries=" << input_entries
+            << ", prefetch_only=" << prefetch_only
             << ", prefetch_cache_hits=" << prefetch_cache_hits
+            << ", prefetch_cache_misses=" << prefetch_cache_misses
             << ", prefetch_h2d_entries=" << prefetch_h2d_entries
             << ", prefetch_h2d_bytes=" << prefetch_h2d_bytes
             << ", fallback_dfs_h2d_entries=" << fallback_dfs_h2d_entries
@@ -7542,12 +7833,18 @@ void RealClient::execute_session_dfs_range_reads(
             << ", dfs_batch_entries=" << disk_batch_keys.size()
             << ", cache_hit_us=" << elapsed_us(timing_start, t_cache_hit_done)
             << ", alloc_us=" << elapsed_us(t_cache_hit_done, t_alloc_done)
+            << ", prefetch_pinned_acquire_us="
+            << prefetch_pinned_acquire_us
+            << ", prefetch_pinned_arena_used="
+            << prefetch_pinned_arena_used
             << ", dfs_read_us=" << elapsed_us(t_alloc_done, t_io_done)
             << ", scatter_us=" << scatter_us
             << ", total_us=" << elapsed_us(timing_start, t_end)
             << ", arena_requested_bytes=" << arena_size
             << ", arena_capacity=" << arena_capacity
             << ", pinned_restore_arena_used=" << pinned_restore_arena_used
+            << ", session_lock_wait_us=" << session_lock_wait_us
+            << ", session_lock_hold_us=" << session_lock_hold_us
             << ", dfs_read_success=" << dfs_read_success
             << ", dfs_read_bytes=" << dfs_read_bytes
             << ", dfs_requested_bytes=" << dfs_requested_bytes
@@ -7562,6 +7859,16 @@ void RealClient::execute_session_dfs_range_reads(
             << ", region_cache_misses=" << async_scatter.region_cache_misses()
             << ", unregistered_pointer_queries="
             << async_scatter.unregistered_pointer_queries()
+            << ", device_lease_count=" << async_scatter.device_lease_count()
+            << ", device_lease_acquire_us="
+            << async_scatter.device_lease_acquire_us()
+            << ", device_lease_wait_us="
+            << async_scatter.device_lease_wait_us()
+            << ", device_lease_hold_us="
+            << async_scatter.device_lease_hold_us()
+            << ", h2d_streams_used=" << async_scatter.h2d_streams_used()
+            << ", device_lease_streams_available="
+            << async_scatter.device_lease_streams_available()
             << ", host_copy_ops=" << async_scatter.host_copy_ops()
             << ", device_copy_ops=" << async_scatter.device_copy_ops()
             << ", host_copy_ranges=" << async_scatter.host_copy_ranges()

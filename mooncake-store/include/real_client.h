@@ -64,6 +64,9 @@ struct SessionRangeReadContext {
     bool record_access{false};
     uint64_t trace_id{0};
     size_t cache_evicted_count{0};
+    int64_t orphan_gc_us{0};
+    int64_t session_lock_wait_us{0};
+    int64_t session_lock_hold_us{0};
     std::vector<std::string> access_sources;
     std::chrono::steady_clock::time_point timing_start;
     std::chrono::steady_clock::time_point cache_gc_done;
