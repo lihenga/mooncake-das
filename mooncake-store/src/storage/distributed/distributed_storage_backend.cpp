@@ -800,7 +800,9 @@ DistributedStorageBackend::BatchWriteBucket(
         size_t index;
         ResolvedTarget target;
         uint64_t offset;
-        std::vector<char> payload;
+        void* payload = nullptr;
+        size_t payload_size = 0;
+        std::vector<char> owned_payload;
     };
     std::vector<Prepared> prepared;
     prepared.reserve(requests.size());
@@ -811,30 +813,43 @@ DistributedStorageBackend::BatchWriteBucket(
             results[i] = tl::make_unexpected(target.error());
             continue;
         }
-        uint64_t value_size = 0;
-        std::vector<char> payload(
-            static_cast<size_t>(request.descriptor.aligned_size), 0);
-        size_t payload_offset = 0;
-        bool invalid = false;
-        for (const auto& slice : request.slices) {
-            if ((!slice.ptr && slice.size > 0) ||
-                slice.size > request.descriptor.object_size - value_size) {
-                invalid = true;
-                break;
+        prepared.push_back(
+            {i, std::move(*target), request.descriptor.offset, nullptr, 0, {}});
+        auto& entry = prepared.back();
+        entry.payload_size =
+            static_cast<size_t>(request.descriptor.aligned_size);
+        if (request.preassembled_payload) {
+            if (request.slices.size() != 1 ||
+                request.slices[0].ptr == nullptr ||
+                request.slices[0].size != entry.payload_size) {
+                prepared.pop_back();
+                continue;
             }
-            if (slice.size) {
-                std::memcpy(payload.data() + payload_offset, slice.ptr, slice.size);
-                payload_offset += slice.size;
-                value_size += slice.size;
+            entry.payload = request.slices[0].ptr;
+        } else {
+            uint64_t value_size = 0;
+            entry.owned_payload.assign(entry.payload_size, 0);
+            size_t payload_offset = 0;
+            bool invalid = false;
+            for (const auto& slice : request.slices) {
+                if ((!slice.ptr && slice.size > 0) ||
+                    slice.size > request.descriptor.object_size - value_size) {
+                    invalid = true;
+                    break;
+                }
+                if (slice.size) {
+                    std::memcpy(entry.owned_payload.data() + payload_offset,
+                                slice.ptr, slice.size);
+                    payload_offset += slice.size;
+                    value_size += slice.size;
+                }
             }
+            if (invalid || value_size != request.descriptor.object_size) {
+                prepared.pop_back();
+                continue;
+            }
+            entry.payload = entry.owned_payload.data();
         }
-        if (invalid || value_size != request.descriptor.object_size) {
-            results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            continue;
-        }
-        prepared.push_back({i, std::move(*target),
-                            request.descriptor.offset,
-                            std::move(payload)});
     }
 
     auto write_run = [&](size_t begin, size_t end) {
@@ -844,17 +859,16 @@ DistributedStorageBackend::BatchWriteBucket(
             uint64_t total_size = 0;
             constexpr size_t kMaxIov = 1024;
             while (stop < end && stop - pos < kMaxIov &&
-                   (stop == pos || total_size + prepared[stop].payload.size() <=
-                                       kMaxMergedIo)) {
-                total_size += prepared[stop].payload.size();
+                   (stop == pos ||
+                    total_size + prepared[stop].payload_size <= kMaxMergedIo)) {
+                total_size += prepared[stop].payload_size;
                 ++stop;
             }
 
             std::vector<iovec> iovs;
             iovs.reserve(stop - pos);
             for (size_t j = pos; j < stop; ++j) {
-                iovs.push_back(
-                    {prepared[j].payload.data(), prepared[j].payload.size()});
+                iovs.push_back({prepared[j].payload, prepared[j].payload_size});
             }
 
             uint64_t written = 0;
@@ -918,7 +932,7 @@ DistributedStorageBackend::BatchWriteBucket(
             prepared[i - 1].target.fd == prepared[i].target.fd &&
             prepared[i - 1].target.mutex == prepared[i].target.mutex &&
             prepared[i].offset ==
-                prepared[i - 1].offset + prepared[i - 1].payload.size();
+                prepared[i - 1].offset + prepared[i - 1].payload_size;
         if (!contiguous) {
             if (run < i) write_run(run, i);
             run = i;

@@ -967,7 +967,6 @@ class Client {
         std::vector<DistributedFSDescriptor> descriptors;
         std::vector<std::vector<Slice>> slices;
         std::vector<PinnedBufferPool::Buffer> staging;
-        std::vector<std::vector<char>> host_staging;
         std::shared_ptr<DistributedStorageBackend> backend;
         std::shared_ptr<PinnedBufferPool> pinned_pool;
         bool is_upsert = false;
@@ -976,9 +975,9 @@ class Client {
     };
 
     /**
-     * @brief Copy a batch's slices into context-owned storage.
-     * GPU pointers go through a D2H copy into pinned host memory; host pointers
-     * are memcpy'd. Returns false if any staging step fails.
+     * @brief Assemble one aligned BUCKET payload per object.
+     * GPU and host slices are copied directly to their final offsets and the
+     * trailing alignment padding is zeroed. Returns false on any failure.
      */
     bool StageDfsWriteData(
         AsyncDfsWriteContext& context,

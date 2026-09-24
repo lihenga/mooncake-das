@@ -97,6 +97,7 @@ class FaultyPosixFsAdapter : public PosixFsAdapter {
     int DirectReadCalls() const { return direct_read_calls_.load(); }
     int AlignedDirectReads() const { return aligned_direct_reads_.load(); }
     int StagedDirectReads() const { return staged_direct_reads_.load(); }
+    void* LastWriteBase() const { return last_write_base_.load(); }
 
     tl::expected<int, ErrorCode> OpenFileDirect(
         const std::string& path) override {
@@ -110,6 +111,7 @@ class FaultyPosixFsAdapter : public PosixFsAdapter {
                                             int iovcnt,
                                             int64_t offset) override {
         const int call = ++write_calls_;
+        last_write_base_.store(iovcnt > 0 ? iov[0].iov_base : nullptr);
         if (call == fail_write_call_.load() ||
             offset == fail_write_offset_.load()) {
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
@@ -175,6 +177,7 @@ class FaultyPosixFsAdapter : public PosixFsAdapter {
     std::atomic<int> fail_read_call_{-1};
     std::atomic<int> short_write_call_{-1};
     std::atomic<size_t> short_write_bytes_{0};
+    std::atomic<void*> last_write_base_{nullptr};
 };
 
 DistributedStorageConfig MakeBucketConfig(const std::string& fsdir) {
@@ -308,6 +311,53 @@ TEST_F(DfsBucketBackendTest, MultiSliceValueWriteAndRead) {
     std::string actual(out_a.begin(), out_a.end());
     actual.append(out_b.begin(), out_b.begin() + (expected.size() - 300));
     EXPECT_EQ(actual, expected);
+}
+
+TEST_F(DfsBucketBackendTest, WritesPreassembledPayloadWithoutRepacking) {
+    const std::string key = "preassembled";
+    const std::string part_a(257, 'A');
+    const std::string part_b(389, 'B');
+    const std::string expected = part_a + part_b;
+    auto desc = allocator_->Allocate(key, expected.size());
+    ASSERT_TRUE(desc.has_value());
+
+    AlignedBuffer payload(desc->aligned_size);
+    ASSERT_NE(payload.data(), nullptr);
+    std::memset(payload.data(), 0, payload.size());
+    std::memcpy(payload.data(), part_a.data(), part_a.size());
+    std::memcpy(payload.data() + part_a.size(), part_b.data(), part_b.size());
+
+    auto results = backend_->BatchWrite(
+        {{key, *desc, {{payload.data(), payload.size()}}, true}});
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_TRUE(results[0].has_value());
+    EXPECT_EQ(adapter_->LastWriteBase(), payload.data());
+    EXPECT_EQ(ReadObject(key, *desc), expected);
+
+    const int fd = ::open(desc->file_path.c_str(), O_RDONLY);
+    ASSERT_GE(fd, 0);
+    std::vector<char> raw(desc->aligned_size, '\0');
+    ASSERT_EQ(
+        ::pread(fd, raw.data(), raw.size(), static_cast<off_t>(desc->offset)),
+        static_cast<ssize_t>(raw.size()));
+    ::close(fd);
+    EXPECT_TRUE(std::all_of(raw.begin() + expected.size(), raw.end(),
+                            [](char byte) { return byte == 0; }));
+}
+
+TEST_F(DfsBucketBackendTest, RejectsMalformedPreassembledPayload) {
+    const std::string key = "bad_preassembled";
+    auto desc = allocator_->Allocate(key, 128);
+    ASSERT_TRUE(desc.has_value());
+    std::vector<char> short_payload(desc->aligned_size - 1, 'X');
+    const int writes_before = adapter_->WriteCalls();
+
+    auto results = backend_->BatchWrite(
+        {{key, *desc, {{short_payload.data(), short_payload.size()}}, true}});
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_FALSE(results[0].has_value());
+    EXPECT_EQ(results[0].error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(adapter_->WriteCalls(), writes_before);
 }
 
 TEST_F(DfsBucketBackendTest, DirectReadChoosesZeroCopyOrStagingByAlignment) {

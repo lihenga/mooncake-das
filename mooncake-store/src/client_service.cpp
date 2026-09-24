@@ -2761,15 +2761,12 @@ bool Client::StageDfsWriteData(
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
 
-    context.slices.resize(slice_lists.size());
-    // Reserve up front so the vectors never reallocate: the Slice pointers we
-    // publish below point into these buffers.
-    size_t total_slices = 0;
-    for (const auto* slices : slice_lists) {
-        if (slices != nullptr) total_slices += slices->size();
+    if (context.descriptors.size() != slice_lists.size() ||
+        context.keys.size() != slice_lists.size()) {
+        return false;
     }
-    context.staging.reserve(total_slices);
-    context.host_staging.reserve(total_slices);
+    context.slices.resize(slice_lists.size());
+    context.staging.reserve(slice_lists.size());
 
     for (size_t i = 0; i < slice_lists.size(); ++i) {
         if (slice_lists[i] == nullptr) {
@@ -2777,11 +2774,33 @@ bool Client::StageDfsWriteData(
                        << context.keys[i];
             return false;
         }
+        const auto& descriptor = context.descriptors[i];
+        if (descriptor.object_size == 0 ||
+            descriptor.aligned_size < descriptor.object_size ||
+            descriptor.aligned_size > std::numeric_limits<size_t>::max()) {
+            LOG(ERROR) << "Invalid descriptor for async DFS write of key "
+                       << context.keys[i];
+            return false;
+        }
+
+        auto payload = pinned_buffer_pool_->Acquire(
+            static_cast<size_t>(descriptor.aligned_size));
+        if (payload.data == nullptr) {
+            LOG(ERROR) << "Failed to acquire staging payload for async DFS "
+                          "write of key "
+                       << context.keys[i];
+            return false;
+        }
+        std::memset(payload.data, 0,
+                    static_cast<size_t>(descriptor.aligned_size));
+        size_t offset = 0;
         for (const auto& slice : *slice_lists[i]) {
             if (slice.size == 0) continue;
-            if (slice.ptr == nullptr) {
-                LOG(ERROR) << "Null slice for async DFS write of key "
+            if (slice.ptr == nullptr ||
+                slice.size > descriptor.object_size - offset) {
+                LOG(ERROR) << "Invalid slice for async DFS write of key "
                            << context.keys[i];
+                pinned_buffer_pool_->Release(std::move(payload));
                 return false;
             }
 
@@ -2792,33 +2811,30 @@ bool Client::StageDfsWriteData(
                 // GPU source: the D2H copy must complete now, while the
                 // caller's device buffer is still guaranteed to be alive.
                 device->SetContext(info.device_id);
-                auto buffer = pinned_buffer_pool_->Acquire(slice.size);
-                if (buffer.data == nullptr) {
-                    LOG(ERROR) << "Failed to acquire pinned staging buffer for "
-                                  "async DFS write of key "
-                               << context.keys[i];
-                    return false;
-                }
-                if (!device->Copy(buffer.data, slice.ptr, slice.size,
+                if (!device->Copy(payload.data + offset, slice.ptr, slice.size,
                                   device::CopyDirection::kDeviceToHost)) {
                     LOG(ERROR) << "DFS D2H staging failed for key "
                                << context.keys[i];
-                    pinned_buffer_pool_->Release(std::move(buffer));
+                    pinned_buffer_pool_->Release(std::move(payload));
                     return false;
                 }
-                context.slices[i].push_back(Slice{buffer.data, slice.size});
-                context.staging.push_back(std::move(buffer));
-                continue;
+            } else {
+                // The caller may free or overwrite host memory as soon as
+                // BatchPut returns, so copy it into the owned payload too.
+                std::memcpy(payload.data + offset, slice.ptr, slice.size);
             }
-
-            // Host source: still copy. The caller may free or overwrite its
-            // buffer as soon as BatchPut returns, so referencing it from the
-            // background task would be a use-after-free.
-            context.host_staging.emplace_back(slice.size);
-            auto& owned = context.host_staging.back();
-            std::memcpy(owned.data(), slice.ptr, slice.size);
-            context.slices[i].push_back(Slice{owned.data(), owned.size()});
+            offset += slice.size;
         }
+        if (offset != descriptor.object_size) {
+            LOG(ERROR) << "DFS staging size mismatch for key "
+                       << context.keys[i] << ": expected "
+                       << descriptor.object_size << ", got " << offset;
+            pinned_buffer_pool_->Release(std::move(payload));
+            return false;
+        }
+        context.slices[i].push_back(
+            Slice{payload.data, static_cast<size_t>(descriptor.aligned_size)});
+        context.staging.push_back(std::move(payload));
     }
     return true;
 }
@@ -2827,8 +2843,9 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
     std::vector<DfsWriteRequest> requests;
     requests.reserve(context->keys.size());
     for (size_t i = 0; i < context->keys.size(); ++i) {
-        requests.push_back(DfsWriteRequest{
-            context->keys[i], context->descriptors[i], context->slices[i]});
+        requests.push_back(DfsWriteRequest{context->keys[i],
+                                           context->descriptors[i],
+                                           context->slices[i], true});
     }
 
     // Every request gets a definite outcome: a missing or short result vector is
@@ -2849,9 +2866,7 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
         for (size_t i = 0; i < results.size(); ++i) {
             outcomes[i] = results[i] ? ErrorCode::OK : results[i].error();
             if (results[i]) {
-                for (const auto& slice : requests[i].slices) {
-                    successful_bytes += slice.size;
-                }
+                successful_bytes += requests[i].descriptor.object_size;
             } else {
                 all_succeeded = false;
             }

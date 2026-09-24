@@ -81,6 +81,9 @@ struct DfsWriteRequest {
     std::string key;
     DistributedFSDescriptor descriptor;
     std::vector<Slice> slices;
+    // BUCKET-only fast path: slices contains one complete aligned payload,
+    // including zero padding. The caller owns it through BatchWrite().
+    bool preassembled_payload = false;
 };
 
 struct DfsReadRequest {
