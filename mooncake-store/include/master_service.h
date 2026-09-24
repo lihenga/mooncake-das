@@ -635,6 +635,10 @@ class MasterService {
         const UUID& client_id, const std::vector<std::string>& keys,
         const TenantId& tenant_id, ReplicaType replica_type);
 
+    std::vector<tl::expected<void, ErrorCode>> BatchInvalidateDfsBuckets(
+        const UUID& client_id, const std::vector<DfsMissingFileReport>& reports,
+        const TenantId& tenant_id);
+
     /**
      * @brief Start a copy operation
      *
@@ -2205,12 +2209,15 @@ class MasterService {
     void FreeDfsReplicas(const std::string& key,
                          const std::vector<Replica>& replicas);
     void RunDfsEviction();
+    void ProcessInvalidatedDfsBuckets();
     // Whole-bucket eviction (BUCKET mode). Uses a strict two-phase protocol:
     // validate every candidate first and only mutate metadata once all of them
     // are accepted, so a bucket file is never deleted while the master still
     // hands out a descriptor into it.
     void RunBucketDfsEviction();
-    bool RunBucketDfsEvictionInternal(bool force_one);
+    bool RunBucketDfsEvictionInternal(
+        bool force_one,
+        std::optional<int64_t> invalidated_bucket_id = std::nullopt);
     bool TryRecoverDfsSpaceAfterAllocationFailure();
     // Shard-mode per-key eviction (unchanged behaviour).
     void RunShardDfsEviction();
@@ -2357,6 +2364,9 @@ class MasterService {
     std::atomic<bool> eviction_running_{false};
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
+
+    std::mutex invalidated_dfs_buckets_mutex_;
+    std::unordered_set<int64_t> invalidated_dfs_buckets_;
 
     // Snapshot manager handles snapshot lifecycle orchestration
     std::unique_ptr<MasterSnapshotManager> snapshot_manager_;

@@ -1318,6 +1318,31 @@ tl::expected<void, ErrorCode> WrappedMasterService::EvictDiskReplica(
 }
 
 std::vector<tl::expected<void, ErrorCode>>
+WrappedMasterService::BatchInvalidateDfsBuckets(
+    const UUID& client_id,
+    const std::vector<DfsMissingFileReport>& reports,
+    const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "BatchInvalidateDfsBuckets");
+    timer.LogRequest("client_id=", client_id,
+                     ", report_count=", reports.size());
+    auto results = WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        reports.size(), [&](const TenantId& resolved_tenant_id) {
+            return master_service_.BatchInvalidateDfsBuckets(
+                client_id, reports, resolved_tenant_id);
+        });
+    size_t failure_count = 0;
+    for (const auto& result : results) {
+        if (!result.has_value()) ++failure_count;
+    }
+    timer.LogResponse("total=", results.size(),
+                      ", success=", results.size() - failure_count,
+                      ", failures=", failure_count);
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>>
 WrappedMasterService::BatchEvictDiskReplica(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::string& tenant_id, ReplicaType replica_type) {
@@ -1891,6 +1916,9 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::BatchEvictDiskReplica>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BatchInvalidateDfsBuckets>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PollRemoveAll>(
         &wrapped_master_service);

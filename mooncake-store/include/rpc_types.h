@@ -14,6 +14,12 @@ struct ObjectMeta {
 };
 YLT_REFL(ObjectMeta, key, object_checksum);
 
+struct DfsMissingFileReport {
+    std::string key;
+    DistributedFSDescriptor descriptor;
+};
+YLT_REFL(DfsMissingFileReport, key, descriptor);
+
 enum class ReplicaActionType {
     ADD = 0,
 };

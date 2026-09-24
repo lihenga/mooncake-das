@@ -1415,6 +1415,19 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         err = TransferRead(replica, slices);
     }
 
+    if (replica.is_dfs_replica() && err == ErrorCode::FILE_NOT_FOUND) {
+        const auto& descriptor = replica.get_dfs_descriptor();
+        const std::vector<DfsMissingFileReport> reports{{object_key,
+                                                         descriptor}};
+        const auto invalidation_results =
+            master_client_.BatchInvalidateDfsBuckets(reports);
+        if (invalidation_results.size() != 1 ||
+            !invalidation_results.front()) {
+            LOG(WARNING) << "Failed to report missing DFS bucket for key "
+                         << object_key;
+        }
+    }
+
     // Release the cache block after transfer completes (memcpy is done)
     if (hot_cache_ && cache_used) {
         hot_cache_->ReleaseHotKey(object_key);
@@ -1767,6 +1780,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
     if (!dfs_read_requests.empty()) {
         auto dfs_results = dfs_storage_backend_->BatchRead(dfs_read_requests);
+        std::vector<DfsMissingFileReport> missing_file_reports;
+        missing_file_reports.reserve(dfs_read_requests.size());
         if (dfs_results.size() != dfs_read_requests.size()) {
             LOG(ERROR) << "DFS BatchRead response size mismatch: expected "
                        << dfs_read_requests.size() << ", got "
@@ -1779,6 +1794,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 const size_t index = dfs_read_indices[i];
                 const auto& request = dfs_read_requests[i];
                 if (!dfs_results[i]) {
+                    if (dfs_results[i].error() == ErrorCode::FILE_NOT_FOUND) {
+                        missing_file_reports.push_back(
+                            DfsMissingFileReport{request.key,
+                                                 request.descriptor});
+                    }
                     results[index] = tl::unexpected(dfs_results[i].error());
                     continue;
                 }
@@ -1790,6 +1810,54 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                     continue;
                 }
                 results[index] = {};
+            }
+            std::sort(
+                missing_file_reports.begin(), missing_file_reports.end(),
+                [](const auto& lhs, const auto& rhs) {
+                    if (lhs.descriptor.shard_idx != rhs.descriptor.shard_idx)
+                        return lhs.descriptor.shard_idx <
+                               rhs.descriptor.shard_idx;
+                    return lhs.key < rhs.key;
+                });
+            missing_file_reports.erase(
+                std::unique(missing_file_reports.begin(),
+                            missing_file_reports.end(),
+                            [](const auto& lhs, const auto& rhs) {
+                                return lhs.key == rhs.key &&
+                                       lhs.descriptor.file_path ==
+                                           rhs.descriptor.file_path &&
+                                       lhs.descriptor.offset ==
+                                           rhs.descriptor.offset &&
+                                       lhs.descriptor.object_size ==
+                                           rhs.descriptor.object_size &&
+                                       lhs.descriptor.aligned_size ==
+                                           rhs.descriptor.aligned_size &&
+                                       lhs.descriptor.shard_idx ==
+                                           rhs.descriptor.shard_idx;
+                            }),
+                missing_file_reports.end());
+            if (!missing_file_reports.empty()) {
+                const auto invalidation_results =
+                    master_client_.BatchInvalidateDfsBuckets(
+                        missing_file_reports);
+                if (invalidation_results.size() !=
+                    missing_file_reports.size()) {
+                    LOG(WARNING)
+                        << "DFS bucket invalidation response size mismatch: "
+                        << "expected " << missing_file_reports.size() << ", got "
+                        << invalidation_results.size();
+                }
+                const size_t result_count = std::min(
+                    invalidation_results.size(), missing_file_reports.size());
+                for (size_t i = 0; i < result_count; ++i) {
+                    if (!invalidation_results[i]) {
+                        LOG(WARNING)
+                            << "Failed to invalidate missing DFS bucket: "
+                            << missing_file_reports[i].descriptor.shard_idx
+                            << ", error: "
+                            << toString(invalidation_results[i].error());
+                    }
+                }
             }
         }
     }
