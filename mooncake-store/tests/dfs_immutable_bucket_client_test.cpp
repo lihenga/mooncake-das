@@ -1,12 +1,15 @@
+#include <fcntl.h>
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -15,6 +18,7 @@
 #include <vector>
 
 #include "client_service.h"
+#include "device/accelerator_registry.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
@@ -47,6 +51,73 @@ class FailingBucketFsAdapter : public PosixFsAdapter {
     std::atomic<int> fail_write_call_{-1};
     std::atomic<bool> fail_all_writes_{false};
 };
+
+class FakeDfsAccelerator final : public device::AcceleratorDevice {
+   public:
+    device::AcceleratorVendor Vendor() const override {
+        return device::AcceleratorVendor::kNvidia;
+    }
+    bool Available(bool ensure = false) const override {
+        (void)ensure;
+        return true;
+    }
+    device::PointerInfo QueryPointer(const void* ptr) const override {
+        const auto address = reinterpret_cast<uintptr_t>(ptr);
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& range : device_ranges_) {
+            const auto begin = reinterpret_cast<uintptr_t>(range.first);
+            if (address >= begin && address - begin < range.second) {
+                return {device::MemoryKind::kDevice, 0};
+            }
+        }
+        return {device::MemoryKind::kHost, -1};
+    }
+    int32_t CurrentDeviceId() const override { return current_device_id_; }
+    void SetContext(int32_t device_id) const override {
+        current_device_id_ = device_id;
+    }
+    bool Copy(void* dst, const void* src, size_t size,
+              device::CopyDirection direction) const override {
+        last_direction_ = direction;
+        ++copy_calls_;
+        if (!copy_succeeds_.load()) return false;
+        std::memcpy(dst, src, size);
+        return true;
+    }
+    PinnedHostBuffer AllocatePinnedHost(size_t size) const override {
+        return PinnedHostBuffer(std::malloc(size), size, std::free);
+    }
+
+    void MarkDeviceRange(const void* ptr, size_t size) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        device_ranges_.push_back({ptr, size});
+    }
+    void Reset() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        device_ranges_.clear();
+        copy_succeeds_.store(true);
+        copy_calls_.store(0);
+        last_direction_ = device::CopyDirection::kAuto;
+    }
+    void SetCopySucceeds(bool succeeds) { copy_succeeds_.store(succeeds); }
+    int CopyCalls() const { return copy_calls_.load(); }
+    device::CopyDirection LastDirection() const { return last_direction_; }
+
+   private:
+    mutable std::mutex mutex_;
+    std::vector<std::pair<const void*, size_t>> device_ranges_;
+    mutable std::atomic<bool> copy_succeeds_{true};
+    mutable std::atomic<int> copy_calls_{0};
+    mutable int32_t current_device_id_ = -1;
+    mutable device::CopyDirection last_direction_ =
+        device::CopyDirection::kAuto;
+};
+
+FakeDfsAccelerator& GetFakeDfsAccelerator() {
+    static FakeDfsAccelerator accelerator;
+    static device::AcceleratorDeviceRegistrar registrar(accelerator);
+    return accelerator;
+}
 
 }  // namespace
 
@@ -328,6 +399,67 @@ TEST_F(DfsBucketClientTest, AsyncWriteSucceedsAfterCallerBufferIsOverwritten) {
 
     ASSERT_TRUE(WaitForDfsReplica(key));
     ExpectDfsValue(key, expected);
+}
+
+TEST_F(DfsBucketClientTest, StagesMixedHostAndDeviceSlicesIntoFinalPayload) {
+    auto& accelerator = GetFakeDfsAccelerator();
+    accelerator.Reset();
+    const std::string key = "bucket_mixed_slices";
+    std::string host_a(333, 'H');
+    std::string gpu_part(777, 'D');
+    std::string host_b(129, 'T');
+    const std::string expected = host_a + gpu_part + host_b;
+    accelerator.MarkDeviceRange(gpu_part.data(), gpu_part.size());
+
+    std::vector<std::string> keys{key};
+    std::vector<std::vector<Slice>> slices{{
+        {host_a.data(), host_a.size()},
+        {gpu_part.data(), gpu_part.size()},
+        {host_b.data(), host_b.size()},
+    }};
+    auto results = writer_->BatchPut(keys, slices, DfsConfig());
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_TRUE(results[0].has_value());
+    std::fill(host_a.begin(), host_a.end(), 'X');
+    std::fill(gpu_part.begin(), gpu_part.end(), 'X');
+    std::fill(host_b.begin(), host_b.end(), 'X');
+
+    ASSERT_TRUE(WaitForDfsReplica(key));
+    ExpectDfsValue(key, expected);
+    EXPECT_GT(accelerator.CopyCalls(), 0);
+    EXPECT_EQ(accelerator.LastDirection(),
+              device::CopyDirection::kDeviceToHost);
+
+    auto query = QueryDfsOnly(key);
+    ASSERT_TRUE(query.has_value());
+    const auto& descriptor = query->replicas[0].get_dfs_descriptor();
+    const int fd = ::open(descriptor.file_path.c_str(), O_RDONLY);
+    ASSERT_GE(fd, 0);
+    std::vector<char> raw(descriptor.aligned_size, '\0');
+    ASSERT_EQ(::pread(fd, raw.data(), raw.size(),
+                      static_cast<off_t>(descriptor.offset)),
+              static_cast<ssize_t>(raw.size()));
+    ::close(fd);
+    EXPECT_TRUE(std::all_of(raw.begin() + expected.size(), raw.end(),
+                            [](char byte) { return byte == 0; }));
+    accelerator.Reset();
+}
+
+TEST_F(DfsBucketClientTest, DeviceStagingFailureRevokesDfsReplica) {
+    auto& accelerator = GetFakeDfsAccelerator();
+    accelerator.Reset();
+    std::string device_value(4096, 'F');
+    accelerator.MarkDeviceRange(device_value.data(), device_value.size());
+    accelerator.SetCopySucceeds(false);
+
+    std::vector<std::string> keys{"bucket_device_stage_fail"};
+    std::vector<std::vector<Slice>> slices{
+        {{device_value.data(), device_value.size()}}};
+    auto results = writer_->BatchPut(keys, slices, DfsConfig());
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_TRUE(WaitForKeyGone(keys[0]));
+    EXPECT_GT(accelerator.CopyCalls(), 0);
+    accelerator.Reset();
 }
 
 TEST_F(DfsBucketClientTest, FailedAsyncWriteRevokesOnlyTheDfsReplica) {
