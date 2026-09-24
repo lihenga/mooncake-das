@@ -71,36 +71,6 @@ DEFINE_int32(http_port, 9300,
 
 namespace mooncake {
 
-bool session_cache_enabled() {
-    static const bool enabled = [] {
-        const char *val = std::getenv("MC_STORE_ENABLE_SESSION_CACHE");
-        bool result = true;
-        if (!val || val[0] == '\0') {
-            result = true;  // unset: enabled
-        } else {
-            std::string s(val);
-            // case-insensitive compare
-            for (auto &c : s) {
-                c = std::tolower(c);
-            }
-            result = s != "0" && s != "false" && s != "off";
-        }
-        std::string raw_value = "<unset>";
-        if (val != nullptr) {
-            raw_value = val;
-        }
-        if (result) {
-            LOG(INFO) << "Session cache enabled"
-                      << " (MC_STORE_ENABLE_SESSION_CACHE=" << raw_value << ")";
-        } else {
-            LOG(INFO) << "Session cache disabled"
-                      << " (MC_STORE_ENABLE_SESSION_CACHE=" << raw_value << ")";
-        }
-        return result;
-    }();
-    return enabled;
-}
-
 namespace {
 constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
 std::atomic<uint64_t> g_dfs_read_trace_id{0};
@@ -1961,10 +1931,6 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
 
     dfs_h2d_stream_pool_.reset();
 
-    {
-        std::lock_guard<std::mutex> lock(session_mutex_);
-        get_session_object_cache_.clear();
-    }
     if (!client_) {
         // Not initialized or already cleaned; treat as success for idempotence
         return {};
@@ -6160,18 +6126,6 @@ RealClient::prepare_session_range_read_requests(
     }
 
     std::lock_guard<std::mutex> lock(session_mutex_);
-    if (session_cache_enabled()) {
-        for (auto it = get_session_object_cache_.begin();
-             it != get_session_object_cache_.end();) {
-            if (get_sessions_.find(it->first) == get_sessions_.end()) {
-                ++context.cache_evicted_count;
-                client_->ObserveDirectSessionCacheEviction();
-                it = get_session_object_cache_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
     context.cache_gc_done = std::chrono::steady_clock::now();
 
     auto now = std::chrono::steady_clock::now();
@@ -6419,7 +6373,6 @@ void RealClient::trace_session_range_reads(
               << ", total_ranges=" << total_ranges
               << ", total_bytes=" << total_bytes
               << ", mem_reads=" << memory_read_count
-              << ", cache_evicted=" << context.cache_evicted_count
               << ", dfs_reads=" << dfs_read_count << ", gc_us="
               << elapsed_us(context.timing_start, context.cache_gc_done)
               << ", session_mem_us="
@@ -6495,7 +6448,6 @@ int RealClient::batch_get_session_end(const std::vector<std::string> &keys) {
                 }
             }
             get_sessions_.erase(key);
-            get_session_object_cache_.erase(key);
         }
     }
     for (const auto &observation : access_observations) {
@@ -6532,7 +6484,6 @@ void RealClient::execute_session_dfs_range_reads(
     const auto timing_start = std::chrono::steady_clock::now();
     const bool trace_enabled = trace_id != 0;
     const size_t input_entries = entries.size();
-    size_t session_cache_hits = 0;
     size_t arena_capacity = 0;
     bool pinned_restore_arena_used = false;
     bool dfs_read_success = false;
@@ -6585,61 +6536,8 @@ void RealClient::execute_session_dfs_range_reads(
             PendingScatterResult{entry, transferred});
     };
 
-    auto cache_and_queue_scatter =
-        [&](SessionRangeReadRequest *entry,
-            const std::shared_ptr<BufferHandle> &handle) {
-            const uint64_t total_size = calculate_total_size(entry->replica);
-            if (session_cache_enabled()) {
-                std::lock_guard<std::mutex> lock(session_mutex_);
-                if (get_sessions_.find(entry->key) != get_sessions_.end()) {
-                    get_session_object_cache_.insert_or_assign(
-                        entry->key, SessionCachedObject{handle, total_size});
-                }
-            }
-            queue_scatter(entry, handle);
-        };
 
-    // Cache hits participate in the same copy plan as newly read objects. A
-    // local shared handle pins the arena even if session end evicts the entry.
-    if (session_cache_enabled()) {
-        std::vector<SessionRangeReadRequest *> miss_entries;
-        miss_entries.reserve(entries.size());
-        for (auto *entry : entries) {
-            std::shared_ptr<BufferHandle> cached_handle;
-            {
-                std::lock_guard<std::mutex> lock(session_mutex_);
-                auto cache_it = get_session_object_cache_.find(entry->key);
-                if (cache_it != get_session_object_cache_.end()) {
-                    cached_handle = cache_it->second.buffer_handle;
-                }
-            }
-            if (!cached_handle) {
-                client_->ObserveDirectSessionCache(false);
-                miss_entries.push_back(entry);
-                continue;
-            }
-            client_->ObserveDirectSessionCache(true);
-            if (results[entry->original_idx] == 0) {
-                if (valid_source_handle(entry, cached_handle)) {
-                    ++session_cache_hits;
-                    queue_scatter(entry, cached_handle);
-                } else {
-                    LOG(ERROR) << "DFS session-cache buffer is smaller than "
-                                  "the replica, key: "
-                               << entry->key;
-                    {
-                        std::lock_guard<std::mutex> lock(session_mutex_);
-                        get_session_object_cache_.erase(entry->key);
-                    }
-                    miss_entries.push_back(entry);
-                }
-            }
-        }
-        entries = std::move(miss_entries);
-    }
-    const auto t_cache_hit_done = std::chrono::steady_clock::now();
-
-    // 2. Cache miss: allocate + BatchGet
+    // 2. Allocate + BatchGet
     std::vector<std::string> disk_batch_keys;
     std::vector<QueryResult> disk_batch_qrs;
     std::unordered_map<std::string, std::vector<Slice>> disk_batch_slices;
@@ -6834,7 +6732,7 @@ void RealClient::execute_session_dfs_range_reads(
                     static_cast<int>(toInt(ErrorCode::INTERNAL_ERROR));
                 continue;
             }
-            cache_and_queue_scatter(entry, handle);
+            queue_scatter(entry, handle);
         }
     }
 
@@ -6897,10 +6795,8 @@ void RealClient::execute_session_dfs_range_reads(
             << "execute_session_dfs_range_reads: trace_id=" << trace_id
             << ", entries=" << entries.size()
             << ", input_entries=" << input_entries
-            << ", session_cache_hits=" << session_cache_hits
             << ", dfs_batch_entries=" << disk_batch_keys.size()
-            << ", cache_hit_us=" << elapsed_us(timing_start, t_cache_hit_done)
-            << ", alloc_us=" << elapsed_us(t_cache_hit_done, t_alloc_done)
+            << ", alloc_us=" << elapsed_us(timing_start, t_alloc_done)
             << ", dfs_read_us=" << elapsed_us(t_alloc_done, t_io_done)
             << ", scatter_us=" << scatter_us
             << ", total_us=" << elapsed_us(timing_start, t_end)

@@ -638,18 +638,6 @@ class Client {
         }
     }
 
-    void ObserveDirectSessionCache(bool hit) {
-        if (metrics_ != nullptr) {
-            metrics_->ObserveDirectSessionCache(hit);
-        }
-    }
-
-    void ObserveDirectSessionCacheEviction() {
-        if (metrics_ != nullptr) {
-            metrics_->ObserveDirectSessionCacheEviction();
-        }
-    }
-
     void ObserveDirectIo(const std::string& operation,
                          const std::string& source, bool success,
                          uint64_t bytes, double duration_seconds) {

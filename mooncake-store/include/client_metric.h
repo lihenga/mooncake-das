@@ -506,8 +506,6 @@ struct TransferOperationMetric {
 
 struct DirectStorageMetric {
     std::array<std::string, 2> access_labels = {"source", "result"};
-    std::array<std::string, 1> cache_labels = {"result"};
-    std::array<std::string, 1> eviction_labels = {"reason"};
     std::array<std::string, 3> io_labels = {"operation", "source", "result"};
     explicit DirectStorageMetric(
         std::map<std::string, std::string> labels = {})
@@ -518,12 +516,6 @@ struct DirectStorageMetric {
               "mooncake_direct_access_bytes_total",
               "Direct logical object access payload bytes by selected source",
               labels, access_labels),
-          session_cache_access_total(
-              "mooncake_direct_session_cache_access_total",
-              "Get-session object cache lookups", labels, cache_labels),
-          session_cache_evictions_total(
-              "mooncake_direct_session_cache_evictions_total",
-              "Get-session object cache evictions", labels, eviction_labels),
           io_operations_total("mooncake_direct_io_operations_total",
                               "Direct storage I/O operations", labels,
                               io_labels),
@@ -541,8 +533,6 @@ struct DirectStorageMetric {
 
     ylt::metric::hybrid_counter_2t access_total;
     ylt::metric::hybrid_counter_2t access_bytes_total;
-    ylt::metric::hybrid_counter_1t session_cache_access_total;
-    ylt::metric::hybrid_counter_1t session_cache_evictions_total;
     ylt::metric::hybrid_counter_3t io_operations_total;
     ylt::metric::hybrid_counter_3t io_bytes_total;
     ylt::metric::hybrid_histogram_3d io_duration_seconds;
@@ -559,14 +549,6 @@ struct DirectStorageMetric {
         prefetched_tokens_total.inc(tokens);
     }
 
-    void ObserveSessionCache(bool hit) {
-        session_cache_access_total.inc({hit ? "hit" : "miss"});
-    }
-
-    void ObserveSessionCacheEviction() {
-        session_cache_evictions_total.inc({"session_missing"});
-    }
-
     void ObserveIo(const std::string& operation, const std::string& source,
                    bool success, uint64_t bytes, double duration_seconds) {
         const std::array<std::string, 3> label = {
@@ -580,8 +562,6 @@ struct DirectStorageMetric {
         prefetched_tokens_total.serialize(str);
         access_total.serialize(str);
         access_bytes_total.serialize(str);
-        session_cache_access_total.serialize(str);
-        session_cache_evictions_total.serialize(str);
         io_operations_total.serialize(str);
         io_bytes_total.serialize(str);
         io_duration_seconds.serialize(str);
@@ -783,14 +763,6 @@ struct ClientMetric {
 
     void ObservePrefetchedTokens(uint64_t tokens) {
         direct_storage_metric.ObservePrefetchedTokens(tokens);
-    }
-
-    void ObserveDirectSessionCache(bool hit) {
-        direct_storage_metric.ObserveSessionCache(hit);
-    }
-
-    void ObserveDirectSessionCacheEviction() {
-        direct_storage_metric.ObserveSessionCacheEviction();
     }
 
     void ObserveDirectIo(const std::string& operation,

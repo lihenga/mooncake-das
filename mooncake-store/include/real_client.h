@@ -34,13 +34,6 @@
 
 namespace mooncake {
 
-// Session-level object cache for DFS reads to avoid
-// repeated I/O on the same key within a session.
-// Enabled by default; set MC_STORE_ENABLE_SESSION_CACHE to
-// "0", "false", or "off" to disable; unset or any other value
-// enables the cache.
-bool session_cache_enabled();
-
 struct SessionRangeReadRequest {
     std::string key;
     size_t original_idx;
@@ -60,19 +53,11 @@ struct SessionRangeReadPlan {
 struct SessionRangeReadContext {
     bool record_access{false};
     uint64_t trace_id{0};
-    size_t cache_evicted_count{0};
     std::vector<std::string> access_sources;
     std::chrono::steady_clock::time_point timing_start;
     std::chrono::steady_clock::time_point cache_gc_done;
     std::chrono::steady_clock::time_point memory_done;
     std::chrono::steady_clock::time_point access_done;
-};
-
-// Session-level object cache for DFS reads to avoid
-// repeated I/O on the same key within a session.
-struct SessionCachedObject {
-    std::shared_ptr<BufferHandle> buffer_handle;  // RAII temp buffer
-    uint64_t total_size;                          // object size in bytes
 };
 
 class RealClient;
@@ -1094,10 +1079,6 @@ class RealClient : public PyClient {
         get_session_access_records_;
     std::unordered_map<std::string, PutSessionEntry> put_sessions_;
 
-    // Per-key object cache for DFS reads within a get session.
-    // Populated lazily on first range-get; released at session end.
-    std::unordered_map<std::string, SessionCachedObject>
-        get_session_object_cache_;
     class DfsH2dStreamPool;
     class DfsAsyncScatterContext;
     mutable std::shared_mutex dfs_read_lifecycle_mutex_;
