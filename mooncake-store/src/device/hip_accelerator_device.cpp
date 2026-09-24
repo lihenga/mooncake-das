@@ -207,6 +207,31 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
         hipStreamDestroy(static_cast<hipStream_t>(stream));
     }
 
+    bool CreateEvent(void** event) const override {
+        hipEvent_t hip_event = nullptr;
+        if (hipEventCreateWithFlags(&hip_event, hipEventDisableTiming) !=
+            hipSuccess) {
+            hipGetLastError();
+            return false;
+        }
+        *event = static_cast<void*>(hip_event);
+        return true;
+    }
+
+    bool RecordEvent(void* event, void* stream) const override {
+        return hipEventRecord(static_cast<hipEvent_t>(event),
+                              static_cast<hipStream_t>(stream)) == hipSuccess;
+    }
+
+    bool SynchronizeEvent(void* event) const override {
+        return hipEventSynchronize(static_cast<hipEvent_t>(event)) ==
+               hipSuccess;
+    }
+
+    void DestroyEvent(void* event) const override {
+        hipEventDestroy(static_cast<hipEvent_t>(event));
+    }
+
     PinnedHostBuffer AllocatePinnedHost(size_t size) const override {
         void* addr = nullptr;
         if (hipHostMalloc(&addr, size, 0) != hipSuccess) {

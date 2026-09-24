@@ -127,6 +127,7 @@ class FakeDfsAccelerator final : public device::AcceleratorDevice {
         std::lock_guard<std::mutex> lock(mutex_);
         async_devices_.push_back(current_device_id_.load());
         fake_stream->copies.push_back({dst, src, size});
+        state_cv_.notify_all();
         return true;
     }
     bool CreateStream(void** stream) const override {
@@ -154,6 +155,42 @@ class FakeDfsAccelerator final : public device::AcceleratorDevice {
         ++destroy_stream_calls_;
         delete static_cast<FakeStream*>(stream);
     }
+    bool CreateEvent(void** event) const override {
+        ++create_event_calls_;
+        *event = new FakeEvent;
+        return true;
+    }
+    bool RecordEvent(void* event, void* stream) const override {
+        ++record_event_calls_;
+        auto* fake_event = static_cast<FakeEvent*>(event);
+        auto* fake_stream = static_cast<FakeStream*>(stream);
+        if (fake_event == nullptr || fake_stream == nullptr) return false;
+        std::lock_guard<std::mutex> lock(mutex_);
+        fake_event->copies = std::move(fake_stream->copies);
+        fake_stream->copies.clear();
+        return true;
+    }
+    bool SynchronizeEvent(void* event) const override {
+        ++synchronize_calls_;
+        auto* fake_event = static_cast<FakeEvent*>(event);
+        if (fake_event == nullptr) return false;
+        std::unique_lock<std::mutex> lock(mutex_);
+        state_cv_.notify_all();
+        state_cv_.wait(lock, [this] { return !block_event_synchronization_; });
+        if (!synchronize_succeeds_.load()) {
+            fake_event->copies.clear();
+            return false;
+        }
+        for (const auto& copy : fake_event->copies) {
+            std::memcpy(copy.dst, copy.src, copy.size);
+        }
+        fake_event->copies.clear();
+        return true;
+    }
+    void DestroyEvent(void* event) const override {
+        ++destroy_event_calls_;
+        delete static_cast<FakeEvent*>(event);
+    }
     PinnedHostBuffer AllocatePinnedHost(size_t size) const override {
         if (!pinned_allocation_succeeds_.load()) return {};
         return PinnedHostBuffer(std::malloc(size), size, std::free);
@@ -177,7 +214,12 @@ class FakeDfsAccelerator final : public device::AcceleratorDevice {
         create_stream_calls_.store(0);
         synchronize_calls_.store(0);
         destroy_stream_calls_.store(0);
+        create_event_calls_.store(0);
+        record_event_calls_.store(0);
+        destroy_event_calls_.store(0);
+        block_event_synchronization_ = false;
         last_direction_ = device::CopyDirection::kAuto;
+        state_cv_.notify_all();
     }
     void SetCopySucceeds(bool succeeds) { copy_succeeds_.store(succeeds); }
     void SetAsyncCopySucceeds(bool succeeds) {
@@ -197,6 +239,30 @@ class FakeDfsAccelerator final : public device::AcceleratorDevice {
     int CreateStreamCalls() const { return create_stream_calls_.load(); }
     int SynchronizeCalls() const { return synchronize_calls_.load(); }
     int DestroyStreamCalls() const { return destroy_stream_calls_.load(); }
+    int CreateEventCalls() const { return create_event_calls_.load(); }
+    int RecordEventCalls() const { return record_event_calls_.load(); }
+    int DestroyEventCalls() const { return destroy_event_calls_.load(); }
+    void BlockEventSynchronization(bool block) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            block_event_synchronization_ = block;
+        }
+        state_cv_.notify_all();
+    }
+    bool WaitForAsyncCopyCalls(int count,
+                               std::chrono::milliseconds timeout) const {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return state_cv_.wait_for(
+            lock, timeout,
+            [&] { return async_copy_calls_.load() >= count; });
+    }
+    bool WaitForSynchronizeCalls(int count,
+                                 std::chrono::milliseconds timeout) const {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return state_cv_.wait_for(
+            lock, timeout,
+            [&] { return synchronize_calls_.load() >= count; });
+    }
     std::vector<int32_t> AsyncDevices() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return async_devices_;
@@ -217,10 +283,15 @@ class FakeDfsAccelerator final : public device::AcceleratorDevice {
     struct FakeStream {
         std::vector<PendingCopy> copies;
     };
+    struct FakeEvent {
+        std::vector<PendingCopy> copies;
+    };
 
     mutable std::mutex mutex_;
+    mutable std::condition_variable state_cv_;
     std::vector<DeviceRange> device_ranges_;
     mutable std::vector<int32_t> async_devices_;
+    mutable bool block_event_synchronization_ = false;
     mutable std::atomic<bool> copy_succeeds_{true};
     mutable std::atomic<bool> async_copy_succeeds_{true};
     mutable std::atomic<bool> create_stream_succeeds_{true};
@@ -231,6 +302,9 @@ class FakeDfsAccelerator final : public device::AcceleratorDevice {
     mutable std::atomic<int> create_stream_calls_{0};
     mutable std::atomic<int> synchronize_calls_{0};
     mutable std::atomic<int> destroy_stream_calls_{0};
+    mutable std::atomic<int> create_event_calls_{0};
+    mutable std::atomic<int> record_event_calls_{0};
+    mutable std::atomic<int> destroy_event_calls_{0};
     mutable std::atomic<int32_t> current_device_id_{-1};
     mutable device::CopyDirection last_direction_ =
         device::CopyDirection::kAuto;
@@ -648,6 +722,51 @@ TEST_F(DfsBucketClientTest, AsyncD2hUsesOnePersistentStreamPerDevice) {
     auto devices = accelerator.AsyncDevices();
     std::sort(devices.begin(), devices.end());
     EXPECT_EQ(devices, (std::vector<int32_t>{0, 1}));
+    accelerator.Reset();
+}
+
+TEST_F(DfsBucketClientTest, ConcurrentD2hBatchesDoNotHoldStreamLockWhileWaiting) {
+    auto& accelerator = GetFakeDfsAccelerator();
+    accelerator.Reset();
+    accelerator.BlockEventSynchronization(true);
+
+    std::vector<std::string> values{std::string(4096, 'A'),
+                                    std::string(4096, 'B')};
+    accelerator.MarkDeviceRange(values[0].data(), values[0].size());
+    accelerator.MarkDeviceRange(values[1].data(), values[1].size());
+    std::atomic<int> successes{0};
+
+    auto put = [&](size_t index) {
+        std::vector<std::string> keys{"bucket_concurrent_d2h_" +
+                                      std::to_string(index)};
+        std::vector<std::vector<Slice>> slices{
+            {{values[index].data(), values[index].size()}}};
+        auto results = writer_->BatchPut(keys, slices, DfsConfig());
+        if (results.size() == 1 && results[0].has_value()) ++successes;
+    };
+
+    std::thread first(put, 0);
+    const bool first_waiting = accelerator.WaitForSynchronizeCalls(
+        1, std::chrono::seconds(2));
+    std::thread second(put, 1);
+    const bool second_submitted =
+        accelerator.WaitForAsyncCopyCalls(2, std::chrono::seconds(2));
+    accelerator.BlockEventSynchronization(false);
+    first.join();
+    second.join();
+
+    EXPECT_TRUE(first_waiting);
+    EXPECT_TRUE(second_submitted)
+        << "the second batch was blocked behind the first batch's completion";
+    EXPECT_EQ(successes.load(), 2);
+    EXPECT_EQ(accelerator.CreateStreamCalls(), 1);
+    EXPECT_EQ(accelerator.CreateEventCalls(), 2);
+    EXPECT_EQ(accelerator.RecordEventCalls(), 2);
+    EXPECT_EQ(accelerator.DestroyEventCalls(), 2);
+    ASSERT_TRUE(WaitForDfsReplica("bucket_concurrent_d2h_0"));
+    ASSERT_TRUE(WaitForDfsReplica("bucket_concurrent_d2h_1"));
+    ExpectDfsValue("bucket_concurrent_d2h_0", values[0]);
+    ExpectDfsValue("bucket_concurrent_d2h_1", values[1]);
     accelerator.Reset();
 }
 

@@ -105,6 +105,32 @@ class CudaLikeAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
         cudaStreamDestroy(static_cast<cudaStream_t>(stream));
     }
 
+    bool CreateEvent(void** event) const override {
+        cudaEvent_t cuda_event = nullptr;
+        if (cudaEventCreateWithFlags(&cuda_event, cudaEventDisableTiming) !=
+            cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        *event = static_cast<void*>(cuda_event);
+        return true;
+    }
+
+    bool RecordEvent(void* event, void* stream) const override {
+        return cudaEventRecord(static_cast<cudaEvent_t>(event),
+                               static_cast<cudaStream_t>(stream)) ==
+               cudaSuccess;
+    }
+
+    bool SynchronizeEvent(void* event) const override {
+        return cudaEventSynchronize(static_cast<cudaEvent_t>(event)) ==
+               cudaSuccess;
+    }
+
+    void DestroyEvent(void* event) const override {
+        cudaEventDestroy(static_cast<cudaEvent_t>(event));
+    }
+
     PinnedHostBuffer AllocatePinnedHost(size_t size) const override {
         void* addr = nullptr;
         if (cudaMallocHost(&addr, size) != cudaSuccess) {

@@ -972,8 +972,10 @@ class Client {
         const device::AcceleratorDevice* device = nullptr;
         int32_t device_id = -1;
         void* stream = nullptr;
+        void* completion_event = nullptr;
         std::shared_ptr<void> state;
         std::unique_lock<std::mutex> lock;
+        int64_t acquire_wait_us = 0;
         bool submitted = false;
     };
 
@@ -999,7 +1001,22 @@ class Client {
         std::shared_ptr<DistributedStorageBackend> backend;
         std::shared_ptr<PinnedBufferPool> pinned_pool;
         std::shared_ptr<DfsStagingBudget> staging_budget;
+        std::chrono::steady_clock::time_point prepare_started;
+        std::chrono::steady_clock::time_point write_queued_at;
+        uint64_t trace_id = 0;
         size_t staging_bytes = 0;
+        size_t staging_budget_in_use = 0;
+        size_t staging_budget_limit = 0;
+        size_t d2h_bytes = 0;
+        size_t d2h_copy_count = 0;
+        size_t synchronous_d2h_copy_count = 0;
+        size_t completion_event_count = 0;
+        size_t event_fallback_count = 0;
+        int64_t stream_wait_us = 0;
+        int64_t stage_us = 0;
+        int64_t replica_wait_us = 0;
+        int64_t sync_us = 0;
+        bool pinned_arena = false;
         bool is_upsert = false;
         bool d2h_synchronized = true;
         DfsStageResult staging_result = DfsStageResult::kSuccess;
@@ -1096,6 +1113,7 @@ class Client {
     std::shared_ptr<PinnedBufferPool> pinned_buffer_pool_;
     std::shared_ptr<DfsStagingBudget> dfs_staging_budget_;
     std::unique_ptr<DfsD2hStreamPool> dfs_d2h_stream_pool_;
+    std::atomic<uint64_t> dfs_trace_sequence_{0};
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;
