@@ -1394,13 +1394,6 @@ RealClient::RealClient() {
         std::make_unique<DfsH2dStreamPool>(h2d_streams_per_device);
     LOG(INFO) << "DFS staging config: h2d_streams_per_device="
               << h2d_streams_per_device;
-    const char *legacy_pool_bytes =
-        std::getenv("MC_STORE_DFS_PINNED_POOL_BYTES");
-    if (legacy_pool_bytes && legacy_pool_bytes[0] != '\0') {
-        LOG(WARNING) << "MC_STORE_DFS_PINNED_POOL_BYTES is deprecated and "
-                        "ignored; DFS prefetch staging now uses the fixed "
-                        "arena sized by MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES";
-    }
 }
 
 RealClient::~RealClient() {
