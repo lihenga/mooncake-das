@@ -78,6 +78,12 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
                               static_cast<hipStream_t>(stream)) == hipSuccess;
     }
 
+    bool CopyToHostAsync(void *dst, const void *src, size_t size,
+                         void *stream) const override {
+        return hipMemcpyAsync(dst, src, size, hipMemcpyDeviceToHost,
+                              static_cast<hipStream_t>(stream)) == hipSuccess;
+    }
+
 #if defined(USE_HYGON)
     bool CopyFromHostBatchAsync(std::span<const HostCopyRange> ranges,
                                 void* stream,

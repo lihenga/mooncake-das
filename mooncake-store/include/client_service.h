@@ -921,6 +921,8 @@ class Client {
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
 
+    struct AsyncDfsWriteContext;
+
     /**
      * @brief Perform the DFS writes for a batch.
      *
@@ -935,9 +937,13 @@ class Client {
      * @param allow_async Set to false to force the synchronous path even in
      *        BUCKET mode. Used by the upsert paths, whose finalize RPCs act on
      *        ReplicaType::ALL and would collide with a deferred completion.
+     * @param staged_context Optional BUCKET payload whose D2H copies were
+     *        submitted while non-DFS replica transfers were in flight.
      */
-    void SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert = false,
-                         bool allow_async = true);
+    void SubmitDfsWrites(
+        std::vector<PutOperation>& ops, bool is_upsert = false,
+        bool allow_async = true,
+        std::shared_ptr<AsyncDfsWriteContext> staged_context = nullptr);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
     void StartBatchUpsert(std::vector<PutOperation>& ops,
                           const ReplicateConfig& config);
@@ -958,6 +964,19 @@ class Client {
         size_t in_use = 0;
     };
 
+    enum class DfsStageResult { kSuccess, kFailed, kCapacityExceeded };
+
+    class DfsD2hStreamPool;
+
+    struct DfsD2hStreamLease {
+        const device::AcceleratorDevice* device = nullptr;
+        int32_t device_id = -1;
+        void* stream = nullptr;
+        std::shared_ptr<void> state;
+        std::unique_lock<std::mutex> lock;
+        bool submitted = false;
+    };
+
     /**
      * @brief Everything one asynchronous DFS write batch needs, owned outright.
      *
@@ -973,12 +992,17 @@ class Client {
         std::vector<std::string> keys;
         std::vector<DistributedFSDescriptor> descriptors;
         std::vector<std::vector<Slice>> slices;
+        std::vector<size_t> op_indices;
+        std::vector<size_t> write_indices;
         PinnedBufferPool::Buffer arena;
+        std::vector<std::unique_ptr<DfsD2hStreamLease>> d2h_streams;
         std::shared_ptr<DistributedStorageBackend> backend;
         std::shared_ptr<PinnedBufferPool> pinned_pool;
         std::shared_ptr<DfsStagingBudget> staging_budget;
         size_t staging_bytes = 0;
         bool is_upsert = false;
+        bool d2h_synchronized = true;
+        DfsStageResult staging_result = DfsStageResult::kSuccess;
 
         ~AsyncDfsWriteContext();
     };
@@ -986,12 +1010,19 @@ class Client {
     /**
      * @brief Assemble one aligned BUCKET payload per object.
      * GPU and host slices are copied directly to their final offsets and the
-     * trailing alignment padding is zeroed. Returns false on any failure.
+     * trailing alignment padding is zeroed.
      */
-    enum class DfsStageResult { kSuccess, kFailed, kCapacityExceeded };
     DfsStageResult StageDfsWriteData(
         AsyncDfsWriteContext& context,
         const std::vector<const std::vector<Slice>*>& slice_lists);
+
+    bool SynchronizeDfsWriteData(AsyncDfsWriteContext& context);
+
+    // Submit BUCKET staging after MEMORY/NoF transfer submission so D2H DMA
+    // can overlap those transfers. Synchronization still happens before
+    // BatchPut returns because the public API does not own the GPU buffers.
+    std::shared_ptr<AsyncDfsWriteContext> PrepareAsyncDfsWrites(
+        std::vector<PutOperation>& ops);
 
     /**
      * @brief Run one staged DFS write batch and report the outcome to master.
@@ -1064,6 +1095,7 @@ class Client {
     // destroyed.
     std::shared_ptr<PinnedBufferPool> pinned_buffer_pool_;
     std::shared_ptr<DfsStagingBudget> dfs_staging_budget_;
+    std::unique_ptr<DfsD2hStreamPool> dfs_d2h_stream_pool_;
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;

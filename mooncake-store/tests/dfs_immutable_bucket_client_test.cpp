@@ -96,16 +96,18 @@ class FakeDfsAccelerator final : public device::AcceleratorDevice {
         const auto address = reinterpret_cast<uintptr_t>(ptr);
         std::lock_guard<std::mutex> lock(mutex_);
         for (const auto& range : device_ranges_) {
-            const auto begin = reinterpret_cast<uintptr_t>(range.first);
-            if (address >= begin && address - begin < range.second) {
-                return {device::MemoryKind::kDevice, 0};
+            const auto begin = reinterpret_cast<uintptr_t>(range.ptr);
+            if (address >= begin && address - begin < range.size) {
+                return {device::MemoryKind::kDevice, range.device_id};
             }
         }
         return {device::MemoryKind::kHost, -1};
     }
-    int32_t CurrentDeviceId() const override { return current_device_id_; }
+    int32_t CurrentDeviceId() const override {
+        return current_device_id_.load();
+    }
     void SetContext(int32_t device_id) const override {
-        current_device_id_ = device_id;
+        current_device_id_.store(device_id);
     }
     bool Copy(void* dst, const void* src, size_t size,
               device::CopyDirection direction) const override {
@@ -115,31 +117,121 @@ class FakeDfsAccelerator final : public device::AcceleratorDevice {
         std::memcpy(dst, src, size);
         return true;
     }
+    bool CopyToHostAsync(void* dst, const void* src, size_t size,
+                         void* stream) const override {
+        last_direction_ = device::CopyDirection::kDeviceToHost;
+        ++async_copy_calls_;
+        if (!async_copy_succeeds_.load()) return false;
+        auto* fake_stream = static_cast<FakeStream*>(stream);
+        if (fake_stream == nullptr) return false;
+        std::lock_guard<std::mutex> lock(mutex_);
+        async_devices_.push_back(current_device_id_.load());
+        fake_stream->copies.push_back({dst, src, size});
+        return true;
+    }
+    bool CreateStream(void** stream) const override {
+        ++create_stream_calls_;
+        if (!create_stream_succeeds_.load()) return false;
+        *stream = new FakeStream;
+        return true;
+    }
+    bool SynchronizeStream(void* stream) const override {
+        ++synchronize_calls_;
+        auto* fake_stream = static_cast<FakeStream*>(stream);
+        if (fake_stream == nullptr) return false;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!synchronize_succeeds_.load()) {
+            fake_stream->copies.clear();
+            return false;
+        }
+        for (const auto& copy : fake_stream->copies) {
+            std::memcpy(copy.dst, copy.src, copy.size);
+        }
+        fake_stream->copies.clear();
+        return true;
+    }
+    void DestroyStream(void* stream) const override {
+        ++destroy_stream_calls_;
+        delete static_cast<FakeStream*>(stream);
+    }
     PinnedHostBuffer AllocatePinnedHost(size_t size) const override {
+        if (!pinned_allocation_succeeds_.load()) return {};
         return PinnedHostBuffer(std::malloc(size), size, std::free);
     }
 
-    void MarkDeviceRange(const void* ptr, size_t size) {
+    void MarkDeviceRange(const void* ptr, size_t size, int32_t device_id = 0) {
         std::lock_guard<std::mutex> lock(mutex_);
-        device_ranges_.push_back({ptr, size});
+        device_ranges_.push_back({ptr, size, device_id});
     }
     void Reset() {
         std::lock_guard<std::mutex> lock(mutex_);
         device_ranges_.clear();
+        async_devices_.clear();
         copy_succeeds_.store(true);
+        async_copy_succeeds_.store(true);
+        create_stream_succeeds_.store(true);
+        synchronize_succeeds_.store(true);
+        pinned_allocation_succeeds_.store(true);
         copy_calls_.store(0);
+        async_copy_calls_.store(0);
+        create_stream_calls_.store(0);
+        synchronize_calls_.store(0);
+        destroy_stream_calls_.store(0);
         last_direction_ = device::CopyDirection::kAuto;
     }
     void SetCopySucceeds(bool succeeds) { copy_succeeds_.store(succeeds); }
+    void SetAsyncCopySucceeds(bool succeeds) {
+        async_copy_succeeds_.store(succeeds);
+    }
+    void SetCreateStreamSucceeds(bool succeeds) {
+        create_stream_succeeds_.store(succeeds);
+    }
+    void SetSynchronizeSucceeds(bool succeeds) {
+        synchronize_succeeds_.store(succeeds);
+    }
+    void SetPinnedAllocationSucceeds(bool succeeds) {
+        pinned_allocation_succeeds_.store(succeeds);
+    }
     int CopyCalls() const { return copy_calls_.load(); }
+    int AsyncCopyCalls() const { return async_copy_calls_.load(); }
+    int CreateStreamCalls() const { return create_stream_calls_.load(); }
+    int SynchronizeCalls() const { return synchronize_calls_.load(); }
+    int DestroyStreamCalls() const { return destroy_stream_calls_.load(); }
+    std::vector<int32_t> AsyncDevices() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return async_devices_;
+    }
     device::CopyDirection LastDirection() const { return last_direction_; }
 
    private:
+    struct DeviceRange {
+        const void* ptr;
+        size_t size;
+        int32_t device_id;
+    };
+    struct PendingCopy {
+        void* dst;
+        const void* src;
+        size_t size;
+    };
+    struct FakeStream {
+        std::vector<PendingCopy> copies;
+    };
+
     mutable std::mutex mutex_;
-    std::vector<std::pair<const void*, size_t>> device_ranges_;
+    std::vector<DeviceRange> device_ranges_;
+    mutable std::vector<int32_t> async_devices_;
     mutable std::atomic<bool> copy_succeeds_{true};
+    mutable std::atomic<bool> async_copy_succeeds_{true};
+    mutable std::atomic<bool> create_stream_succeeds_{true};
+    mutable std::atomic<bool> synchronize_succeeds_{true};
+    mutable std::atomic<bool> pinned_allocation_succeeds_{true};
     mutable std::atomic<int> copy_calls_{0};
-    mutable int32_t current_device_id_ = -1;
+    mutable std::atomic<int> async_copy_calls_{0};
+    mutable std::atomic<int> create_stream_calls_{0};
+    mutable std::atomic<int> synchronize_calls_{0};
+    mutable std::atomic<int> destroy_stream_calls_{0};
+    mutable std::atomic<int32_t> current_device_id_{-1};
     mutable device::CopyDirection last_direction_ =
         device::CopyDirection::kAuto;
 };
@@ -467,7 +559,10 @@ TEST_F(DfsBucketClientTest, StagesMixedHostAndDeviceSlicesIntoFinalPayload) {
 
     ASSERT_TRUE(WaitForDfsReplica(key));
     ExpectDfsValue(key, expected);
-    EXPECT_GT(accelerator.CopyCalls(), 0);
+    EXPECT_EQ(accelerator.CopyCalls(), 0);
+    EXPECT_EQ(accelerator.AsyncCopyCalls(), 1);
+    EXPECT_EQ(accelerator.CreateStreamCalls(), 1);
+    EXPECT_EQ(accelerator.SynchronizeCalls(), 1);
     EXPECT_EQ(accelerator.LastDirection(),
               device::CopyDirection::kDeviceToHost);
 
@@ -486,20 +581,153 @@ TEST_F(DfsBucketClientTest, StagesMixedHostAndDeviceSlicesIntoFinalPayload) {
     accelerator.Reset();
 }
 
-TEST_F(DfsBucketClientTest, DeviceStagingFailureRevokesDfsReplica) {
+TEST_F(DfsBucketClientTest, AsyncD2hSubmissionFailureRevokesDfsReplica) {
     auto& accelerator = GetFakeDfsAccelerator();
     accelerator.Reset();
     std::string device_value(4096, 'F');
     accelerator.MarkDeviceRange(device_value.data(), device_value.size());
-    accelerator.SetCopySucceeds(false);
+    accelerator.SetAsyncCopySucceeds(false);
 
     std::vector<std::string> keys{"bucket_device_stage_fail"};
     std::vector<std::vector<Slice>> slices{
         {{device_value.data(), device_value.size()}}};
     auto results = writer_->BatchPut(keys, slices, DfsConfig());
     ASSERT_EQ(results.size(), 1u);
+    EXPECT_FALSE(results[0].has_value());
     ASSERT_TRUE(WaitForKeyGone(keys[0]));
-    EXPECT_GT(accelerator.CopyCalls(), 0);
+    EXPECT_EQ(accelerator.AsyncCopyCalls(), 1);
+    accelerator.Reset();
+}
+
+TEST_F(DfsBucketClientTest, AsyncD2hSynchronizationFailureRevokesDfsReplica) {
+    auto& accelerator = GetFakeDfsAccelerator();
+    accelerator.Reset();
+    std::string device_value(4096, 'S');
+    accelerator.MarkDeviceRange(device_value.data(), device_value.size());
+    accelerator.SetSynchronizeSucceeds(false);
+
+    std::vector<std::string> keys{"bucket_device_sync_fail"};
+    std::vector<std::vector<Slice>> slices{
+        {{device_value.data(), device_value.size()}}};
+    auto results = writer_->BatchPut(keys, slices, DfsConfig());
+    ASSERT_EQ(results.size(), 1u);
+    EXPECT_FALSE(results[0].has_value());
+    ASSERT_TRUE(WaitForKeyGone(keys[0]));
+    EXPECT_EQ(accelerator.AsyncCopyCalls(), 1);
+    EXPECT_EQ(accelerator.SynchronizeCalls(), 1);
+    accelerator.SetSynchronizeSucceeds(true);
+    accelerator.Reset();
+}
+
+TEST_F(DfsBucketClientTest, AsyncD2hUsesOnePersistentStreamPerDevice) {
+    auto& accelerator = GetFakeDfsAccelerator();
+    accelerator.Reset();
+    const std::string key = "bucket_multi_device";
+    std::string device_zero(701, '0');
+    std::string device_one(907, '1');
+    const std::string expected = device_zero + device_one;
+    accelerator.MarkDeviceRange(device_zero.data(), device_zero.size(), 0);
+    accelerator.MarkDeviceRange(device_one.data(), device_one.size(), 1);
+
+    std::vector<std::string> keys{key};
+    std::vector<std::vector<Slice>> slices{{
+        {device_zero.data(), device_zero.size()},
+        {device_one.data(), device_one.size()},
+    }};
+    auto results = writer_->BatchPut(keys, slices, DfsConfig());
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_TRUE(results[0].has_value());
+    std::fill(device_zero.begin(), device_zero.end(), 'X');
+    std::fill(device_one.begin(), device_one.end(), 'X');
+
+    ASSERT_TRUE(WaitForDfsReplica(key));
+    ExpectDfsValue(key, expected);
+    EXPECT_EQ(accelerator.AsyncCopyCalls(), 2);
+    EXPECT_EQ(accelerator.CreateStreamCalls(), 2);
+    EXPECT_EQ(accelerator.SynchronizeCalls(), 2);
+    auto devices = accelerator.AsyncDevices();
+    std::sort(devices.begin(), devices.end());
+    EXPECT_EQ(devices, (std::vector<int32_t>{0, 1}));
+    accelerator.Reset();
+}
+
+TEST_F(DfsBucketClientTest, PinnedAllocationFailureUsesSynchronousD2h) {
+    auto& accelerator = GetFakeDfsAccelerator();
+    accelerator.Reset();
+    accelerator.SetPinnedAllocationSucceeds(false);
+    const std::string key = "bucket_pageable_d2h";
+    const std::string expected(4096, 'P');
+    std::string device_value = expected;
+    accelerator.MarkDeviceRange(device_value.data(), device_value.size());
+
+    std::vector<std::string> keys{key};
+    std::vector<std::vector<Slice>> slices{
+        {{device_value.data(), device_value.size()}}};
+    auto results = writer_->BatchPut(keys, slices, DfsConfig());
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_TRUE(results[0].has_value());
+    std::fill(device_value.begin(), device_value.end(), 'X');
+
+    ASSERT_TRUE(WaitForDfsReplica(key));
+    ExpectDfsValue(key, expected);
+    EXPECT_EQ(accelerator.AsyncCopyCalls(), 0);
+    EXPECT_EQ(accelerator.CopyCalls(), 1);
+    EXPECT_EQ(accelerator.CreateStreamCalls(), 0);
+    accelerator.Reset();
+}
+
+TEST_F(DfsBucketClientTest, CopyStreamCreationFailureUsesSynchronousD2h) {
+    auto& accelerator = GetFakeDfsAccelerator();
+    accelerator.Reset();
+    accelerator.SetCreateStreamSucceeds(false);
+    const std::string key = "bucket_stream_fallback";
+    const std::string expected(4096, 'C');
+    std::string device_value = expected;
+    accelerator.MarkDeviceRange(device_value.data(), device_value.size());
+
+    std::vector<std::string> keys{key};
+    std::vector<std::vector<Slice>> slices{
+        {{device_value.data(), device_value.size()}}};
+    auto results = writer_->BatchPut(keys, slices, DfsConfig());
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_TRUE(results[0].has_value());
+    std::fill(device_value.begin(), device_value.end(), 'X');
+
+    ASSERT_TRUE(WaitForDfsReplica(key));
+    ExpectDfsValue(key, expected);
+    EXPECT_EQ(accelerator.CreateStreamCalls(), 1);
+    EXPECT_EQ(accelerator.AsyncCopyCalls(), 0);
+    EXPECT_EQ(accelerator.CopyCalls(), 1);
+    accelerator.Reset();
+}
+
+TEST_F(DfsBucketClientTest, ClientShutdownDestroysReusedCopyStream) {
+    auto& accelerator = GetFakeDfsAccelerator();
+    accelerator.Reset();
+    auto local_client = CreateClient("127.0.0.1:18206");
+    ASSERT_NE(local_client, nullptr);
+    local_client->SetDfsStorageBackend(backend_);
+
+    std::vector<std::string> keys{"bucket_stream_reuse_one",
+                                  "bucket_stream_reuse_two"};
+    std::vector<std::string> values{std::string(1024, 'A'),
+                                    std::string(1024, 'B')};
+    for (size_t i = 0; i < keys.size(); ++i) {
+        accelerator.MarkDeviceRange(values[i].data(), values[i].size());
+        std::vector<std::string> one_key{keys[i]};
+        std::vector<std::vector<Slice>> slices{
+            {{values[i].data(), values[i].size()}}};
+        auto results = local_client->BatchPut(one_key, slices, DfsConfig());
+        ASSERT_EQ(results.size(), 1u);
+        ASSERT_TRUE(results[0].has_value());
+    }
+    for (const auto& key : keys) ASSERT_TRUE(WaitForDfsReplica(key));
+
+    EXPECT_EQ(accelerator.CreateStreamCalls(), 1);
+    EXPECT_EQ(accelerator.AsyncCopyCalls(), 2);
+    EXPECT_EQ(accelerator.DestroyStreamCalls(), 0);
+    local_client.reset();
+    EXPECT_EQ(accelerator.DestroyStreamCalls(), 1);
     accelerator.Reset();
 }
 
