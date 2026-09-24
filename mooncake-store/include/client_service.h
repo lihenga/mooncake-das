@@ -950,14 +950,21 @@ class Client {
         const std::vector<const std::vector<Slice>*>& slice_lists,
         const std::vector<DistributedFSDescriptor>& descriptors);
 
+    struct DfsStagingBudget {
+        explicit DfsStagingBudget(size_t limit) : limit(limit) {}
+
+        std::mutex mutex;
+        const size_t limit;
+        size_t in_use = 0;
+    };
+
     /**
      * @brief Everything one asynchronous DFS write batch needs, owned outright.
      *
      * The background task must not reference the caller's CPU or GPU buffers,
-     * which may be freed or overwritten as soon as BatchPut returns. All slice
-     * bytes are therefore copied into owned storage (pinned host memory when a
-     * GPU is involved, plain host memory otherwise) before the task is queued,
-     * and `slices` points into that storage.
+     * which may be freed or overwritten as soon as BatchPut returns. All
+     * objects are therefore assembled in one owned, bounded batch arena before
+     * the task is queued, and `slices` contains aligned object views into it.
      *
      * `backend` and `pinned_pool` are held by shared_ptr so the task keeps them
      * alive even if the Client is torn down while the write is in flight.
@@ -966,9 +973,11 @@ class Client {
         std::vector<std::string> keys;
         std::vector<DistributedFSDescriptor> descriptors;
         std::vector<std::vector<Slice>> slices;
-        std::vector<PinnedBufferPool::Buffer> staging;
+        PinnedBufferPool::Buffer arena;
         std::shared_ptr<DistributedStorageBackend> backend;
         std::shared_ptr<PinnedBufferPool> pinned_pool;
+        std::shared_ptr<DfsStagingBudget> staging_budget;
+        size_t staging_bytes = 0;
         bool is_upsert = false;
 
         ~AsyncDfsWriteContext();
@@ -979,7 +988,8 @@ class Client {
      * GPU and host slices are copied directly to their final offsets and the
      * trailing alignment padding is zeroed. Returns false on any failure.
      */
-    bool StageDfsWriteData(
+    enum class DfsStageResult { kSuccess, kFailed, kCapacityExceeded };
+    DfsStageResult StageDfsWriteData(
         AsyncDfsWriteContext& context,
         const std::vector<const std::vector<Slice>*>& slice_lists);
 
@@ -1053,6 +1063,7 @@ class Client {
     // in-flight async DFS write keeps it alive even while the Client is being
     // destroyed.
     std::shared_ptr<PinnedBufferPool> pinned_buffer_pool_;
+    std::shared_ptr<DfsStagingBudget> dfs_staging_budget_;
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;

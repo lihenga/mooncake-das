@@ -445,10 +445,12 @@ Client::Client(const std::string& local_hostname,
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
       object_checksum_enabled_(Environ::Get().GetStoreChecksumEnabled()),
-      pinned_buffer_pool_(
-          std::make_shared<PinnedBufferPool>(Environ::GetSizeT(
-              "MC_STORE_DFS_PINNED_POOL_BYTES",
-              PinnedBufferPool::kDefaultMaxCachedBytes))),
+      pinned_buffer_pool_(std::make_shared<PinnedBufferPool>(
+          Environ::GetSizeT("MC_STORE_DFS_PINNED_POOL_BYTES",
+                            PinnedBufferPool::kDefaultMaxCachedBytes))),
+      dfs_staging_budget_(std::make_shared<DfsStagingBudget>(
+          Environ::GetSizeT("MC_STORE_DFS_WRITE_STAGING_BYTES",
+                            PinnedBufferPool::kDefaultMaxCachedBytes))),
       write_thread_pool_(2),
       task_thread_pool_(4) {
     LOG(INFO) << "client_id=" << client_id_;
@@ -2745,17 +2747,20 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
 }
 
 Client::AsyncDfsWriteContext::~AsyncDfsWriteContext() {
-    // Pinned buffers must go back to the pool that handed them out, and only
-    // once every reference to their memory (the Slice vectors) is gone.
-    if (pinned_pool) {
-        for (auto& buffer : staging) {
-            pinned_pool->Release(std::move(buffer));
+    // The arena returns only after every Slice view and background write is
+    // done with it. Release the in-flight budget at the same lifetime edge.
+    if (pinned_pool) pinned_pool->Release(std::move(arena));
+    if (staging_budget && staging_bytes != 0) {
+        std::lock_guard<std::mutex> lock(staging_budget->mutex);
+        if (staging_bytes <= staging_budget->in_use) {
+            staging_budget->in_use -= staging_bytes;
+        } else {
+            staging_budget->in_use = 0;
         }
     }
-    staging.clear();
 }
 
-bool Client::StageDfsWriteData(
+Client::DfsStageResult Client::StageDfsWriteData(
     AsyncDfsWriteContext& context,
     const std::vector<const std::vector<Slice>*>& slice_lists) {
     auto runtime_accelerator =
@@ -2763,36 +2768,76 @@ bool Client::StageDfsWriteData(
 
     if (context.descriptors.size() != slice_lists.size() ||
         context.keys.size() != slice_lists.size()) {
-        return false;
+        return DfsStageResult::kFailed;
     }
     context.slices.resize(slice_lists.size());
-    context.staging.reserve(slice_lists.size());
+    std::vector<size_t> offsets(slice_lists.size());
+    size_t arena_size = 0;
 
     for (size_t i = 0; i < slice_lists.size(); ++i) {
         if (slice_lists[i] == nullptr) {
             LOG(ERROR) << "Missing slices for async DFS write of key "
                        << context.keys[i];
-            return false;
+            return DfsStageResult::kFailed;
         }
         const auto& descriptor = context.descriptors[i];
         if (descriptor.object_size == 0 ||
             descriptor.aligned_size < descriptor.object_size ||
-            descriptor.aligned_size > std::numeric_limits<size_t>::max()) {
+            descriptor.aligned_size >
+                std::numeric_limits<size_t>::max() - arena_size) {
             LOG(ERROR) << "Invalid descriptor for async DFS write of key "
                        << context.keys[i];
-            return false;
+            return DfsStageResult::kFailed;
         }
+        offsets[i] = arena_size;
+        arena_size += static_cast<size_t>(descriptor.aligned_size);
+    }
 
-        auto payload = pinned_buffer_pool_->Acquire(
-            static_cast<size_t>(descriptor.aligned_size));
-        if (payload.data == nullptr) {
-            LOG(ERROR) << "Failed to acquire staging payload for async DFS "
-                          "write of key "
-                       << context.keys[i];
-            return false;
+    size_t reserved_bytes = PinnedBufferPool::SizeClass(arena_size);
+    if (reserved_bytes == 0 || !context.staging_budget) {
+        return DfsStageResult::kFailed;
+    }
+    {
+        std::lock_guard<std::mutex> lock(context.staging_budget->mutex);
+        if (reserved_bytes > context.staging_budget->limit -
+                                 std::min(context.staging_budget->limit,
+                                          context.staging_budget->in_use)) {
+            return DfsStageResult::kCapacityExceeded;
         }
-        std::memset(payload.data, 0,
-                    static_cast<size_t>(descriptor.aligned_size));
+        context.staging_budget->in_use += reserved_bytes;
+        context.staging_bytes = reserved_bytes;
+    }
+
+    context.arena = pinned_buffer_pool_->Acquire(arena_size);
+    if (context.arena.data == nullptr) {
+        LOG(ERROR) << "Failed to acquire async DFS write staging arena";
+        return DfsStageResult::kFailed;
+    }
+    if (context.arena.capacity != reserved_bytes) {
+        std::lock_guard<std::mutex> lock(context.staging_budget->mutex);
+        if (context.arena.capacity > reserved_bytes) {
+            const size_t extra = context.arena.capacity - reserved_bytes;
+            const size_t available = context.staging_budget->limit -
+                                     std::min(context.staging_budget->limit,
+                                              context.staging_budget->in_use);
+            if (extra > available) {
+                context.staging_budget->in_use -= reserved_bytes;
+                context.staging_bytes = 0;
+                pinned_buffer_pool_->Release(std::move(context.arena));
+                return DfsStageResult::kCapacityExceeded;
+            }
+            context.staging_budget->in_use += extra;
+        } else {
+            context.staging_budget->in_use -=
+                reserved_bytes - context.arena.capacity;
+        }
+        reserved_bytes = context.arena.capacity;
+        context.staging_bytes = reserved_bytes;
+    }
+    std::memset(context.arena.data, 0, arena_size);
+
+    for (size_t i = 0; i < slice_lists.size(); ++i) {
+        const auto& descriptor = context.descriptors[i];
         size_t offset = 0;
         for (const auto& slice : *slice_lists[i]) {
             if (slice.size == 0) continue;
@@ -2800,8 +2845,7 @@ bool Client::StageDfsWriteData(
                 slice.size > descriptor.object_size - offset) {
                 LOG(ERROR) << "Invalid slice for async DFS write of key "
                            << context.keys[i];
-                pinned_buffer_pool_->Release(std::move(payload));
-                return false;
+                return DfsStageResult::kFailed;
             }
 
             device::PointerInfo info{};
@@ -2811,17 +2855,18 @@ bool Client::StageDfsWriteData(
                 // GPU source: the D2H copy must complete now, while the
                 // caller's device buffer is still guaranteed to be alive.
                 device->SetContext(info.device_id);
-                if (!device->Copy(payload.data + offset, slice.ptr, slice.size,
+                if (!device->Copy(context.arena.data + offsets[i] + offset,
+                                  slice.ptr, slice.size,
                                   device::CopyDirection::kDeviceToHost)) {
                     LOG(ERROR) << "DFS D2H staging failed for key "
                                << context.keys[i];
-                    pinned_buffer_pool_->Release(std::move(payload));
-                    return false;
+                    return DfsStageResult::kFailed;
                 }
             } else {
                 // The caller may free or overwrite host memory as soon as
                 // BatchPut returns, so copy it into the owned payload too.
-                std::memcpy(payload.data + offset, slice.ptr, slice.size);
+                std::memcpy(context.arena.data + offsets[i] + offset, slice.ptr,
+                            slice.size);
             }
             offset += slice.size;
         }
@@ -2829,14 +2874,13 @@ bool Client::StageDfsWriteData(
             LOG(ERROR) << "DFS staging size mismatch for key "
                        << context.keys[i] << ": expected "
                        << descriptor.object_size << ", got " << offset;
-            pinned_buffer_pool_->Release(std::move(payload));
-            return false;
+            return DfsStageResult::kFailed;
         }
         context.slices[i].push_back(
-            Slice{payload.data, static_cast<size_t>(descriptor.aligned_size)});
-        context.staging.push_back(std::move(payload));
+            Slice{context.arena.data + offsets[i],
+                  static_cast<size_t>(descriptor.aligned_size)});
     }
-    return true;
+    return DfsStageResult::kSuccess;
 }
 
 void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
@@ -2987,7 +3031,7 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
     // once the DFS copy is durable. Asynchronous writes are a BUCKET feature.
     const bool async_write =
         allow_async && backend->GetAllocatorType() == DfsAllocatorType::BUCKET;
-    if (!async_write) {
+    auto write_synchronously = [&]() {
         auto results = WriteDfsReplicas(keys, slice_lists, descriptors);
         for (size_t i = 0; i < results.size(); ++i) {
             auto& op = ops[op_indices[i]];
@@ -2999,6 +3043,9 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
                                         toString(results[i]));
             }
         }
+    };
+    if (!async_write) {
+        write_synchronously();
         return;
     }
 
@@ -3007,11 +3054,19 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
     context->descriptors = descriptors;
     context->backend = std::move(backend);
     context->pinned_pool = pinned_buffer_pool_;
+    context->staging_budget = dfs_staging_budget_;
     context->is_upsert = is_upsert;
 
     // Copy all payload bytes before returning, so the task never touches the
     // caller's memory. A staging failure is reported synchronously.
-    if (!StageDfsWriteData(*context, slice_lists)) {
+    const auto stage_result = StageDfsWriteData(*context, slice_lists);
+    if (stage_result == DfsStageResult::kCapacityExceeded) {
+        LOG(WARNING) << "Async DFS staging limit reached; writing "
+                     << keys.size() << " objects synchronously";
+        write_synchronously();
+        return;
+    }
+    if (stage_result != DfsStageResult::kSuccess) {
         for (const size_t index : op_indices) {
             auto& op = ops[index];
             op.transfer_summary.RecordFailure(ReplicaType::DFS,
