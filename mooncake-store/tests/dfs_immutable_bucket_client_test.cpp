@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -35,11 +36,37 @@ class FailingBucketFsAdapter : public PosixFsAdapter {
     int WriteCalls() const { return write_calls_.load(); }
     void FailWriteCall(int call) { fail_write_call_.store(call); }
     void FailAllWrites(bool fail) { fail_all_writes_.store(fail); }
+    void BlockWrites(bool block) {
+        {
+            std::lock_guard<std::mutex> lock(write_mutex_);
+            block_writes_ = block;
+        }
+        write_cv_.notify_all();
+    }
+    bool WaitForWriteCalls(int count, std::chrono::milliseconds timeout =
+                                          std::chrono::seconds(5)) {
+        std::unique_lock<std::mutex> lock(write_mutex_);
+        return write_cv_.wait_for(lock, timeout,
+                                  [&] { return write_calls_.load() >= count; });
+    }
+    std::vector<std::pair<void*, size_t>> LastWriteIovs() const {
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        return last_write_iovs_;
+    }
 
     tl::expected<size_t, ErrorCode> WriteAt(int fd, const iovec* iov,
                                             int iovcnt,
                                             int64_t offset) override {
         const int call = ++write_calls_;
+        {
+            std::unique_lock<std::mutex> lock(write_mutex_);
+            last_write_iovs_.clear();
+            for (int i = 0; i < iovcnt; ++i) {
+                last_write_iovs_.push_back({iov[i].iov_base, iov[i].iov_len});
+            }
+            write_cv_.notify_all();
+            write_cv_.wait(lock, [&] { return !block_writes_; });
+        }
         if (fail_all_writes_.load() || call == fail_write_call_.load()) {
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
@@ -50,6 +77,10 @@ class FailingBucketFsAdapter : public PosixFsAdapter {
     std::atomic<int> write_calls_{0};
     std::atomic<int> fail_write_call_{-1};
     std::atomic<bool> fail_all_writes_{false};
+    mutable std::mutex write_mutex_;
+    std::condition_variable write_cv_;
+    bool block_writes_ = false;
+    std::vector<std::pair<void*, size_t>> last_write_iovs_;
 };
 
 class FakeDfsAccelerator final : public device::AcceleratorDevice {
@@ -375,6 +406,16 @@ TEST_F(DfsBucketClientTest, BatchPutWritesEveryKeyAndKeepsBatchContiguous) {
         EXPECT_EQ(entry_start, previous_end)
             << "entry " << i << " is not contiguous with its predecessor";
     }
+
+    const auto iovs = adapter_->LastWriteIovs();
+    ASSERT_EQ(iovs.size(), descriptors.size());
+    for (size_t i = 0; i < iovs.size(); ++i) {
+        EXPECT_EQ(iovs[i].second, descriptors[i].aligned_size);
+        if (i == 0) continue;
+        const auto previous = reinterpret_cast<uintptr_t>(iovs[i - 1].first);
+        const auto current = reinterpret_cast<uintptr_t>(iovs[i].first);
+        EXPECT_EQ(current - previous, descriptors[i - 1].aligned_size);
+    }
 }
 
 TEST_F(DfsBucketClientTest, AsyncWriteSucceedsAfterCallerBufferIsOverwritten) {
@@ -662,6 +703,74 @@ TEST_F(DfsBucketClientTest, ClientDestructionDrainsInFlightAsyncWrites) {
             EXPECT_EQ(std::memcmp(out.data(), value.data(), value.size()), 0);
         }
     }
+}
+
+TEST_F(DfsBucketClientTest, StagingLimitFallsBackWhileArenaIsInFlight) {
+    SetEnv("MC_STORE_DFS_WRITE_STAGING_BYTES", "4096");
+    auto limited_client = CreateClient("127.0.0.1:18205");
+    ASSERT_NE(limited_client, nullptr);
+    limited_client->SetDfsStorageBackend(backend_);
+
+    adapter_->BlockWrites(true);
+    const int writes_before = adapter_->WriteCalls();
+    std::string first_value(1000, '1');
+    std::atomic<bool> first_returned{false};
+    std::atomic<bool> first_succeeded{false};
+    std::thread first([&] {
+        std::vector<std::string> keys{"bounded_arena_first"};
+        std::vector<std::vector<Slice>> slices{
+            {{first_value.data(), first_value.size()}}};
+        auto results = limited_client->BatchPut(keys, slices, DfsConfig());
+        first_succeeded.store(results.size() == 1 && results[0].has_value());
+        first_returned.store(true);
+    });
+    const bool first_started = adapter_->WaitForWriteCalls(writes_before + 1);
+
+    const auto first_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!first_returned.load() &&
+           std::chrono::steady_clock::now() < first_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!first_started || !first_returned.load()) {
+        adapter_->BlockWrites(false);
+        first.join();
+        FAIL() << "the first arena-backed BatchPut should return while its DFS "
+                  "write is blocked";
+        return;
+    }
+
+    std::atomic<bool> second_returned{false};
+    std::atomic<bool> second_succeeded{false};
+    std::string second_value(1000, '2');
+    std::thread second([&] {
+        std::vector<std::string> keys{"bounded_arena_second"};
+        std::vector<std::vector<Slice>> slices{
+            {{second_value.data(), second_value.size()}}};
+        auto results = limited_client->BatchPut(keys, slices, DfsConfig());
+        second_succeeded.store(results.size() == 1 && results[0].has_value());
+        second_returned.store(true);
+    });
+    const bool second_started = adapter_->WaitForWriteCalls(writes_before + 2);
+    EXPECT_TRUE(first_started);
+    EXPECT_TRUE(second_started);
+    EXPECT_FALSE(second_returned.load())
+        << "capacity exhaustion should use the synchronous fallback";
+
+    adapter_->BlockWrites(false);
+    second.join();
+    first.join();
+    ASSERT_TRUE(first_succeeded.load());
+    ASSERT_TRUE(second_succeeded.load());
+    ASSERT_TRUE(WaitForDfsReplica("bounded_arena_first"));
+    auto second_query = limited_client->Query("bounded_arena_second");
+    ASSERT_TRUE(second_query.has_value());
+    ASSERT_TRUE(std::any_of(
+        second_query->replicas.begin(), second_query->replicas.end(),
+        [](const Replica::Descriptor& replica) {
+            return replica.is_dfs_replica() &&
+                   replica.status == ReplicaStatus::COMPLETE;
+        }));
 }
 
 TEST_F(DfsBucketClientTest, ZeroSizeAndEmptyKeyArePutRejected) {
