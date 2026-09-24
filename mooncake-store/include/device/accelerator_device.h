@@ -66,6 +66,13 @@ class AcceleratorDevice {
         (void)stream;
         return Copy(dst, src, size, CopyDirection::kHostToDevice);
     }
+    // Asynchronous device-to-host copy. Backends without stream support use
+    // the synchronous implementation as a correctness-preserving fallback.
+    virtual bool CopyToHostAsync(void* dst, const void* src, size_t size,
+                                 void* stream) const {
+        (void)stream;
+        return Copy(dst, src, size, CopyDirection::kDeviceToHost);
+    }
     // Submit a set of independent host-to-device copies on one stream. The
     // default implementation deliberately keeps the old semantics; backends
     // with a native scatter-copy primitive or a suitable batch kernel can

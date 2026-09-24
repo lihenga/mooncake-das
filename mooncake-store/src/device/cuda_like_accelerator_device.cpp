@@ -79,6 +79,13 @@ class CudaLikeAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
                cudaSuccess;
     }
 
+    bool CopyToHostAsync(void* dst, const void* src, size_t size,
+                         void* stream) const override {
+        return cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToHost,
+                               static_cast<cudaStream_t>(stream)) ==
+               cudaSuccess;
+    }
+
     bool CreateStream(void** stream) const override {
         cudaStream_t cuda_stream = nullptr;
         if (cudaStreamCreate(&cuda_stream) != cudaSuccess) {

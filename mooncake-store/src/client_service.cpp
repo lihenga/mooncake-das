@@ -17,10 +17,12 @@
 #include <cstdlib>
 #include <iomanip>
 #include <limits>
+#include <map>
 #ifdef USE_NOF
 #include <numa.h>
 #endif
 #include <optional>
+#include <numeric>
 #include <ranges>
 #include <span>
 #include <sched.h>
@@ -430,6 +432,114 @@ FinalizeDecision DetermineFinalizeDecision(
     return slice_size;
 }
 
+class Client::DfsD2hStreamPool {
+   private:
+    struct DeviceKey {
+        const device::AcceleratorDevice* device = nullptr;
+        int32_t device_id = -1;
+
+        bool operator<(const DeviceKey& other) const {
+            if (device != other.device) {
+                return std::less<const device::AcceleratorDevice*>{}(
+                    device, other.device);
+            }
+            return device_id < other.device_id;
+        }
+    };
+
+    struct DeviceState {
+        DeviceState(const device::AcceleratorDevice* device, int32_t device_id)
+            : device(device), device_id(device_id) {}
+
+        const device::AcceleratorDevice* device;
+        int32_t device_id;
+        std::mutex mutex;
+        void* stream = nullptr;
+        bool initialized = false;
+    };
+
+   public:
+    ~DfsD2hStreamPool() {
+        if (!Shutdown()) {
+            LOG(ERROR) << "Failed to synchronize a DFS D2H stream during "
+                          "shutdown";
+        }
+    }
+
+    std::unique_ptr<DfsD2hStreamLease> Acquire(
+        const device::AcceleratorDevice* accelerator, int32_t device_id) {
+        std::shared_ptr<DeviceState> state;
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (shutting_down_) return nullptr;
+        const DeviceKey key{accelerator, device_id};
+        auto [it, inserted] = states_.try_emplace(key);
+        if (inserted) {
+            it->second = std::make_shared<DeviceState>(accelerator, device_id);
+        }
+        state = it->second;
+
+        // Keep the map locked until the device state is leased. Shutdown can
+        // then swap the map and wait for every active lease before destroying
+        // a persistent stream.
+        std::unique_lock<std::mutex> state_lock(state->mutex);
+        lock.unlock();
+        state->device->SetContext(state->device_id);
+        if (!state->initialized) {
+            state->initialized = true;
+            if (!state->device->CreateStream(&state->stream)) {
+                state->stream = nullptr;
+            }
+        }
+
+        auto lease = std::make_unique<DfsD2hStreamLease>();
+        lease->device = state->device;
+        lease->device_id = state->device_id;
+        lease->stream = state->stream;
+        lease->state = state;
+        lease->lock = std::move(state_lock);
+        return lease;
+    }
+
+    bool Shutdown() {
+        std::map<DeviceKey, std::shared_ptr<DeviceState>> states;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            if (shutting_down_) {
+                shutdown_cv_.wait(lock, [this] { return shutdown_complete_; });
+                return shutdown_succeeded_;
+            }
+            shutting_down_ = true;
+            states.swap(states_);
+        }
+
+        bool succeeded = true;
+        for (auto& [_, state] : states) {
+            std::lock_guard<std::mutex> state_lock(state->mutex);
+            state->device->SetContext(state->device_id);
+            if (state->stream != nullptr) {
+                succeeded &= state->device->SynchronizeStream(state->stream);
+                state->device->DestroyStream(state->stream);
+                state->stream = nullptr;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            shutdown_succeeded_ = succeeded;
+            shutdown_complete_ = true;
+        }
+        shutdown_cv_.notify_all();
+        return succeeded;
+    }
+
+   private:
+    std::mutex mutex_;
+    std::condition_variable shutdown_cv_;
+    std::map<DeviceKey, std::shared_ptr<DeviceState>> states_;
+    bool shutting_down_ = false;
+    bool shutdown_complete_ = false;
+    bool shutdown_succeeded_ = true;
+};
+
 Client::Client(const std::string& local_hostname,
                const std::string& metadata_connstring,
                const std::string& protocol,
@@ -451,6 +561,7 @@ Client::Client(const std::string& local_hostname,
       dfs_staging_budget_(std::make_shared<DfsStagingBudget>(
           Environ::GetSizeT("MC_STORE_DFS_WRITE_STAGING_BYTES",
                             PinnedBufferPool::kDefaultMaxCachedBytes))),
+      dfs_d2h_stream_pool_(std::make_unique<DfsD2hStreamPool>()),
       write_thread_pool_(2),
       task_thread_pool_(4) {
     LOG(INFO) << "client_id=" << client_id_;
@@ -481,6 +592,9 @@ Client::~Client() {
     // They report their result through master_client_ and write through
     // dfs_storage_backend_, so they must not outlive this object.
     DrainAsyncDfsWrites();
+    if (dfs_d2h_stream_pool_ && !dfs_d2h_stream_pool_->Shutdown()) {
+        LOG(ERROR) << "Failed to shut down DFS D2H copy streams";
+    }
     write_thread_pool_.stop();
 
     task_poll_running_ = false;
@@ -2747,6 +2861,22 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
 }
 
 Client::AsyncDfsWriteContext::~AsyncDfsWriteContext() {
+    // Defensive cleanup for an early return after one or more DMA submissions.
+    // Normal BatchPut paths synchronize explicitly before caller buffers may
+    // be released and clear these leases before background DFS I/O begins.
+    if (!d2h_synchronized) {
+        for (auto& lease : d2h_streams) {
+            if (!lease->submitted || lease->stream == nullptr) continue;
+            lease->device->SetContext(lease->device_id);
+            if (!lease->device->SynchronizeStream(lease->stream)) {
+                LOG(ERROR) << "Failed to synchronize DFS D2H staging during "
+                              "context cleanup";
+            }
+        }
+        d2h_synchronized = true;
+    }
+    d2h_streams.clear();
+
     // The arena returns only after every Slice view and background write is
     // done with it. Release the in-flight budget at the same lifetime edge.
     if (pinned_pool) pinned_pool->Release(std::move(arena));
@@ -2808,7 +2938,7 @@ Client::DfsStageResult Client::StageDfsWriteData(
         context.staging_bytes = reserved_bytes;
     }
 
-    context.arena = pinned_buffer_pool_->Acquire(arena_size);
+    context.arena = context.pinned_pool->Acquire(arena_size);
     if (context.arena.data == nullptr) {
         LOG(ERROR) << "Failed to acquire async DFS write staging arena";
         return DfsStageResult::kFailed;
@@ -2823,7 +2953,7 @@ Client::DfsStageResult Client::StageDfsWriteData(
             if (extra > available) {
                 context.staging_budget->in_use -= reserved_bytes;
                 context.staging_bytes = 0;
-                pinned_buffer_pool_->Release(std::move(context.arena));
+                context.pinned_pool->Release(std::move(context.arena));
                 return DfsStageResult::kCapacityExceeded;
             }
             context.staging_budget->in_use += extra;
@@ -2836,6 +2966,28 @@ Client::DfsStageResult Client::StageDfsWriteData(
     }
     std::memset(context.arena.data, 0, arena_size);
 
+    struct D2hTarget {
+        const device::AcceleratorDevice* device;
+        int32_t device_id;
+
+        bool operator<(const D2hTarget& other) const {
+            if (device != other.device) {
+                return std::less<const device::AcceleratorDevice*>{}(
+                    device, other.device);
+            }
+            return device_id < other.device_id;
+        }
+        bool operator==(const D2hTarget& other) const {
+            return device == other.device && device_id == other.device_id;
+        }
+    };
+
+    // Validate the complete batch and acquire every device lease in a stable
+    // order before submitting any DMA. Stable ordering prevents two
+    // multi-device BatchPut calls from deadlocking on opposite slice orders.
+    std::vector<D2hTarget> targets;
+    const bool can_submit_async = context.arena.pinned_host.addr != nullptr &&
+                                  dfs_d2h_stream_pool_ != nullptr;
     for (size_t i = 0; i < slice_lists.size(); ++i) {
         const auto& descriptor = context.descriptors[i];
         size_t offset = 0;
@@ -2847,19 +2999,75 @@ Client::DfsStageResult Client::StageDfsWriteData(
                            << context.keys[i];
                 return DfsStageResult::kFailed;
             }
+            if (can_submit_async) {
+                device::PointerInfo info{};
+                auto* source_device =
+                    runtime_accelerator.FindDeviceForPointer(slice.ptr, &info);
+                if (source_device != nullptr) {
+                    targets.push_back({source_device, info.device_id});
+                }
+            }
+            offset += slice.size;
+        }
+        if (offset != descriptor.object_size) {
+            LOG(ERROR) << "DFS staging size mismatch for key "
+                       << context.keys[i] << ": expected "
+                       << descriptor.object_size << ", got " << offset;
+            return DfsStageResult::kFailed;
+        }
+    }
+    std::sort(targets.begin(), targets.end());
+    targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+    for (const auto& target : targets) {
+        auto lease =
+            dfs_d2h_stream_pool_->Acquire(target.device, target.device_id);
+        if (lease) context.d2h_streams.push_back(std::move(lease));
+    }
+
+    for (size_t i = 0; i < slice_lists.size(); ++i) {
+        const auto& descriptor = context.descriptors[i];
+        size_t offset = 0;
+        for (const auto& slice : *slice_lists[i]) {
+            if (slice.size == 0) continue;
 
             device::PointerInfo info{};
             auto* device =
                 runtime_accelerator.FindDeviceForPointer(slice.ptr, &info);
             if (device != nullptr) {
-                // GPU source: the D2H copy must complete now, while the
-                // caller's device buffer is still guaranteed to be alive.
+                // Pageable fallback cannot be a reliable async DMA target.
+                // Preserve correctness with the synchronous device copy.
                 device->SetContext(info.device_id);
-                if (!device->Copy(context.arena.data + offsets[i] + offset,
-                                  slice.ptr, slice.size,
-                                  device::CopyDirection::kDeviceToHost)) {
+                DfsD2hStreamLease* lease = nullptr;
+                if (can_submit_async) {
+                    auto it = std::find_if(
+                        context.d2h_streams.begin(), context.d2h_streams.end(),
+                        [device, &info](const auto& candidate) {
+                            return candidate->device == device &&
+                                   candidate->device_id == info.device_id;
+                        });
+                    if (it != context.d2h_streams.end()) {
+                        lease = it->get();
+                    }
+                }
+
+                bool copied = false;
+                if (lease != nullptr && lease->stream != nullptr) {
+                    copied = device->CopyToHostAsync(
+                        context.arena.data + offsets[i] + offset, slice.ptr,
+                        slice.size, lease->stream);
+                    if (copied) {
+                        lease->submitted = true;
+                        context.d2h_synchronized = false;
+                    }
+                } else {
+                    copied = device->Copy(
+                        context.arena.data + offsets[i] + offset, slice.ptr,
+                        slice.size, device::CopyDirection::kDeviceToHost);
+                }
+                if (!copied) {
                     LOG(ERROR) << "DFS D2H staging failed for key "
                                << context.keys[i];
+                    SynchronizeDfsWriteData(context);
                     return DfsStageResult::kFailed;
                 }
             } else {
@@ -2870,23 +3078,39 @@ Client::DfsStageResult Client::StageDfsWriteData(
             }
             offset += slice.size;
         }
-        if (offset != descriptor.object_size) {
-            LOG(ERROR) << "DFS staging size mismatch for key "
-                       << context.keys[i] << ": expected "
-                       << descriptor.object_size << ", got " << offset;
-            return DfsStageResult::kFailed;
-        }
         context.slices[i].push_back(
             Slice{context.arena.data + offsets[i],
                   static_cast<size_t>(descriptor.aligned_size)});
     }
+    if (context.d2h_synchronized) context.d2h_streams.clear();
     return DfsStageResult::kSuccess;
+}
+
+bool Client::SynchronizeDfsWriteData(AsyncDfsWriteContext& context) {
+    if (context.d2h_synchronized) {
+        context.d2h_streams.clear();
+        return true;
+    }
+
+    bool succeeded = true;
+    for (auto& lease : context.d2h_streams) {
+        if (!lease->submitted || lease->stream == nullptr) continue;
+        lease->device->SetContext(lease->device_id);
+        if (!lease->device->SynchronizeStream(lease->stream)) {
+            LOG(ERROR) << "Failed to synchronize DFS D2H staging on device "
+                       << lease->device_id;
+            succeeded = false;
+        }
+    }
+    context.d2h_synchronized = true;
+    context.d2h_streams.clear();
+    return succeeded;
 }
 
 void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
     std::vector<DfsWriteRequest> requests;
-    requests.reserve(context->keys.size());
-    for (size_t i = 0; i < context->keys.size(); ++i) {
+    requests.reserve(context->write_indices.size());
+    for (const size_t i : context->write_indices) {
         requests.push_back(DfsWriteRequest{context->keys[i],
                                            context->descriptors[i],
                                            context->slices[i], true});
@@ -2924,7 +3148,7 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
     // The RPCs are idempotent on the master side, so a bounded retry is safe.
     constexpr int kMaxCompletionAttempts = 3;
     for (size_t i = 0; i < outcomes.size(); ++i) {
-        const auto& key = context->keys[i];
+        const auto& key = context->keys[context->write_indices[i]];
         const bool succeeded = outcomes[i] == ErrorCode::OK;
         if (!succeeded) {
             LOG(ERROR) << "Async DFS write failed for key " << key
@@ -2968,8 +3192,58 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
     }
 }
 
-void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
-                             bool allow_async) {
+std::shared_ptr<Client::AsyncDfsWriteContext> Client::PrepareAsyncDfsWrites(
+    std::vector<PutOperation>& ops) {
+    auto backend = dfs_storage_backend_;
+    if (!backend || backend->GetAllocatorType() != DfsAllocatorType::BUCKET) {
+        return nullptr;
+    }
+
+    auto context = std::make_shared<AsyncDfsWriteContext>();
+    context->backend = std::move(backend);
+    context->pinned_pool = pinned_buffer_pool_;
+    context->staging_budget = dfs_staging_budget_;
+
+    std::vector<const std::vector<Slice>*> slice_lists;
+    for (size_t i = 0; i < ops.size(); ++i) {
+        auto& op = ops[i];
+        if (op.IsResolved() ||
+            op.transfer_summary.allocated_dfs_replicas == 0 ||
+            !HasExpectedReplicaAllocation(op.ToReplicateConfig(),
+                                          op.transfer_summary)) {
+            continue;
+        }
+
+        auto dfs_it = std::find_if(op.replicas.begin(), op.replicas.end(),
+                                   [](const Replica::Descriptor& replica) {
+                                       return replica.is_dfs_replica();
+                                   });
+        if (dfs_it == op.replicas.end()) {
+            op.transfer_summary.RecordFailure(ReplicaType::DFS,
+                                              ErrorCode::INVALID_REPLICA);
+            op.AppendFailureContext("Allocated DFS replica has no descriptor");
+            continue;
+        }
+
+        context->keys.push_back(op.key);
+        context->descriptors.push_back(dfs_it->get_dfs_descriptor());
+        context->op_indices.push_back(i);
+        slice_lists.push_back(&op.slices);
+    }
+
+    if (!context->keys.empty()) {
+        context->staging_result = StageDfsWriteData(*context, slice_lists);
+    }
+    return context;
+}
+
+void Client::SubmitDfsWrites(
+    std::vector<PutOperation>& ops, bool is_upsert, bool allow_async,
+    std::shared_ptr<AsyncDfsWriteContext> staged_context) {
+    if (staged_context && !SynchronizeDfsWriteData(*staged_context)) {
+        staged_context->staging_result = DfsStageResult::kFailed;
+    }
+
     std::vector<std::string> keys;
     std::vector<const std::vector<Slice>*> slice_lists;
     std::vector<DistributedFSDescriptor> descriptors;
@@ -3012,7 +3286,8 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
 
     if (keys.empty()) return;
 
-    auto backend = dfs_storage_backend_;
+    auto backend =
+        staged_context ? staged_context->backend : dfs_storage_backend_;
     if (!backend) {
         // No backend: fail every affected key here instead of queueing a task
         // that would dereference a null pointer.
@@ -3049,24 +3324,48 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
         return;
     }
 
-    auto context = std::make_shared<AsyncDfsWriteContext>();
-    context->keys = keys;
-    context->descriptors = descriptors;
-    context->backend = std::move(backend);
-    context->pinned_pool = pinned_buffer_pool_;
-    context->staging_budget = dfs_staging_budget_;
-    context->is_upsert = is_upsert;
+    auto context = std::move(staged_context);
+    if (context) {
+        op_indices.clear();
+        context->write_indices.clear();
+        for (size_t i = 0; i < context->op_indices.size(); ++i) {
+            const size_t op_index = context->op_indices[i];
+            auto& op = ops[op_index];
+            if (op.IsResolved() ||
+                !NonDfsTransfersSucceeded(op.transfer_summary) ||
+                !HasExpectedReplicaAllocation(op.ToReplicateConfig(),
+                                              op.transfer_summary)) {
+                continue;
+            }
+            context->write_indices.push_back(i);
+            op_indices.push_back(op_index);
+        }
+        if (op_indices.empty()) return;
+    } else {
+        context = std::make_shared<AsyncDfsWriteContext>();
+        context->keys = keys;
+        context->descriptors = descriptors;
+        context->backend = std::move(backend);
+        context->pinned_pool = pinned_buffer_pool_;
+        context->staging_budget = dfs_staging_budget_;
+        context->is_upsert = is_upsert;
+        context->staging_result = StageDfsWriteData(*context, slice_lists);
+        if (context->staging_result == DfsStageResult::kSuccess &&
+            !SynchronizeDfsWriteData(*context)) {
+            context->staging_result = DfsStageResult::kFailed;
+        }
+        context->write_indices.resize(context->keys.size());
+        std::iota(context->write_indices.begin(), context->write_indices.end(),
+                  0);
+    }
 
-    // Copy all payload bytes before returning, so the task never touches the
-    // caller's memory. A staging failure is reported synchronously.
-    const auto stage_result = StageDfsWriteData(*context, slice_lists);
-    if (stage_result == DfsStageResult::kCapacityExceeded) {
+    if (context->staging_result == DfsStageResult::kCapacityExceeded) {
         LOG(WARNING) << "Async DFS staging limit reached; writing "
-                     << keys.size() << " objects synchronously";
+                     << op_indices.size() << " objects synchronously";
         write_synchronously();
         return;
     }
-    if (stage_result != DfsStageResult::kSuccess) {
+    if (context->staging_result != DfsStageResult::kSuccess) {
         for (const size_t index : op_indices) {
             auto& op = ops[index];
             op.transfer_summary.RecordFailure(ReplicaType::DFS,
@@ -3079,8 +3378,8 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
     {
         std::lock_guard<std::mutex> lock(dfs_inflight_mutex_);
         if (dfs_writes_shutting_down_.load(std::memory_order_acquire)) {
-            LOG(ERROR) << "Client is shutting down; refusing " << keys.size()
-                       << " async DFS writes";
+            LOG(ERROR) << "Client is shutting down; refusing "
+                       << op_indices.size() << " async DFS writes";
             for (const size_t index : op_indices) {
                 auto& op = ops[index];
                 op.transfer_summary.RecordFailure(
@@ -3592,6 +3891,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
                     << " transfers for key " << merged_ops.back().key;
         }
     }
+    std::shared_ptr<AsyncDfsWriteContext> dfs_context;
+    if (!is_upsert) {
+        dfs_context = PrepareAsyncDfsWrites(ops);
+    }
     WaitForTransfers(merged_ops);
     for (auto& op : merged_ops) {
         auto& memory_descriptor = op.replicas[0].get_memory_descriptor();
@@ -3619,7 +3922,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
         op.failure_context = seg_to_ops.at(seg).failure_context;
     }
     // Puts may write asynchronously in bucket mode.
-    SubmitDfsWrites(ops, /*is_upsert=*/false, /*allow_async=*/true);
+    SubmitDfsWrites(ops, /*is_upsert=*/false, /*allow_async=*/true,
+                    std::move(dfs_context));
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
                   .count();
@@ -3665,8 +3969,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
 
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
+    auto dfs_context = PrepareAsyncDfsWrites(ops);
     WaitForTransfers(ops);
-    SubmitDfsWrites(ops);
+    SubmitDfsWrites(ops, /*is_upsert=*/false, /*allow_async=*/true,
+                    std::move(dfs_context));
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
                   .count();
