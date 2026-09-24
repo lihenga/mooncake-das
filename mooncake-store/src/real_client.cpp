@@ -726,6 +726,7 @@ class RealClient::DfsAsyncScatterContext {
         // Keep merges within one result entry so all of that entry's writes
         // retain their original order on a single stream.
         if (!operations_.empty() &&
+            operations_.size() > submitted_operation_count_ &&
             range_results_[operations_.back().first_range] == result_index &&
             CanMerge(operations_.back(), dst, src, src_device, size,
                      target)) {
@@ -737,44 +738,18 @@ class RealClient::DfsAsyncScatterContext {
             CopyOperation{dst, src, src_device, size, target, range_index, 1});
     }
 
-    // Incremental submit: submit current operations to DMA, then clear the
-    // operation buffers so AddCopy can continue accumulating into the same
-    // context. Region/pointer caches and the lease are preserved across
-    // submits, avoiding repeated GPU pointer queries and lease churn.
+    // Submit newly added operations without waiting for device completion.
     void Submit() {
-        if (operations_.empty() && !submitted_) return;
-        if (submitted_) return;
+        if (submitted_operation_count_ == operations_.size()) return;
 
         std::map<Target, std::vector<size_t>> device_operations;
-        for (size_t i = 0; i < operations_.size(); ++i) {
+        for (size_t i = submitted_operation_count_; i < operations_.size(); ++i) {
             const auto &operation = operations_[i];
             if (!operation.target.device) {
                 std::memcpy(operation.dst, operation.src, operation.size);
                 continue;
             }
             device_operations[operation.target].push_back(i);
-        }
-
-        bool targets_match =
-            active_devices_.size() == device_operations.size();
-        if (targets_match) {
-            for (const auto &[target, _] : device_operations) {
-                const bool found = std::any_of(
-                    active_devices_.begin(), active_devices_.end(),
-                    [&](const ActiveDevice &active) {
-                        return active.target == target;
-                    });
-                if (!found) {
-                    targets_match = false;
-                    break;
-                }
-            }
-        }
-        // Do not acquire a new device while holding leases for a different
-        // target set. Releasing first preserves the global Target ordering and
-        // avoids cross-context lock-order inversion.
-        if (!targets_match) {
-            active_devices_.clear();
         }
 
         for (const auto &[target, operation_indices] : device_operations) {
@@ -801,8 +776,6 @@ class RealClient::DfsAsyncScatterContext {
             }
 
             auto &active = *owned_active;
-            active.operations_by_stream.clear();
-            active.used_streams.clear();
             const auto &streams = active.lease->streams();
             if (streams.empty()) {
                 for (size_t operation_index : operation_indices) {
@@ -818,6 +791,7 @@ class RealClient::DfsAsyncScatterContext {
 
             active.operations_by_stream.resize(streams.size());
             active.used_streams.resize(streams.size());
+            std::vector<std::vector<size_t>> submitted_by_stream(streams.size());
             size_t next_stream = 0;
             std::unordered_map<size_t, size_t> result_streams;
             for (size_t operation_index : operation_indices) {
@@ -830,15 +804,15 @@ class RealClient::DfsAsyncScatterContext {
                     stream_it->second = next_stream++ % streams.size();
                 }
                 const size_t stream_index = stream_it->second;
-                owned_active->used_streams[stream_index] = true;
-                owned_active->operations_by_stream[stream_index].push_back(
+                submitted_by_stream[stream_index].push_back(operation_index);
+                active.used_streams[stream_index] = true;
+                active.operations_by_stream[stream_index].push_back(
                     operation_index);
             }
 
             for (size_t stream_index = 0; stream_index < streams.size();
                  ++stream_index) {
-                auto &stream_operations =
-                    owned_active->operations_by_stream[stream_index];
+                auto &stream_operations = submitted_by_stream[stream_index];
                 if (stream_operations.empty()) continue;
                 std::vector<device::HostCopyRange> ranges;
                 ranges.reserve(stream_operations.size());
@@ -857,9 +831,11 @@ class RealClient::DfsAsyncScatterContext {
                 }
             }
         }
+        submitted_operation_count_ = operations_.size();
         submitted_ = true;
     }
 
+    // Wait for all submitted operations and release their device leases.
     void Synchronize() {
         if (synchronized_) return;
         if (!submitted_) return;
@@ -882,8 +858,7 @@ class RealClient::DfsAsyncScatterContext {
             for (auto &worker : sync_workers) worker.join();
             for (size_t i = 0; i < streams.size(); ++i) {
                 if (!active.used_streams[i] || stream_results[i]) continue;
-                for (size_t operation_index :
-                     active.operations_by_stream[i]) {
+                for (size_t operation_index : active.operations_by_stream[i]) {
                     MarkFailed(operation_index);
                 }
             }
@@ -893,19 +868,9 @@ class RealClient::DfsAsyncScatterContext {
             active.used_streams.clear();
         }
         synchronized_ = true;
-        // Now safe to clear operation buffers — Synchronize has finished
-        // using them for MarkFailed. AddCopy can accumulate fresh operations.
         operations_.clear();
         range_results_.clear();
-    }
-
-    // Flush: submit pending operations and synchronize. Caches, leases, and
-    // failed result indices survive across flushes.
-    void Flush() {
-        Submit();
-        Synchronize();
-        submitted_ = false;
-        synchronized_ = false;
+        submitted_operation_count_ = 0;
     }
 
     void ReleaseLeases() { active_devices_.clear(); }
@@ -974,6 +939,7 @@ class RealClient::DfsAsyncScatterContext {
     std::unordered_map<void *, Target> target_cache_;
     std::vector<size_t> range_results_;
     std::vector<CopyOperation> operations_;
+    size_t submitted_operation_count_ = 0;
     std::vector<ActiveDevice> active_devices_;
     std::unordered_set<size_t> failed_results_;
     bool submitted_ = false;
@@ -6631,10 +6597,12 @@ void RealClient::execute_session_dfs_range_reads(
     auto start_callback_scatter_worker = [&] {
         callback_scatter_worker = std::thread([&] {
             // One long-lived context across all epochs. Region/pointer caches
-            // and the H2D lease are preserved across Flush() calls, so GPU
+            // and the H2D lease are preserved across Submit() calls, so GPU
             // pointer queries don't repeat for buffers seen in earlier epochs.
             DfsAsyncScatterContext scatter_ctx(*this,
                                                *dfs_h2d_stream_pool_);
+            std::vector<std::pair<size_t, size_t>> pending_scatter_results;
+            pending_scatter_results.reserve(disk_batch_entries.size());
             for (;;) {
                 std::vector<size_t> epoch_indices;
                 std::deque<ScatterJob> jobs;
@@ -6661,8 +6629,6 @@ void RealClient::execute_session_dfs_range_reads(
                 try {
                     std::vector<std::pair<size_t, size_t>> pending_results;
                     pending_results.reserve(epoch_indices.size());
-                    std::vector<std::pair<size_t, int>> completed_results;
-                    completed_results.reserve(epoch_indices.size());
                     uint64_t epoch_bytes = 0;
                     for (size_t index : epoch_indices) {
                         auto *entry = disk_batch_entries[index];
@@ -6693,41 +6659,35 @@ void RealClient::execute_session_dfs_range_reads(
                         pending_results.push_back({index, transferred});
                     }
 
-                    scatter_ctx.Flush();
+                    scatter_ctx.Submit();
                     callback_scatter_bytes += epoch_bytes;
-                    for (const auto &[index, transferred] : pending_results) {
-                        const auto *entry = disk_batch_entries[index];
-                        completed_results.push_back({
-                            index,
-                            scatter_ctx.EntryFailed(entry->original_idx)
-                                ? static_cast<int>(
-                                      toInt(ErrorCode::TRANSFER_FAIL))
-                                : static_cast<int>(transferred)});
-                    }
-                    {
-                        std::lock_guard<std::mutex> lock(
-                            callback_scatter_mutex);
-                        for (const auto &[index, result] : completed_results) {
-                            task_scatter_results[index] = result;
-                        }
-                    }
+                    pending_scatter_results.insert(
+                        pending_scatter_results.end(), pending_results.begin(),
+                        pending_results.end());
                 } catch (const std::exception &e) {
                     LOG(ERROR) << "DFS scatter epoch failed: " << e.what();
-                    std::lock_guard<std::mutex> lock(
-                        callback_scatter_mutex);
+                    std::lock_guard<std::mutex> lock(callback_scatter_mutex);
                     for (size_t index : epoch_indices) {
                         task_scatter_results[index] = static_cast<int>(
                             toInt(ErrorCode::TRANSFER_FAIL));
                     }
                 } catch (...) {
                     LOG(ERROR) << "DFS scatter epoch failed";
-                    std::lock_guard<std::mutex> lock(
-                        callback_scatter_mutex);
+                    std::lock_guard<std::mutex> lock(callback_scatter_mutex);
                     for (size_t index : epoch_indices) {
                         task_scatter_results[index] = static_cast<int>(
                             toInt(ErrorCode::TRANSFER_FAIL));
                     }
                 }
+            }
+            scatter_ctx.Synchronize();
+            std::lock_guard<std::mutex> lock(callback_scatter_mutex);
+            for (const auto &[index, transferred] : pending_scatter_results) {
+                const auto *entry = disk_batch_entries[index];
+                task_scatter_results[index] =
+                    scatter_ctx.EntryFailed(entry->original_idx)
+                        ? static_cast<int>(toInt(ErrorCode::TRANSFER_FAIL))
+                        : static_cast<int>(transferred);
             }
         });
     };
