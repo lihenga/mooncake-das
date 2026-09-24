@@ -206,11 +206,15 @@ class Client {
      * @param slices Map of object keys to their data slices
      * @return Vector of ErrorCode results for each object
      */
+    using DfsBatchReadCompletionCallback =
+        std::function<void(const std::vector<size_t>& successful_indices)>;
+
     std::vector<tl::expected<void, ErrorCode>> BatchGet(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices,
-        bool prefer_same_node = false);
+        bool prefer_same_node = false,
+        DfsBatchReadCompletionCallback dfs_read_completion_callback = nullptr);
 
     /**
      * @brief Stores data with replication

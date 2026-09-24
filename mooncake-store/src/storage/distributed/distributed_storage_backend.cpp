@@ -1221,10 +1221,38 @@ void DistributedStorageBackend::ExecuteMergedReadTask(
 void DistributedStorageBackend::ExecuteReadTasks(
     const std::vector<ReadTask>& tasks,
     const std::vector<DfsReadRequest>& requests,
-    std::vector<tl::expected<void, ErrorCode>>& results) {
+    std::vector<tl::expected<void, ErrorCode>>& results,
+    const BatchReadTaskCompletionCallback& task_completion_callback) {
+    auto notify_task_completion =
+        [&requests, &results, &task_completion_callback](const ReadTask& task) {
+            if (!task_completion_callback) return;
+            try {
+                std::vector<uintptr_t> user_cookies;
+                std::vector<size_t> request_indices;
+                std::vector<tl::expected<void, ErrorCode>> task_results;
+                user_cookies.reserve(task.entries.size());
+                request_indices.reserve(task.entries.size());
+                task_results.reserve(task.entries.size());
+                for (const auto& entry : task.entries) {
+                    user_cookies.push_back(
+                        requests[entry.request_index].user_cookie);
+                    request_indices.push_back(entry.request_index);
+                    task_results.push_back(results[entry.request_index]);
+                }
+                task_completion_callback(user_cookies, request_indices,
+                                         task_results);
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "Batch read task completion callback failed: "
+                           << e.what();
+            } catch (...) {
+                LOG(ERROR) << "Batch read task completion callback failed";
+            }
+        };
+
     if (batch_read_pool_ == nullptr || tasks.size() <= 1) {
         for (const auto& task : tasks) {
             ExecuteReadTask(task, requests, results);
+            notify_task_completion(task);
         }
         return;
     }
@@ -1242,26 +1270,28 @@ void DistributedStorageBackend::ExecuteReadTasks(
     };
 
     auto worker_fn = [this, &tasks, &requests, &results, &mark_done,
-                      &next_task]() {
+                      &next_task, &notify_task_completion]() {
         while (true) {
             const size_t task_index =
                 next_task.fetch_add(1, std::memory_order_relaxed);
             if (task_index >= tasks.size()) break;
+            const auto& task = tasks[task_index];
             try {
-                ExecuteReadTask(tasks[task_index], requests, results);
+                ExecuteReadTask(task, requests, results);
             } catch (const std::exception& e) {
                 LOG(ERROR) << "Batch read task failed: " << e.what();
-                for (const auto& entry : tasks[task_index].entries) {
+                for (const auto& entry : task.entries) {
                     results[entry.request_index] =
                         tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
                 }
             } catch (...) {
                 LOG(ERROR) << "Batch read task failed";
-                for (const auto& entry : tasks[task_index].entries) {
+                for (const auto& entry : task.entries) {
                     results[entry.request_index] =
                         tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
                 }
             }
+            notify_task_completion(task);
         }
         mark_done();
     };
@@ -1284,7 +1314,8 @@ void DistributedStorageBackend::ExecuteReadTasks(
 }
 
 std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
-    const std::vector<DfsReadRequest>& requests) {
+    const std::vector<DfsReadRequest>& requests,
+    BatchReadTaskCompletionCallback task_completion_callback) {
     const auto timing_start = std::chrono::steady_clock::now();
     std::vector<tl::expected<void, ErrorCode>> results(
         requests.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
@@ -1302,9 +1333,12 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
 
     if (!IsBucketMode()) return BatchReadShard(requests);
 
+    if (!SupportsBatchReadTaskCompletionCallback()) {
+        task_completion_callback = nullptr;
+    }
     auto tasks = PrepareReadTasks(requests, results);
     const auto prepare_done = std::chrono::steady_clock::now();
-    ExecuteReadTasks(tasks, requests, results);
+    ExecuteReadTasks(tasks, requests, results, task_completion_callback);
 
     if (dfs_read_trace_enabled()) {
         const int64_t prepare_us =

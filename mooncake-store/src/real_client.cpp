@@ -11,6 +11,8 @@
 #include <signal.h>
 #include <thread>
 #include <stop_token>
+#include <condition_variable>
+#include <deque>
 
 #include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
@@ -117,17 +119,6 @@ std::string DirectSourceForReplica(const Replica::Descriptor &replica) {
         return DirectStorageMetricSource(ReplicaType::DFS);
     }
     return "unknown";
-}
-
-uint64_t SumSliceBytes(
-    const std::unordered_map<std::string, std::vector<Slice>> &objects) {
-    uint64_t total = 0;
-    for (const auto &[_, slices] : objects) {
-        for (const auto &slice : slices) {
-            total += slice.size;
-        }
-    }
-    return total;
 }
 
 bool IsHostStoreSegmentProtocol(const std::string &protocol) {
@@ -678,6 +669,7 @@ class RealClient::DfsAsyncScatterContext {
     };
 
     struct ActiveDevice {
+        Target target;
         std::unique_ptr<DfsH2dStreamPool::Lease> lease;
         std::vector<std::vector<size_t>> operations_by_stream;
         std::vector<uint8_t> used_streams;
@@ -685,29 +677,19 @@ class RealClient::DfsAsyncScatterContext {
 
    public:
     explicit DfsAsyncScatterContext(RealClient &owner,
-                                    DfsH2dStreamPool &stream_pool,
-                                    bool collect_metrics)
+                                    DfsH2dStreamPool &stream_pool)
         : owner_(owner),
           stream_pool_(stream_pool),
-          runtime_(device::GetAcceleratorRegistry().RuntimeAccelerators()),
-          collect_metrics_(collect_metrics) {}
+          runtime_(device::GetAcceleratorRegistry().RuntimeAccelerators()) {}
 
     ~DfsAsyncScatterContext() {
         if (!submitted_ || synchronized_) return;
-        for (auto &active : active_devices_) {
-            active.lease->device()->SetContext(active.lease->device_id());
-            const auto &streams = active.lease->streams();
-            for (size_t i = 0; i < streams.size(); ++i) {
-                if (active.used_streams[i]) {
-                    active.lease->device()->SynchronizeStream(streams[i]);
-                }
-            }
-        }
+        // Best-effort sync of any un-synchronized submission on destruction.
+        Synchronize();
     }
 
     void AddCopy(void *dst, const void *src, const void *src_device,
                  size_t size, size_t result_index) {
-        ++original_range_count_;
         if (size == 0) return;
 
         Target target;
@@ -717,13 +699,11 @@ class RealClient::DfsAsyncScatterContext {
         if (region_it != region_cache_.begin()) {
             --region_it;
             if (ContainsAddress(region_it->second, address)) {
-                if (collect_metrics_) ++region_cache_hits_;
                 target = region_it->second.target;
                 region_resolved = true;
             }
         }
         if (!region_resolved) {
-            if (collect_metrics_) ++region_cache_misses_;
             const auto region = owner_.resolve_writable_buffer_region(dst);
             if (region && IsUsableRegion(*region)) {
                 target = QueryTarget(dst);
@@ -733,10 +713,8 @@ class RealClient::DfsAsyncScatterContext {
             } else {
                 auto target_it = target_cache_.find(dst);
                 if (target_it != target_cache_.end()) {
-                    if (collect_metrics_) ++pointer_cache_hits_;
                     target = target_it->second;
                 } else {
-                    if (collect_metrics_) ++unregistered_pointer_queries_;
                     target = QueryTarget(dst);
                     target_cache_.emplace(dst, target);
                 }
@@ -759,40 +737,72 @@ class RealClient::DfsAsyncScatterContext {
             CopyOperation{dst, src, src_device, size, target, range_index, 1});
     }
 
-    bool Submit() {
-        if (submitted_) return failed_results_.empty();
-        submitted_ = true;
+    // Incremental submit: submit current operations to DMA, then clear the
+    // operation buffers so AddCopy can continue accumulating into the same
+    // context. Region/pointer caches and the lease are preserved across
+    // submits, avoiding repeated GPU pointer queries and lease churn.
+    void Submit() {
+        if (operations_.empty() && !submitted_) return;
+        if (submitted_) return;
 
         std::map<Target, std::vector<size_t>> device_operations;
         for (size_t i = 0; i < operations_.size(); ++i) {
             const auto &operation = operations_[i];
             if (!operation.target.device) {
-                if (collect_metrics_) {
-                    ++host_copy_ops_;
-                    host_copy_ranges_ += operation.range_count;
-                }
                 std::memcpy(operation.dst, operation.src, operation.size);
                 continue;
-            }
-            if (collect_metrics_) {
-                ++device_copy_ops_;
-                device_copy_ranges_ += operation.range_count;
             }
             device_operations[operation.target].push_back(i);
         }
 
-        active_devices_.reserve(device_operations.size());
-        for (const auto &[target, operation_indices] : device_operations) {
-            ActiveDevice active;
-            active.lease =
-                stream_pool_.Acquire(target.device, target.device_id);
-            if (!active.lease) {
-                for (size_t operation_index : operation_indices) {
-                    MarkFailed(operation_index);
+        bool targets_match =
+            active_devices_.size() == device_operations.size();
+        if (targets_match) {
+            for (const auto &[target, _] : device_operations) {
+                const bool found = std::any_of(
+                    active_devices_.begin(), active_devices_.end(),
+                    [&](const ActiveDevice &active) {
+                        return active.target == target;
+                    });
+                if (!found) {
+                    targets_match = false;
+                    break;
                 }
-                continue;
+            }
+        }
+        // Do not acquire a new device while holding leases for a different
+        // target set. Releasing first preserves the global Target ordering and
+        // avoids cross-context lock-order inversion.
+        if (!targets_match) {
+            active_devices_.clear();
+        }
+
+        for (const auto &[target, operation_indices] : device_operations) {
+            ActiveDevice *owned_active = nullptr;
+            for (auto &active : active_devices_) {
+                if (active.target == target) {
+                    owned_active = &active;
+                    break;
+                }
+            }
+            if (owned_active == nullptr) {
+                ActiveDevice active;
+                active.target = target;
+                active.lease =
+                    stream_pool_.Acquire(target.device, target.device_id);
+                if (!active.lease) {
+                    for (size_t operation_index : operation_indices) {
+                        MarkFailed(operation_index);
+                    }
+                    continue;
+                }
+                active_devices_.push_back(std::move(active));
+                owned_active = &active_devices_.back();
             }
 
+            auto &active = *owned_active;
+            active.operations_by_stream.clear();
+            active.used_streams.clear();
             const auto &streams = active.lease->streams();
             if (streams.empty()) {
                 for (size_t operation_index : operation_indices) {
@@ -808,8 +818,6 @@ class RealClient::DfsAsyncScatterContext {
 
             active.operations_by_stream.resize(streams.size());
             active.used_streams.resize(streams.size());
-            active_devices_.push_back(std::move(active));
-            auto &owned_active = active_devices_.back();
             size_t next_stream = 0;
             std::unordered_map<size_t, size_t> result_streams;
             for (size_t operation_index : operation_indices) {
@@ -822,17 +830,15 @@ class RealClient::DfsAsyncScatterContext {
                     stream_it->second = next_stream++ % streams.size();
                 }
                 const size_t stream_index = stream_it->second;
-                owned_active.used_streams[stream_index] = true;
-                owned_active.operations_by_stream[stream_index].push_back(
+                owned_active->used_streams[stream_index] = true;
+                owned_active->operations_by_stream[stream_index].push_back(
                     operation_index);
             }
 
-            // Submit one batch per stream. Unsupported backends use the
-            // default implementation, preserving the original DMA behavior.
             for (size_t stream_index = 0; stream_index < streams.size();
                  ++stream_index) {
                 auto &stream_operations =
-                    owned_active.operations_by_stream[stream_index];
+                    owned_active->operations_by_stream[stream_index];
                 if (stream_operations.empty()) continue;
                 std::vector<device::HostCopyRange> ranges;
                 ranges.reserve(stream_operations.size());
@@ -842,12 +848,8 @@ class RealClient::DfsAsyncScatterContext {
                         operation.dst, operation.src, operation.size,
                         operation.src_device});
                 }
-                bool used_h2d_kernel = false;
                 if (target.device->CopyFromHostBatchAsync(
-                        ranges, streams[stream_index], &used_h2d_kernel)) {
-                    if (collect_metrics_ && used_h2d_kernel) {
-                        ++h2d_kernel_batches_;
-                    }
+                        ranges, streams[stream_index])) {
                     continue;
                 }
                 for (size_t operation_index : stream_operations) {
@@ -855,15 +857,16 @@ class RealClient::DfsAsyncScatterContext {
                 }
             }
         }
-        return failed_results_.empty();
+        submitted_ = true;
     }
 
-    bool Synchronize() {
-        if (synchronized_) return failed_results_.empty();
-        if (!submitted_) Submit();
+    void Synchronize() {
+        if (synchronized_) return;
+        if (!submitted_) return;
 
         for (auto &active : active_devices_) {
             const auto &streams = active.lease->streams();
+            if (active.used_streams.size() != streams.size()) continue;
             std::vector<uint8_t> stream_results(streams.size(), 1);
             std::vector<std::thread> sync_workers;
             sync_workers.reserve(streams.size());
@@ -885,35 +888,31 @@ class RealClient::DfsAsyncScatterContext {
                 }
             }
         }
-        active_devices_.clear();
+        for (auto &active : active_devices_) {
+            active.operations_by_stream.clear();
+            active.used_streams.clear();
+        }
         synchronized_ = true;
-        return failed_results_.empty();
+        // Now safe to clear operation buffers — Synchronize has finished
+        // using them for MarkFailed. AddCopy can accumulate fresh operations.
+        operations_.clear();
+        range_results_.clear();
     }
+
+    // Flush: submit pending operations and synchronize. Caches, leases, and
+    // failed result indices survive across flushes.
+    void Flush() {
+        Submit();
+        Synchronize();
+        submitted_ = false;
+        synchronized_ = false;
+    }
+
+    void ReleaseLeases() { active_devices_.clear(); }
 
     bool EntryFailed(size_t result_index) const {
         return failed_results_.find(result_index) != failed_results_.end();
     }
-
-    size_t original_range_count() const { return original_range_count_; }
-    size_t merged_range_count() const { return operations_.size(); }
-    size_t pointer_query_count() const { return pointer_query_count_; }
-    size_t pointer_cache_hits() const { return pointer_cache_hits_; }
-    uint64_t pointer_query_us() const {
-        return static_cast<uint64_t>(std::chrono::duration_cast<
-                                         std::chrono::microseconds>(
-                                         pointer_query_duration_)
-                                         .count());
-    }
-    size_t region_cache_hits() const { return region_cache_hits_; }
-    size_t region_cache_misses() const { return region_cache_misses_; }
-    size_t unregistered_pointer_queries() const {
-        return unregistered_pointer_queries_;
-    }
-    size_t host_copy_ops() const { return host_copy_ops_; }
-    size_t device_copy_ops() const { return device_copy_ops_; }
-    size_t host_copy_ranges() const { return host_copy_ranges_; }
-    size_t device_copy_ranges() const { return device_copy_ranges_; }
-    size_t h2d_kernel_batches() const { return h2d_kernel_batches_; }
 
    private:
     static bool IsUsableRegion(const RealClient::WritableBufferRegion &region) {
@@ -934,15 +933,7 @@ class RealClient::DfsAsyncScatterContext {
     Target QueryTarget(void *dst) {
         Target target;
         device::PointerInfo info{};
-        if (collect_metrics_) {
-            const auto query_start = std::chrono::steady_clock::now();
-            target.device = runtime_.FindDeviceForPointer(dst, &info);
-            pointer_query_duration_ +=
-                std::chrono::steady_clock::now() - query_start;
-            ++pointer_query_count_;
-        } else {
-            target.device = runtime_.FindDeviceForPointer(dst, &info);
-        }
+        target.device = runtime_.FindDeviceForPointer(dst, &info);
         if (target.device) target.device_id = info.device_id;
         return target;
     }
@@ -979,27 +970,14 @@ class RealClient::DfsAsyncScatterContext {
     RealClient &owner_;
     DfsH2dStreamPool &stream_pool_;
     device::RuntimeAccelerator runtime_;
-    bool collect_metrics_ = false;
     std::map<uintptr_t, CachedRegion> region_cache_;
     std::unordered_map<void *, Target> target_cache_;
     std::vector<size_t> range_results_;
     std::vector<CopyOperation> operations_;
     std::vector<ActiveDevice> active_devices_;
     std::unordered_set<size_t> failed_results_;
-    size_t original_range_count_ = 0;
     bool submitted_ = false;
     bool synchronized_ = false;
-    size_t pointer_query_count_ = 0;
-    size_t pointer_cache_hits_ = 0;
-    std::chrono::steady_clock::duration pointer_query_duration_{};
-    size_t region_cache_hits_ = 0;
-    size_t region_cache_misses_ = 0;
-    size_t unregistered_pointer_queries_ = 0;
-    size_t host_copy_ops_ = 0;
-    size_t device_copy_ops_ = 0;
-    size_t host_copy_ranges_ = 0;
-    size_t device_copy_ranges_ = 0;
-    size_t h2d_kernel_batches_ = 0;
 };
 
 PyClient::~PyClient() {}
@@ -6489,12 +6467,8 @@ void RealClient::execute_session_dfs_range_reads(
     bool dfs_read_success = false;
     uint64_t dfs_read_bytes = 0;
     uint64_t dfs_requested_bytes = 0;
-    std::chrono::steady_clock::time_point t_scatter_plan_done = timing_start;
-    std::chrono::steady_clock::time_point t_scatter_submit_start =
-        timing_start;
-    std::chrono::steady_clock::time_point t_scatter_submit_done = timing_start;
-    std::chrono::steady_clock::time_point t_scatter_sync_start = timing_start;
-    std::chrono::steady_clock::time_point t_scatter_sync_done = timing_start;
+    std::chrono::steady_clock::time_point t_batch_get_return = timing_start;
+    std::chrono::steady_clock::time_point t_scatter_done = timing_start;
     struct PendingScatterResult {
         SessionRangeReadRequest *entry;
         size_t transferred;
@@ -6504,8 +6478,17 @@ void RealClient::execute_session_dfs_range_reads(
     std::vector<std::shared_ptr<BufferHandle>> inflight_handles;
     inflight_handles.reserve(entries.size());
     uint64_t scatter_bytes = 0;
-    DfsAsyncScatterContext async_scatter(*this, *dfs_h2d_stream_pool_,
-                                         trace_enabled);
+    struct ScatterJob {
+        std::vector<size_t> disk_indices;
+    };
+    uint64_t callback_scatter_bytes = 0;
+    size_t callback_scatter_queue_high_watermark = 0;
+    std::mutex callback_scatter_mutex;
+    std::condition_variable callback_scatter_not_empty;
+    std::deque<ScatterJob> callback_scatter_jobs;
+    std::vector<std::optional<int>> task_scatter_results;
+    bool callback_scatter_closed = false;
+    DfsAsyncScatterContext async_scatter(*this, *dfs_h2d_stream_pool_);
 
     auto valid_source_handle = [](const SessionRangeReadRequest *entry,
                                   const std::shared_ptr<BufferHandle> &handle) {
@@ -6536,13 +6519,14 @@ void RealClient::execute_session_dfs_range_reads(
             PendingScatterResult{entry, transferred});
     };
 
-
-    // 2. Allocate + BatchGet
+    // All DFS entries use the shared staging arena and full BatchGet path.
+    // 2. Allocate + BatchGet.
     std::vector<std::string> disk_batch_keys;
+    std::vector<SessionRangeReadRequest *> disk_batch_entries;
     std::vector<QueryResult> disk_batch_qrs;
     std::unordered_map<std::string, std::vector<Slice>> disk_batch_slices;
-    std::unordered_map<std::string, std::shared_ptr<BufferHandle>>
-        disk_temp_handles;
+    std::vector<std::shared_ptr<BufferHandle>> disk_temp_handles;
+    disk_temp_handles.reserve(entries.size());
 
     struct ArenaView {
         SessionRangeReadRequest *entry;
@@ -6631,10 +6615,11 @@ void RealClient::execute_session_dfs_range_reads(
         allocateSlices(disk_slices, view.entry->replica, handle->ptr());
 
         disk_batch_keys.push_back(view.entry->key);
+        disk_batch_entries.push_back(view.entry);
         disk_batch_qrs.push_back(
             FilterQueryResult(view.entry->query_result, view.entry->replica));
         disk_batch_slices[view.entry->key] = std::move(disk_slices);
-        disk_temp_handles.emplace(view.entry->key, std::move(handle));
+        disk_temp_handles.push_back(std::move(handle));
         if (trace_enabled) {
             for (size_t size : view.entry->sizes) {
                 dfs_requested_bytes += size;
@@ -6642,9 +6627,123 @@ void RealClient::execute_session_dfs_range_reads(
         }
     }
 
-    // Buffer allocation done here; what follows is the DFS read (BatchGet) and
-    // then the scatter. Splitting alloc from read tells a slow
-    // alloc_batch_get_us apart: allocation churn vs actual disk I/O.
+    std::thread callback_scatter_worker;
+    auto start_callback_scatter_worker = [&] {
+        callback_scatter_worker = std::thread([&] {
+            // One long-lived context across all epochs. Region/pointer caches
+            // and the H2D lease are preserved across Flush() calls, so GPU
+            // pointer queries don't repeat for buffers seen in earlier epochs.
+            DfsAsyncScatterContext scatter_ctx(*this,
+                                               *dfs_h2d_stream_pool_);
+            for (;;) {
+                std::vector<size_t> epoch_indices;
+                std::deque<ScatterJob> jobs;
+                {
+                    std::unique_lock<std::mutex> lock(callback_scatter_mutex);
+                    callback_scatter_not_empty.wait(lock, [&] {
+                        return callback_scatter_closed ||
+                               !callback_scatter_jobs.empty();
+                    });
+                    if (callback_scatter_jobs.empty() && callback_scatter_closed) {
+                        break;
+                    }
+                    jobs.swap(callback_scatter_jobs);
+                }
+                for (auto &job : jobs) {
+                    for (size_t index : job.disk_indices) {
+                        if (index < disk_batch_entries.size()) {
+                            epoch_indices.push_back(index);
+                        }
+                    }
+                }
+                if (epoch_indices.empty()) continue;
+
+                try {
+                    std::vector<std::pair<size_t, size_t>> pending_results;
+                    pending_results.reserve(epoch_indices.size());
+                    std::vector<std::pair<size_t, int>> completed_results;
+                    completed_results.reserve(epoch_indices.size());
+                    uint64_t epoch_bytes = 0;
+                    for (size_t index : epoch_indices) {
+                        auto *entry = disk_batch_entries[index];
+                        const auto &handle = disk_temp_handles[index];
+                        if (!valid_source_handle(entry, handle)) {
+                            task_scatter_results[index] = static_cast<int>(
+                                toInt(ErrorCode::INTERNAL_ERROR));
+                            continue;
+                        }
+
+                        size_t transferred = 0;
+                        for (size_t j = 0; j < entry->sizes.size(); ++j) {
+                            const void *src =
+                                static_cast<const char *>(handle->ptr()) +
+                                entry->src_offsets[j];
+                            const void *src_device =
+                                handle->device_ptr()
+                                    ? static_cast<const char *>(
+                                          handle->device_ptr()) +
+                                          entry->src_offsets[j]
+                                    : nullptr;
+                            scatter_ctx.AddCopy(
+                                entry->buffers[j], src, src_device,
+                                entry->sizes[j], entry->original_idx);
+                            transferred += entry->sizes[j];
+                            epoch_bytes += entry->sizes[j];
+                        }
+                        pending_results.push_back({index, transferred});
+                    }
+
+                    scatter_ctx.Flush();
+                    callback_scatter_bytes += epoch_bytes;
+                    for (const auto &[index, transferred] : pending_results) {
+                        const auto *entry = disk_batch_entries[index];
+                        completed_results.push_back({
+                            index,
+                            scatter_ctx.EntryFailed(entry->original_idx)
+                                ? static_cast<int>(
+                                      toInt(ErrorCode::TRANSFER_FAIL))
+                                : static_cast<int>(transferred)});
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            callback_scatter_mutex);
+                        for (const auto &[index, result] : completed_results) {
+                            task_scatter_results[index] = result;
+                        }
+                    }
+                } catch (const std::exception &e) {
+                    LOG(ERROR) << "DFS scatter epoch failed: " << e.what();
+                    std::lock_guard<std::mutex> lock(
+                        callback_scatter_mutex);
+                    for (size_t index : epoch_indices) {
+                        task_scatter_results[index] = static_cast<int>(
+                            toInt(ErrorCode::TRANSFER_FAIL));
+                    }
+                } catch (...) {
+                    LOG(ERROR) << "DFS scatter epoch failed";
+                    std::lock_guard<std::mutex> lock(
+                        callback_scatter_mutex);
+                    for (size_t index : epoch_indices) {
+                        task_scatter_results[index] = static_cast<int>(
+                            toInt(ErrorCode::TRANSFER_FAIL));
+                    }
+                }
+            }
+        });
+    };
+
+    auto stop_callback_scatter_worker = [&] {
+        {
+            std::lock_guard<std::mutex> lock(callback_scatter_mutex);
+            callback_scatter_closed = true;
+        }
+        callback_scatter_not_empty.notify_all();
+        if (callback_scatter_worker.joinable()) {
+            callback_scatter_worker.join();
+        }
+    };
+
+    // Buffer allocation done here; DFS read and scatter run concurrently.
     const auto t_alloc_done = std::chrono::steady_clock::now();
 
     if (disk_batch_keys.empty()) {
@@ -6654,80 +6753,89 @@ void RealClient::execute_session_dfs_range_reads(
     }
     auto t_io_done = std::chrono::steady_clock::now();
     if (!disk_batch_keys.empty()) {
+        task_scatter_results.resize(disk_batch_keys.size());
+        start_callback_scatter_worker();
+        auto scatter_completed_task =
+            [&](const std::vector<size_t>& completed_indices) {
+                ScatterJob job;
+                job.disk_indices.reserve(completed_indices.size());
+                for (size_t index : completed_indices) {
+                    if (index < disk_batch_entries.size() &&
+                        index < disk_temp_handles.size()) {
+                        job.disk_indices.push_back(index);
+                    }
+                }
+                if (job.disk_indices.empty()) return;
+
+                std::unique_lock<std::mutex> lock(callback_scatter_mutex);
+                if (callback_scatter_closed) return;
+                const bool was_empty = callback_scatter_jobs.empty();
+                callback_scatter_jobs.push_back(std::move(job));
+                callback_scatter_queue_high_watermark = std::max(
+                    callback_scatter_queue_high_watermark,
+                    callback_scatter_jobs.size());
+                lock.unlock();
+                if (was_empty) {
+                    callback_scatter_not_empty.notify_one();
+                }
+            };
+
         const auto io_start = std::chrono::steady_clock::now();
-        auto disk_results = client_->BatchGet(disk_batch_keys, disk_batch_qrs,
-                                              disk_batch_slices);
+        auto disk_results = client_->BatchGet(
+            disk_batch_keys, disk_batch_qrs, disk_batch_slices, false,
+            scatter_completed_task);
+        t_io_done = std::chrono::steady_clock::now();
+        t_batch_get_return = t_io_done;
+        stop_callback_scatter_worker();
         const double io_duration =
-            std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                          io_start)
-                .count();
+            std::chrono::duration<double>(t_io_done - io_start).count();
         dfs_read_success =
             disk_results.size() == disk_batch_keys.size() &&
             std::all_of(disk_results.begin(), disk_results.end(),
-                        [](const auto &result) { return result.has_value(); });
+                        [](const auto& result) { return result.has_value(); });
         dfs_read_bytes = 0;
         if (disk_results.size() == disk_batch_keys.size()) {
             for (size_t i = 0; i < disk_results.size(); ++i) {
                 if (!disk_results[i]) continue;
                 auto slices_it = disk_batch_slices.find(disk_batch_keys[i]);
                 if (slices_it == disk_batch_slices.end()) continue;
-                for (const auto &slice : slices_it->second) {
+                for (const auto& slice : slices_it->second) {
                     dfs_read_bytes += slice.size;
                 }
             }
         }
-        t_io_done = std::chrono::steady_clock::now();
         client_->ObserveDirectIo(
             "read", DirectStorageMetricSource(ReplicaType::DFS),
-            dfs_read_success,
-            dfs_read_bytes, io_duration);
+            dfs_read_success, dfs_read_bytes, io_duration);
 
-        // Build key -> entry map for O(1) lookup
-        std::unordered_map<std::string, SessionRangeReadRequest *> entry_map;
-        for (auto *entry_ptr : entries) {
-            entry_map[entry_ptr->key] = entry_ptr;
-        }
-
-        // Build a copy plan before submitting any DMA. Destination pointers are
-        // resolved once, adjacent compatible ranges are merged, and operations
-        // are grouped by accelerator and physical device.
         for (size_t di = 0; di < disk_batch_keys.size(); ++di) {
-            const auto &key = disk_batch_keys[di];
-            auto handle_it = disk_temp_handles.find(key);
-            if (handle_it == disk_temp_handles.end()) {
-                continue;
-            }
-
-            // A short backend response is a failure for the missing entries;
-            // do not index past the returned vector.
+            auto* entry = disk_batch_entries[di];
             if (di >= disk_results.size()) {
-                auto map_it = entry_map.find(key);
-                if (map_it != entry_map.end()) {
-                    results[map_it->second->original_idx] =
-                        static_cast<int>(toInt(ErrorCode::INTERNAL_ERROR));
-                }
+                results[entry->original_idx] =
+                    static_cast<int>(toInt(ErrorCode::INTERNAL_ERROR));
                 continue;
             }
-
             if (!disk_results[di]) {
-                auto map_it = entry_map.find(key);
-                if (map_it != entry_map.end()) {
-                    results[map_it->second->original_idx] =
-                        static_cast<int>(toInt(disk_results[di].error()));
-                }
+                results[entry->original_idx] =
+                    static_cast<int>(toInt(disk_results[di].error()));
                 continue;
             }
 
-            auto map_it = entry_map.find(key);
-            if (map_it == entry_map.end()) {
+            std::optional<int> task_scatter_result;
+            {
+                std::lock_guard<std::mutex> lock(callback_scatter_mutex);
+                task_scatter_result = task_scatter_results[di];
+            }
+            if (task_scatter_result) {
+                results[entry->original_idx] = *task_scatter_result;
                 continue;
             }
-            SessionRangeReadRequest *entry = map_it->second;
-            std::shared_ptr<BufferHandle> handle = std::move(handle_it->second);
+
+            const auto& handle = disk_temp_handles[di];
             if (!valid_source_handle(entry, handle)) {
                 LOG(ERROR) << "DFS read buffer is smaller than the replica, "
                               "key: "
-                           << key;
+                           << entry->key;
                 results[entry->original_idx] =
                     static_cast<int>(toInt(ErrorCode::INTERNAL_ERROR));
                 continue;
@@ -6736,16 +6844,10 @@ void RealClient::execute_session_dfs_range_reads(
         }
     }
 
-    t_scatter_plan_done = std::chrono::steady_clock::now();
-    t_scatter_submit_start = t_scatter_plan_done;
     async_scatter.Submit();
-    t_scatter_submit_done = std::chrono::steady_clock::now();
-    t_scatter_sync_start = t_scatter_submit_done;
-    const bool scatter_succeeded = async_scatter.Synchronize();
-    t_scatter_sync_done = std::chrono::steady_clock::now();
-    const uint64_t scatter_ranges = async_scatter.original_range_count();
-    const uint64_t scatter_merged_ranges = async_scatter.merged_range_count();
+    async_scatter.Synchronize();
 
+    scatter_bytes += callback_scatter_bytes;
     for (const auto &pending : pending_scatter_results) {
         const size_t result_index = pending.entry->original_idx;
         if (async_scatter.EntryFailed(result_index)) {
@@ -6755,14 +6857,12 @@ void RealClient::execute_session_dfs_range_reads(
         }
         results[result_index] = static_cast<int>(pending.transferred);
     }
-    if (!scatter_succeeded) {
-        LOG(ERROR) << "One or more DFS H2D stream operations failed";
-    }
 
     // Inflight references are released only after explicit stream
     // synchronization, preserving the synchronous batch-get API contract.
     inflight_handles.clear();
-    const auto t_end = std::chrono::steady_clock::now();
+    t_scatter_done = std::chrono::steady_clock::now();
+    const auto t_end = t_scatter_done;
     auto elapsed_us = [](const auto &a, const auto &b) {
         return std::chrono::duration_cast<std::chrono::microseconds>(b - a)
             .count();
@@ -6772,14 +6872,6 @@ void RealClient::execute_session_dfs_range_reads(
         // so a slow stage can be attributed to bandwidth (bytes/us near the H2D
         // ceiling) or to overhead (many tiny ranges, few bytes).
         const uint64_t scatter_us = elapsed_us(t_io_done, t_end);
-        const uint64_t scatter_plan_us =
-            elapsed_us(t_io_done, t_scatter_plan_done);
-        const uint64_t scatter_submit_us =
-            elapsed_us(t_scatter_submit_start, t_scatter_submit_done);
-        const uint64_t scatter_sync_us =
-            elapsed_us(t_scatter_sync_start, t_scatter_sync_done);
-        const uint64_t scatter_finalize_us =
-            elapsed_us(t_scatter_sync_done, t_end);
         double scatter_gbps = 0.0;
         if (scatter_us > 0) {
             // bytes / us == MB/s; /1000 -> GB/s.
@@ -6806,26 +6898,12 @@ void RealClient::execute_session_dfs_range_reads(
             << ", dfs_read_success=" << dfs_read_success
             << ", dfs_read_bytes=" << dfs_read_bytes
             << ", dfs_requested_bytes=" << dfs_requested_bytes
-            << ", scatter_ranges=" << scatter_ranges
-            << ", scatter_merged_ranges=" << scatter_merged_ranges
             << ", scatter_bytes=" << scatter_bytes
             << ", read_amplification=" << read_amplification
-            << ", pointer_query_count=" << async_scatter.pointer_query_count()
-            << ", pointer_cache_hits=" << async_scatter.pointer_cache_hits()
-            << ", pointer_query_us=" << async_scatter.pointer_query_us()
-            << ", region_cache_hits=" << async_scatter.region_cache_hits()
-            << ", region_cache_misses=" << async_scatter.region_cache_misses()
-            << ", unregistered_pointer_queries="
-            << async_scatter.unregistered_pointer_queries()
-            << ", host_copy_ops=" << async_scatter.host_copy_ops()
-            << ", device_copy_ops=" << async_scatter.device_copy_ops()
-            << ", host_copy_ranges=" << async_scatter.host_copy_ranges()
-            << ", device_copy_ranges=" << async_scatter.device_copy_ranges()
-            << ", h2d_kernel_batches=" << async_scatter.h2d_kernel_batches()
-            << ", scatter_plan_us=" << scatter_plan_us
-            << ", scatter_submit_us=" << scatter_submit_us
-            << ", scatter_sync_us=" << scatter_sync_us
-            << ", scatter_finalize_us=" << scatter_finalize_us
+            << ", callback_scatter_tail_us="
+            << elapsed_us(t_batch_get_return, t_scatter_done)
+            << ", callback_scatter_queue_high_watermark="
+            << callback_scatter_queue_high_watermark
             << ", scatter_GBps=" << scatter_gbps;
     }
 }

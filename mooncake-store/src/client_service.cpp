@@ -1647,7 +1647,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<std::string>& object_keys,
     const std::vector<QueryResult>& query_results,
     std::unordered_map<std::string, std::vector<Slice>>& slices,
-    bool prefer_alloc_in_same_node) {
+    bool prefer_alloc_in_same_node,
+    DfsBatchReadCompletionCallback dfs_read_completion_callback) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         std::vector<tl::expected<void, ErrorCode>> results;
@@ -1730,7 +1731,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             }
             const auto& desc = replica.get_dfs_descriptor();
             dfs_read_requests.push_back(
-                DfsReadRequest{key, desc, slices_it->second});
+                DfsReadRequest{key, desc, slices_it->second, i});
             dfs_read_indices.push_back(i);
             continue;
         } else if (replica.is_nof_replica()) {
@@ -1766,7 +1767,49 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     }
 
     if (!dfs_read_requests.empty()) {
-        auto dfs_results = dfs_storage_backend_->BatchRead(dfs_read_requests);
+        const bool task_callback_enabled =
+            dfs_read_completion_callback != nullptr &&
+            dfs_storage_backend_->SupportsBatchReadTaskCompletionCallback();
+        std::vector<uint8_t> callback_processed(dfs_read_requests.size(), 0);
+        auto process_completed_task =
+            [&dfs_read_requests, &dfs_read_indices, &results,
+             &callback_processed,
+             &dfs_read_completion_callback](
+                const std::vector<uintptr_t>& user_cookies,
+                const std::vector<size_t>& request_indices,
+                const std::vector<tl::expected<void, ErrorCode>>& task_results) {
+                const size_t completed = std::min(
+                    {user_cookies.size(), request_indices.size(),
+                     task_results.size()});
+                std::vector<size_t> successful_indices;
+                successful_indices.reserve(completed);
+                for (size_t i = 0; i < completed; ++i) {
+                    const size_t request_index = request_indices[i];
+                    const size_t index = static_cast<size_t>(user_cookies[i]);
+                    if (request_index >= dfs_read_requests.size() ||
+                        index >= results.size()) {
+                        continue;
+                    }
+                    callback_processed[request_index] = 1;
+                    if (!task_results[i]) {
+                        results[index] =
+                            tl::unexpected(task_results[i].error());
+                        continue;
+                    }
+                    results[index] = {};
+                    successful_indices.push_back(index);
+                }
+                if (!successful_indices.empty()) {
+                    dfs_read_completion_callback(successful_indices);
+                }
+            };
+        DistributedStorageBackend::BatchReadTaskCompletionCallback
+            task_completion_callback;
+        if (task_callback_enabled) {
+            task_completion_callback = process_completed_task;
+        }
+        auto dfs_results = dfs_storage_backend_->BatchRead(
+            dfs_read_requests, std::move(task_completion_callback));
         if (dfs_results.size() != dfs_read_requests.size()) {
             LOG(ERROR) << "DFS BatchRead response size mismatch: expected "
                        << dfs_read_requests.size() << ", got "
@@ -1776,10 +1819,15 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             }
         } else {
             for (size_t i = 0; i < dfs_results.size(); ++i) {
+                if (callback_processed[i]) continue;
                 const size_t index = dfs_read_indices[i];
                 const auto& request = dfs_read_requests[i];
                 if (!dfs_results[i]) {
                     results[index] = tl::unexpected(dfs_results[i].error());
+                    continue;
+                }
+                if (task_callback_enabled) {
+                    results[index] = {};
                     continue;
                 }
                 auto checksum_result = VerifyObjectChecksum(

@@ -2,9 +2,11 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -87,6 +89,10 @@ struct DfsReadRequest {
     std::string key;
     DistributedFSDescriptor descriptor;
     std::vector<Slice> slices;
+    // Opaque tag echoed back via BatchReadTaskCompletionCallback so callers
+    // can correlate completions with their own bookkeeping without relying
+    // on the internal request-index ordering of the backend.
+    uintptr_t user_cookie = 0;
 };
 
 /**
@@ -129,8 +135,19 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::vector<tl::expected<void, ErrorCode>> BatchWrite(
         const std::vector<DfsWriteRequest>& requests);
 
+    using BatchReadTaskCompletionCallback = std::function<void(
+        const std::vector<uintptr_t>& user_cookies,
+        const std::vector<size_t>& request_indices,
+        const std::vector<tl::expected<void, ErrorCode>>& task_results)>;
+
     std::vector<tl::expected<void, ErrorCode>> BatchRead(
-        const std::vector<DfsReadRequest>& requests);
+        const std::vector<DfsReadRequest>& requests,
+        BatchReadTaskCompletionCallback task_completion_callback = nullptr);
+
+    bool SupportsBatchReadTaskCompletionCallback() const {
+        return IsBucketMode() && fs_adapter_ != nullptr &&
+               std::string_view(fs_adapter_->GetName()) == "posix";
+    }
 
     // Key-only storage backend operations cannot safely address DFS objects;
     // callers must use BatchRead/BatchWrite with request-scoped descriptors.
@@ -274,7 +291,8 @@ class DistributedStorageBackend : public StorageBackendInterface {
     void ExecuteReadTasks(
         const std::vector<ReadTask>& tasks,
         const std::vector<DfsReadRequest>& requests,
-        std::vector<tl::expected<void, ErrorCode>>& results);
+        std::vector<tl::expected<void, ErrorCode>>& results,
+        const BatchReadTaskCompletionCallback& task_completion_callback);
 
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
     std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
