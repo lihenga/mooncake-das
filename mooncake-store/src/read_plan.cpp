@@ -424,9 +424,29 @@ struct ReadPlan::Impl {
                     if (seen.insert(key).second) session.push_back(key);
             }
             reservation = std::make_unique<ActiveKeys>(client.get(), session);
+            const char *adaptive_source =
+                std::getenv("MOONCAKE_READ_PLAN_ADAPTIVE_SOURCE");
+            const bool adaptive = page_wise && adaptive_source &&
+                                  std::string(adaptive_source) == "1";
+            bool effective_page_wise = page_wise;
             {
                 started = true;
-                auto result = client->batch_get_session_start(session);
+                std::vector<int> result;
+                if (adaptive) {
+                    // Session start selects and pins one replica per key. Use
+                    // those actual sources instead of querying metadata again.
+                    auto [codes, sources] =
+                        client->batch_get_session_start_with_sources(session);
+                    result = std::move(codes);
+                    effective_page_wise =
+                        session.empty() || sources.size() != session.size() ||
+                        !std::all_of(sources.begin(), sources.end(),
+                                     [](const std::string &source) {
+                                         return source == "memory";
+                                     });
+                } else {
+                    result = client->batch_get_session_start(session);
+                }
                 if (result.size() != session.size() ||
                     std::any_of(result.begin(), result.end(),
                                 [](int x) { return x != 0; }))
@@ -436,7 +456,7 @@ struct ReadPlan::Impl {
             const char *enabled = std::getenv("MOONCAKE_READ_PLAN_PIPELINE");
             const bool requested = enabled && std::string(enabled) == "1";
             const bool pipeline =
-                requested && !reuse && !page_wise && groups > 1 &&
+                requested && !reuse && !effective_page_wise && groups > 1 &&
                 disjoint_groups();
             if (requested) {
                 static std::atomic<bool> logged_yes{false}, logged_no{false};
@@ -448,7 +468,7 @@ struct ReadPlan::Impl {
                         "keys=%zu\n",
                         int(pipeline), groups, session.size());
             }
-            if (page_wise) {
+            if (effective_page_wise) {
                 // One batch_get carries every group's ranges per key; readiness
                 // is published only after the single transfer succeeds.
                 auto r = build_all();
