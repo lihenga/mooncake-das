@@ -303,10 +303,35 @@ class PyClient {
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }
 
+    // Refresh leases for already-active get sessions without starting a new
+    // session or discarding its session-local object cache.
+    virtual std::vector<int> batch_get_session_refresh(
+        const std::vector<std::string> &keys) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
     virtual std::pair<std::vector<int>, std::vector<std::string>>
     batch_get_session_start_with_sources(const std::vector<std::string> &keys) {
         return {batch_get_session_start(keys),
                 std::vector<std::string>(keys.size(), "unknown")};
+    }
+
+    // Read DFS session objects into Mooncake's dedicated prefetch arena
+    // without copying them to caller buffers. Non-DFS keys succeed without
+    // preloading; a later batch_get_into_multi_buffer_ranges() call remains
+    // authoritative.
+    virtual std::vector<int> batch_get_session_prefetch(
+        const std::vector<std::string> &keys) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    // Whether batch_get_session_prefetch() has a staging arena for DFS reads.
+    virtual bool dfs_prefetch_arena_available() const { return false; }
+
+    virtual std::string dfs_prefetch_arena_status() const {
+        return "unsupported";
     }
 
     virtual void record_prefetched_tokens(uint64_t /*tokens*/) {}
