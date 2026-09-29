@@ -210,6 +210,13 @@ class ClientRequester {
 };
 
 // Python-specific wrapper class for client interface
+struct GetSessionStartResult {
+    std::vector<int> codes;
+    std::vector<std::string> sources;
+    // True only when every key successfully selected a MEMORY replica.
+    bool all_memory = false;
+};
+
 class PyClient {
    public:
     // Request-scoped cache of fresh batch_query() results that can be reused by
@@ -311,10 +318,17 @@ class PyClient {
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }
 
-    virtual std::pair<std::vector<int>, std::vector<std::string>>
+    virtual GetSessionStartResult
     batch_get_session_start_with_sources(const std::vector<std::string> &keys) {
         return {batch_get_session_start(keys),
-                std::vector<std::string>(keys.size(), "unknown")};
+                std::vector<std::string>(keys.size(), "unknown"), false};
+    }
+
+    // Inspect caller-owned get sessions without querying Master or changing
+    // their selected replicas and prefetched buffers.
+    virtual bool all_get_sessions_memory(
+        const std::vector<std::string> & /*keys*/) const {
+        return false;
     }
 
     // Read DFS session objects into Mooncake's dedicated prefetch arena
