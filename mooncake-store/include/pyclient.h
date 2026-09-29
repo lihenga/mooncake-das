@@ -209,6 +209,13 @@ class ClientRequester {
         const std::string &client_addr, Args &&...args);
 };
 
+struct GetSessionStartResult {
+    std::vector<int> codes;
+    std::vector<std::string> sources;
+    // True only when every requested key successfully selects MEMORY.
+    bool all_memory = false;
+};
+
 // Python-specific wrapper class for client interface
 class PyClient {
    public:
@@ -303,10 +310,10 @@ class PyClient {
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }
 
-    virtual std::pair<std::vector<int>, std::vector<std::string>>
+    virtual GetSessionStartResult
     batch_get_session_start_with_sources(const std::vector<std::string> &keys) {
         return {batch_get_session_start(keys),
-                std::vector<std::string>(keys.size(), "unknown")};
+                std::vector<std::string>(keys.size(), "unknown"), false};
     }
 
     virtual void record_prefetched_tokens(uint64_t /*tokens*/) {}

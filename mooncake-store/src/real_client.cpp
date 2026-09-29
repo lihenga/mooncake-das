@@ -6059,21 +6059,22 @@ std::vector<int> RealClient::batch_put_from_multi_buffers(
 
 std::vector<int> RealClient::batch_get_session_start(
     const std::vector<std::string> &keys) {
-    return batch_get_session_start_with_sources(keys).first;
+    return batch_get_session_start_with_sources(keys).codes;
 }
 
-std::pair<std::vector<int>, std::vector<std::string>>
+GetSessionStartResult
 RealClient::batch_get_session_start_with_sources(
     const std::vector<std::string> &keys) {
-    std::vector<int> results(
-        keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
-    std::vector<std::string> sources(keys.size(), "unknown");
+    GetSessionStartResult result{
+        std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS))),
+        std::vector<std::string>(keys.size(), "unknown"), false};
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
-        return {std::move(results), std::move(sources)};
+        return result;
     }
     if (keys.empty()) {
-        return {{}, {}};
+        return result;
     }
 
     // Master interaction only here: query replicas + lease.
@@ -6081,12 +6082,13 @@ RealClient::batch_get_session_start_with_sources(
     if (query_results.size() != keys.size()) {
         LOG(ERROR) << "Session query result size mismatch: expected="
                    << keys.size() << ", got=" << query_results.size();
-        return {std::vector<int>(keys.size(),
-                                 static_cast<int>(toInt(ErrorCode::RPC_FAIL))),
-                std::move(sources)};
+        result.codes.assign(keys.size(),
+                            static_cast<int>(toInt(ErrorCode::RPC_FAIL)));
+        return result;
     }
     auto local_endpoints = client_->GetLocalEndpoints();
     const bool record_access = client_->MetricsEnabled();
+    result.all_memory = true;
 
     std::lock_guard<std::mutex> lock(session_mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -6094,14 +6096,18 @@ RealClient::batch_get_session_start_with_sources(
             get_session_access_records_.erase(keys[i]);
         }
         if (!query_results[i]) {
-            results[i] = static_cast<int>(toInt(query_results[i].error()));
+            result.all_memory = false;
+            result.codes[i] =
+                static_cast<int>(toInt(query_results[i].error()));
             get_sessions_.erase(keys[i]);
             continue;
         }
 
         const auto &query_result = query_results[i].value();
         if (query_result.IsLeaseExpired()) {
-            results[i] = static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+            result.all_memory = false;
+            result.codes[i] =
+                static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
             get_sessions_.erase(keys[i]);
             continue;
         }
@@ -6109,21 +6115,24 @@ RealClient::batch_get_session_start_with_sources(
         const auto *replica =
             SelectSessionReplica(query_result.replicas, local_endpoints);
         if (!replica) {
+            result.all_memory = false;
             LOG(ERROR) << "No supported complete session replica for key: "
                        << keys[i];
-            results[i] = static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
+            result.codes[i] =
+                static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
             get_sessions_.erase(keys[i]);
             continue;
         }
+        result.all_memory &= replica->is_memory_replica();
 
         // QueryResult members are const: erase + emplace (no operator=).
         get_sessions_.erase(keys[i]);
         get_sessions_.emplace(keys[i],
                               FilterQueryResult(query_result, *replica));
-        sources[i] = DirectSourceForReplica(*replica);
-        results[i] = 0;
+        result.sources[i] = DirectSourceForReplica(*replica);
+        result.codes[i] = 0;
     }
-    return {std::move(results), std::move(sources)};
+    return result;
 }
 
 void RealClient::record_prefetched_tokens(uint64_t tokens) {

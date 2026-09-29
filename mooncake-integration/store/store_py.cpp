@@ -3080,7 +3080,10 @@ PYBIND11_MODULE(store, m) {
                                      std::vector<std::string>>{};
                 }
                 py::gil_scoped_release release;
-                return self.store_->batch_get_session_start_with_sources(keys);
+                auto result =
+                    self.store_->batch_get_session_start_with_sources(keys);
+                return std::make_pair(std::move(result.codes),
+                                      std::move(result.sources));
             },
             py::arg("keys"),
             "Start get sessions and return each result with its selected "

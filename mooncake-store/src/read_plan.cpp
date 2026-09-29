@@ -433,17 +433,10 @@ struct ReadPlan::Impl {
                 started = true;
                 std::vector<int> result;
                 if (adaptive) {
-                    // Session start selects and pins one replica per key. Use
-                    // those actual sources instead of querying metadata again.
-                    auto [codes, sources] =
+                    auto start =
                         client->batch_get_session_start_with_sources(session);
-                    result = std::move(codes);
-                    effective_page_wise =
-                        session.empty() || sources.size() != session.size() ||
-                        !std::all_of(sources.begin(), sources.end(),
-                                     [](const std::string &source) {
-                                         return source == "memory";
-                                     });
+                    result = std::move(start.codes);
+                    effective_page_wise = !start.all_memory;
                 } else {
                     result = client->batch_get_session_start(session);
                 }
