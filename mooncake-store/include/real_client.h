@@ -297,9 +297,12 @@ class RealClient : public PyClient {
     std::vector<int> batch_get_session_refresh(
         const std::vector<std::string> &keys) override;
 
-    std::pair<std::vector<int>, std::vector<std::string>>
+    GetSessionStartResult
     batch_get_session_start_with_sources(
         const std::vector<std::string> &keys) override;
+
+    bool all_get_sessions_memory(
+        const std::vector<std::string> &keys) const override;
 
     // Synchronously populate the prefetch buffer for DFS-backed active get
     // sessions. A successful DFS status means the complete buffered bytes
