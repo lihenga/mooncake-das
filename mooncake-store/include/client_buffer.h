@@ -61,6 +61,12 @@ class ClientBufferAllocator
     [[nodiscard]] std::optional<BufferHandle> allocate_aligned(
         size_t size, size_t alignment);
 
+    // Free space and a conservative lower bound of the largest free region
+    // (taken from the largest non-empty bin). All zero when the allocator has
+    // no backing buffer.
+    [[nodiscard]] offset_allocator::OffsetAllocStorageReport storageReport()
+        const;
+
    protected:
     // Constructors accessible to derived classes
     ClientBufferAllocator(void* addr, size_t size, const std::string& protocol,
