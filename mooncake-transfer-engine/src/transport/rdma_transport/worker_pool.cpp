@@ -466,6 +466,12 @@ WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
 #endif
 {
     collective_slice_queue_.resize(worker_count_);
+    keepalive_schedule_.resize(worker_count_);
+    keepalive_inbox_.resize(worker_count_);
+    keepalive_inbox_pending_ =
+        std::make_unique<std::atomic<bool>[]>(worker_count_);
+    for (int i = 0; i < worker_count_; ++i)
+        keepalive_inbox_pending_[i].store(false, std::memory_order_relaxed);
     for (int i = 0; i < worker_count_; ++i)
         worker_thread_.emplace_back(
             std::thread(std::bind(&WorkerPool::transferWorker, this, i)));
@@ -1088,6 +1094,9 @@ int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
     }
     if (nr_poll == 0) return 0;
 
+    // Failed keepalives are identified while qp_depth still pins the endpoint.
+    // After releasing it, deleteEndpointByPtr only compares these pointers.
+    std::vector<RdmaEndPoint *> failed_keepalives;
     int wr_retired = 0;
     const bool use_fifo = globalConfig().rdma_signal_interval > 1;
     std::vector<Transport::Slice *> drained;
@@ -1095,6 +1104,23 @@ int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
         Transport::Slice *completed = (Transport::Slice *)wc[i].wr_id;
         if (!completed) continue;
         assert(postingThreadForPeer(completed->peerNicPath()) == thread_id);
+        RdmaEndPoint *endpoint = completed->rdma.endpoint;
+        // Keepalives are not in posted_fifo_ and never complete a transfer.
+        // Inspect their endpoint-owned slice before releasing qp_depth.
+        if (endpoint && endpoint->isKeepaliveSlice(completed)) {
+            if (wc[i].status != IBV_WC_SUCCESS &&
+                wc[i].status != IBV_WC_WR_FLUSH_ERR) {
+                LOG(WARNING) << "RDMA keepalive to " << completed->peerNicPath()
+                             << " on " << context_.deviceName()
+                             << " failed: " << ibv_wc_status_str(wc[i].status)
+                             << " (vendor_err " << wc[i].vendor_err
+                             << "); retiring idle endpoint";
+                failed_keepalives.push_back(endpoint);
+            }
+            completed->rdma.qp_depth->fetch_sub(1, std::memory_order_acq_rel);
+            ++wr_retired;
+            continue;
+        }
         drained.clear();
         if (use_fifo && completed->rdma.endpoint) {
             const size_t n = completed->rdma.endpoint->collectPostedCompletions(
@@ -1127,6 +1153,9 @@ int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
     if (wr_retired)
         context_.cqOutstandingCount(cq_index)->fetch_sub(
             wr_retired, std::memory_order_acq_rel);
+
+    for (auto *endpoint : failed_keepalives)
+        context_.deleteEndpointByPtr(endpoint, /*pause_connect=*/false);
 
     if (!wc_list.empty())
         processCompletions(thread_id, wc_list, defer_local_redispatch);
@@ -1532,6 +1561,40 @@ bool WorkerPool::hasOutstandingCq(int thread_id) {
                std::memory_order_relaxed) > 0;
 }
 
+void WorkerPool::registerEndpointForKeepalive(
+    const std::shared_ptr<RdmaEndPoint> &endpoint,
+    const std::string &peer_nic_path) {
+    if (!endpoint || worker_count_ <= 0) return;
+    const int owner = postingThreadForPeer(peer_nic_path);
+    if (owner < 0 || owner >= worker_count_) return;
+    {
+        std::lock_guard<std::mutex> lock(worker_slice_queue_lock_[owner]);
+        keepalive_inbox_[owner].push_back(endpoint);
+    }
+    keepalive_inbox_pending_[owner].store(true, std::memory_order_release);
+}
+
+void WorkerPool::serviceKeepalives(int thread_id, uint64_t now_ns) {
+    const uint64_t idle_ns =
+        globalConfig().endpoint_idle_timeout_s * 1000000000ull;
+    if (!idle_ns) return;
+    auto &schedule = keepalive_schedule_[thread_id];
+    if (keepalive_inbox_pending_[thread_id].load(std::memory_order_acquire) &&
+        keepalive_inbox_pending_[thread_id].exchange(
+            false, std::memory_order_acq_rel)) {
+        std::vector<std::weak_ptr<RdmaEndPoint>> inbox;
+        {
+            std::lock_guard<std::mutex> lock(
+                worker_slice_queue_lock_[thread_id]);
+            inbox.swap(keepalive_inbox_[thread_id]);
+        }
+        for (auto &endpoint : inbox)
+            schedule.add(std::move(endpoint), now_ns + idle_ns);
+    }
+    schedule.service(now_ns, idle_ns,
+                     [](RdmaEndPoint &endpoint) { endpoint.postKeepalive(); });
+}
+
 void WorkerPool::transferWorker(int thread_id) {
     bindToSocket(numa_socket_id_);
     // Busy-poll this long after the pool goes idle before parking
@@ -1540,6 +1603,9 @@ void WorkerPool::transferWorker(int thread_id) {
         globalConfig().rdma_worker_idle_spin_us * 1000;
     uint64_t last_wait_ts = getCurrentTimeInNano();
     while (workers_running_.load(std::memory_order_relaxed)) {
+        // Before the idle check: a posted keepalive is an outstanding CQE, so
+        // the worker stays awake to poll its completion.
+        serviceKeepalives(thread_id, getCurrentTimeInNano());
         auto processed_slice_count =
             processed_slice_count_.load(std::memory_order_relaxed);
         auto submitted_slice_count =

@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <sstream>
 #include <strings.h>
 #include <unistd.h>
@@ -785,6 +786,18 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    if (const char* value = std::getenv("MC_ENDPOINT_IDLE_TIMEOUT")) {
+        const auto parsed = TryParseInteger<uint64_t>(value);
+        if (parsed.has_value() &&
+            *parsed <= std::numeric_limits<uint64_t>::max() / 1000000000ull) {
+            config.endpoint_idle_timeout_s = *parsed;
+        } else {
+            LOG(WARNING) << "Invalid MC_ENDPOINT_IDLE_TIMEOUT environment value: "
+                         << value << ", keeping default "
+                         << config.endpoint_idle_timeout_s;
+        }
+    }
+
     const char* endpoint_store_type_env = std::getenv("MC_ENDPOINT_STORE_TYPE");
     if (endpoint_store_type_env) {
         if (strcmp(endpoint_store_type_env, "FIFO") == 0) {
@@ -944,6 +957,7 @@ void dumpGlobalConfig() {
     LOG(INFO) << "max_cqe = " << config.max_cqe;
     LOG(INFO) << "max_ep_per_ctx = " << config.max_ep_per_ctx;
     LOG(INFO) << "num_qp_per_ep = " << config.num_qp_per_ep;
+    LOG(INFO) << "endpoint_idle_timeout_s = " << config.endpoint_idle_timeout_s;
     LOG(INFO) << "max_sge = " << config.max_sge;
     LOG(INFO) << "max_wr = " << config.max_wr;
     LOG(INFO) << "rdma_signal_interval = " << config.rdma_signal_interval;
