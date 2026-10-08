@@ -1,4 +1,5 @@
 #include "client_service.h"
+#include "store_trace.h"
 
 #include <boost/algorithm/string.hpp>
 #include <glog/logging.h>
@@ -469,6 +470,8 @@ class Client::DfsD2hStreamPool {
     std::unique_ptr<DfsD2hStreamLease> Acquire(
         const device::AcceleratorDevice* accelerator, int32_t device_id) {
         std::shared_ptr<DeviceState> state;
+        StoreTrace::Count("dfs_device", device_id);
+        StoreTrace::Mark("dfs_stream_map_lock");
         std::unique_lock<std::mutex> lock(mutex_);
         if (shutting_down_) return nullptr;
         const DeviceKey key{accelerator, device_id};
@@ -481,8 +484,19 @@ class Client::DfsD2hStreamPool {
         // Keep the map locked until the device state is leased. Shutdown can
         // then swap the map and wait for every active lease before destroying
         // a persistent stream.
+        const auto wait_started = std::chrono::steady_clock::now();
+        StoreTrace::Mark("dfs_stream_device_lock");
         std::unique_lock<std::mutex> state_lock(state->mutex);
+        const auto wait_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - wait_started)
+                .count();
+        if (wait_us >= 1000000) {
+            LOG(WARNING) << "Slow DFS D2H stream acquisition on device "
+                         << device_id << ": " << wait_us / 1000 << " ms";
+        }
         lock.unlock();
+        StoreTrace::Mark("dfs_stream_initialize");
         state->device->SetContext(state->device_id);
         if (!state->initialized) {
             state->initialized = true;
@@ -497,6 +511,7 @@ class Client::DfsD2hStreamPool {
         lease->stream = state->stream;
         lease->state = state;
         lease->lock = std::move(state_lock);
+        lease->acquire_wait_us = wait_us;
         return lease;
     }
 
@@ -565,6 +580,27 @@ Client::Client(const std::string& local_hostname,
       write_thread_pool_(2),
       task_thread_pool_(4) {
     LOG(INFO) << "client_id=" << client_id_;
+    if (StoreTrace::Enabled()) {
+        LOG(INFO) << "STORE_DIAGNOSTICS_CONFIG version=2 pid=" << getpid()
+                  << " owner=" << this << " client_id=" << client_id_
+                  << " endpoint=" << local_hostname_
+                  << " protocol=" << protocol_
+                  << " staging_limit=" << dfs_staging_budget_->limit
+                  << " checksum=" << object_checksum_enabled_
+                  << " copy_stream=default_flags completion=batch_event"
+                  << " watchdog_interval_s=2 stall_interval_s=5";
+        for (const char* name :
+             {"MC_STORE_MEMCPY", "MC_STORE_ENABLE_SESSION_CACHE",
+              "MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES",
+              "MC_STORE_DFS_PINNED_POOL_BYTES",
+              "MC_STORE_PREFETCH_ARENA_SIZE_BYTES",
+              "MOONCAKE_OFFLOAD_USE_URING", "SGLANG_ENABLE_WAR_BARRIER"}) {
+            const char* value = std::getenv(name);
+            LOG(INFO) << "STORE_DIAGNOSTICS_CONFIG owner=" << this
+                      << " env=" << name
+                      << " value=" << (value ? value : "unset");
+        }
+    }
     if (!host_id_.empty()) {
         LOG(INFO) << "client_id=" << client_id_ << ", host_id=" << host_id_;
     }
@@ -1385,9 +1421,15 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
 
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     const std::vector<std::string>& object_keys, const std::string& tenant_id) {
+    StoreTrace trace("batch_query", this, object_keys.size(),
+                     StoreTrace::CurrentId(), true, false);
+    trace.Keys(object_keys);
+    trace.Phase("master_query");
     std::chrono::steady_clock::time_point start_time =
         std::chrono::steady_clock::now();
     auto response = master_client_.BatchGetReplicaList(object_keys, tenant_id);
+    trace.Phase("build_query_results");
+    trace.Results(response);
 
     // Check if we got the expected number of responses
     if (response.size() != object_keys.size()) {
@@ -2291,25 +2333,37 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
+    StoreTrace trace("batch_upsert", this, keys.size());
+    trace.Keys(keys);
+    trace.Phase("attach_config");
     ReplicateConfig client_cfg = AttachConfig(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
+    trace.Phase("create_operations");
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
+    trace.Phase("checksum");
     ComputeBatchObjectChecksums(ops);
     if (client_cfg.prefer_alloc_in_same_node) {
         if (auto err = ValidatePreferSameNodeWriteConfig(client_cfg)) {
             return std::vector<tl::expected<void, ErrorCode>>(
                 keys.size(), tl::unexpected(*err));
         }
+        trace.Phase("master_start");
         StartBatchUpsert(ops, client_cfg);
+        trace.Phase("external_staging");
         StageWriteBuffersForRemoteReplicas(ops, stager);
-        return BatchWriteWhenPreferSameNode(ops, true);
+        auto results = BatchWriteWhenPreferSameNode(ops, true);
+        trace.Results(results);
+        return results;
     }
 
+    trace.Phase("master_start");
     StartBatchUpsert(ops, client_cfg);
+    trace.Phase("external_staging");
     StageWriteBuffersForRemoteReplicas(ops, stager);
     auto t0 = std::chrono::steady_clock::now();
+    trace.Phase("transfer_submit");
     SubmitTransfers(ops);
     WaitForTransfers(ops);
     // Upserts keep the synchronous DFS write path: FinalizeBatchUpsert settles
@@ -2324,8 +2378,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
         metrics_->transfer_metric.batch_put_latency_us.observe(us);
     }
 
+    trace.Phase("master_finalize");
     FinalizeBatchUpsert(ops);
-    return CollectResults(ops);
+    trace.Phase("collect_results");
+    auto results = CollectResults(ops);
+    trace.Results(results);
+    return results;
 }
 
 // TODO: `client.cpp` is too long, consider split it into multiple files
@@ -2724,6 +2782,23 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
 }
 
 void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
+    const auto wait_started = std::chrono::steady_clock::now();
+    size_t pending_count = 0;
+    size_t memcpy_count = 0, engine_count = 0, nof_count = 0;
+    for (const auto& op : ops) {
+        pending_count += op.pending_transfers.size();
+        for (const auto& pending : op.pending_transfers) {
+            auto strategy = pending.future.strategy();
+            memcpy_count += strategy == TransferStrategy::LOCAL_MEMCPY;
+            engine_count += strategy == TransferStrategy::TRANSFER_ENGINE;
+            nof_count += pending.replica_type == ReplicaType::NOF_SSD;
+        }
+    }
+    StoreTrace::Count("pending_transfers", pending_count);
+    StoreTrace::Count("memcpy_transfers", memcpy_count);
+    StoreTrace::Count("engine_transfers", engine_count);
+    StoreTrace::Count("nof_transfers", nof_count);
+    StoreTrace::Mark("replica_wait");
     for (auto& op : ops) {
         // Skip operations that already failed or completed
         if (op.IsResolved()) {
@@ -2750,6 +2825,14 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
                 << ", nof=" << op.transfer_summary.successful_nof_transfers
                 << "), fail(mem=" << op.transfer_summary.failed_memory_transfers
                 << ", nof=" << op.transfer_summary.failed_nof_transfers << ")";
+    }
+    const auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - wait_started)
+                             .count();
+    if (pending_count != 0 && wait_ms >= 1000) {
+        LOG(WARNING) << "Slow replica transfer wait: operations=" << ops.size()
+                     << ", transfers=" << pending_count
+                     << ", duration_ms=" << wait_ms;
     }
 }
 
@@ -2868,7 +2951,15 @@ Client::AsyncDfsWriteContext::~AsyncDfsWriteContext() {
         for (auto& lease : d2h_streams) {
             if (!lease->submitted || lease->stream == nullptr) continue;
             lease->device->SetContext(lease->device_id);
-            if (!lease->device->SynchronizeStream(lease->stream)) {
+            const bool synchronized =
+                lease->completion_event != nullptr
+                    ? lease->device->SynchronizeEvent(lease->completion_event)
+                    : lease->device->SynchronizeStream(lease->stream);
+            if (lease->completion_event != nullptr) {
+                lease->device->DestroyEvent(lease->completion_event);
+                lease->completion_event = nullptr;
+            }
+            if (!synchronized) {
                 LOG(ERROR) << "Failed to synchronize DFS D2H staging during "
                               "context cleanup";
             }
@@ -2879,6 +2970,7 @@ Client::AsyncDfsWriteContext::~AsyncDfsWriteContext() {
 
     // The arena returns only after every Slice view and background write is
     // done with it. Release the in-flight budget at the same lifetime edge.
+    if (write_trace) write_trace->Phase("release_arena");
     if (pinned_pool) pinned_pool->Release(std::move(arena));
     if (staging_budget && staging_bytes != 0) {
         std::lock_guard<std::mutex> lock(staging_budget->mutex);
@@ -2887,6 +2979,8 @@ Client::AsyncDfsWriteContext::~AsyncDfsWriteContext() {
         } else {
             staging_budget->in_use = 0;
         }
+        if (write_trace)
+            write_trace->Field("staging_after_release", staging_budget->in_use);
     }
 }
 
@@ -2924,20 +3018,26 @@ Client::DfsStageResult Client::StageDfsWriteData(
     }
 
     size_t reserved_bytes = PinnedBufferPool::SizeClass(arena_size);
+    StoreTrace::Count("dfs_arena_bytes", arena_size);
+    StoreTrace::Mark("dfs_budget_reserve");
     if (reserved_bytes == 0 || !context.staging_budget) {
         return DfsStageResult::kFailed;
     }
     {
         std::lock_guard<std::mutex> lock(context.staging_budget->mutex);
+        context.staging_budget_limit = context.staging_budget->limit;
+        context.staging_budget_in_use = context.staging_budget->in_use;
         if (reserved_bytes > context.staging_budget->limit -
                                  std::min(context.staging_budget->limit,
                                           context.staging_budget->in_use)) {
             return DfsStageResult::kCapacityExceeded;
         }
         context.staging_budget->in_use += reserved_bytes;
+        context.staging_budget_in_use = context.staging_budget->in_use;
         context.staging_bytes = reserved_bytes;
     }
 
+    StoreTrace::Mark("dfs_pinned_allocate");
     context.arena = context.pinned_pool->Acquire(arena_size);
     if (context.arena.data == nullptr) {
         LOG(ERROR) << "Failed to acquire async DFS write staging arena";
@@ -2964,6 +3064,7 @@ Client::DfsStageResult Client::StageDfsWriteData(
         reserved_bytes = context.arena.capacity;
         context.staging_bytes = reserved_bytes;
     }
+    StoreTrace::Mark("dfs_zero_arena");
     std::memset(context.arena.data, 0, arena_size);
 
     struct D2hTarget {
@@ -2986,6 +3087,7 @@ Client::DfsStageResult Client::StageDfsWriteData(
     // order before submitting any DMA. Stable ordering prevents two
     // multi-device BatchPut calls from deadlocking on opposite slice orders.
     std::vector<D2hTarget> targets;
+    StoreTrace::Mark("dfs_validate_and_query_devices");
     const bool can_submit_async = context.arena.pinned_host.addr != nullptr &&
                                   dfs_d2h_stream_pool_ != nullptr;
     for (size_t i = 0; i < slice_lists.size(); ++i) {
@@ -3021,9 +3123,15 @@ Client::DfsStageResult Client::StageDfsWriteData(
     for (const auto& target : targets) {
         auto lease =
             dfs_d2h_stream_pool_->Acquire(target.device, target.device_id);
-        if (lease) context.d2h_streams.push_back(std::move(lease));
+        if (lease) {
+            context.stream_wait_us += lease->acquire_wait_us;
+            context.d2h_streams.push_back(std::move(lease));
+        }
     }
 
+    StoreTrace::Mark("dfs_copy_submit");
+    const auto copies_started = std::chrono::steady_clock::now();
+    size_t host_bytes = 0, host_copies = 0;
     for (size_t i = 0; i < slice_lists.size(); ++i) {
         const auto& descriptor = context.descriptors[i];
         size_t offset = 0;
@@ -3070,11 +3178,18 @@ Client::DfsStageResult Client::StageDfsWriteData(
                     SynchronizeDfsWriteData(context);
                     return DfsStageResult::kFailed;
                 }
+                ++context.d2h_copy_count;
+                context.d2h_bytes += slice.size;
+                if (lease == nullptr || lease->stream == nullptr) {
+                    ++context.synchronous_d2h_copy_count;
+                }
             } else {
                 // The caller may free or overwrite host memory as soon as
                 // BatchPut returns, so copy it into the owned payload too.
                 std::memcpy(context.arena.data + offsets[i] + offset, slice.ptr,
                             slice.size);
+                host_bytes += slice.size;
+                ++host_copies;
             }
             offset += slice.size;
         }
@@ -3082,11 +3197,52 @@ Client::DfsStageResult Client::StageDfsWriteData(
             Slice{context.arena.data + offsets[i],
                   static_cast<size_t>(descriptor.aligned_size)});
     }
+    context.pinned_arena = context.arena.pinned_host.addr != nullptr;
+    StoreTrace::Count("dfs_host_bytes", host_bytes);
+    StoreTrace::Count("dfs_host_copies", host_copies);
+    StoreTrace::Count("dfs_copy_submit_us",
+                      std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() - copies_started)
+                          .count());
+    StoreTrace::Mark("dfs_record_completion_events");
+
+    // An event marks this batch's boundary on the persistent stream. Release
+    // the stream mutex as soon as the event is recorded so another BatchPut
+    // can submit D2H work while this one waits for MEMORY/NoF transfers.
+    for (auto& lease : context.d2h_streams) {
+        if (!lease->submitted || lease->stream == nullptr) continue;
+        lease->device->SetContext(lease->device_id);
+        void* event = nullptr;
+        if (lease->device->CreateEvent(&event) &&
+            lease->device->RecordEvent(event, lease->stream)) {
+            lease->completion_event = event;
+            ++context.completion_event_count;
+            lease->lock.unlock();
+            continue;
+        }
+        ++context.event_fallback_count;
+        if (event != nullptr) lease->device->DestroyEvent(event);
+        LOG(WARNING) << "Failed to record DFS D2H completion event on device "
+                     << lease->device_id
+                     << "; synchronizing the copy stream immediately";
+        if (!lease->device->SynchronizeStream(lease->stream)) {
+            LOG(ERROR) << "Failed to synchronize DFS D2H staging after event "
+                          "fallback on device "
+                       << lease->device_id;
+            return DfsStageResult::kFailed;
+        }
+        lease->submitted = false;
+        lease->lock.unlock();
+    }
+    context.d2h_synchronized =
+        std::none_of(context.d2h_streams.begin(), context.d2h_streams.end(),
+                     [](const auto& lease) { return lease->submitted; });
     if (context.d2h_synchronized) context.d2h_streams.clear();
     return DfsStageResult::kSuccess;
 }
 
 bool Client::SynchronizeDfsWriteData(AsyncDfsWriteContext& context) {
+    StoreTrace::Mark("dfs_d2h_sync");
     if (context.d2h_synchronized) {
         context.d2h_streams.clear();
         return true;
@@ -3096,7 +3252,25 @@ bool Client::SynchronizeDfsWriteData(AsyncDfsWriteContext& context) {
     for (auto& lease : context.d2h_streams) {
         if (!lease->submitted || lease->stream == nullptr) continue;
         lease->device->SetContext(lease->device_id);
-        if (!lease->device->SynchronizeStream(lease->stream)) {
+        const auto sync_started = std::chrono::steady_clock::now();
+        const bool synchronized =
+            lease->completion_event != nullptr
+                ? lease->device->SynchronizeEvent(lease->completion_event)
+                : lease->device->SynchronizeStream(lease->stream);
+        const auto sync_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - sync_started)
+                .count();
+        context.sync_us += sync_us;
+        if (lease->completion_event != nullptr) {
+            lease->device->DestroyEvent(lease->completion_event);
+            lease->completion_event = nullptr;
+        }
+        if (sync_us >= 1000000) {
+            LOG(WARNING) << "Slow DFS D2H completion on device "
+                         << lease->device_id << ": " << sync_us / 1000 << " ms";
+        }
+        if (!synchronized) {
             LOG(ERROR) << "Failed to synchronize DFS D2H staging on device "
                        << lease->device_id;
             succeeded = false;
@@ -3108,6 +3282,7 @@ bool Client::SynchronizeDfsWriteData(AsyncDfsWriteContext& context) {
 }
 
 void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
+    if (context->write_trace) context->write_trace->Phase("build_dfs_requests");
     std::vector<DfsWriteRequest> requests;
     requests.reserve(context->write_indices.size());
     for (const size_t i : context->write_indices) {
@@ -3119,6 +3294,7 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
     // Every request gets a definite outcome: a missing or short result vector is
     // treated as failure for the affected keys rather than silently ignored.
     std::vector<ErrorCode> outcomes(requests.size(), ErrorCode::INTERNAL_ERROR);
+    if (context->write_trace) context->write_trace->Phase("dfs_io");
     const auto write_started = std::chrono::steady_clock::now();
     auto results = context->backend->BatchWrite(requests);
     const double write_duration_seconds =
@@ -3143,10 +3319,17 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
     ObserveDirectIo("write", DirectStorageMetricSource(ReplicaType::DFS),
                     all_succeeded, successful_bytes,
                     write_duration_seconds);
+    const auto queue_wait_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            write_started - context->write_queued_at)
+            .count();
 
     // Report each key individually so one failure cannot revoke its neighbours.
     // The RPCs are idempotent on the master side, so a bounded retry is safe.
     constexpr int kMaxCompletionAttempts = 3;
+    if (context->write_trace) context->write_trace->Phase("dfs_completion_rpc");
+    const auto finalize_started = std::chrono::steady_clock::now();
+    size_t finalize_failures = 0;
     for (size_t i = 0; i < outcomes.size(); ++i) {
         const auto& key = context->keys[context->write_indices[i]];
         const bool succeeded = outcomes[i] == ErrorCode::OK;
@@ -3183,12 +3366,30 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
             }
         }
         if (!completion) {
+            ++finalize_failures;
             LOG(ERROR) << "Failed to finalize async DFS write for key " << key
                        << " (" << (succeeded ? "PutEnd" : "PutRevoke")
                        << "), error=" << toString(completion.error())
                        << "; the master will reclaim the PROCESSING replica via "
                           "its put-start timeout";
         }
+    }
+    const auto completed_at = std::chrono::steady_clock::now();
+    const auto finalize_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(completed_at -
+                                                              finalize_started)
+            .count();
+    if (context->write_trace) {
+        context->write_trace->Field("queue_wait_us", queue_wait_us);
+        context->write_trace->Field(
+            "write_us",
+            static_cast<int64_t>(write_duration_seconds * 1000000.0));
+        context->write_trace->Field("finalize_us", finalize_us);
+        context->write_trace->Field("successful_bytes", successful_bytes);
+        context->write_trace->Field("finalize_failures", finalize_failures);
+        context->write_trace->Result(
+            all_succeeded && finalize_failures == 0 ? "success" : "failed");
+        context->write_trace->Phase("arena_lifetime_tail");
     }
 }
 
@@ -3200,6 +3401,10 @@ std::shared_ptr<Client::AsyncDfsWriteContext> Client::PrepareAsyncDfsWrites(
     }
 
     auto context = std::make_shared<AsyncDfsWriteContext>();
+    context->parent_trace_id = StoreTrace::CurrentId();
+    context->trace_id =
+        dfs_trace_sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
+    context->prepare_started = std::chrono::steady_clock::now();
     context->backend = std::move(backend);
     context->pinned_pool = pinned_buffer_pool_;
     context->staging_budget = dfs_staging_budget_;
@@ -3232,7 +3437,12 @@ std::shared_ptr<Client::AsyncDfsWriteContext> Client::PrepareAsyncDfsWrites(
     }
 
     if (!context->keys.empty()) {
+        const auto stage_started = std::chrono::steady_clock::now();
         context->staging_result = StageDfsWriteData(*context, slice_lists);
+        context->stage_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - stage_started)
+                .count();
     }
     return context;
 }
@@ -3242,6 +3452,45 @@ void Client::SubmitDfsWrites(
     std::shared_ptr<AsyncDfsWriteContext> staged_context) {
     if (staged_context && !SynchronizeDfsWriteData(*staged_context)) {
         staged_context->staging_result = DfsStageResult::kFailed;
+    }
+    if (staged_context && !staged_context->keys.empty()) {
+        const char* result = "success";
+        if (staged_context->staging_result ==
+            DfsStageResult::kCapacityExceeded) {
+            result = "capacity_exceeded";
+        } else if (staged_context->staging_result == DfsStageResult::kFailed) {
+            result = "failed";
+        }
+        const auto total_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() -
+                staged_context->prepare_started)
+                .count();
+        if (auto* trace = StoreTrace::Current()) {
+            trace->Field("dfs_trace", staged_context->trace_id);
+            trace->Field("dfs_objects", staged_context->keys.size());
+            trace->Field("staging_bytes", staged_context->staging_bytes);
+            trace->Field("staging_in_use",
+                         staged_context->staging_budget_in_use);
+            trace->Field("staging_limit", staged_context->staging_budget_limit);
+            trace->Field("pinned_arena", staged_context->pinned_arena);
+            trace->Field("d2h_copies", staged_context->d2h_copy_count);
+            trace->Field("d2h_bytes", staged_context->d2h_bytes);
+            trace->Field("sync_d2h_copies",
+                         staged_context->synchronous_d2h_copy_count);
+            trace->Field("completion_events",
+                         staged_context->completion_event_count);
+            trace->Field("event_fallbacks",
+                         staged_context->event_fallback_count);
+            trace->Field("stream_device_wait_us",
+                         staged_context->stream_wait_us);
+            trace->Field("stage_us", staged_context->stage_us);
+            trace->Field("replica_wait_total_us",
+                         staged_context->replica_wait_us);
+            trace->Field("d2h_sync_total_us", staged_context->sync_us);
+            trace->Field("dfs_prepare_to_sync_us", total_us);
+            trace->Field("dfs_stage_result", result);
+        }
     }
 
     std::vector<std::string> keys;
@@ -3307,6 +3556,7 @@ void Client::SubmitDfsWrites(
     const bool async_write =
         allow_async && backend->GetAllocatorType() == DfsAllocatorType::BUCKET;
     auto write_synchronously = [&]() {
+        StoreTrace::Mark("dfs_synchronous_fallback");
         auto results = WriteDfsReplicas(keys, slice_lists, descriptors);
         for (size_t i = 0; i < results.size(); ++i) {
             auto& op = ops[op_indices[i]];
@@ -3343,6 +3593,10 @@ void Client::SubmitDfsWrites(
         if (op_indices.empty()) return;
     } else {
         context = std::make_shared<AsyncDfsWriteContext>();
+        context->parent_trace_id = StoreTrace::CurrentId();
+        context->trace_id =
+            dfs_trace_sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
+        context->write_queued_at = std::chrono::steady_clock::now();
         context->keys = keys;
         context->descriptors = descriptors;
         context->backend = std::move(backend);
@@ -3360,12 +3614,14 @@ void Client::SubmitDfsWrites(
     }
 
     if (context->staging_result == DfsStageResult::kCapacityExceeded) {
+        StoreTrace::Count("dfs_capacity_fallback", 1);
         LOG(WARNING) << "Async DFS staging limit reached; writing "
                      << op_indices.size() << " objects synchronously";
         write_synchronously();
         return;
     }
     if (context->staging_result != DfsStageResult::kSuccess) {
+        StoreTrace::Count("dfs_staging_failed", 1);
         for (const size_t index : op_indices) {
             auto& op = ops[index];
             op.transfer_summary.RecordFailure(ReplicaType::DFS,
@@ -3398,12 +3654,27 @@ void Client::SubmitDfsWrites(
     };
 
     try {
+        StoreTrace::Mark("dfs_enqueue");
+        if (StoreTrace::Enabled()) {
+            context->write_trace = std::make_shared<StoreTrace>(
+                "dfs_background_write", this, context->write_indices.size(),
+                context->parent_trace_id, false);
+            context->write_trace->Field("dfs_trace", context->trace_id);
+            context->write_trace->Field("staging_bytes",
+                                        context->staging_bytes);
+            context->write_trace->Phase("dfs_queue");
+        }
+        context->write_queued_at = std::chrono::steady_clock::now();
         write_thread_pool_.enqueue([this, context, release_inflight]() {
             try {
                 RunAsyncDfsWrite(context);
             } catch (const std::exception& e) {
+                if (context->write_trace)
+                    context->write_trace->Result("exception");
                 LOG(ERROR) << "Async DFS write task threw: " << e.what();
             } catch (...) {
+                if (context->write_trace)
+                    context->write_trace->Result("exception");
                 LOG(ERROR) << "Async DFS write task threw an unknown exception";
             }
             release_inflight();
@@ -3432,11 +3703,14 @@ void Client::SubmitDfsWrites(
 }
 
 void Client::DrainAsyncDfsWrites() {
+    StoreTrace trace("dfs_shutdown", this, 0);
+    trace.Phase("dfs_drain");
     dfs_writes_shutting_down_.store(true, std::memory_order_release);
     std::unique_lock<std::mutex> lock(dfs_inflight_mutex_);
     // Wait for tasks that still use master_client_ / dfs_storage_backend_ so
     // they cannot outlive the Client and access freed state.
     dfs_inflight_cv_.wait(lock, [this] { return dfs_inflight_writes_ == 0; });
+    trace.Result("success");
 }
 
 void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
@@ -3829,6 +4103,7 @@ void Client::StageWriteBuffersForRemoteReplicas(
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
     std::vector<PutOperation>& ops, bool is_upsert) {
+    StoreTrace::Mark("same_node_merge_and_submit");
     auto t0 = std::chrono::steady_clock::now();
     std::unordered_map<std::string, PutOperation> seg_to_ops{};
     for (auto& op : ops) {
@@ -3895,7 +4170,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
     if (!is_upsert) {
         dfs_context = PrepareAsyncDfsWrites(ops);
     }
+    const auto replica_wait_started = std::chrono::steady_clock::now();
     WaitForTransfers(merged_ops);
+    if (dfs_context) {
+        dfs_context->replica_wait_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - replica_wait_started)
+                .count();
+    }
     for (auto& op : merged_ops) {
         auto& memory_descriptor = op.replicas[0].get_memory_descriptor();
         auto& buffer_descriptor = memory_descriptor.buffer_descriptor;
@@ -3921,6 +4203,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
             seg_to_ops.at(seg).transfer_summary.first_error;
         op.failure_context = seg_to_ops.at(seg).failure_context;
     }
+    StoreTrace::Mark("dfs_submit");
     // Puts may write asynchronously in bucket mode.
     SubmitDfsWrites(ops, /*is_upsert=*/false, /*allow_async=*/true,
                     std::move(dfs_context));
@@ -3930,6 +4213,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
     if (metrics_) {
         metrics_->transfer_metric.batch_put_latency_us.observe(us);
     }
+    StoreTrace::Mark("master_finalize");
     if (is_upsert) {
         FinalizeBatchUpsert(ops);
     } else {
@@ -3949,28 +4233,62 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
+    StoreTrace trace("batch_put", this, keys.size());
+    trace.Keys(keys);
+    trace.Field("stager", bool(stager));
+    trace.Phase("attach_config");
     ReplicateConfig client_cfg = AttachConfig(config);
+    trace.Field("same_node", client_cfg.prefer_alloc_in_same_node);
+    trace.Field("requested_mem", client_cfg.replica_num);
+    trace.Field("requested_dfs", client_cfg.dfs_replica_num);
+    trace.Field("requested_nof", client_cfg.nof_replica_num);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
+    trace.Phase("create_operations");
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
+    size_t bytes = 0, slices = 0;
+    for (const auto& object : batched_slices) {
+        slices += object.size();
+        for (const auto& slice : object) bytes += slice.size;
+    }
+    trace.Field("bytes", bytes);
+    trace.Field("slices", slices);
+    trace.Phase("checksum");
     ComputeBatchObjectChecksums(ops);
     if (client_cfg.prefer_alloc_in_same_node) {
         if (auto err = ValidatePreferSameNodeWriteConfig(client_cfg)) {
+            trace.Result("invalid_config");
             return std::vector<tl::expected<void, ErrorCode>>(
                 keys.size(), tl::unexpected(*err));
         }
+        trace.Phase("master_start");
         StartBatchPut(ops, client_cfg);
+        trace.Phase("external_staging");
         StageWriteBuffersForRemoteReplicas(ops, stager);
-        return BatchWriteWhenPreferSameNode(ops, false);
+        auto results = BatchWriteWhenPreferSameNode(ops, false);
+        trace.Results(results);
+        return results;
     }
+    trace.Phase("master_start");
     StartBatchPut(ops, client_cfg);
+    trace.Phase("external_staging");
     StageWriteBuffersForRemoteReplicas(ops, stager);
 
     auto t0 = std::chrono::steady_clock::now();
+    trace.Phase("transfer_submit");
     SubmitTransfers(ops);
+    trace.Phase("dfs_prepare");
     auto dfs_context = PrepareAsyncDfsWrites(ops);
+    const auto replica_wait_started = std::chrono::steady_clock::now();
     WaitForTransfers(ops);
+    if (dfs_context) {
+        dfs_context->replica_wait_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - replica_wait_started)
+                .count();
+    }
+    trace.Phase("dfs_submit");
     SubmitDfsWrites(ops, /*is_upsert=*/false, /*allow_async=*/true,
                     std::move(dfs_context));
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -3980,8 +4298,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         metrics_->transfer_metric.batch_put_latency_us.observe(us);
     }
 
+    trace.Phase("master_finalize");
     FinalizeBatchPut(ops);
-    return CollectResults(ops);
+    trace.Phase("collect_results");
+    auto results = CollectResults(ops);
+    trace.Results(results);
+    return results;
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
@@ -4416,7 +4738,13 @@ tl::expected<bool, ErrorCode> Client::IsExist(const std::string& key) {
 
 std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
     const std::vector<std::string>& keys) {
+    StoreTrace trace("batch_exists", this, keys.size(), StoreTrace::CurrentId(),
+                     true, false);
+    trace.Keys(keys);
+    trace.Phase("master_exists");
     auto response = master_client_.BatchExistKey(keys);
+    trace.Phase("validate_response");
+    trace.Results(response);
 
     // Check if we got the expected number of responses
     if (response.size() != keys.size()) {

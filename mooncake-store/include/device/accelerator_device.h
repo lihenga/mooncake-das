@@ -100,6 +100,20 @@ class AcceleratorDevice {
         return true;
     }
     virtual void DestroyStream(void* stream) const { (void)stream; }
+    virtual bool CreateEvent(void** event) const {
+        (void)event;
+        return false;
+    }
+    virtual bool RecordEvent(void* event, void* stream) const {
+        (void)event;
+        (void)stream;
+        return false;
+    }
+    virtual bool SynchronizeEvent(void* event) const {
+        (void)event;
+        return false;
+    }
+    virtual void DestroyEvent(void* event) const { (void)event; }
     virtual PinnedHostBuffer AllocatePinnedHost(size_t size) const = 0;
 
     // Allocate host memory with a device-visible mapping when supported. This

@@ -1,4 +1,5 @@
 #include "transfer_task.h"
+#include "store_trace.h"
 
 #include <glog/logging.h>
 
@@ -621,6 +622,10 @@ MemcpyWorkerPool::~MemcpyWorkerPool() {
 }
 
 void MemcpyWorkerPool::submitTask(MemcpyTask task) {
+    if (StoreTrace::Enabled()) {
+        task.parent_trace = StoreTrace::CurrentId();
+        task.queued_at = StoreTrace::Clock::now();
+    }
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         if (shutdown_.load()) {
@@ -636,6 +641,7 @@ void MemcpyWorkerPool::submitTask(MemcpyTask task) {
 
 void MemcpyWorkerPool::workerThread() {
     VLOG(2) << "MemcpyWorkerPool worker thread started";
+    auto last_queue_report = StoreTrace::Clock::time_point{};
 
     while (true) {
         MemcpyTask task({}, nullptr);
@@ -659,11 +665,28 @@ void MemcpyWorkerPool::workerThread() {
 
         // Execute the task if we have one
         if (task.state) {
+            StoreTrace trace("local_memcpy", this, task.operations.size(),
+                             task.parent_trace, true, false);
+            const auto queue_us =
+                StoreTrace::Enabled()
+                    ? std::chrono::duration_cast<std::chrono::microseconds>(
+                          StoreTrace::Clock::now() - task.queued_at)
+                          .count()
+                    : 0;
+            trace.Field("queue_us", queue_us);
+            if (queue_us >= 100000 &&
+                StoreTrace::Clock::now() - last_queue_report >=
+                    std::chrono::seconds(1)) {
+                trace.ForceSummary();
+                last_queue_report = StoreTrace::Clock::now();
+            }
             try {
                 bool ok = true;
+                size_t gpu_copies = 0, bytes = 0;
                 auto runtime_accelerator =
                     device::GetAcceleratorRegistry().RuntimeAccelerators();
                 for (const auto& op : task.operations) {
+                    trace.Phase("pointer_query");
                     device::PointerInfo src_info;
                     device::PointerInfo dst_info;
                     auto* src_device = runtime_accelerator.FindDeviceForPointer(
@@ -672,6 +695,7 @@ void MemcpyWorkerPool::workerThread() {
                         op.dest, &dst_info);
 
                     if (!src_device && !dst_device) {
+                        trace.Phase("host_copy");
                         std::memcpy(op.dest, op.src, op.size);
                     } else {
                         if (src_device && dst_device &&
@@ -701,7 +725,9 @@ void MemcpyWorkerPool::workerThread() {
                             device_id = dst_info.device_id;
                             direction = device::CopyDirection::kHostToDevice;
                         }
+                        trace.Phase("context_set");
                         accelerator->SetContext(device_id);
+                        trace.Phase("synchronous_gpu_copy");
                         if (!accelerator->Copy(op.dest, op.src, op.size,
                                                direction)) {
                             LOG(ERROR) << "GPU memcpy failed: src_dev="
@@ -711,8 +737,14 @@ void MemcpyWorkerPool::workerThread() {
                             ok = false;
                             break;
                         }
+                        ++gpu_copies;
                     }
+                    bytes += op.size;
                 }
+                trace.Field("gpu_copies", gpu_copies);
+                trace.Field("bytes", bytes);
+                trace.Result(ok ? "success" : "failed");
+                if (!ok) trace.ForceSummary();
 
                 VLOG(2) << "Memcpy task completed with "
                         << task.operations.size() << " operations"
@@ -720,6 +752,8 @@ void MemcpyWorkerPool::workerThread() {
                 task.state->set_completed(ok ? ErrorCode::OK
                                              : ErrorCode::TRANSFER_FAIL);
             } catch (const std::exception& e) {
+                trace.Result("exception");
+                trace.ForceSummary();
                 LOG(ERROR) << "Exception during async memcpy: " << e.what();
                 task.state->set_completed(ErrorCode::TRANSFER_FAIL);
             }

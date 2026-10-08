@@ -2,6 +2,7 @@
 #include "pinned_host_buffer.h"
 
 #include "cuda_alike.h"
+#include <glog/logging.h>
 
 #include <cstdint>
 #include <cstdlib>
@@ -19,6 +20,14 @@ namespace device {
 namespace {
 
 void FreeHipPinnedHostBuffer(void* addr) { hipHostFree(addr); }
+
+bool CheckHipResult(hipError_t result, const char *api) {
+    if (result == hipSuccess) return true;
+    LOG(ERROR) << "STORE_GPU_ERROR backend=hip api=" << api
+               << " error=" << static_cast<int>(result)
+               << " message=" << hipGetErrorString(result);
+    return false;
+}
 
 class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
    public:
@@ -48,7 +57,8 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
     }
 
     void SetContext(int32_t device_id) const override {
-        if (device_id >= 0) hipSetDevice(device_id);
+        if (device_id >= 0)
+            CheckHipResult(hipSetDevice(device_id), "hipSetDevice");
     }
 
     bool Copy(void* dst, const void* src, size_t size,
@@ -69,19 +79,23 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
                 kind = hipMemcpyDefault;
                 break;
         }
-        return hipMemcpy(dst, src, size, kind) == hipSuccess;
+        return CheckHipResult(hipMemcpy(dst, src, size, kind), "hipMemcpy");
     }
 
     bool CopyFromHostAsync(void* dst, const void* src, size_t size,
                            void* stream) const override {
-        return hipMemcpyAsync(dst, src, size, hipMemcpyHostToDevice,
-                              static_cast<hipStream_t>(stream)) == hipSuccess;
+        return CheckHipResult(
+            hipMemcpyAsync(dst, src, size, hipMemcpyHostToDevice,
+                           static_cast<hipStream_t>(stream)),
+            "hipMemcpyAsync_H2D");
     }
 
     bool CopyToHostAsync(void *dst, const void *src, size_t size,
                          void *stream) const override {
-        return hipMemcpyAsync(dst, src, size, hipMemcpyDeviceToHost,
-                              static_cast<hipStream_t>(stream)) == hipSuccess;
+        return CheckHipResult(
+            hipMemcpyAsync(dst, src, size, hipMemcpyDeviceToHost,
+                           static_cast<hipStream_t>(stream)),
+            "hipMemcpyAsync_D2H");
     }
 
 #if defined(USE_HYGON)
@@ -172,7 +186,7 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
 
     bool CreateStream(void** stream) const override {
         hipStream_t hip_stream = nullptr;
-        if (hipStreamCreate(&hip_stream) != hipSuccess) {
+        if (!CheckHipResult(hipStreamCreate(&hip_stream), "hipStreamCreate")) {
             hipGetLastError();
             return false;
         }
@@ -182,7 +196,8 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
 
     bool SynchronizeStream(void* stream) const override {
         const auto hip_stream = static_cast<hipStream_t>(stream);
-        const bool success = hipStreamSynchronize(hip_stream) == hipSuccess;
+        const bool success = CheckHipResult(hipStreamSynchronize(hip_stream),
+                                            "hipStreamSynchronize");
 #if defined(USE_HYGON)
         // Synchronization establishes that the kernel no longer dereferences
         // the mapped descriptor array. Free it even when the stream reports a
@@ -207,9 +222,37 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
         hipStreamDestroy(static_cast<hipStream_t>(stream));
     }
 
+    bool CreateEvent(void **event) const override {
+        hipEvent_t hip_event = nullptr;
+        if (!CheckHipResult(
+                hipEventCreateWithFlags(&hip_event, hipEventDisableTiming),
+                "hipEventCreateWithFlags")) {
+            hipGetLastError();
+            return false;
+        }
+        *event = static_cast<void *>(hip_event);
+        return true;
+    }
+
+    bool RecordEvent(void *event, void *stream) const override {
+        return CheckHipResult(hipEventRecord(static_cast<hipEvent_t>(event),
+                                             static_cast<hipStream_t>(stream)),
+                              "hipEventRecord");
+    }
+
+    bool SynchronizeEvent(void *event) const override {
+        return CheckHipResult(
+            hipEventSynchronize(static_cast<hipEvent_t>(event)),
+            "hipEventSynchronize");
+    }
+
+    void DestroyEvent(void *event) const override {
+        hipEventDestroy(static_cast<hipEvent_t>(event));
+    }
+
     PinnedHostBuffer AllocatePinnedHost(size_t size) const override {
         void* addr = nullptr;
-        if (hipHostMalloc(&addr, size, 0) != hipSuccess) {
+        if (!CheckHipResult(hipHostMalloc(&addr, size, 0), "hipHostMalloc")) {
             hipGetLastError();
             return PinnedHostBuffer();
         }

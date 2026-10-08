@@ -6,6 +6,7 @@
 #include "pinned_host_buffer.h"
 
 #include "cuda_alike.h"
+#include <glog/logging.h>
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
     defined(USE_COREX) || (defined(USE_HYGON) && !defined(USE_HIP))
@@ -18,6 +19,14 @@ void EnsureCudaLikeAcceleratorDeviceLinked() {}
 namespace {
 
 void FreeCudaLikePinnedHostBuffer(void* addr) { cudaFreeHost(addr); }
+
+bool CheckCudaLikeResult(cudaError_t result, const char* api) {
+    if (result == cudaSuccess) return true;
+    LOG(ERROR) << "STORE_GPU_ERROR backend=cuda_like api=" << api
+               << " error=" << static_cast<int>(result)
+               << " message=" << cudaGetErrorString(result);
+    return false;
+}
 
 class CudaLikeAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
    public:
@@ -48,7 +57,8 @@ class CudaLikeAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
     }
 
     void SetContext(int32_t device_id) const override {
-        if (device_id >= 0) cudaSetDevice(device_id);
+        if (device_id >= 0)
+            CheckCudaLikeResult(cudaSetDevice(device_id), "cudaSetDevice");
     }
 
     bool Copy(void* dst, const void* src, size_t size,
@@ -69,26 +79,30 @@ class CudaLikeAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
                 kind = cudaMemcpyDefault;
                 break;
         }
-        return cudaMemcpy(dst, src, size, kind) == cudaSuccess;
+        return CheckCudaLikeResult(cudaMemcpy(dst, src, size, kind),
+                                   "cudaMemcpy");
     }
 
     bool CopyFromHostAsync(void* dst, const void* src, size_t size,
                            void* stream) const override {
-        return cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice,
-                               static_cast<cudaStream_t>(stream)) ==
-               cudaSuccess;
+        return CheckCudaLikeResult(
+            cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice,
+                            static_cast<cudaStream_t>(stream)),
+            "cudaMemcpyAsync_H2D");
     }
 
     bool CopyToHostAsync(void* dst, const void* src, size_t size,
                          void* stream) const override {
-        return cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToHost,
-                               static_cast<cudaStream_t>(stream)) ==
-               cudaSuccess;
+        return CheckCudaLikeResult(
+            cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToHost,
+                            static_cast<cudaStream_t>(stream)),
+            "cudaMemcpyAsync_D2H");
     }
 
     bool CreateStream(void** stream) const override {
         cudaStream_t cuda_stream = nullptr;
-        if (cudaStreamCreate(&cuda_stream) != cudaSuccess) {
+        if (!CheckCudaLikeResult(cudaStreamCreate(&cuda_stream),
+                                 "cudaStreamCreate")) {
             cudaGetLastError();
             return false;
         }
@@ -97,17 +111,48 @@ class CudaLikeAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
     }
 
     bool SynchronizeStream(void* stream) const override {
-        return cudaStreamSynchronize(static_cast<cudaStream_t>(stream)) ==
-               cudaSuccess;
+        return CheckCudaLikeResult(
+            cudaStreamSynchronize(static_cast<cudaStream_t>(stream)),
+            "cudaStreamSynchronize");
     }
 
     void DestroyStream(void* stream) const override {
         cudaStreamDestroy(static_cast<cudaStream_t>(stream));
     }
 
+    bool CreateEvent(void** event) const override {
+        cudaEvent_t cuda_event = nullptr;
+        if (!CheckCudaLikeResult(
+                cudaEventCreateWithFlags(&cuda_event, cudaEventDisableTiming),
+                "cudaEventCreateWithFlags")) {
+            cudaGetLastError();
+            return false;
+        }
+        *event = static_cast<void*>(cuda_event);
+        return true;
+    }
+
+    bool RecordEvent(void* event, void* stream) const override {
+        return CheckCudaLikeResult(
+            cudaEventRecord(static_cast<cudaEvent_t>(event),
+                            static_cast<cudaStream_t>(stream)),
+            "cudaEventRecord");
+    }
+
+    bool SynchronizeEvent(void* event) const override {
+        return CheckCudaLikeResult(
+            cudaEventSynchronize(static_cast<cudaEvent_t>(event)),
+            "cudaEventSynchronize");
+    }
+
+    void DestroyEvent(void* event) const override {
+        cudaEventDestroy(static_cast<cudaEvent_t>(event));
+    }
+
     PinnedHostBuffer AllocatePinnedHost(size_t size) const override {
         void* addr = nullptr;
-        if (cudaMallocHost(&addr, size) != cudaSuccess) {
+        if (!CheckCudaLikeResult(cudaMallocHost(&addr, size),
+                                 "cudaMallocHost")) {
             cudaGetLastError();
             return PinnedHostBuffer();
         }

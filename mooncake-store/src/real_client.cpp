@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "real_client.h"
+#include "store_trace.h"
 #include "scatter_utils.h"
 #include "registered_pinned_memory.h"
 #include "client_buffer.h"
@@ -281,6 +282,7 @@ std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
+    StoreTrace::Mark("build_nested_slices");
     auto batched_slices =
         BuildNestedSlicesFromBuffers(keys, all_buffers, all_sizes);
     if (!batched_slices) {
@@ -296,6 +298,7 @@ std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
             return StageWriteSlices(allocator, slices, staging_handles);
         };
     }
+    StoreTrace::Mark("native_write");
     return ((*client).*write)(keys, batched_slices.value(), config, stager);
 }
 
@@ -6123,11 +6126,16 @@ std::vector<int> RealClient::batch_put_from_multi_buffers(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &sizes,
     const ReplicateConfig &config, bool stage_nonlocal) {
+    StoreTrace trace("real_batch_put", client_.get(), keys.size());
+    trace.Keys(keys);
+    trace.Field("stage_nonlocal", stage_nonlocal);
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<void, ErrorCode>>>(
             [&]() {
-                return batch_put_from_multi_buffers_internal(
+                auto results = batch_put_from_multi_buffers_internal(
                     keys, all_buffers, sizes, config, stage_nonlocal);
+                trace.Phase("operation_metrics");
+                return results;
             },
             [](const auto &) { return true; },
             [&](uint64_t latency_us, const auto &ret) {
@@ -6141,6 +6149,8 @@ std::vector<int> RealClient::batch_put_from_multi_buffers(
                     "batch_put_from_multi_buffers",
                     sum_successful_nested_sizes(py_results, sizes), latency_us);
             });
+    trace.Phase("python_result_conversion");
+    trace.Results(internal_results);
     return ToPyResults(internal_results);
 }
 
@@ -6152,6 +6162,9 @@ std::vector<int> RealClient::batch_get_session_start(
 GetSessionStartResult
 RealClient::batch_get_session_start_with_sources(
     const std::vector<std::string> &keys) {
+    StoreTrace trace("get_session_start", client_.get(), keys.size());
+    trace.Keys(keys);
+    trace.Phase("initialize_results");
     GetSessionStartResult result{
         std::vector<int>(
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS))),
@@ -6163,6 +6176,7 @@ RealClient::batch_get_session_start_with_sources(
     if (keys.empty()) return result;
 
     // Master interaction only here: query replicas + lease.
+    trace.Phase("session_master_query");
     const auto query_results = client_->BatchQuery(keys);
     if (query_results.size() != keys.size()) {
         LOG(ERROR) << "Session query result size mismatch: expected="
@@ -6177,7 +6191,9 @@ RealClient::batch_get_session_start_with_sources(
 
     std::vector<std::shared_ptr<BufferHandle>> detached_prefetch_buffers;
     detached_prefetch_buffers.reserve(keys.size());
+    trace.Phase("session_lock");
     std::lock_guard<std::mutex> lock(session_mutex_);
+    trace.Phase("session_build");
     for (size_t i = 0; i < keys.size(); ++i) {
         if (record_access) {
             get_session_access_records_.erase(keys[i]);
@@ -6223,6 +6239,7 @@ RealClient::batch_get_session_start_with_sources(
         result.sources[i] = DirectSourceForReplica(*replica);
         result.codes[i] = 0;
     }
+    trace.Codes(result.codes);
     return result;
 }
 
@@ -6942,6 +6959,9 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
     const std::vector<std::vector<size_t>> &all_src_offsets) {
+    StoreTrace trace("get_session_ranges", client_.get(), keys.size());
+    trace.Keys(keys);
+    trace.Phase("validate_arguments");
     std::vector<int> results(
         keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     if (!validate_session_range_batch_arguments(keys, all_buffers, all_sizes,
@@ -6956,10 +6976,16 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         dfs_read_trace_enabled() ? NextDfsReadTraceId() : uint64_t{0};
     context.record_access = client_->MetricsEnabled();
 
+    trace.Phase("prepare_read_plan");
     auto requests = prepare_session_range_read_requests(
         keys, all_buffers, all_sizes, all_src_offsets, results, context);
+    trace.Phase("classify_read_plan");
     auto plan =
         classify_session_range_read_requests(std::move(requests), results);
+    trace.Field("memory_reads", plan.memory_requests.size());
+    trace.Field("dfs_reads", plan.dfs_requests.size());
+    trace.Field("local_disk_reads", plan.local_disk_requests.size());
+    trace.Phase("session_memory_read");
     execute_session_memory_range_reads(plan.memory_requests, results);
     context.memory_done = std::chrono::steady_clock::now();
     std::unordered_map<std::string, std::vector<NonMemReadEntry *>>
@@ -6969,14 +6995,18 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
             request.replica.get_local_disk_descriptor().transport_endpoint;
         local_disk_by_endpoint[endpoint].push_back(&request);
     }
+    trace.Phase("session_local_disk_read");
     process_session_local_disk_reads(local_disk_by_endpoint, results);
+    trace.Phase("session_dfs_read_and_scatter");
     execute_session_dfs_range_reads(plan.dfs_requests, results,
                                     context.trace_id);
+    trace.Phase("record_access");
     record_session_range_accesses(keys, all_buffers, all_sizes, all_src_offsets,
                                   results, context);
     context.access_done = std::chrono::steady_clock::now();
     trace_session_range_reads(keys, all_sizes, plan.memory_requests.size(),
                               plan.dfs_requests.size(), context);
+    trace.Codes(results);
     return results;
 }
 
@@ -7101,6 +7131,7 @@ void RealClient::process_session_disk_dfs_reads(
 void RealClient::execute_session_dfs_range_reads(
     std::vector<SessionRangeReadRequest> &requests, std::vector<int> &results,
     uint64_t trace_id, bool prefetch_only) {
+    StoreTrace::Mark("dfs_read_lifecycle_lock");
     if (requests.empty()) {
         return;
     }
@@ -7121,6 +7152,7 @@ void RealClient::execute_session_dfs_range_reads(
         return;
     }
 
+    StoreTrace::Mark("dfs_read_cache_lookup");
     const auto timing_start = std::chrono::steady_clock::now();
     const bool trace_enabled = trace_id != 0;
     const size_t input_entries = entries.size();
@@ -7282,6 +7314,7 @@ void RealClient::execute_session_dfs_range_reads(
     }
     entries = std::move(miss_entries);
     const auto t_cache_hit_done = std::chrono::steady_clock::now();
+    StoreTrace::Mark("dfs_read_allocate");
 
     // 2. Cache miss: allocate + BatchGet
     std::vector<std::string> disk_batch_keys;
@@ -7420,6 +7453,7 @@ void RealClient::execute_session_dfs_range_reads(
     // then the scatter. Splitting alloc from read tells a slow
     // alloc_batch_get_us apart: allocation churn vs actual disk I/O.
     const auto t_alloc_done = std::chrono::steady_clock::now();
+    StoreTrace::Mark("dfs_read_io");
 
     if (disk_batch_keys.empty()) {
         // An empty batch is a successful no-op unless arena construction had
@@ -7511,12 +7545,14 @@ void RealClient::execute_session_dfs_range_reads(
     }
 
     t_scatter_plan_done = std::chrono::steady_clock::now();
+    StoreTrace::Mark("dfs_scatter_submit");
     t_scatter_submit_start = t_scatter_plan_done;
     bool scatter_succeeded = true;
     if (!prefetch_only) {
         async_scatter.Submit();
         t_scatter_submit_done = std::chrono::steady_clock::now();
         t_scatter_sync_start = t_scatter_submit_done;
+        StoreTrace::Mark("dfs_scatter_sync");
         scatter_succeeded = async_scatter.Synchronize();
         t_scatter_sync_done = std::chrono::steady_clock::now();
     } else {
@@ -7544,6 +7580,7 @@ void RealClient::execute_session_dfs_range_reads(
 
     // Inflight references are released only after explicit stream
     // synchronization, preserving the synchronous batch-get API contract.
+    StoreTrace::Mark("dfs_read_release_buffers");
     inflight_handles.clear();
     const auto t_end = std::chrono::steady_clock::now();
     auto elapsed_us = [](const auto &a, const auto &b) {

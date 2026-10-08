@@ -312,6 +312,8 @@ struct MemcpyOperation {
 struct MemcpyTask {
     std::vector<MemcpyOperation> operations;
     std::shared_ptr<MemcpyOperationState> state;
+    uint64_t parent_trace{0};
+    std::chrono::steady_clock::time_point queued_at{};
 
     MemcpyTask(std::vector<MemcpyOperation> ops,
                std::shared_ptr<MemcpyOperationState> s)
