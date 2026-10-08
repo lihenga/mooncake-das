@@ -348,7 +348,7 @@ class WrappedMasterService {
 
     std::vector<tl::expected<void, ErrorCode>> BatchInvalidateDfsBuckets(
         const UUID& client_id,
-        const std::vector<DfsMissingFileReport>& reports,
+        const std::vector<DfsMissingBucketReport>& reports,
         const std::string& tenant_id);
 
     bool KvEventsEnabled() const;

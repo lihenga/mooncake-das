@@ -5994,7 +5994,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchEvictDiskReplica(
 
 std::vector<tl::expected<void, ErrorCode>>
 MasterService::BatchInvalidateDfsBuckets(
-    const UUID& client_id, const std::vector<DfsMissingFileReport>& reports,
+    const UUID& client_id, const std::vector<DfsMissingBucketReport>& reports,
     const TenantId& tenant_id) {
     (void)client_id;
     assert(tenant_id.IsValid());
@@ -6008,45 +6008,12 @@ MasterService::BatchInvalidateDfsBuckets(
 
     std::unordered_set<int64_t> bucket_ids;
     for (const auto& report : reports) {
-        const auto& descriptor = report.descriptor;
-        bool matched = false;
-        if (!report.key.empty() && descriptor.shard_idx >= 0) {
-            const size_t shard_idx =
-                getMetadataShardIndex(tenant_id, report.key);
-            std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
-            SharedMutexLocker shard_lock(&metadata_shards_[shard_idx].mutex);
-            auto tenant_it = metadata_shards_[shard_idx].tenants.find(tenant_id);
-            if (tenant_it != metadata_shards_[shard_idx].tenants.end()) {
-                auto metadata_it = tenant_it->second.metadata.find(report.key);
-                if (metadata_it != tenant_it->second.metadata.end()) {
-                    matched = metadata_it->second.HasReplica(
-                        [&](const Replica& replica) {
-                            if (!replica.is_dfs_replica() ||
-                                !replica.is_completed()) {
-                                return false;
-                            }
-                            const auto& current =
-                                replica.get_dfs_descriptor();
-                            return current.file_path == descriptor.file_path &&
-                                   current.offset == descriptor.offset &&
-                                   current.object_size ==
-                                       descriptor.object_size &&
-                                   current.aligned_size ==
-                                       descriptor.aligned_size &&
-                                   current.shard_idx == descriptor.shard_idx;
-                        });
-                }
-            }
-        }
-        if (!matched) {
+        if (report.bucket_id < 0 ||
+            !bucket_allocator_->HasBucket(report.bucket_id)) {
             results.emplace_back(tl::make_unexpected(ErrorCode::INVALID_PARAMS));
             continue;
         }
-        if (!bucket_allocator_->HasBucket(descriptor.shard_idx)) {
-            results.emplace_back(tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-            continue;
-        }
-        bucket_ids.insert(descriptor.shard_idx);
+        bucket_ids.insert(report.bucket_id);
         results.emplace_back();
     }
 

@@ -1320,7 +1320,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::EvictDiskReplica(
 std::vector<tl::expected<void, ErrorCode>>
 WrappedMasterService::BatchInvalidateDfsBuckets(
     const UUID& client_id,
-    const std::vector<DfsMissingFileReport>& reports,
+    const std::vector<DfsMissingBucketReport>& reports,
     const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "BatchInvalidateDfsBuckets");
     timer.LogRequest("client_id=", client_id,

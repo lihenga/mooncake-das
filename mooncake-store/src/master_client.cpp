@@ -1376,7 +1376,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchEvictDiskReplica(
 
 std::vector<tl::expected<void, ErrorCode>>
 MasterClient::BatchInvalidateDfsBuckets(
-    const std::vector<DfsMissingFileReport>& reports) {
+    const std::vector<DfsMissingBucketReport>& reports) {
     ScopedVLogTimer timer(1, "MasterClient::BatchInvalidateDfsBuckets");
     timer.LogRequest("report_count=", reports.size());
     auto results = invoke_batch_rpc<

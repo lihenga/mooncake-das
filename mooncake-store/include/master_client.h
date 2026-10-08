@@ -690,7 +690,7 @@ class MasterClient {
 
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>>
     BatchInvalidateDfsBuckets(
-        const std::vector<DfsMissingFileReport>& reports);
+        const std::vector<DfsMissingBucketReport>& reports);
 
    private:
     /**

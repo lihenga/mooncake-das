@@ -636,7 +636,8 @@ class MasterService {
         const TenantId& tenant_id, ReplicaType replica_type);
 
     std::vector<tl::expected<void, ErrorCode>> BatchInvalidateDfsBuckets(
-        const UUID& client_id, const std::vector<DfsMissingFileReport>& reports,
+        const UUID& client_id,
+        const std::vector<DfsMissingBucketReport>& reports,
         const TenantId& tenant_id);
 
     /**
