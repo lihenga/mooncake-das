@@ -86,6 +86,13 @@ struct HttpSegmentsDetailResponse {
 };
 YLT_REFL(HttpSegmentsDetailResponse, total_segments);
 
+struct HttpMemoryUsageResponse {
+    uint64_t used_bytes{0};
+    uint64_t available_bytes{0};
+    uint64_t capacity_bytes{0};
+};
+YLT_REFL(HttpMemoryUsageResponse, used_bytes, available_bytes, capacity_bytes);
+
 std::string WriteTenantQuotaPolicyForTest(
     const std::map<std::string, uint64_t>& tenant_quotas) {
     TenantQuotaPolicySnapshot snapshot;
@@ -830,6 +837,18 @@ TEST_F(MasterAdminServerWithServiceTest, GetSegmentsDetailReturnsDetailedInfo) {
     EXPECT_NE(resp.body.find("\"allocator_used_bytes\""), std::string::npos);
     EXPECT_NE(resp.body.find("\"allocator_capacity_bytes\""),
               std::string::npos);
+}
+
+TEST_F(MasterAdminServerWithServiceTest, MemoryUsageReturnsClusterDramUsage) {
+    auto resp = HttpGet("/memory_usage");
+    ASSERT_EQ(resp.http_status, 200);
+
+    HttpMemoryUsageResponse parsed;
+    struct_json::from_json(parsed, resp.body);
+    EXPECT_GT(parsed.used_bytes, 0u);
+    EXPECT_EQ(parsed.capacity_bytes, segment_.size);
+    EXPECT_EQ(parsed.available_bytes,
+              parsed.capacity_bytes - parsed.used_bytes);
 }
 
 // -----------------------------------------------------------------------

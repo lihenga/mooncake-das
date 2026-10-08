@@ -754,6 +754,13 @@ struct HttpSegmentsDetailResponse {
 };
 YLT_REFL(HttpSegmentsDetailResponse, total_segments, segments);
 
+struct HttpMemoryUsageResponse {
+    uint64_t used_bytes{0};
+    uint64_t available_bytes{0};
+    uint64_t capacity_bytes{0};
+};
+YLT_REFL(HttpMemoryUsageResponse, used_bytes, available_bytes, capacity_bytes);
+
 void MasterAdminServer::HandleGetSegmentsDetail(
     coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
     WithActiveService(resp, [&](auto service) {
@@ -794,6 +801,21 @@ void MasterAdminServer::HandleGetSegmentsDetail(
                     : 0.0;
             payload.segments.push_back(std::move(item));
         }
+        WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+    });
+}
+
+void MasterAdminServer::HandleMemoryUsage(
+    coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
+    WithActiveService(resp, [&](auto service) {
+        const auto usage = service->GetStorageUsageSnapshot().memory;
+        HttpMemoryUsageResponse payload;
+        payload.used_bytes = usage.used_bytes;
+        payload.capacity_bytes = usage.capacity_bytes;
+        payload.available_bytes =
+            usage.used_bytes < usage.capacity_bytes
+                ? usage.capacity_bytes - usage.used_bytes
+                : 0;
         WriteJsonResponse(resp, coro_http::status_type::ok, payload);
     });
 }
@@ -1344,6 +1366,11 @@ void MasterAdminServer::RegisterHandler() {
         "/get_segments_detail",
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleGetSegmentsDetail(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/memory_usage",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleMemoryUsage(req, resp);
         });
 
     http_server_.set_http_handler<GET>(

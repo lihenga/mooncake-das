@@ -82,6 +82,8 @@ class MasterAdminServer {
                               coro_http::coro_http_response& resp);
     void HandleGetSegmentsDetail(coro_http::coro_http_request& req,
                                  coro_http::coro_http_response& resp);
+    void HandleMemoryUsage(coro_http::coro_http_request& req,
+                           coro_http::coro_http_response& resp);
     void HandleQuerySegment(coro_http::coro_http_request& req,
                             coro_http::coro_http_response& resp);
     void HandleCreateDrainJob(coro_http::coro_http_request& req,
