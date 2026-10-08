@@ -1812,19 +1812,19 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 }
                 results[index] = {};
             }
-            std::sort(
-                missing_bucket_reports.begin(), missing_bucket_reports.end(),
-                [](const auto& lhs, const auto& rhs) {
-                    return lhs.bucket_id < rhs.bucket_id;
-                });
-            missing_bucket_reports.erase(
-                std::unique(missing_bucket_reports.begin(),
-                            missing_bucket_reports.end(),
-                            [](const auto& lhs, const auto& rhs) {
-                                return lhs.bucket_id == rhs.bucket_id;
-                            }),
-                missing_bucket_reports.end());
             if (!missing_bucket_reports.empty()) {
+                std::sort(
+                    missing_bucket_reports.begin(), missing_bucket_reports.end(),
+                    [](const auto& lhs, const auto& rhs) {
+                        return lhs.bucket_id < rhs.bucket_id;
+                    });
+                missing_bucket_reports.erase(
+                    std::unique(missing_bucket_reports.begin(),
+                                missing_bucket_reports.end(),
+                                [](const auto& lhs, const auto& rhs) {
+                                    return lhs.bucket_id == rhs.bucket_id;
+                                }),
+                    missing_bucket_reports.end());
                 const auto invalidation_results =
                     master_client_.BatchInvalidateDfsBuckets(
                         missing_bucket_reports);
