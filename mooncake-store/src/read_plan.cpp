@@ -11,6 +11,7 @@
 #include <tuple>
 #include <vector>
 #include "read_plan.h"
+#include "session_diagnostics.h"
 #include <set>
 #include <thread>
 #include <atomic>
@@ -281,12 +282,24 @@ struct ReadPlan::Impl {
         for (size_t k = 0; k < results.size(); ++k) {
             size_t expected = 0;
             for (auto s : r.sizes[k]) expected = checked_add(expected, s);
-            if (results[k] < 0 || size_t(results[k]) != expected)
+            if (results[k] < 0 || size_t(results[k]) != expected) {
+                size_t failed_keys = 0;
+                for (int rc : results) failed_keys += rc < 0;
+                LOG(INFO) << "KV_READ_PLAN_FAILURE op_id="
+                          << KVSessionDiagnosticBatch::CurrentId()
+                          << " client=" << client.get() << " group=" << group
+                          << " key_index=" << k
+                          << " key_hash=" << KVSessionKeyHash(r.keys[k])
+                          << " rc=" << results[k] << " expected=" << expected
+                          << " result_keys=" << results.size()
+                          << " failed_keys=" << failed_keys
+                          << " borrowed_sessions=" << borrowed_sessions;
                 throw std::runtime_error(
                     "Mooncake read plan range get failed at group=" +
                     std::to_string(group) + " key_index=" + std::to_string(k) +
                     " rc=" + std::to_string(results[k]) +
                     " expected=" + std::to_string(expected));
+            }
             bytes += expected;
         }
         ++stats[0];
@@ -410,6 +423,10 @@ struct ReadPlan::Impl {
     }
 
     void run_impl() {
+        KVSessionDiagnosticBatch diagnostic("read_plan", client.get(), 0);
+        diagnostic.Field("groups", groups);
+        diagnostic.Field("borrowed_sessions", borrowed_sessions);
+        diagnostic.Field("requested_page_wise", page_wise);
         {
             std::lock_guard lock(mutex);
             if (running) throw std::runtime_error("plan may only run once");
@@ -426,6 +443,7 @@ struct ReadPlan::Impl {
                     if (seen.insert(key).second) session.push_back(key);
             }
             reservation = std::make_unique<ActiveKeys>(client.get(), session);
+            diagnostic.Field("unique_keys", session.size());
             const char *adaptive_source =
                 std::getenv("MOONCAKE_READ_PLAN_ADAPTIVE_SOURCE");
             const bool adaptive = page_wise && adaptive_source &&
@@ -458,6 +476,8 @@ struct ReadPlan::Impl {
             const bool pipeline =
                 requested && !reuse && !effective_page_wise && groups > 1 &&
                 disjoint_groups();
+            diagnostic.Field("effective_page_wise", effective_page_wise);
+            diagnostic.Field("pipeline", pipeline);
             if (requested) {
                 static std::atomic<bool> logged_yes{false}, logged_no{false};
                 auto &logged = pipeline ? logged_yes : logged_no;
@@ -524,6 +544,7 @@ struct ReadPlan::Impl {
             }
         }
         reservation.reset();
+        diagnostic.Field("result", error ? "exception" : "success");
         finish(error);
         if (error) std::rethrow_exception(error);
     }

@@ -250,3 +250,66 @@ ib_write_bw -d [rdma_device] -R -x gdr [server_ip]
 Expected Output:
 Successful bidirectional transfer with "BW peak" reported
 Errors with -x gdr indicate GDR setup failures
+
+## Diagnosing KV read-session expiry and missing sessions
+
+Build and install the Mooncake Store Python module from the diagnostic branch.
+Verify the loaded module path and build revision before collecting logs; an
+older binary does not contain these events. Diagnostic logging is always on:
+no environment variable or startup override is needed. It logs operation
+begin/end summaries, successful lifecycle events and per-key failures. Each
+operation retains at most 64 normal and 64 failure events; `omitted_events`
+reports truncation. This is a diagnostic build, not a throughput baseline:
+logging adds overhead.
+Keep the workload, dispatch settings, lease TTL and P/D waiting timeout unchanged
+for the first reproduction. Do not extend timeouts at the same time as deploying
+this diagnostic build: that makes the comparison ambiguous.
+
+The new log markers are `KV_SESSION_BEGIN`, `KV_SESSION_EVENT`, `KV_SESSION_END`,
+`KV_SESSION_ARGUMENT_ERROR` and `KV_READ_PLAN_FAILURE`. Collect the full Prefill,
+Decode, router, master and benchmark logs, including startup. Record the Mooncake
+and SGLang commits, loaded shared-library paths, nodes, input/output lengths,
+concurrency and all environment overrides. There are no SGLang modifications in
+this branch: request IDs, Python reference counts, bootstrap-room propagation
+and P/D abort acknowledgements require separate SGLang instrumentation.
+
+### Correlating events
+
+- Correlate `key_hash` across processes (stable FNV-1a, not Python's randomized
+  `hash`). No key strings, KV payloads or prompt contents are logged.
+- Within one process, use `client`, `op_id`, `parent_id` and the worker/rank log
+  identity. Operation IDs and diagnostic generations are **not** global IDs.
+  Pipeline worker threads do not inherit the parent operation ID; correlate
+  their keys and timestamps instead. The existing DFS `trace_id` is included in
+  the range summary as `dfs_trace_id` to connect storage timing with read results.
+- Failure events include `session_exists`, `generation`, `age_ms`,
+  `since_refresh_ms`, `lease_remaining_ms`, `prefetch_cached`,
+  `since_mutation_ms`, `last_mutation_op` and `last_event`. Events are buffered
+  until the session mutex is released; use `observed_mono_us` for their original
+  observation order within a process, not the log emission timestamp.
+  Lease durations use the local monotonic
+  clock; do not subtract monotonic timestamps from different machines.
+- The diagnostic history retains at most 65,536 keys per client, independently
+  of actual sessions. `history_known=0` means the history is unavailable, **not**
+  that no session ever existed. `history_evictions` reports the bounded history's
+  evictions. Generations are diagnostic labels and do not alter API semantics.
+
+### Distinguishing failure causes
+
+`rc=-707` with `reason=range_lease_expired` means the range reader locally found
+an expired lease and retired its session. A subsequent `rc=-600` with
+`reason=range_session_missing`, the same key hash and
+`last_event=range_lease_expired` shows a read after that retirement without a
+recorded successful restart. This supports the stale-session-reuse hypothesis;
+Python reference-count logs are still needed to prove the upstream cause.
+
+Other reasons separate `range_shape_mismatch`, `range_overflow` (including range
+index, offset, size and replica limit), explicit session end, concurrent session
+changes during refresh, and expiry before/after prefetch I/O. Do not classify
+every `-600` as session expiry. Range-result events also report errors returned
+by the actual I/O path after admission.
+
+Check whether the failed Prefill request's `bootstrap_room` is promptly failed
+and released on Decode, or only released by its waiting timeout. Mooncake's
+read-session lease and SGLang's Decode waiting timeout are separate mechanisms.
+This patch does not renew leases, retry reads, modify scheduling, or fix the bug.

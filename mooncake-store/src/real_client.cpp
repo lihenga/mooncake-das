@@ -6152,6 +6152,7 @@ std::vector<int> RealClient::batch_get_session_start(
 GetSessionStartResult
 RealClient::batch_get_session_start_with_sources(
     const std::vector<std::string> &keys) {
+    KVSessionDiagnosticBatch diagnostic("start", this, keys.size());
     GetSessionStartResult result{
         std::vector<int>(
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS))),
@@ -6163,7 +6164,12 @@ RealClient::batch_get_session_start_with_sources(
     if (keys.empty()) return result;
 
     // Master interaction only here: query replicas + lease.
+    const auto query_started = std::chrono::steady_clock::now();
     const auto query_results = client_->BatchQuery(keys);
+    diagnostic.Field("master_query_us",
+                     std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - query_started)
+                         .count());
     if (query_results.size() != keys.size()) {
         LOG(ERROR) << "Session query result size mismatch: expected="
                    << keys.size() << ", got=" << query_results.size();
@@ -6190,6 +6196,10 @@ RealClient::batch_get_session_start_with_sources(
             result.all_memory = false;
             result.codes[i] =
                 static_cast<int>(toInt(query_results[i].error()));
+            get_session_diagnostics_.Observe(
+                diagnostic, keys[i], i, "retire", result.codes[i],
+                get_sessions_.count(keys[i]) != 0, {}, false, "unknown",
+                "start_master_query_failed");
             get_sessions_.erase(keys[i]);
             continue;
         }
@@ -6199,6 +6209,10 @@ RealClient::batch_get_session_start_with_sources(
             result.all_memory = false;
             result.codes[i] =
                 static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+            get_session_diagnostics_.Observe(
+                diagnostic, keys[i], i, "retire", result.codes[i],
+                get_sessions_.count(keys[i]) != 0, query_result.lease_timeout,
+                false, "unknown", "start_query_already_expired");
             get_sessions_.erase(keys[i]);
             continue;
         }
@@ -6211,17 +6225,26 @@ RealClient::batch_get_session_start_with_sources(
                        << keys[i];
             result.codes[i] =
                 static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
+            get_session_diagnostics_.Observe(
+                diagnostic, keys[i], i, "retire", result.codes[i],
+                get_sessions_.count(keys[i]) != 0, query_result.lease_timeout,
+                false, "unknown", "start_no_supported_replica");
             get_sessions_.erase(keys[i]);
             continue;
         }
         result.all_memory &= replica->is_memory_replica();
 
         // QueryResult members are const: erase + emplace (no operator=).
+        const bool replaced_existing = get_sessions_.count(keys[i]) != 0;
         get_sessions_.erase(keys[i]);
         get_sessions_.emplace(keys[i],
                               FilterQueryResult(query_result, *replica));
         result.sources[i] = DirectSourceForReplica(*replica);
         result.codes[i] = 0;
+        get_session_diagnostics_.Observe(
+            diagnostic, keys[i], i, "start", 0, true,
+            query_result.lease_timeout, false, result.sources[i],
+            replaced_existing ? "replaced_existing_session" : "new_session");
     }
     return result;
 }
@@ -6243,6 +6266,7 @@ bool RealClient::all_get_sessions_memory(
 
 std::vector<int> RealClient::batch_get_session_refresh(
     const std::vector<std::string> &keys) {
+    KVSessionDiagnosticBatch diagnostic("refresh", this, keys.size());
     std::vector<int> results(
         keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     if (!client_) {
@@ -6276,6 +6300,10 @@ std::vector<int> RealClient::batch_get_session_refresh(
 
             auto session_it = get_sessions_.find(keys[i]);
             if (session_it == get_sessions_.end()) {
+                get_session_diagnostics_.Observe(
+                    diagnostic, keys[i], i, "refresh_skip", results[i], false,
+                    {}, get_session_prefetch_cache_.count(keys[i]) != 0,
+                    "unknown", "refresh_session_missing");
                 // Do not leave an orphaned pinned object if the session was
                 // already retired by a concurrent expiry/end path.
                 DetachPrefetchedSessionBuffer(
@@ -6296,6 +6324,7 @@ std::vector<int> RealClient::batch_get_session_refresh(
         // Unlike batch_get_session_start, this fresh metadata query is only
         // committed after checking that the existing session is unchanged.
         const auto fresh_queries = client_->BatchQuery(query_keys);
+        diagnostic.Field("queried_keys", query_keys.size());
         const auto local_endpoints = client_->GetLocalEndpoints();
         for (size_t i = 0; i < pending.size(); ++i) {
             const auto &entry = pending[i];
@@ -6332,6 +6361,17 @@ std::vector<int> RealClient::batch_get_session_refresh(
                 // Never erase or overwrite that newer session.
                 results[entry.result_index] =
                     static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+                get_session_diagnostics_.Observe(
+                    diagnostic, entry.key, entry.result_index, "refresh_skip",
+                    results[entry.result_index], current != get_sessions_.end(),
+                    current != get_sessions_.end()
+                        ? current->second.lease_timeout
+                        : std::chrono::steady_clock::time_point{},
+                    get_session_prefetch_cache_.count(entry.key) != 0,
+                    "unknown",
+                    current == get_sessions_.end()
+                        ? "refresh_concurrent_session_removed"
+                        : "refresh_concurrent_session_changed");
                 continue;
             }
 
@@ -6356,6 +6396,12 @@ std::vector<int> RealClient::batch_get_session_refresh(
             }
 
             if (refresh_error != ErrorCode::OK) {
+                get_session_diagnostics_.Observe(
+                    diagnostic, entry.key, entry.result_index, "retire",
+                    static_cast<int>(toInt(refresh_error)), true,
+                    current->second.lease_timeout,
+                    cache_it != get_session_prefetch_cache_.end(), "unknown",
+                    "refresh_failed");
                 get_sessions_.erase(current);
                 DetachPrefetchedSessionBuffer(
                     get_session_prefetch_cache_, entry.key,
@@ -6370,6 +6416,10 @@ std::vector<int> RealClient::batch_get_session_refresh(
                 DirectSourceForReplica(refreshed_session->replicas.front());
             get_sessions_.erase(current);
             get_sessions_.emplace(entry.key, std::move(*refreshed_session));
+            get_session_diagnostics_.Observe(
+                diagnostic, entry.key, entry.result_index, "refresh", 0, true,
+                get_sessions_.at(entry.key).lease_timeout,
+                cache_it != get_session_prefetch_cache_.end(), source);
             auto access_it = get_session_access_records_.find(entry.key);
             if (access_it != get_session_access_records_.end()) {
                 access_it->second.source = source;
@@ -6486,6 +6536,7 @@ std::shared_ptr<BufferHandle> RealClient::AllocatePrefetchArenaRegion(
 
 std::vector<int> RealClient::batch_get_session_prefetch(
     const std::vector<std::string> &keys) {
+    KVSessionDiagnosticBatch diagnostic("prefetch", this, keys.size());
     std::vector<int> results(
         keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     if (!client_) {
@@ -6514,10 +6565,20 @@ std::vector<int> RealClient::batch_get_session_prefetch(
             }
 
             auto session_it = get_sessions_.find(keys[i]);
-            if (session_it == get_sessions_.end()) continue;
+            if (session_it == get_sessions_.end()) {
+                get_session_diagnostics_.Observe(
+                    diagnostic, keys[i], i, "prefetch", results[i], false, {},
+                    false, "unknown", "prefetch_session_missing");
+                continue;
+            }
             if (session_it->second.IsLeaseExpired(now)) {
                 results[i] =
                     static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+                get_session_diagnostics_.Observe(
+                    diagnostic, keys[i], i, "retire", results[i], true,
+                    session_it->second.lease_timeout,
+                    get_session_prefetch_cache_.count(keys[i]) != 0, "unknown",
+                    "prefetch_lease_expired_before_io");
                 get_sessions_.erase(session_it);
                 DetachPrefetchedSessionBuffer(
                     get_session_prefetch_cache_, keys[i],
@@ -6527,10 +6588,19 @@ std::vector<int> RealClient::batch_get_session_prefetch(
             if (session_it->second.replicas.empty()) {
                 results[i] =
                     static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
+                get_session_diagnostics_.Observe(
+                    diagnostic, keys[i], i, "prefetch", results[i], true,
+                    session_it->second.lease_timeout, false, "unknown",
+                    "prefetch_empty_replicas");
                 continue;
             }
 
             const auto &replica = session_it->second.replicas.front();
+            get_session_diagnostics_.Observe(
+                diagnostic, keys[i], i, "prefetch_begin", 0, true,
+                session_it->second.lease_timeout,
+                get_session_prefetch_cache_.count(keys[i]) != 0,
+                DirectSourceForReplica(replica));
             if (!replica.is_dfs_replica()) {
                 // The ordinary session range-get path remains authoritative
                 // for memory, local-disk, and legacy disk replicas.
@@ -6565,12 +6635,26 @@ std::vector<int> RealClient::batch_get_session_prefetch(
         auto completed_at = std::chrono::steady_clock::now();
         for (const auto &entry : entries) {
             const size_t i = entry.original_idx;
-            if (results[i] != 0) continue;
+            if (results[i] != 0) {
+                get_session_diagnostics_.Observe(
+                    diagnostic, entry.key, i, "prefetch", results[i],
+                    get_sessions_.count(entry.key) != 0,
+                    entry.query_result.lease_timeout,
+                    get_session_prefetch_cache_.count(entry.key) != 0,
+                    DirectSourceForReplica(entry.replica),
+                    "prefetch_io_failed");
+                continue;
+            }
 
             auto session_it = get_sessions_.find(entry.key);
             if (session_it == get_sessions_.end()) {
                 results[i] =
                     static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+                get_session_diagnostics_.Observe(
+                    diagnostic, entry.key, i, "prefetch", results[i], false,
+                    entry.query_result.lease_timeout, false,
+                    DirectSourceForReplica(entry.replica),
+                    "prefetch_session_removed_during_io");
                 continue;
             }
             if (!CompatibleSessionCacheRefresh(entry.query_result,
@@ -6584,11 +6668,22 @@ std::vector<int> RealClient::batch_get_session_prefetch(
                     detached_prefetch_buffers);
                 results[i] =
                     static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
+                get_session_diagnostics_.Observe(
+                    diagnostic, entry.key, i, "prefetch", results[i], true,
+                    session_it->second.lease_timeout, false,
+                    DirectSourceForReplica(entry.replica),
+                    "prefetch_replica_changed_during_io");
                 continue;
             }
             if (session_it->second.IsLeaseExpired(completed_at)) {
                 results[i] =
                     static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+                get_session_diagnostics_.Observe(
+                    diagnostic, entry.key, i, "retire", results[i], true,
+                    session_it->second.lease_timeout,
+                    get_session_prefetch_cache_.count(entry.key) != 0,
+                    DirectSourceForReplica(entry.replica),
+                    "prefetch_lease_expired_after_io");
                 get_sessions_.erase(session_it);
                 DetachPrefetchedSessionBuffer(
                     get_session_prefetch_cache_, entry.key,
@@ -6611,6 +6706,12 @@ std::vector<int> RealClient::batch_get_session_prefetch(
                 results[i] =
                     static_cast<int>(toInt(ErrorCode::INTERNAL_ERROR));
             }
+            get_session_diagnostics_.Observe(
+                diagnostic, entry.key, i, "prefetch_ready", results[i], true,
+                session_it->second.lease_timeout,
+                cache_it != get_session_prefetch_cache_.end(),
+                DirectSourceForReplica(entry.replica),
+                results[i] ? "prefetch_buffer_invalid" : "ready");
         }
     }
 
@@ -6639,6 +6740,12 @@ bool RealClient::validate_session_range_batch_arguments(
         return true;
     }
     LOG(ERROR) << "Invalid get ranges args";
+    LOG(INFO) << "KV_SESSION_ARGUMENT_ERROR op_id="
+              << KVSessionDiagnosticBatch::CurrentId() << " client=" << this
+              << " initialized=" << bool(client_) << " keys=" << keys.size()
+              << " buffers=" << all_buffers.size()
+              << " sizes=" << all_sizes.size()
+              << " offsets=" << all_src_offsets.size();
     return false;
 }
 
@@ -6649,6 +6756,7 @@ RealClient::prepare_session_range_read_requests(
     const std::vector<std::vector<size_t>> &all_sizes,
     const std::vector<std::vector<size_t>> &all_src_offsets,
     std::vector<int> &results, SessionRangeReadContext &context) {
+    KVSessionDiagnosticBatch diagnostic("range_prepare", this, keys.size());
     std::vector<SessionRangeReadRequest> requests;
     requests.reserve(keys.size());
     if (context.record_access) {
@@ -6681,15 +6789,30 @@ RealClient::prepare_session_range_read_requests(
         const auto &offsets = all_src_offsets[i];
         if (buffers.size() != sizes.size() ||
             buffers.size() != offsets.size()) {
+            get_session_diagnostics_.Observe(
+                diagnostic, keys[i], i, "read", results[i],
+                get_sessions_.count(keys[i]) != 0, {}, false, "unknown",
+                "range_shape_mismatch buffers=" +
+                    std::to_string(buffers.size()) +
+                    " sizes=" + std::to_string(sizes.size()) +
+                    " offsets=" + std::to_string(offsets.size()));
             continue;
         }
 
         auto session_it = get_sessions_.find(keys[i]);
         if (session_it == get_sessions_.end()) {
+            get_session_diagnostics_.Observe(
+                diagnostic, keys[i], i, "read", results[i], false, {},
+                get_session_prefetch_cache_.count(keys[i]) != 0, "unknown",
+                "range_session_missing");
             continue;
         }
         if (session_it->second.replicas.size() != 1) {
             results[i] = static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
+            get_session_diagnostics_.Observe(
+                diagnostic, keys[i], i, "read", results[i], true,
+                session_it->second.lease_timeout, false, "unknown",
+                "range_replica_count_invalid");
             continue;
         }
 
@@ -6708,6 +6831,12 @@ RealClient::prepare_session_range_read_requests(
                     record_it->second.success = false;
                 }
             }
+            get_session_diagnostics_.Observe(
+                diagnostic, keys[i], i, "retire",
+                static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED)), true,
+                session_it->second.lease_timeout,
+                get_session_prefetch_cache_.count(keys[i]) != 0,
+                DirectSourceForReplica(replica), "range_lease_expired");
             get_sessions_.erase(session_it);
             DetachPrefetchedSessionBuffer(get_session_prefetch_cache_, keys[i],
                                           detached_prefetch_buffers);
@@ -6729,6 +6858,16 @@ RealClient::prepare_session_range_read_requests(
             for (size_t j = 0; j < buffers.size(); ++j) {
                 if (is_object_range_overflow(offsets[j], sizes[j],
                                              replica_limit)) {
+                    get_session_diagnostics_.Observe(
+                        diagnostic, keys[i], i, "read",
+                        static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)),
+                        true, session_it->second.lease_timeout,
+                        get_session_prefetch_cache_.count(keys[i]) != 0,
+                        DirectSourceForReplica(replica),
+                        "range_overflow range_index=" + std::to_string(j) +
+                            " offset=" + std::to_string(offsets[j]) +
+                            " size=" + std::to_string(sizes[j]) +
+                            " replica_limit=" + std::to_string(replica_limit));
                     overflow = true;
                     break;
                 }
@@ -6740,6 +6879,11 @@ RealClient::prepare_session_range_read_requests(
         }
 
         results[i] = 0;
+        get_session_diagnostics_.Observe(
+            diagnostic, keys[i], i, "read_admitted", 0, true,
+            session_it->second.lease_timeout,
+            get_session_prefetch_cache_.count(keys[i]) != 0,
+            DirectSourceForReplica(replica));
         requests.push_back(SessionRangeReadRequest{
             keys[i], i, replica, session_it->second,
             std::vector<void *>(buffers.begin(), buffers.end()),
@@ -6942,6 +7086,7 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
     const std::vector<std::vector<size_t>> &all_src_offsets) {
+    KVSessionDiagnosticBatch diagnostic("ranges", this, keys.size());
     std::vector<int> results(
         keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     if (!validate_session_range_batch_arguments(keys, all_buffers, all_sizes,
@@ -6977,10 +7122,24 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     context.access_done = std::chrono::steady_clock::now();
     trace_session_range_reads(keys, all_sizes, plan.memory_requests.size(),
                               plan.dfs_requests.size(), context);
+    size_t failed = 0;
+    for (int rc : results) failed += rc < 0;
+    diagnostic.Field("result_failures", failed);
+    diagnostic.Field("dfs_trace_id", context.trace_id);
+    diagnostic.Field("memory_keys", plan.memory_requests.size());
+    diagnostic.Field("dfs_keys", plan.dfs_requests.size());
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (results[i] >= 0) continue;
+        diagnostic.Event(
+            true, " key_hash=" + std::to_string(KVSessionKeyHash(keys[i])) +
+                      " key_index=" + std::to_string(i) +
+                      " event=range_result rc=" + std::to_string(results[i]));
+    }
     return results;
 }
 
 int RealClient::batch_get_session_end(const std::vector<std::string> &keys) {
+    KVSessionDiagnosticBatch diagnostic("end", this, keys.size());
     struct DirectAccessObservation {
         std::string source;
         bool success;
@@ -6999,7 +7158,18 @@ int RealClient::batch_get_session_end(const std::vector<std::string> &keys) {
         if (record_access) {
             ended_keys.reserve(keys.size());
         }
+        size_t index = 0;
         for (const auto &key : keys) {
+            auto session = get_sessions_.find(key);
+            get_session_diagnostics_.Observe(
+                diagnostic, key, index++, "end", 0,
+                session != get_sessions_.end(),
+                session != get_sessions_.end()
+                    ? session->second.lease_timeout
+                    : std::chrono::steady_clock::time_point{},
+                get_session_prefetch_cache_.count(key) != 0, "unknown",
+                session == get_sessions_.end() ? "end_session_already_missing"
+                                               : "explicit_end");
             if (record_access) {
                 if (!ended_keys.insert(key).second) continue;
                 auto access_it = get_session_access_records_.find(key);
