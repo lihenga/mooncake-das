@@ -90,6 +90,14 @@ ClientBufferAllocator::~ClientBufferAllocator() {
     }
 }
 
+offset_allocator::OffsetAllocStorageReport
+ClientBufferAllocator::storageReport() const {
+    if (allocator_ == nullptr) {
+        return {0, 0};
+    }
+    return allocator_->storageReport();
+}
+
 std::optional<BufferHandle> ClientBufferAllocator::allocate(size_t size) {
     if (allocator_ == nullptr) {
         return std::nullopt;
