@@ -464,6 +464,52 @@ TEST_F(DfsBucketClientTest, BatchUpsertKeepsSynchronousDfsSemantics) {
     }
 }
 
+TEST_F(DfsBucketClientTest, BatchGetInvalidatesMissingBucket) {
+    std::vector<std::string> keys{"missing_bucket_0", "missing_bucket_1",
+                                  "missing_bucket_2", "missing_bucket_3"};
+    std::vector<std::string> values{std::string(4096, 'P'),
+                                    std::string(4096, 'Q'),
+                                    std::string(4096, 'R'),
+                                    std::string(4096, 'S')};
+    auto write_slices = MakeSlices(values);
+    auto put_results = writer_->BatchPut(keys, write_slices, DfsConfig());
+    ASSERT_EQ(put_results.size(), keys.size());
+    for (const auto& result : put_results) ASSERT_TRUE(result.has_value());
+
+    std::vector<QueryResult> queries;
+    for (const auto& key : keys) {
+        ASSERT_TRUE(WaitForDfsReplica(key));
+        auto query = QueryDfsOnly(key);
+        ASSERT_TRUE(query.has_value());
+        queries.push_back(*query);
+    }
+
+    const auto& descriptor = queries.front().replicas.front()
+                                 .get_dfs_descriptor();
+    for (const auto& query : queries) {
+        EXPECT_EQ(query.replicas.front().get_dfs_descriptor().shard_idx,
+                  descriptor.shard_idx);
+    }
+    const auto bucket_path =
+        std::filesystem::path(root_) /
+        ("bucket_" +
+         ImmutableBucketAllocator::FormatBucketId(descriptor.shard_idx) +
+         ".data");
+    ASSERT_TRUE(std::filesystem::remove(bucket_path));
+
+    std::vector<std::string> output(1, std::string(4096, '\0'));
+    std::unordered_map<std::string, std::vector<Slice>> read_slices;
+    read_slices[keys.front()] = {{output.front().data(), output.front().size()}};
+    auto get_results = writer_->BatchGet(
+        {keys.front()}, {queries.front()}, read_slices);
+    ASSERT_EQ(get_results.size(), 1);
+    ASSERT_FALSE(get_results.front().has_value());
+    EXPECT_EQ(get_results.front().error(), ErrorCode::FILE_NOT_FOUND);
+    for (const auto& key : keys) {
+        EXPECT_TRUE(WaitForKeyGone(key));
+    }
+}
+
 TEST_F(DfsBucketClientTest, BatchGetReadsBucketDescriptors) {
     std::vector<std::string> keys{"bucket_get_0", "bucket_get_1"};
     std::vector<std::string> values{std::string(4096, 'N'),

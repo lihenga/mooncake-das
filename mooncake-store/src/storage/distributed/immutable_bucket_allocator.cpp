@@ -1571,6 +1571,77 @@ ImmutableBucketAllocator::PrepareEviction() {
 }
 
 ImmutableBucketAllocator::PendingEviction
+ImmutableBucketAllocator::PrepareInvalidation(int64_t bucket_id) {
+    return PrepareInvalidationInternal(bucket_id);
+}
+
+bool ImmutableBucketAllocator::HasBucket(int64_t bucket_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return buckets_.contains(bucket_id);
+}
+
+ImmutableBucketAllocator::PendingEviction
+ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
+    PendingEviction pending;
+    if (!initialized_.load(std::memory_order_acquire) || bucket_id < 0) {
+        return pending;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto bucket_it = buckets_.find(bucket_id);
+        if (bucket_it == buckets_.end() || bucket_it->second->frozen) {
+            return pending;
+        }
+        const bool was_active = active_bucket_id_ == bucket_id;
+        const BucketPtr& victim = bucket_it->second;
+        const bool has_pending = std::any_of(
+            victim->entries.begin(), victim->entries.end(), [](const auto& item) {
+                return item.second.state == BucketEntryState::PENDING;
+            });
+        if (has_pending) return pending;
+
+        std::vector<DfsAllocatorInterface::EvictionCandidate> candidates;
+        for (const auto& [key, entry] : victim->entries) {
+            if (!IsLive(entry.state)) continue;
+            auto layout = RebuildBucketEntryLayout(entry.entry_offset,
+                                                   entry.value_size, alignment_);
+            if (!layout) {
+                LOG(ERROR) << "Skipping DFS invalidation of bucket " << bucket_id
+                           << ": entry for key " << key
+                           << " has an inconsistent layout";
+                return pending;
+            }
+            DfsAllocatorInterface::EvictionCandidate candidate;
+            candidate.key = key;
+            candidate.shard_idx = static_cast<int>(bucket_id);
+            candidate.offset = layout->offset;
+            candidate.descriptor =
+                MakeBucketDescriptor(BucketDataPath(bucket_id), *layout, bucket_id);
+            candidates.push_back(std::move(candidate));
+        }
+
+        victim->frozen = true;
+        RemoveFromLruLocked(bucket_id);
+        if (!victim->sealed) {
+            victim->sealed = true;
+            victim->meta_dirty = true;
+        }
+        if (was_active) {
+            active_bucket_id_ = -1;
+            RequestRefillLocked(/*urgent=*/true);
+        }
+        pending.owner_ = this;
+        pending.bucket_id_ = bucket_id;
+        pending.bucket_identity_ = victim;
+        pending.candidates_ = std::move(candidates);
+    }
+
+    FlushDirtyMetadata();
+    return pending;
+}
+
+ImmutableBucketAllocator::PendingEviction
 ImmutableBucketAllocator::PrepareEvictionForAllocationFailure() {
     return PrepareEvictionInternal(/*force_one=*/true);
 }
