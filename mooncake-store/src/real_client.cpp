@@ -6244,10 +6244,37 @@ bool RealClient::all_get_sessions_memory(
 
 std::vector<int> RealClient::batch_get_session_ensure(
     const std::vector<std::string> &keys, int64_t min_remaining_ms) {
+    static const bool diagnostic = [] {
+        const char *value = std::getenv("MC_STORE_SESSION_ENSURE_DIAGNOSTICS");
+        const bool enabled = !value || std::strcmp(value, "1") == 0;
+        if (enabled)
+            LOG(INFO) << "KVSESSION event=native_diagnostics_enabled version=1 pid="
+                      << getpid();
+        return enabled;
+    }();
+    const auto started = diagnostic ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
+    uint64_t rpc_us = 0, wait_us = 0, lock_us = 0;
+    size_t missing_keys = 0, expiring_keys = 0, joined_keys = 0;
+    size_t discarded_prefetch = 0;
+    const auto unavailable = std::numeric_limits<int64_t>::min();
+    std::vector<const char *> reasons(diagnostic ? keys.size() : 0, "healthy");
+    std::vector<int64_t> initial_remaining(diagnostic ? keys.size() : 0,
+                                          unavailable);
+    std::vector<int64_t> final_remaining(diagnostic ? keys.size() : 0,
+                                        unavailable);
+    std::vector<int64_t> query_remaining(diagnostic ? keys.size() : 0,
+                                        unavailable);
     const int invalid = static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
     std::vector<int> results(keys.size(), invalid);
-    if (!client_ || min_remaining_ms < 0 || min_remaining_ms > 3600000)
+    if (!client_ || min_remaining_ms < 0 || min_remaining_ms > 3600000) {
+        if (diagnostic)
+            LOG(WARNING) << "KVSESSION event=ensure_invalid client=" << this
+                         << " pid=" << getpid() << " keys=" << keys.size()
+                         << " min_remaining_ms=" << min_remaining_ms
+                         << " initialized=" << static_cast<bool>(client_);
         return results;
+    }
     const auto margin = std::chrono::milliseconds(min_remaining_ms);
     struct Pending {
         std::string key;
@@ -6263,7 +6290,10 @@ std::vector<int> RealClient::batch_get_session_ensure(
     std::vector<std::shared_ptr<BufferHandle>> detached;
     detached.reserve(keys.size());
     auto finish_owned = [&] {
+        const auto before_lock = diagnostic ? std::chrono::steady_clock::now()
+                                            : started;
         std::lock_guard<std::mutex> lock(session_mutex_);
+        if (diagnostic) lock_us += elapsed_us_since(before_lock);
         for (const auto &entry : owned) {
             auto it = get_session_repairs_.find(entry.key);
             if (it != get_session_repairs_.end() && it->second == entry.repair)
@@ -6274,10 +6304,17 @@ std::vector<int> RealClient::batch_get_session_ensure(
     };
     try {
         {
+            const auto before_lock = diagnostic ? std::chrono::steady_clock::now()
+                                                : started;
             std::lock_guard<std::mutex> lock(session_mutex_);
+            if (diagnostic) lock_us += elapsed_us_since(before_lock);
             const auto deadline = std::chrono::steady_clock::now() + margin;
             for (size_t i = 0; i < keys.size(); ++i) {
                 auto current = get_sessions_.find(keys[i]);
+                if (diagnostic && current != get_sessions_.end())
+                    initial_remaining[i] = std::chrono::duration_cast<
+                        std::chrono::milliseconds>(current->second.lease_timeout -
+                                                   (deadline - margin)).count();
                 if (current != get_sessions_.end() &&
                     current->second.lease_timeout > deadline) {
                     results[i] = 0;
@@ -6285,13 +6322,18 @@ std::vector<int> RealClient::batch_get_session_ensure(
                 }
                 auto pending = get_session_repairs_.find(keys[i]);
                 if (pending != get_session_repairs_.end()) {
+                    ++joined_keys;
                     waiting.emplace_back(i, pending->second);
                     continue;
                 }
                 auto repair = std::make_shared<GetSessionRepair>();
                 owned.push_back(Pending{keys[i], repair, std::nullopt});
-                if (current != get_sessions_.end())
+                if (current != get_sessions_.end()) {
+                    ++expiring_keys;
                     owned.back().old_session.emplace(current->second);
+                } else {
+                    ++missing_keys;
+                }
                 get_session_repairs_.emplace(keys[i], repair);
                 waiting.emplace_back(i, std::move(repair));
             }
@@ -6300,15 +6342,23 @@ std::vector<int> RealClient::batch_get_session_ensure(
             std::vector<std::string> query_keys;
             query_keys.reserve(owned.size());
             for (const auto &entry : owned) query_keys.push_back(entry.key);
+            const auto query_started = diagnostic ? std::chrono::steady_clock::now()
+                                                   : started;
             const auto queries = client_->BatchQuery(query_keys);
+            if (diagnostic) rpc_us = elapsed_us_since(query_started);
             const auto endpoints = client_->GetLocalEndpoints();
+            const auto before_lock = diagnostic ? std::chrono::steady_clock::now()
+                                                : started;
             std::lock_guard<std::mutex> lock(session_mutex_);
+            if (diagnostic) lock_us += elapsed_us_since(before_lock);
             for (size_t i = 0; i < owned.size(); ++i) {
                 const auto &entry = owned[i];
                 auto pending = get_session_repairs_.find(entry.key);
                 if (pending == get_session_repairs_.end() ||
-                    pending->second != entry.repair)
+                    pending->second != entry.repair) {
+                    entry.repair->reason = "repair_cancelled_by_start_end_refresh";
                     continue;  // End/start/refresh cancelled this repair.
+                }
                 auto current = get_sessions_.find(entry.key);
                 const bool unchanged =
                     entry.old_session
@@ -6316,20 +6366,30 @@ std::vector<int> RealClient::batch_get_session_ensure(
                               SameGetSessionSnapshot(current->second,
                                                      *entry.old_session)
                         : current == get_sessions_.end();
-                if (!unchanged) continue;
+                if (!unchanged) {
+                    entry.repair->reason = "snapshot_changed_during_query";
+                    continue;
+                }
                 if (queries.size() != owned.size()) {
+                    entry.repair->reason = "query_result_count_mismatch";
                     entry.repair->result =
                         static_cast<int>(toInt(ErrorCode::RPC_FAIL));
                     continue;
                 }
                 if (!queries[i]) {
+                    entry.repair->reason = "query_error";
                     entry.repair->result =
                         static_cast<int>(toInt(queries[i].error()));
                     continue;
                 }
                 const auto &query = queries[i].value();
+                if (diagnostic)
+                    entry.repair->query_remaining_ms = std::chrono::duration_cast<
+                        std::chrono::milliseconds>(query.lease_timeout -
+                            std::chrono::steady_clock::now()).count();
                 if (query.lease_timeout <= std::chrono::steady_clock::now() +
                                                margin) {
+                    entry.repair->reason = "fresh_lease_below_margin";
                     entry.repair->result =
                         static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
                     continue;  // No retry loop if the margin exceeds the TTL.
@@ -6337,6 +6397,7 @@ std::vector<int> RealClient::batch_get_session_ensure(
                 const auto *replica =
                     SelectSessionReplica(query.replicas, endpoints);
                 if (!replica) {
+                    entry.repair->reason = "no_usable_replica";
                     entry.repair->result =
                         static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
                     continue;
@@ -6352,6 +6413,8 @@ std::vector<int> RealClient::batch_get_session_ensure(
                 if (!entry.old_session ||
                     !CompatibleSessionCacheRefresh(*entry.old_session, fresh) ||
                     invalid_buffer) {
+                    discarded_prefetch +=
+                        cached != get_session_prefetch_cache_.end();
                     DetachPrefetchedSessionBuffer(get_session_prefetch_cache_,
                                                   entry.key, detached);
                 }
@@ -6359,31 +6422,141 @@ std::vector<int> RealClient::batch_get_session_ensure(
                 get_sessions_.erase(entry.key);
                 get_sessions_.emplace(entry.key, std::move(fresh));
                 entry.repair->result = 0;
+                entry.repair->reason = "repaired";
             }
         }
     } catch (...) {
         finish_owned();
+        if (diagnostic)
+            LOG(WARNING) << "KVSESSION event=ensure_exception client=" << this
+                         << " pid=" << getpid() << " keys=" << keys.size()
+                         << " queried_keys=" << owned.size()
+                         << " total_us=" << elapsed_us_since(started);
         throw;
     }
     finish_owned();
     {
+        const auto before_lock = diagnostic ? std::chrono::steady_clock::now()
+                                            : started;
         std::unique_lock<std::mutex> lock(session_mutex_);
+        if (diagnostic) lock_us += elapsed_us_since(before_lock);
         for (const auto &[index, repair] : waiting) {
+            const auto before_wait = diagnostic && !repair->done
+                ? std::chrono::steady_clock::now() : started;
             session_cv_.wait(lock, [&] { return repair->done; });
+            if (diagnostic && before_wait != started)
+                wait_us += elapsed_us_since(before_wait);
             results[index] = repair->result;
+            if (diagnostic) {
+                reasons[index] = repair->reason;
+                query_remaining[index] =
+                    repair->query_remaining_ms.value_or(unavailable);
+            }
         }
         // Waiting for another batch/RPC also consumes lease time. Recheck
         // locally without querying again or accepting another repair's smaller
         // margin. This covers the keys that took the initial healthy fast path.
         const auto deadline = std::chrono::steady_clock::now() + margin;
         for (size_t i = 0; i < keys.size(); ++i) {
-            if (results[i] != 0) continue;
+            if (!diagnostic && results[i] != 0) continue;
             auto current = get_sessions_.find(keys[i]);
+            if (diagnostic && current != get_sessions_.end())
+                final_remaining[i] = std::chrono::duration_cast<
+                    std::chrono::milliseconds>(current->second.lease_timeout -
+                                               (deadline - margin)).count();
+            if (results[i] != 0) continue;
             if (current == get_sessions_.end()) {
                 results[i] = invalid;
+                if (diagnostic) reasons[i] = "final_session_missing";
             } else if (current->second.lease_timeout <= deadline) {
                 results[i] = static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+                if (diagnostic) reasons[i] = "final_lease_below_margin";
             }
+        }
+    }
+    if (diagnostic) {
+        const auto total_us = elapsed_us_since(started);
+        size_t failures = 0;
+        std::map<std::string, size_t> failure_counts;
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (results[i] == 0) continue;
+            ++failure_counts[reasons[i]];
+            if (++failures > 4) continue;
+            LOG(WARNING) << "KVSESSION event=ensure_key_failure client=" << this
+                         << " pid=" << getpid() << " index=" << i
+                         << " key=" << keys[i].substr(0, 128)
+                         << " key_hash=" << std::hash<std::string>{}(keys[i])
+                         << " rc=" << results[i] << " reason=" << reasons[i]
+                         << " initial_remaining_ms="
+                         << (initial_remaining[i] == unavailable ? "missing" :
+                             std::to_string(initial_remaining[i]))
+                         << " final_remaining_ms="
+                         << (final_remaining[i] == unavailable ? "missing" :
+                             std::to_string(final_remaining[i]))
+                         << " query_remaining_ms="
+                         << (query_remaining[i] == unavailable ? "unavailable" :
+                             std::to_string(query_remaining[i]))
+                         << " min_remaining_ms=" << min_remaining_ms;
+        }
+        if (failures) {
+            std::string counts;
+            for (const auto &[reason, count] : failure_counts)
+                counts += reason + ":" + std::to_string(count) + ",";
+            LOG(WARNING) << "KVSESSION event=ensure_failure client=" << this
+                         << " pid=" << getpid() << " keys=" << keys.size()
+                         << " failed_keys=" << failures << " reasons=" << counts
+                         << " query_keys=" << owned.size()
+                         << " total_us=" << total_us << " rpc_us=" << rpc_us
+                         << " join_wait_us=" << wait_us
+                         << " lock_wait_us=" << lock_us;
+        }
+        auto &d = get_session_ensure_diagnostics_;
+        std::lock_guard<std::mutex> diagnostic_lock(d.mutex);
+        const auto now = std::chrono::steady_clock::now();
+        if (!d.calls) d.window_start = now;
+        ++d.calls;
+        d.keys += keys.size();
+        d.query_batches += !owned.empty();
+        d.queried_keys += owned.size();
+        d.missing_keys += missing_keys;
+        d.expiring_keys += expiring_keys;
+        d.joined_keys += joined_keys;
+        d.failures += failures != 0;
+        d.discarded_prefetch += discarded_prefetch;
+        d.total_us += total_us;
+        d.max_us = std::max(d.max_us, total_us);
+        d.rpc_us += rpc_us;
+        d.wait_us += wait_us;
+        d.lock_us += lock_us;
+        const uint64_t bounds[] = {1000, 5000, 10000, 50000, 100000, 500000};
+        size_t bucket = 0;
+        while (bucket < 6 && total_us > bounds[bucket]) ++bucket;
+        ++d.buckets[bucket];
+        if (now - d.window_start >= std::chrono::seconds(60)) {
+            LOG(INFO) << "KVSESSION event=ensure_window client=" << this
+                      << " pid=" << getpid()
+                      << " window_ms=" << std::chrono::duration_cast<
+                             std::chrono::milliseconds>(now - d.window_start).count()
+                      << " calls=" << d.calls << " keys=" << d.keys
+                      << " query_batches=" << d.query_batches
+                      << " query_keys=" << d.queried_keys
+                      << " missing_keys=" << d.missing_keys
+                      << " expiring_keys=" << d.expiring_keys
+                      << " joined_keys=" << d.joined_keys
+                      << " failed_calls=" << d.failures
+                      << " discarded_prefetch=" << d.discarded_prefetch
+                      << " total_us=" << d.total_us << " max_us=" << d.max_us
+                      << " rpc_us=" << d.rpc_us << " join_wait_us=" << d.wait_us
+                      << " lock_wait_us=" << d.lock_us
+                      << " latency_buckets_le_1_5_10_50_100_500ms_gt500="
+                      << d.buckets[0] << "," << d.buckets[1] << "," << d.buckets[2]
+                      << "," << d.buckets[3] << "," << d.buckets[4] << ","
+                      << d.buckets[5] << "," << d.buckets[6];
+            d.calls = d.keys = d.query_batches = d.queried_keys = 0;
+            d.missing_keys = d.expiring_keys = d.joined_keys = d.failures = 0;
+            d.discarded_prefetch = d.total_us = d.max_us = 0;
+            d.rpc_us = d.wait_us = d.lock_us = 0;
+            std::fill(d.buckets, d.buckets + 7, 0);
         }
     }
     return results;

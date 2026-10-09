@@ -1121,11 +1121,24 @@ class RealClient : public PyClient {
     struct GetSessionRepair {
         bool done{false};
         int result{static_cast<int>(toInt(ErrorCode::INVALID_PARAMS))};
+        const char *reason{"pending"};
+        std::optional<int64_t> query_remaining_ms;
     };
     // Only in-flight repairs occupy this map. Removing an entry on end/start
     // cancels its commit, including when the old session was already missing.
     std::unordered_map<std::string, std::shared_ptr<GetSessionRepair>>
         get_session_repairs_;
+    // Opt-in diagnostics use a separate lock, never held across session work.
+    struct GetSessionEnsureDiagnostics {
+        std::mutex mutex;
+        std::chrono::steady_clock::time_point window_start{};
+        uint64_t calls{0}, keys{0}, query_batches{0}, queried_keys{0};
+        uint64_t missing_keys{0}, expiring_keys{0}, joined_keys{0}, failures{0};
+        uint64_t discarded_prefetch{0}, total_us{0}, max_us{0};
+        uint64_t rpc_us{0}, wait_us{0}, lock_us{0};
+        // <=1ms, <=5ms, <=10ms, <=50ms, <=100ms, <=500ms, >500ms.
+        uint64_t buckets[7]{};
+    } get_session_ensure_diagnostics_;
     struct GetSessionAccessRecord {
         std::string source;
         bool success{true};
