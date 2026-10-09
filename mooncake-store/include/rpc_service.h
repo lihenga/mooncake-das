@@ -341,6 +341,11 @@ class WrappedMasterService {
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id, ReplicaType replica_type);
 
+    std::vector<tl::expected<void, ErrorCode>> BatchInvalidateDfsBuckets(
+        const UUID& client_id,
+        const std::vector<DfsMissingBucketReport>& reports,
+        const std::string& tenant_id);
+
     bool KvEventsEnabled() const;
     KvEventPublisher::Stats GetKvEventStats() const;
 
