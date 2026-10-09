@@ -48,8 +48,6 @@ struct FileStorageEnvironment {
     ScopedEnvVar local_buffer_size{"MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES"};
     ScopedEnvVar pinned_restore_arena_size{
         "MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES"};
-    ScopedEnvVar pinned_prefetch_arena_size{
-        "MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES"};
     ScopedEnvVar scanmeta_iterator_keys_limit{
         "MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT"};
     ScopedEnvVar legacy_scanmeta_iterator_keys_limit{
@@ -81,7 +79,6 @@ void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
     EXPECT_EQ(config.storage_filepath, "/data/file_storage");
     EXPECT_EQ(config.local_buffer_size, 1280 * 1024 * 1024);
     EXPECT_EQ(config.pinned_restore_arena_size, 0);
-    EXPECT_EQ(config.pinned_prefetch_arena_size, 0);
     EXPECT_EQ(config.scanmeta_iterator_keys_limit, 20000);
     EXPECT_EQ(config.total_keys_limit, 10'000'000);
     EXPECT_EQ(config.total_size_limit, 2ULL * 1024 * 1024 * 1024 * 1024);
@@ -131,7 +128,6 @@ TEST_F(FileStorageConfigTest, ReadsValidValues) {
     env.storage_path.Set("/tmp/storage");
     env.local_buffer_size.Set("2147483648");
     env.pinned_restore_arena_size.Set("67108864");
-    env.pinned_prefetch_arena_size.Set("134217728");
     env.scanmeta_iterator_keys_limit.Set("12345");
     env.total_keys_limit.Set("5000000");
     env.total_size_limit.Set("1099511627776");
@@ -149,7 +145,6 @@ TEST_F(FileStorageConfigTest, ReadsValidValues) {
     EXPECT_EQ(config.storage_filepath, "/tmp/storage");
     EXPECT_EQ(config.local_buffer_size, 2147483648);
     EXPECT_EQ(config.pinned_restore_arena_size, 64 * 1024 * 1024);
-    EXPECT_EQ(config.pinned_prefetch_arena_size, 128 * 1024 * 1024);
     EXPECT_EQ(config.scanmeta_iterator_keys_limit, 12345);
     EXPECT_EQ(config.total_keys_limit, 5000000);
     EXPECT_EQ(config.total_size_limit, 1099511627776);
@@ -232,7 +227,6 @@ TEST_F(FileStorageConfigTest, PreservesInvalidPreferredAliasBehavior) {
 TEST_F(FileStorageConfigTest, InvalidValuesUseDefaultsAndPreserveDiagnostics) {
     env.local_buffer_size.Set("invalid");
     env.pinned_restore_arena_size.Set("invalid");
-    env.pinned_prefetch_arena_size.Set("invalid");
     env.scanmeta_iterator_keys_limit.Set("invalid");
     env.total_keys_limit.Set("invalid");
     env.total_size_limit.Set("invalid");
@@ -252,7 +246,6 @@ TEST_F(FileStorageConfigTest, InvalidValuesUseDefaultsAndPreserveDiagnostics) {
     for (const char* name : {
              "MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES",
              "MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES",
-             "MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES",
              "MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT",
              "MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT",
              "MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES",
@@ -351,10 +344,6 @@ TEST_F(FileStorageConfigTest, ValidateFailsOnInvalidLimits) {
     EXPECT_FALSE(config.Validate());
 
     config.pinned_restore_arena_size = 0;
-    config.pinned_prefetch_arena_size = -1;
-    EXPECT_FALSE(config.Validate());
-
-    config.pinned_prefetch_arena_size = 0;
     config.heartbeat_interval_seconds = 0;
     EXPECT_FALSE(config.Validate());
 
