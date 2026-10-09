@@ -147,6 +147,7 @@ add_store_test(client_metrics_test client_metrics_test.cpp)
 add_store_test(ssd_metrics_test ssd_metrics_test.cpp)
 add_store_test(serializer_test serializer_test.cpp)
 add_store_test(dfs_posix_test dfs_posix_test.cpp)
+add_store_test(xds_buffer_registry_test xds_buffer_registry_test.cpp)
 add_store_test(dfs_sync_client_test dfs_sync_client_test.cpp)
 add_test(NAME dfs_batch_read_checksum_test
          COMMAND dfs_sync_client_test

@@ -1,14 +1,18 @@
 #pragma once
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <sys/types.h>
 #include <unordered_map>
 #include <vector>
 
 #include "fs_adapter.h"
+#include "storage/distributed/accelerator_file_io.h"
 #include "replica.h"
 #include "storage/distributed/object_storage_adapter.h"
 #include "storage/distributed/dfs_allocator_interface.h"
@@ -64,6 +68,14 @@ struct DistributedStorageConfig {
     // (page-cache-bypassing where the adapter supports it, e.g. O_DIRECT on
     // POSIX). When false, reads go through the regular cached handles.
     bool direct_read_enabled = true;
+    XdsMode xds_mode = XdsMode::kPosix;
+    uint64_t xds_min_read_size = 16384;
+    size_t xds_file_cache_size = 1024;
+    bool xds_allow_request_fallback = true;
+    // Cleared by FromEnvironment() when the direct-I/O backend name is
+    // unknown. Keep this separate from allocator validation so diagnostics
+    // identify the actual invalid setting.
+    bool xds_mode_valid = true;
     // Cleared by FromEnvironment() when MOONCAKE_DFS_ALLOCATOR_TYPE names an
     // unknown allocator, so the master can reject the configuration instead of
     // silently defaulting to SHARD.
@@ -87,6 +99,20 @@ struct DfsReadRequest {
     std::string key;
     DistributedFSDescriptor descriptor;
     std::vector<Slice> slices;
+};
+
+struct DfsReadRange {
+    void* dst = nullptr;
+    uint64_t length = 0;
+    uint64_t object_offset = 0;
+    int32_t device_id = -1;
+    uint64_t registration_id = 0;
+};
+
+struct DfsRangeReadRequest {
+    std::string key;
+    DistributedFSDescriptor descriptor;
+    std::vector<DfsReadRange> ranges;
 };
 
 /**
@@ -132,6 +158,13 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::vector<tl::expected<void, ErrorCode>> BatchRead(
         const std::vector<DfsReadRequest>& requests);
 
+    void SetAcceleratorFileIo(std::shared_ptr<AcceleratorFileIo> accelerator);
+    tl::expected<void, XdsError> RegisterXdsBuffer(void* base, size_t length,
+                                                  int32_t device_id);
+    tl::expected<void, XdsError> UnregisterXdsBuffer(void* base);
+    std::vector<tl::expected<void, XdsError>> BatchReadRanges(
+        const std::vector<DfsRangeReadRequest>& requests);
+
     // Key-only storage backend operations cannot safely address DFS objects;
     // callers must use BatchRead/BatchWrite with request-scoped descriptors.
     tl::expected<void, ErrorCode> BatchLoad(
@@ -154,6 +187,10 @@ class DistributedStorageBackend : public StorageBackendInterface {
      */
     DfsAllocatorType GetAllocatorType() const {
         return distributed_config_.allocator_type;
+    }
+    XdsMode GetXdsMode() const { return distributed_config_.xds_mode; }
+    bool AllowXdsRequestFallback() const {
+        return distributed_config_.xds_allow_request_fallback;
     }
 
    private:
@@ -201,6 +238,7 @@ class DistributedStorageBackend : public StorageBackendInterface {
         std::mutex* mutex = nullptr;
         bool direct_read = false;
         std::shared_ptr<OpenFileHandle> keepalive;
+        std::string path;
     };
 
     /**
@@ -295,6 +333,35 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::unordered_map<int64_t, std::shared_ptr<OpenFileHandle>>
         bucket_id_direct_cache_;
     std::unique_ptr<ThreadPool> batch_read_pool_;
+
+    struct XdsBufferEntry {
+        uintptr_t base = 0;
+        size_t length = 0;
+        int32_t device_id = -1;
+        pid_t pid = 0;
+        uint64_t logical_refs = 1;
+        uint64_t inflight = 0;
+        bool accepting = true;
+        bool quarantined = false;
+        XdsBufferRegistration registration;
+        std::condition_variable drained;
+    };
+    struct XdsFileEntry {
+        XdsFileRegistration registration;
+        std::shared_ptr<OpenFileHandle> file;
+        XdsFileIdentity identity;
+    };
+    std::shared_ptr<XdsBufferEntry> PinXdsBuffer(const DfsReadRange& range,
+                                                 XdsError* error);
+    void UnpinXdsBuffer(const std::shared_ptr<XdsBufferEntry>& entry);
+    tl::expected<XdsFileEntry, XdsError> GetXdsFile(
+        const DistributedFSDescriptor& descriptor, const std::string& key,
+        const std::shared_ptr<AcceleratorFileIo>& accelerator);
+    std::shared_ptr<AcceleratorFileIo> accelerator_file_io_;
+    std::mutex xds_mutex_;
+    std::map<uintptr_t, std::shared_ptr<XdsBufferEntry>> xds_buffers_;
+    std::unordered_map<std::string, XdsFileEntry> xds_files_;
+    bool xds_fatal_ = false;
 
     bool initialized_ = false;
 };

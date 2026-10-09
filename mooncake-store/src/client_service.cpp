@@ -4166,6 +4166,50 @@ void Client::SetDfsStorageBackend(
     EnsureStorageControlPlaneStarted();
 }
 
+void Client::SetAcceleratorFileIo(
+    std::shared_ptr<AcceleratorFileIo> accelerator) {
+    if (dfs_storage_backend_) {
+        dfs_storage_backend_->SetAcceleratorFileIo(std::move(accelerator));
+    }
+}
+
+tl::expected<void, XdsError> Client::RegisterXdsBuffer(
+    void* base, size_t length, int32_t device_id) {
+    if (!dfs_storage_backend_) {
+        return tl::make_unexpected(XdsError{
+            XdsErrorClass::kNotEligible, XdsTargetState::kUntouched, 0,
+            "dfs-backend-unavailable"});
+    }
+    return dfs_storage_backend_->RegisterXdsBuffer(base, length, device_id);
+}
+
+tl::expected<void, XdsError> Client::UnregisterXdsBuffer(void* base) {
+    if (!dfs_storage_backend_) return {};
+    return dfs_storage_backend_->UnregisterXdsBuffer(base);
+}
+
+std::vector<tl::expected<void, XdsError>> Client::BatchReadDfsRanges(
+    const std::vector<DfsRangeReadRequest>& requests) {
+    if (dfs_storage_backend_) {
+        return dfs_storage_backend_->BatchReadRanges(requests);
+    }
+    return std::vector<tl::expected<void, XdsError>>(
+        requests.size(), tl::make_unexpected(XdsError{
+                             XdsErrorClass::kNotEligible,
+                             XdsTargetState::kUntouched, 0,
+                             "dfs-backend-unavailable"}));
+}
+
+XdsMode Client::GetXdsMode() const {
+    return dfs_storage_backend_ ? dfs_storage_backend_->GetXdsMode()
+                                : XdsMode::kPosix;
+}
+
+bool Client::AllowXdsRequestFallback() const {
+    return dfs_storage_backend_ &&
+           dfs_storage_backend_->AllowXdsRequestFallback();
+}
+
 tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(
     std::vector<PromotionTaskItem>& promotion_objects) {
     auto response = master_client_.PromotionObjectHeartbeat(client_id_);

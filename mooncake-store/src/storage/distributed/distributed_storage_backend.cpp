@@ -4,10 +4,16 @@
 #include <condition_variable>
 #include <cstring>
 #include <filesystem>
+#include <fcntl.h>
 #include <iterator>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <sstream>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <unordered_set>
 
 #include "environ.h"
 #include "storage/distributed/bucket_entry_layout.h"
@@ -31,6 +37,32 @@ constexpr int kMaxBucketCreateConcurrency = 8;
 // BatchAllocate output to one read. Larger batches become a few contiguous
 // reads rather than one read per object.
 constexpr uint64_t kMaxMergedIo = 4ULL * 1024 * 1024;
+
+XdsMode ParseXdsMode(const std::string& value, bool* valid) {
+    *valid = true;
+    if (value == "posix") return XdsMode::kPosix;
+    if (value == "xds-auto") return XdsMode::kAuto;
+    if (value == "xds-required") return XdsMode::kRequired;
+    *valid = false;
+    return XdsMode::kPosix;
+}
+
+const char* ToString(XdsMode mode) {
+    switch (mode) {
+        case XdsMode::kPosix:
+            return "posix";
+        case XdsMode::kAuto:
+            return "xds-auto";
+        case XdsMode::kRequired:
+            return "xds-required";
+    }
+    return "posix";
+}
+
+XdsError XdsFailure(XdsErrorClass cls, XdsTargetState state,
+                    std::string operation, int64_t raw = 0) {
+    return XdsError{cls, state, raw, std::move(operation)};
+}
 
 struct MergedReadScratch {
     std::vector<char> sink;
@@ -122,6 +154,10 @@ const char* ToString(DfsAllocatorType type) {
 }
 
 bool DistributedStorageConfig::Validate() const {
+    if (!xds_mode_valid) {
+        LOG(ERROR) << "DistributedStorageConfig: invalid direct-I/O backend";
+        return false;
+    }
     if (fsdir.empty()) {
         LOG(ERROR) << "DistributedStorageConfig: fsdir is empty";
         return false;
@@ -156,6 +192,11 @@ bool DistributedStorageConfig::Validate() const {
     if (!single_tenant) {
         LOG(ERROR) << "DistributedStorageConfig: Currently, DFS requires "
                       "single_tenant=true";
+        return false;
+    }
+    if (xds_file_cache_size == 0 || xds_min_read_size == 0) {
+        LOG(ERROR) << "DistributedStorageConfig: xDS cache size and minimum "
+                      "read size must be positive";
         return false;
     }
     return true;
@@ -323,6 +364,19 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
                          config.batch_read_merge_enabled);
     config.direct_read_enabled = Environ::GetBool(
         "MOONCAKE_DFS_DIRECT_READ_ENABLED", config.direct_read_enabled);
+    bool parsed_xds_mode = false;
+    config.xds_mode = ParseXdsMode(Environ::GetString(
+                                       "MOONCAKE_DFS_DIRECT_IO_BACKEND",
+                                       ToString(config.xds_mode)),
+                                   &parsed_xds_mode);
+    config.xds_mode_valid = parsed_xds_mode;
+    config.xds_min_read_size = Environ::GetUInt64(
+        "MOONCAKE_XDS_MIN_READ_SIZE", config.xds_min_read_size);
+    config.xds_file_cache_size = static_cast<size_t>(Environ::GetUInt64(
+        "MOONCAKE_XDS_FILE_CACHE_SIZE", config.xds_file_cache_size));
+    config.xds_allow_request_fallback = Environ::GetBool(
+        "MOONCAKE_XDS_ALLOW_REQUEST_FALLBACK",
+        config.xds_allow_request_fallback);
     LOG(INFO) << config.FormatStr();
     return config;
 }
@@ -347,7 +401,11 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", bucket_create_concurrency=" << bucket_create_concurrency
         << ", batch_read_threads=" << batch_read_threads
         << ", batch_read_merge_enabled=" << batch_read_merge_enabled
-        << ", direct_read_enabled=" << direct_read_enabled;
+        << ", direct_read_enabled=" << direct_read_enabled
+        << ", xds_mode=" << ToString(xds_mode)
+        << ", xds_min_read_size=" << xds_min_read_size
+        << ", xds_file_cache_size=" << xds_file_cache_size
+        << ", xds_allow_request_fallback=" << xds_allow_request_fallback;
     return oss.str();
 }
 
@@ -376,6 +434,16 @@ DistributedStorageBackend::DistributedStorageBackend(
 }
 
 DistributedStorageBackend::~DistributedStorageBackend() {
+    if (accelerator_file_io_) {
+        for (auto& [_, entry] : xds_files_) {
+            (void)accelerator_file_io_->DeregisterFile(entry.registration);
+        }
+        for (auto& [_, entry] : xds_buffers_) {
+            (void)accelerator_file_io_->DeregisterBuffer(entry->registration);
+        }
+        xds_files_.clear();
+        xds_buffers_.clear();
+    }
     for (auto& shard : shard_files_) {
         if (shard && fs_adapter_) {
             if (shard->fd >= 0) {
@@ -561,7 +629,8 @@ DistributedStorageBackend::ResolveTarget(
                        << distributed_config_.shard_capacity;
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        return ResolvedTarget{shard.fd, &shard.mutex, false, nullptr};
+        return ResolvedTarget{shard.fd, &shard.mutex, false, nullptr,
+                              shard.path};
     }
 
     // BUCKET mode: the descriptor carries an allocator-chosen path, so it must
@@ -595,7 +664,7 @@ DistributedStorageBackend::ResolveTarget(
     // BUCKET mode needs no per-fd lock: the allocator hands each object a
     // unique, non-overlapping on-disk range, so concurrent writers and readers
     // never touch the same bytes.
-    return ResolvedTarget{shared->fd, nullptr, read_only, shared};
+    return ResolvedTarget{shared->fd, nullptr, read_only, shared, shared->path};
 }
 
 tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
@@ -1411,6 +1480,491 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ScanMeta(
         if (err != ErrorCode::OK) return tl::make_unexpected(err);
     }
     return {};
+}
+
+void DistributedStorageBackend::SetAcceleratorFileIo(
+    std::shared_ptr<AcceleratorFileIo> accelerator) {
+    std::lock_guard<std::mutex> lock(xds_mutex_);
+    if (!xds_buffers_.empty() || !xds_files_.empty()) {
+        LOG(ERROR) << "Cannot replace xDS backend while registrations exist";
+        return;
+    }
+    accelerator_file_io_ = std::move(accelerator);
+}
+
+tl::expected<void, XdsError> DistributedStorageBackend::RegisterXdsBuffer(
+    void* base, size_t length, int32_t device_id) {
+    if (!base || length == 0 ||
+        reinterpret_cast<uintptr_t>(base) >
+            std::numeric_limits<uintptr_t>::max() - length) {
+        return tl::make_unexpected(XdsFailure(
+            XdsErrorClass::kContractViolation, XdsTargetState::kUntouched,
+            "register-buffer-arguments"));
+    }
+    std::unique_lock<std::mutex> lock(xds_mutex_);
+    const uintptr_t address = reinterpret_cast<uintptr_t>(base);
+    auto existing = xds_buffers_.find(address);
+    if (existing != xds_buffers_.end()) {
+        auto& entry = existing->second;
+        if (entry->length != length || entry->device_id != device_id ||
+            entry->pid != ::getpid() || entry->quarantined) {
+            return tl::make_unexpected(XdsFailure(
+                XdsErrorClass::kContractViolation,
+                XdsTargetState::kUntouched, "register-buffer-overlap"));
+        }
+        ++entry->logical_refs;
+        return {};
+    }
+    auto next = xds_buffers_.upper_bound(address);
+    if (next != xds_buffers_.end() && address + length > next->first) {
+        return tl::make_unexpected(XdsFailure(
+            XdsErrorClass::kContractViolation, XdsTargetState::kUntouched,
+            "register-buffer-overlap"));
+    }
+    if (next != xds_buffers_.begin()) {
+        const auto& previous = std::prev(next)->second;
+        if (previous->base + previous->length > address) {
+            return tl::make_unexpected(XdsFailure(
+                XdsErrorClass::kContractViolation,
+                XdsTargetState::kUntouched, "register-buffer-overlap"));
+        }
+    }
+    if (!accelerator_file_io_) {
+        return tl::make_unexpected(XdsFailure(
+            XdsErrorClass::kNotEligible, XdsTargetState::kUntouched,
+            "xds-backend-unavailable"));
+    }
+    if (accelerator_file_io_->DeviceState(device_id) !=
+        DeviceXdsState::kAvailable) {
+        return tl::make_unexpected(XdsFailure(
+            XdsErrorClass::kNotEligible, XdsTargetState::kUntouched,
+            "xds-device-unavailable"));
+    }
+    auto registration =
+        accelerator_file_io_->RegisterBuffer(base, length, device_id);
+    if (!registration) return tl::make_unexpected(registration.error());
+    auto entry = std::make_shared<XdsBufferEntry>();
+    entry->base = address;
+    entry->length = length;
+    entry->device_id = device_id;
+    entry->pid = ::getpid();
+    entry->registration = *registration;
+    xds_buffers_.emplace(address, std::move(entry));
+    return {};
+}
+
+tl::expected<void, XdsError> DistributedStorageBackend::UnregisterXdsBuffer(
+    void* base) {
+    std::unique_lock<std::mutex> lock(xds_mutex_);
+    auto it = xds_buffers_.find(reinterpret_cast<uintptr_t>(base));
+    if (it == xds_buffers_.end()) return {};
+    auto entry = it->second;
+    if (entry->logical_refs > 1) {
+        --entry->logical_refs;
+        return {};
+    }
+    entry->logical_refs = 0;
+    entry->accepting = false;
+    entry->drained.wait(lock, [&] { return entry->inflight == 0; });
+    auto registration = entry->registration;
+    auto accelerator = accelerator_file_io_;
+    if (!accelerator) {
+        entry->quarantined = true;
+        return tl::make_unexpected(XdsFailure(
+            XdsErrorClass::kBackendFatal, XdsTargetState::kUntouched,
+            "xds-backend-lost-before-deregister"));
+    }
+    lock.unlock();
+    auto result = accelerator->DeregisterBuffer(registration);
+    lock.lock();
+    if (!result) {
+        entry->quarantined = true;
+        return tl::make_unexpected(result.error());
+    }
+    xds_buffers_.erase(it);
+    return {};
+}
+
+std::shared_ptr<DistributedStorageBackend::XdsBufferEntry>
+DistributedStorageBackend::PinXdsBuffer(const DfsReadRange& range,
+                                        XdsError* error) {
+    std::lock_guard<std::mutex> lock(xds_mutex_);
+    const uintptr_t address = reinterpret_cast<uintptr_t>(range.dst);
+    auto it = xds_buffers_.upper_bound(address);
+    if (it == xds_buffers_.begin()) {
+        *error = XdsFailure(XdsErrorClass::kNotEligible,
+                            XdsTargetState::kUntouched, "buffer-not-registered");
+        return nullptr;
+    }
+    auto entry = std::prev(it)->second;
+    if (!entry->accepting || entry->quarantined ||
+        entry->pid != ::getpid() || entry->device_id != range.device_id ||
+        address < entry->base ||
+        range.length > entry->length ||
+        address - entry->base > entry->length - range.length ||
+        (range.registration_id != 0 &&
+         range.registration_id != entry->registration.id)) {
+        *error = XdsFailure(XdsErrorClass::kNotEligible,
+                            XdsTargetState::kUntouched, "buffer-not-eligible");
+        return nullptr;
+    }
+    ++entry->inflight;
+    return entry;
+}
+
+void DistributedStorageBackend::UnpinXdsBuffer(
+    const std::shared_ptr<XdsBufferEntry>& entry) {
+    std::lock_guard<std::mutex> lock(xds_mutex_);
+    if (--entry->inflight == 0) entry->drained.notify_all();
+}
+
+tl::expected<DistributedStorageBackend::XdsFileEntry, XdsError>
+DistributedStorageBackend::GetXdsFile(
+    const DistributedFSDescriptor& descriptor, const std::string& key,
+    const std::shared_ptr<AcceleratorFileIo>& accelerator) {
+    if (!IsBucketMode()) {
+        return tl::make_unexpected(XdsFailure(
+            XdsErrorClass::kNotEligible, XdsTargetState::kUntouched,
+            "allocator-not-supported"));
+    }
+    auto target = ResolveTarget(descriptor, key, true);
+    if (!target) {
+        if (target.error() == ErrorCode::INVALID_PARAMS ||
+            target.error() == ErrorCode::FILE_NOT_FOUND) {
+            return tl::make_unexpected(XdsFailure(
+                XdsErrorClass::kContractViolation,
+                XdsTargetState::kUntouched,
+                target.error() == ErrorCode::FILE_NOT_FOUND
+                    ? "file-not-found"
+                    : "descriptor-validation",
+                toInt(target.error())));
+        }
+        return tl::make_unexpected(XdsFailure(
+            target.error() == ErrorCode::NOT_SUPPORTED
+                ? XdsErrorClass::kNotEligible
+                : XdsErrorClass::kTransientIo,
+            XdsTargetState::kUntouched, "direct-file-open",
+            toInt(target.error())));
+    }
+    if (!target->direct_read || !target->keepalive) {
+        return tl::make_unexpected(XdsFailure(
+            XdsErrorClass::kNotEligible, XdsTargetState::kUntouched,
+            "direct-file-unavailable"));
+    }
+#ifdef O_DIRECT
+    const int flags = ::fcntl(target->fd, F_GETFL);
+    if (flags < 0 || (flags & O_DIRECT) == 0) {
+        return tl::make_unexpected(XdsFailure(
+            XdsErrorClass::kNotEligible, XdsTargetState::kUntouched,
+            "direct-fd-lacks-o-direct"));
+    }
+#endif
+    struct stat info {};
+    if (::fstat(target->fd, &info) != 0) {
+        return tl::make_unexpected(XdsFailure(
+            XdsErrorClass::kTransientIo, XdsTargetState::kUntouched, "fstat"));
+    }
+    struct stat path_info {};
+    if (::stat(target->path.c_str(), &path_info) != 0) {
+        return tl::make_unexpected(XdsFailure(
+            XdsErrorClass::kContractViolation, XdsTargetState::kUntouched,
+            "file-not-found", toInt(ErrorCode::FILE_NOT_FOUND)));
+    }
+    if (info.st_dev != path_info.st_dev || info.st_ino != path_info.st_ino) {
+        return tl::make_unexpected(XdsFailure(
+            XdsErrorClass::kContractViolation, XdsTargetState::kUntouched,
+            "xds-file-identity-changed"));
+    }
+    XdsFileIdentity identity{target->path, static_cast<uint64_t>(info.st_dev),
+                             static_cast<uint64_t>(info.st_ino)};
+    {
+        std::lock_guard<std::mutex> lock(xds_mutex_);
+        if (!accelerator || accelerator_file_io_ != accelerator) {
+            return tl::make_unexpected(XdsFailure(
+                XdsErrorClass::kNotEligible, XdsTargetState::kUntouched,
+                "xds-backend-replaced"));
+        }
+        auto it = xds_files_.find(target->path);
+        if (it != xds_files_.end()) {
+            if (it->second.identity.device != identity.device ||
+                it->second.identity.inode != identity.inode) {
+                return tl::make_unexpected(XdsFailure(
+                    XdsErrorClass::kContractViolation,
+                    XdsTargetState::kUntouched, "xds-file-identity-changed"));
+            }
+            return it->second;
+        }
+        if (xds_files_.size() >= distributed_config_.xds_file_cache_size) {
+            return tl::make_unexpected(XdsFailure(
+                XdsErrorClass::kNotEligible, XdsTargetState::kUntouched,
+                "xds-file-cache-full"));
+        }
+    }
+    auto registration = accelerator->RegisterFile(target->fd, identity);
+    if (!registration) return tl::make_unexpected(registration.error());
+    XdsFileEntry entry{*registration, target->keepalive, identity};
+    std::lock_guard<std::mutex> lock(xds_mutex_);
+    if (accelerator_file_io_ != accelerator) {
+        (void)accelerator->DeregisterFile(entry.registration);
+        return tl::make_unexpected(XdsFailure(
+            XdsErrorClass::kNotEligible, XdsTargetState::kUntouched,
+            "xds-backend-replaced"));
+    }
+    auto [it, inserted] = xds_files_.emplace(target->path, entry);
+    if (!inserted) {
+        (void)accelerator->DeregisterFile(entry.registration);
+    }
+    return it->second;
+}
+
+std::vector<tl::expected<void, XdsError>>
+DistributedStorageBackend::BatchReadRanges(
+    const std::vector<DfsRangeReadRequest>& requests) {
+    std::vector<tl::expected<void, XdsError>> results(
+        requests.size(), tl::make_unexpected(XdsFailure(
+                             XdsErrorClass::kContractViolation,
+                             XdsTargetState::kUntouched, "invalid-request")));
+    std::unordered_set<std::string> unique_keys;
+    std::vector<std::pair<uintptr_t, uintptr_t>> target_intervals;
+    for (const auto& request : requests) {
+        if (request.ranges.empty() ||
+            !unique_keys.emplace(request.key).second) {
+            return results;
+        }
+        for (const auto& range : request.ranges) {
+            const uintptr_t address = reinterpret_cast<uintptr_t>(range.dst);
+            if (!range.dst || range.length == 0 ||
+                range.length >
+                    static_cast<uint64_t>(
+                        std::numeric_limits<uintptr_t>::max()) ||
+                address > std::numeric_limits<uintptr_t>::max() -
+                              static_cast<uintptr_t>(range.length)) {
+                return results;
+            }
+            target_intervals.emplace_back(
+                address, address + static_cast<uintptr_t>(range.length));
+        }
+    }
+    std::sort(target_intervals.begin(), target_intervals.end());
+    for (size_t i = 1; i < target_intervals.size(); ++i) {
+        if (target_intervals[i - 1].second > target_intervals[i].first) {
+            return results;
+        }
+    }
+    std::shared_ptr<AcceleratorFileIo> accelerator;
+    {
+        std::lock_guard<std::mutex> lock(xds_mutex_);
+        accelerator = accelerator_file_io_;
+    }
+    const auto capabilities =
+        accelerator ? accelerator->Capabilities() : DirectIoCapabilities{};
+    if (!accelerator || !capabilities.available ||
+        !capabilities.supports_distributed_fs ||
+        capabilities.file_offset_alignment == 0 ||
+        capabilities.device_address_alignment == 0 ||
+        capabilities.length_alignment == 0) {
+        std::fill(results.begin(), results.end(),
+                  tl::make_unexpected(XdsFailure(
+                      XdsErrorClass::kNotEligible,
+                      XdsTargetState::kUntouched, "xds-backend-unavailable")));
+        return results;
+    }
+    {
+        std::lock_guard<std::mutex> lock(xds_mutex_);
+        if (xds_fatal_) {
+            std::fill(results.begin(), results.end(),
+                      tl::make_unexpected(XdsFailure(
+                          XdsErrorClass::kBackendFatal,
+                          XdsTargetState::kUnknownMayStillBeWritten,
+                          "xds-backend-fatal")));
+            return results;
+        }
+    }
+    struct PlannedRequest {
+        std::vector<std::shared_ptr<XdsBufferEntry>> pins;
+        std::vector<DirectReadOp> operations;
+        std::optional<XdsError> error;
+    };
+    std::vector<PlannedRequest> plans(requests.size());
+    bool batch_contract_invalid = false;
+
+    // Plan and validate the complete sub-batch before any Read() call can
+    // write a target. This preserves the public all-arguments-before-I/O
+    // contract even when a later key is malformed.
+    for (size_t request_index = 0; request_index < requests.size();
+         ++request_index) {
+        const auto& request = requests[request_index];
+        auto& plan = plans[request_index];
+        if (request.ranges.empty()) {
+            plan.error = XdsFailure(XdsErrorClass::kContractViolation,
+                                    XdsTargetState::kUntouched,
+                                    "empty-ranges");
+            batch_contract_invalid = true;
+            continue;
+        }
+        auto file = GetXdsFile(request.descriptor, request.key, accelerator);
+        if (!file) {
+            plan.error = file.error();
+            batch_contract_invalid |=
+                file.error().error_class == XdsErrorClass::kContractViolation &&
+                file.error().raw_code != toInt(ErrorCode::FILE_NOT_FOUND);
+            continue;
+        }
+        XdsError error;
+        bool valid = true;
+        int32_t request_device = -1;
+        for (const auto& range : request.ranges) {
+            uint64_t file_offset = 0;
+            if (!range.dst || range.length == 0 ||
+                range.object_offset > request.descriptor.object_size ||
+                range.length > request.descriptor.object_size -
+                                   range.object_offset ||
+                request.descriptor.offset >
+                    std::numeric_limits<uint64_t>::max() -
+                        range.object_offset) {
+                error = XdsFailure(XdsErrorClass::kContractViolation,
+                                   XdsTargetState::kUntouched, "range-bounds");
+                valid = false;
+                break;
+            }
+            if (request_device >= 0 && request_device != range.device_id) {
+                error = XdsFailure(XdsErrorClass::kNotEligible,
+                                   XdsTargetState::kUntouched,
+                                   "mixed-device-key");
+                valid = false;
+                break;
+            }
+            request_device = range.device_id;
+            if (accelerator->DeviceState(range.device_id) !=
+                DeviceXdsState::kAvailable) {
+                error = XdsFailure(XdsErrorClass::kNotEligible,
+                                   XdsTargetState::kUntouched,
+                                   "xds-device-unavailable");
+                valid = false;
+                break;
+            }
+            file_offset = request.descriptor.offset + range.object_offset;
+            if (file_offset > std::numeric_limits<uint64_t>::max() -
+                                  range.length) {
+                error = XdsFailure(XdsErrorClass::kContractViolation,
+                                   XdsTargetState::kUntouched,
+                                   "file-range-overflow");
+                valid = false;
+                break;
+            }
+            const uintptr_t address = reinterpret_cast<uintptr_t>(range.dst);
+            if (file_offset % capabilities.file_offset_alignment != 0 ||
+                address % capabilities.device_address_alignment != 0 ||
+                range.length % capabilities.length_alignment != 0 ||
+                range.length >
+                    static_cast<uint64_t>(
+                        std::numeric_limits<ssize_t>::max())) {
+                error = XdsFailure(XdsErrorClass::kNotEligible,
+                                   XdsTargetState::kUntouched, "alignment");
+                valid = false;
+                break;
+            }
+            auto pin = PinXdsBuffer(range, &error);
+            if (!pin) {
+                valid = false;
+                break;
+            }
+            DirectReadOp operation{
+                file->registration, pin->registration, file_offset,
+                address - pin->base, range.length, range.device_id};
+            if (!plan.operations.empty()) {
+                auto& previous = plan.operations.back();
+                const bool contiguous =
+                    previous.file.id == operation.file.id &&
+                    previous.buffer.id == operation.buffer.id &&
+                    previous.device_id == operation.device_id &&
+                    previous.file_offset + previous.length ==
+                        operation.file_offset &&
+                    previous.device_offset + previous.length ==
+                        operation.device_offset &&
+                    operation.length <=
+                        static_cast<uint64_t>(
+                            std::numeric_limits<ssize_t>::max()) -
+                            previous.length;
+                if (contiguous) {
+                    previous.length += operation.length;
+                } else {
+                    plan.operations.push_back(operation);
+                }
+            } else {
+                plan.operations.push_back(operation);
+            }
+            plan.pins.push_back(std::move(pin));
+        }
+        if (valid) {
+            for (const auto& operation : plan.operations) {
+                if (operation.length < distributed_config_.xds_min_read_size) {
+                    error = XdsFailure(XdsErrorClass::kNotEligible,
+                                       XdsTargetState::kUntouched,
+                                       "below-min-read");
+                    valid = false;
+                    break;
+                }
+            }
+        }
+        if (!valid) {
+            plan.error = std::move(error);
+            batch_contract_invalid |= plan.error->error_class ==
+                                      XdsErrorClass::kContractViolation;
+        }
+    }
+
+    if (batch_contract_invalid) {
+        for (auto& plan : plans) {
+            for (const auto& pin : plan.pins) UnpinXdsBuffer(pin);
+        }
+        return results;
+    }
+
+    // The first version is deliberately synchronous and serial. The vendor
+    // implementation is responsible for its process-wide API lock and device
+    // synchronization before returning a completion.
+    bool execution_fatal = false;
+    for (size_t request_index = 0; request_index < plans.size();
+         ++request_index) {
+        auto& plan = plans[request_index];
+        if (execution_fatal && !plan.error) {
+            plan.error = XdsFailure(
+                XdsErrorClass::kBackendFatal,
+                XdsTargetState::kUnknownMayStillBeWritten,
+                "xds-backend-fatal");
+        }
+        if (!plan.error) {
+            for (const auto& operation : plan.operations) {
+                auto completion = accelerator->Read(operation);
+                if (!completion) {
+                    plan.error = completion.error();
+                    const auto& error = *plan.error;
+                    if (error.error_class == XdsErrorClass::kBackendFatal ||
+                        error.target_state ==
+                            XdsTargetState::kUnknownMayStillBeWritten) {
+                        std::lock_guard<std::mutex> lock(xds_mutex_);
+                        xds_fatal_ = true;
+                        execution_fatal = true;
+                    }
+                    break;
+                }
+                if (completion->bytes != operation.length) {
+                    plan.error = XdsFailure(
+                        XdsErrorClass::kTransientIo,
+                        XdsTargetState::kStoppedSafeToOverwrite, "short-read");
+                    break;
+                }
+            }
+        }
+        for (const auto& pin : plan.pins) UnpinXdsBuffer(pin);
+        if (plan.error) {
+            results[request_index] = tl::make_unexpected(*plan.error);
+        } else {
+            results[request_index] = {};
+        }
+    }
+    return results;
 }
 
 }  // namespace mooncake

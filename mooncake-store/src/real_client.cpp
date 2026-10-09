@@ -22,6 +22,7 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <unordered_set>
 #include <vector>
 
 #include "real_client.h"
@@ -40,6 +41,7 @@
 #include "utils.h"
 #include "rpc_types.h"
 #include "file_storage.h"
+#include "storage/distributed/distributed_storage_backend.h"
 #include "device/accelerator_registry.h"
 #include "default_config.h"
 #include "uds_transport.h"
@@ -4078,6 +4080,29 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
     if (!result) {
         return result;
     }
+    const XdsMode xds_mode = client_->GetXdsMode();
+    if (xds_mode != XdsMode::kPosix) {
+        auto runtime = device::GetAcceleratorRegistry().RuntimeAccelerators();
+        device::PointerInfo info;
+        auto* accelerator = runtime.FindDeviceForPointer(buffer, &info);
+        tl::expected<void, XdsError> xds_result = tl::make_unexpected(XdsError{
+            XdsErrorClass::kNotEligible, XdsTargetState::kUntouched, 0,
+            "unsupported-memory-kind"});
+        if (accelerator && info.kind == device::MemoryKind::kDevice) {
+            xds_result = client_->RegisterXdsBuffer(buffer, size, info.device_id);
+        }
+        if (!xds_result && xds_mode == XdsMode::kRequired) {
+            (void)client_->unregisterLocalMemory(buffer, true);
+            LOG(ERROR) << "Required xDS buffer registration failed at "
+                       << xds_result.error().operation;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (!xds_result) {
+            VLOG(1) << "xDS buffer registration skipped; retaining TE-only "
+                       "registration, reason="
+                    << xds_result.error().operation;
+        }
+    }
     {
         std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
         registered_buffer_sizes_[buffer] = size;
@@ -4094,6 +4119,12 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto xds_result = client_->UnregisterXdsBuffer(buffer);
+    if (!xds_result) {
+        LOG(ERROR) << "Unregister xDS buffer failed at "
+                   << xds_result.error().operation;
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
     auto unregister_result = client_->unregisterLocalMemory(buffer, true);
     if (!unregister_result) {
@@ -6611,13 +6642,60 @@ bool RealClient::validate_session_range_batch_arguments(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
     const std::vector<std::vector<size_t>> &all_src_offsets) const {
-    if (client_ && keys.size() == all_buffers.size() &&
-        keys.size() == all_sizes.size() &&
-        keys.size() == all_src_offsets.size()) {
-        return true;
+    if (!client_ || keys.size() != all_buffers.size() ||
+        keys.size() != all_sizes.size() ||
+        keys.size() != all_src_offsets.size()) {
+        LOG(ERROR) << "Invalid get ranges args: inconsistent batch sizes";
+        return false;
     }
-    LOG(ERROR) << "Invalid get ranges args";
-    return false;
+
+    std::unordered_set<std::string> unique_keys;
+    std::vector<std::pair<uintptr_t, uintptr_t>> target_intervals;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!unique_keys.emplace(keys[i]).second) {
+            LOG(ERROR) << "Invalid get ranges args: duplicate key";
+            return false;
+        }
+
+        const auto &buffers = all_buffers[i];
+        const auto &sizes = all_sizes[i];
+        const auto &offsets = all_src_offsets[i];
+        if (buffers.empty() || buffers.size() != sizes.size() ||
+            buffers.size() != offsets.size()) {
+            LOG(ERROR) << "Invalid get ranges args: inconsistent ranges";
+            return false;
+        }
+
+        size_t total_size = 0;
+        for (size_t j = 0; j < buffers.size(); ++j) {
+            if (buffers[j] == nullptr || sizes[j] == 0 ||
+                sizes[j] >
+                    static_cast<size_t>(std::numeric_limits<int>::max()) ||
+                total_size >
+                    static_cast<size_t>(std::numeric_limits<int>::max()) -
+                        sizes[j]) {
+                LOG(ERROR) << "Invalid get ranges args: invalid range size";
+                return false;
+            }
+            total_size += sizes[j];
+
+            const auto begin = reinterpret_cast<uintptr_t>(buffers[j]);
+            if (begin > std::numeric_limits<uintptr_t>::max() - sizes[j]) {
+                LOG(ERROR) << "Invalid get ranges args: address overflow";
+                return false;
+            }
+            target_intervals.emplace_back(begin, begin + sizes[j]);
+        }
+    }
+
+    std::sort(target_intervals.begin(), target_intervals.end());
+    for (size_t i = 1; i < target_intervals.size(); ++i) {
+        if (target_intervals[i - 1].second > target_intervals[i].first) {
+            LOG(ERROR) << "Invalid get ranges args: overlapping targets";
+            return false;
+        }
+    }
+    return true;
 }
 
 std::vector<SessionRangeReadRequest>
@@ -7260,6 +7338,110 @@ void RealClient::execute_session_dfs_range_reads(
     }
     entries = std::move(miss_entries);
     const auto t_cache_hit_done = std::chrono::steady_clock::now();
+
+    // xDS is attempted only for complete per-key plans. The backend validates
+    // registrations, alignment and file identity again before touching device
+    // memory. Ineligible and safely stopped failures retain the existing
+    // full-object host fallback below.
+    if (!prefetch_only && client_->GetXdsMode() != XdsMode::kPosix &&
+        !entries.empty()) {
+        std::vector<DfsRangeReadRequest> direct_requests;
+        std::vector<SessionRangeReadRequest*> direct_entries;
+        std::vector<SessionRangeReadRequest*> initial_fallback;
+        auto runtime = device::GetAcceleratorRegistry().RuntimeAccelerators();
+        for (auto* entry : entries) {
+            DfsRangeReadRequest request;
+            request.key = entry->key;
+            request.descriptor = entry->replica.get_dfs_descriptor();
+            bool eligible = true;
+            int32_t key_device = -1;
+            uint64_t requested = 0;
+            for (size_t i = 0; i < entry->buffers.size(); ++i) {
+                device::PointerInfo info;
+                if (!runtime.FindDeviceForPointer(entry->buffers[i], &info) ||
+                    info.kind != device::MemoryKind::kDevice ||
+                    (key_device >= 0 && key_device != info.device_id) ||
+                    entry->sizes[i] >
+                        static_cast<size_t>(std::numeric_limits<int>::max()) ||
+                    requested > static_cast<uint64_t>(
+                                    std::numeric_limits<int>::max()) -
+                                    entry->sizes[i]) {
+                    eligible = false;
+                    break;
+                }
+                key_device = info.device_id;
+                requested += entry->sizes[i];
+                request.ranges.push_back(DfsReadRange{
+                    entry->buffers[i], static_cast<uint64_t>(entry->sizes[i]),
+                    static_cast<uint64_t>(entry->src_offsets[i]), info.device_id,
+                    0});
+            }
+            if (!eligible || request.ranges.empty()) {
+                initial_fallback.push_back(entry);
+                continue;
+            }
+            direct_entries.push_back(entry);
+            direct_requests.push_back(std::move(request));
+        }
+        auto direct_results = client_->BatchReadDfsRanges(direct_requests);
+        if (direct_results.size() != direct_requests.size()) {
+            for (auto* entry : direct_entries) {
+                results[entry->original_idx] =
+                    static_cast<int>(toInt(ErrorCode::INTERNAL_ERROR));
+            }
+        } else {
+            for (size_t i = 0; i < direct_results.size(); ++i) {
+                auto* entry = direct_entries[i];
+                if (direct_results[i]) {
+                    bool publish = false;
+                    {
+                        std::lock_guard<std::mutex> lock(session_mutex_);
+                        auto current = get_sessions_.find(entry->key);
+                        auto now = std::chrono::steady_clock::now();
+                        publish = current != get_sessions_.end() &&
+                                  CompatibleSessionCacheRefresh(
+                                      entry->query_result, current->second) &&
+                                  !current->second.IsLeaseExpired(now);
+                    }
+                    if (!publish) {
+                        results[entry->original_idx] = static_cast<int>(
+                            toInt(ErrorCode::LEASE_EXPIRED));
+                        continue;
+                    }
+                    uint64_t transferred = 0;
+                    for (size_t size : entry->sizes) transferred += size;
+                    results[entry->original_idx] =
+                        static_cast<int>(transferred);
+                    continue;
+                }
+                const auto& error = direct_results[i].error();
+                const bool safe =
+                    error.target_state == XdsTargetState::kUntouched ||
+                    error.target_state ==
+                        XdsTargetState::kStoppedSafeToOverwrite;
+                const bool ordinary_auto_fallback =
+                    error.error_class == XdsErrorClass::kNotEligible &&
+                    client_->GetXdsMode() == XdsMode::kAuto;
+                const bool policy_fallback =
+                    safe && client_->AllowXdsRequestFallback() &&
+                    error.error_class != XdsErrorClass::kContractViolation;
+                if (ordinary_auto_fallback || policy_fallback) {
+                    initial_fallback.push_back(entry);
+                } else {
+                    const auto public_error =
+                        error.raw_code == toInt(ErrorCode::FILE_NOT_FOUND)
+                            ? ErrorCode::FILE_NOT_FOUND
+                            : error.error_class ==
+                                      XdsErrorClass::kContractViolation
+                                  ? ErrorCode::INVALID_PARAMS
+                                  : ErrorCode::TRANSFER_FAIL;
+                    results[entry->original_idx] =
+                        static_cast<int>(toInt(public_error));
+                }
+            }
+        }
+        entries = std::move(initial_fallback);
+    }
 
     // 2. Cache miss: allocate + BatchGet
     std::vector<std::string> disk_batch_keys;

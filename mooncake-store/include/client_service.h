@@ -27,11 +27,12 @@
 #include "count_min_sketch.h"
 #include "local_hot_cache.h"
 #include "pinned_buffer_pool.h"
+#include "storage/distributed/accelerator_file_io.h"
+#include "storage/distributed/distributed_storage_backend.h"
 
 namespace mooncake {
 
 class PutOperation;
-class DistributedStorageBackend;
 class RealClient;
 
 std::optional<size_t> GetTransportRegistrationLimit(
@@ -583,6 +584,14 @@ class Client {
         const std::vector<StorageObjectMetadata>& metadatas);
     void SetDfsStorageBackend(
         std::shared_ptr<DistributedStorageBackend> backend);
+    void SetAcceleratorFileIo(std::shared_ptr<AcceleratorFileIo> accelerator);
+    tl::expected<void, XdsError> RegisterXdsBuffer(void* base, size_t length,
+                                                   int32_t device_id);
+    tl::expected<void, XdsError> UnregisterXdsBuffer(void* base);
+    std::vector<tl::expected<void, XdsError>> BatchReadDfsRanges(
+        const std::vector<DfsRangeReadRequest>& requests);
+    XdsMode GetXdsMode() const;
+    bool AllowXdsRequestFallback() const;
 
     /**
      * @brief Fetch tasks assigned to a client
