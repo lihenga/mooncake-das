@@ -3075,6 +3075,21 @@ PYBIND11_MODULE(store, m) {
             py::arg("keys"),
             "Start a get session: query replicas once and cache them")
         .def(
+            "batch_get_session_ensure",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys, int64_t min_remaining_ms) {
+                if (!self.is_client_initialized()) return std::vector<int>{};
+                py::gil_scoped_release release;
+                return self.store_->batch_get_session_ensure(keys,
+                                                            min_remaining_ms);
+            },
+            py::arg("keys"), py::arg("min_remaining_ms") = 1000,
+            "Locally check caller-owned sessions; batch-query only missing or "
+            "expiring keys. Keep compatible prefetched buffers. Call before "
+            "loading, not after publishing partial data; retain key ownership "
+            "until reads finish. Margin must be between 0 and 3600000 ms and "
+            "smaller than the server lease TTL.")
+        .def(
             "batch_get_session_refresh",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys) {

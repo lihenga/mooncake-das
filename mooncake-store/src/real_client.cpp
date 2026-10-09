@@ -6179,6 +6179,7 @@ RealClient::batch_get_session_start_with_sources(
     detached_prefetch_buffers.reserve(keys.size());
     std::lock_guard<std::mutex> lock(session_mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {
+        get_session_repairs_.erase(keys[i]);
         if (record_access) {
             get_session_access_records_.erase(keys[i]);
         }
@@ -6239,6 +6240,153 @@ bool RealClient::all_get_sessions_memory(
             return false;
     }
     return true;
+}
+
+std::vector<int> RealClient::batch_get_session_ensure(
+    const std::vector<std::string> &keys, int64_t min_remaining_ms) {
+    const int invalid = static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+    std::vector<int> results(keys.size(), invalid);
+    if (!client_ || min_remaining_ms < 0 || min_remaining_ms > 3600000)
+        return results;
+    const auto margin = std::chrono::milliseconds(min_remaining_ms);
+    struct Pending {
+        std::string key;
+        std::shared_ptr<GetSessionRepair> repair;
+        std::optional<QueryResult> old_session;
+    };
+    std::vector<Pending> owned;
+    std::vector<std::pair<size_t, std::shared_ptr<GetSessionRepair>>> waiting;
+    // Reserve before publishing any work so vector allocation cannot strand
+    // waiters. No session mutex is held across the Master RPC or the wait.
+    owned.reserve(keys.size());
+    waiting.reserve(keys.size());
+    std::vector<std::shared_ptr<BufferHandle>> detached;
+    detached.reserve(keys.size());
+    auto finish_owned = [&] {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        for (const auto &entry : owned) {
+            auto it = get_session_repairs_.find(entry.key);
+            if (it != get_session_repairs_.end() && it->second == entry.repair)
+                get_session_repairs_.erase(it);
+            entry.repair->done = true;
+        }
+        session_cv_.notify_all();
+    };
+    try {
+        {
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            const auto deadline = std::chrono::steady_clock::now() + margin;
+            for (size_t i = 0; i < keys.size(); ++i) {
+                auto current = get_sessions_.find(keys[i]);
+                if (current != get_sessions_.end() &&
+                    current->second.lease_timeout > deadline) {
+                    results[i] = 0;
+                    continue;
+                }
+                auto pending = get_session_repairs_.find(keys[i]);
+                if (pending != get_session_repairs_.end()) {
+                    waiting.emplace_back(i, pending->second);
+                    continue;
+                }
+                auto repair = std::make_shared<GetSessionRepair>();
+                owned.push_back(Pending{keys[i], repair, std::nullopt});
+                if (current != get_sessions_.end())
+                    owned.back().old_session.emplace(current->second);
+                get_session_repairs_.emplace(keys[i], repair);
+                waiting.emplace_back(i, std::move(repair));
+            }
+        }
+        if (!owned.empty()) {
+            std::vector<std::string> query_keys;
+            query_keys.reserve(owned.size());
+            for (const auto &entry : owned) query_keys.push_back(entry.key);
+            const auto queries = client_->BatchQuery(query_keys);
+            const auto endpoints = client_->GetLocalEndpoints();
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            for (size_t i = 0; i < owned.size(); ++i) {
+                const auto &entry = owned[i];
+                auto pending = get_session_repairs_.find(entry.key);
+                if (pending == get_session_repairs_.end() ||
+                    pending->second != entry.repair)
+                    continue;  // End/start/refresh cancelled this repair.
+                auto current = get_sessions_.find(entry.key);
+                const bool unchanged =
+                    entry.old_session
+                        ? current != get_sessions_.end() &&
+                              SameGetSessionSnapshot(current->second,
+                                                     *entry.old_session)
+                        : current == get_sessions_.end();
+                if (!unchanged) continue;
+                if (queries.size() != owned.size()) {
+                    entry.repair->result =
+                        static_cast<int>(toInt(ErrorCode::RPC_FAIL));
+                    continue;
+                }
+                if (!queries[i]) {
+                    entry.repair->result =
+                        static_cast<int>(toInt(queries[i].error()));
+                    continue;
+                }
+                const auto &query = queries[i].value();
+                if (query.lease_timeout <= std::chrono::steady_clock::now() +
+                                               margin) {
+                    entry.repair->result =
+                        static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+                    continue;  // No retry loop if the margin exceeds the TTL.
+                }
+                const auto *replica =
+                    SelectSessionReplica(query.replicas, endpoints);
+                if (!replica) {
+                    entry.repair->result =
+                        static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
+                    continue;
+                }
+                auto fresh = FilterQueryResult(query, *replica);
+                auto cached = get_session_prefetch_cache_.find(entry.key);
+                const bool invalid_buffer =
+                    cached != get_session_prefetch_cache_.end() &&
+                    (!cached->second.buffer_handle ||
+                     !cached->second.buffer_handle->ptr() ||
+                     cached->second.total_size >
+                         cached->second.buffer_handle->size());
+                if (!entry.old_session ||
+                    !CompatibleSessionCacheRefresh(*entry.old_session, fresh) ||
+                    invalid_buffer) {
+                    DetachPrefetchedSessionBuffer(get_session_prefetch_cache_,
+                                                  entry.key, detached);
+                }
+                // Compatible DFS bytes keep their handle and are not reread.
+                get_sessions_.erase(entry.key);
+                get_sessions_.emplace(entry.key, std::move(fresh));
+                entry.repair->result = 0;
+            }
+        }
+    } catch (...) {
+        finish_owned();
+        throw;
+    }
+    finish_owned();
+    {
+        std::unique_lock<std::mutex> lock(session_mutex_);
+        for (const auto &[index, repair] : waiting) {
+            session_cv_.wait(lock, [&] { return repair->done; });
+            results[index] = repair->result;
+        }
+        // Waiting for another batch/RPC also consumes lease time. Recheck
+        // locally without querying again or accepting another repair's smaller
+        // margin. This covers the keys that took the initial healthy fast path.
+        const auto deadline = std::chrono::steady_clock::now() + margin;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (results[i] != 0) continue;
+            auto current = get_sessions_.find(keys[i]);
+            if (current == get_sessions_.end()) {
+                results[i] = invalid;
+            } else if (current->second.lease_timeout <= deadline) {
+                results[i] = static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+            }
+        }
+    }
+    return results;
 }
 
 std::vector<int> RealClient::batch_get_session_refresh(
@@ -6339,6 +6487,8 @@ std::vector<int> RealClient::batch_get_session_refresh(
                 refreshed_session->IsLeaseExpired()) {
                 refresh_error = ErrorCode::LEASE_EXPIRED;
             }
+
+            get_session_repairs_.erase(entry.key);
 
             auto cache_it = get_session_prefetch_cache_.find(entry.key);
             if (refresh_error == ErrorCode::OK &&
@@ -6816,7 +6966,12 @@ void RealClient::execute_session_memory_range_reads(
             if (now >= request.lease_deadline) {
                 results[request.original_idx] =
                     static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
-                get_sessions_.erase(request.key);
+                auto current = get_sessions_.find(request.key);
+                if (current != get_sessions_.end() &&
+                    SameGetSessionSnapshot(current->second,
+                                           request.query_result)) {
+                    get_sessions_.erase(current);
+                }
             } else {
                 results[request.original_idx] =
                     static_cast<int>(transfer[i].value());
@@ -7000,6 +7155,7 @@ int RealClient::batch_get_session_end(const std::vector<std::string> &keys) {
             ended_keys.reserve(keys.size());
         }
         for (const auto &key : keys) {
+            get_session_repairs_.erase(key);
             if (record_access) {
                 if (!ended_keys.insert(key).second) continue;
                 auto access_it = get_session_access_records_.find(key);
@@ -7215,7 +7371,10 @@ void RealClient::execute_session_dfs_range_reads(
         bool buffered_for_session = false;
         if (prefetch_only) {
             std::lock_guard<std::mutex> lock(session_mutex_);
-            if (get_sessions_.find(entry->key) != get_sessions_.end()) {
+            auto current = get_sessions_.find(entry->key);
+            if (current != get_sessions_.end() &&
+                CompatibleSessionCacheRefresh(entry->query_result,
+                                              current->second)) {
                 auto cache_it = get_session_prefetch_cache_.find(entry->key);
                 if (cache_it != get_session_prefetch_cache_.end()) {
                     // Move the old handle out before replacing it so a
@@ -7251,7 +7410,11 @@ void RealClient::execute_session_dfs_range_reads(
         if (entry->replica.is_dfs_replica()) {
             std::lock_guard<std::mutex> lock(session_mutex_);
             auto prefetch_it = get_session_prefetch_cache_.find(entry->key);
-            if (prefetch_it != get_session_prefetch_cache_.end()) {
+            auto current = get_sessions_.find(entry->key);
+            if (prefetch_it != get_session_prefetch_cache_.end() &&
+                current != get_sessions_.end() &&
+                CompatibleSessionCacheRefresh(entry->query_result,
+                                              current->second)) {
                 cached_handle = prefetch_it->second.buffer_handle;
             }
         }
@@ -7272,9 +7435,13 @@ void RealClient::execute_session_dfs_range_reads(
                            << entry->key;
                 {
                     std::lock_guard<std::mutex> lock(session_mutex_);
-                    DetachPrefetchedSessionBuffer(
-                        get_session_prefetch_cache_, entry->key,
-                        detached_prefetch_buffers);
+                    auto current = get_session_prefetch_cache_.find(entry->key);
+                    if (current != get_session_prefetch_cache_.end() &&
+                        current->second.buffer_handle == cached_handle) {
+                        DetachPrefetchedSessionBuffer(
+                            get_session_prefetch_cache_, entry->key,
+                            detached_prefetch_buffers);
+                    }
                 }
                 miss_entries.push_back(entry);
             }

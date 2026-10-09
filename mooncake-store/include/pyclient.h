@@ -318,6 +318,18 @@ class PyClient {
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }
 
+    // Ensure caller-owned sessions before starting a load. Healthy sessions
+    // need no RPC; missing/expiring keys are queried in one batch. This is not
+    // an ownership acquisition: callers must keep their key references alive
+    // through ensure and the subsequent reads. Do not use it to switch object
+    // snapshots midway through a partially published load.
+    virtual std::vector<int> batch_get_session_ensure(
+        const std::vector<std::string> &keys,
+        int64_t /*min_remaining_ms*/ = 1000) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
     virtual GetSessionStartResult
     batch_get_session_start_with_sources(const std::vector<std::string> &keys) {
         return {batch_get_session_start(keys),

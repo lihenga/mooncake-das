@@ -297,6 +297,10 @@ class RealClient : public PyClient {
     std::vector<int> batch_get_session_refresh(
         const std::vector<std::string> &keys) override;
 
+    std::vector<int> batch_get_session_ensure(
+        const std::vector<std::string> &keys,
+        int64_t min_remaining_ms = 1000) override;
+
     GetSessionStartResult
     batch_get_session_start_with_sources(
         const std::vector<std::string> &keys) override;
@@ -1114,6 +1118,14 @@ class RealClient : public PyClient {
     mutable std::mutex session_mutex_;
     std::condition_variable session_cv_;
     std::unordered_map<std::string, QueryResult> get_sessions_;
+    struct GetSessionRepair {
+        bool done{false};
+        int result{static_cast<int>(toInt(ErrorCode::INVALID_PARAMS))};
+    };
+    // Only in-flight repairs occupy this map. Removing an entry on end/start
+    // cancels its commit, including when the old session was already missing.
+    std::unordered_map<std::string, std::shared_ptr<GetSessionRepair>>
+        get_session_repairs_;
     struct GetSessionAccessRecord {
         std::string source;
         bool success{true};
