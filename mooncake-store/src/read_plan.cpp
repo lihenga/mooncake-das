@@ -11,6 +11,7 @@
 #include <tuple>
 #include <vector>
 #include "read_plan.h"
+#include "session_diagnostics.h"
 #include <set>
 #include <thread>
 #include <atomic>
@@ -281,12 +282,29 @@ struct ReadPlan::Impl {
         for (size_t k = 0; k < results.size(); ++k) {
             size_t expected = 0;
             for (auto s : r.sizes[k]) expected = checked_add(expected, s);
-            if (results[k] < 0 || size_t(results[k]) != expected)
+            if (results[k] < 0 || size_t(results[k]) != expected) {
+                if (KVSessionTraceEnabled()) {
+                    size_t failed_keys = 0;
+                    for (int rc : results) failed_keys += rc < 0;
+                    LOG(INFO)
+                        << "KV_READ_PLAN_FAILURE op_id="
+                        << KVSessionDiagnosticBatch::CurrentId()
+                        << " trace_id=" << KVSessionTraceContext()
+                        << " site=" << __FILE__ << ":" << __LINE__
+                        << " client=" << client.get() << " group=" << group
+                        << " key_index=" << k
+                        << " key_hash=" << KVSessionKeyHash(r.keys[k])
+                        << " rc=" << results[k] << " expected=" << expected
+                        << " result_keys=" << results.size()
+                        << " failed_keys=" << failed_keys
+                        << " borrowed_sessions=" << borrowed_sessions;
+                }
                 throw std::runtime_error(
                     "Mooncake read plan range get failed at group=" +
                     std::to_string(group) + " key_index=" + std::to_string(k) +
                     " rc=" + std::to_string(results[k]) +
                     " expected=" + std::to_string(expected));
+            }
             bytes += expected;
         }
         ++stats[0];
@@ -337,7 +355,13 @@ struct ReadPlan::Impl {
         std::condition_variable work_cv;
         int next = 0, consumed = 0;
         bool stop = false;
+        const auto trace_context = KVSessionTraceContext();
+        const auto parent_op = KVSessionDiagnosticBatch::CurrentId();
         auto worker = [&] {
+            KVSessionTraceScope trace_scope(trace_context);
+            KVSessionDiagnosticBatch worker_diagnostic("read_plan_worker",
+                                                       client.get(), 0);
+            worker_diagnostic.Field("plan_op_id", parent_op);
             while (true) {
                 int g;
                 {
@@ -350,7 +374,11 @@ struct ReadPlan::Impl {
                 }
                 auto &slot = slots[g];
                 try {
+                    const auto metadata_started =
+                        std::chrono::steady_clock::now();
                     slot.ranges = build(g);
+                    worker_diagnostic.Elapsed("range_metadata_us",
+                                              metadata_started);
                     slot.built = true;
                     auto &r = slot.ranges;
                     if (!r.keys.empty())
@@ -410,6 +438,11 @@ struct ReadPlan::Impl {
     }
 
     void run_impl() {
+        const auto plan_started = std::chrono::steady_clock::now();
+        KVSessionDiagnosticBatch diagnostic("read_plan", client.get(), 0);
+        diagnostic.Field("groups", groups);
+        diagnostic.Field("borrowed_sessions", borrowed_sessions);
+        diagnostic.Field("requested_page_wise", page_wise);
         {
             std::lock_guard lock(mutex);
             if (running) throw std::runtime_error("plan may only run once");
@@ -426,6 +459,7 @@ struct ReadPlan::Impl {
                     if (seen.insert(key).second) session.push_back(key);
             }
             reservation = std::make_unique<ActiveKeys>(client.get(), session);
+            diagnostic.Field("unique_keys", session.size());
             const char *adaptive_source =
                 std::getenv("MOONCAKE_READ_PLAN_ADAPTIVE_SOURCE");
             const bool adaptive = page_wise && adaptive_source &&
@@ -458,6 +492,8 @@ struct ReadPlan::Impl {
             const bool pipeline =
                 requested && !reuse && !effective_page_wise && groups > 1 &&
                 disjoint_groups();
+            diagnostic.Field("effective_page_wise", effective_page_wise);
+            diagnostic.Field("pipeline", pipeline);
             if (requested) {
                 static std::atomic<bool> logged_yes{false}, logged_no{false};
                 auto &logged = pipeline ? logged_yes : logged_no;
@@ -468,10 +504,13 @@ struct ReadPlan::Impl {
                         "keys=%zu\n",
                         int(pipeline), groups, session.size());
             }
+            diagnostic.Elapsed("plan_setup_us", plan_started);
             if (effective_page_wise) {
                 // One batch_get carries every group's ranges per key; readiness
                 // is published only after the single transfer succeeds.
+                const auto metadata_started = std::chrono::steady_clock::now();
                 auto r = build_all();
+                diagnostic.Elapsed("range_metadata_us", metadata_started);
                 ++built_count;
                 if (!r.keys.empty()) {
                     auto result = client->batch_get_into_multi_buffer_ranges(
@@ -483,6 +522,8 @@ struct ReadPlan::Impl {
             } else {
                 std::map<std::vector<size_t>, Ranges> cached_ranges;
                 for (int group = 0; group < groups; ++group) {
+                    const auto metadata_started =
+                        std::chrono::steady_clock::now();
                     Ranges fresh;
                     Ranges *selected = nullptr;
                     if (reuse) {
@@ -501,6 +542,7 @@ struct ReadPlan::Impl {
                         selected = &fresh;
                         ++built_count;
                     }
+                    diagnostic.Elapsed("range_metadata_us", metadata_started);
                     auto &r = *selected;
                     if (!r.keys.empty()) {
                         auto result = client->batch_get_into_multi_buffer_ranges(
@@ -524,6 +566,7 @@ struct ReadPlan::Impl {
             }
         }
         reservation.reset();
+        diagnostic.Field("result", error ? "exception" : "success");
         finish(error);
         if (error) std::rethrow_exception(error);
     }

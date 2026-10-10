@@ -1,3 +1,4 @@
+#include "session_diagnostics.h"
 #include "client_service.h"
 
 #include <boost/algorithm/string.hpp>
@@ -1269,9 +1270,45 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
 
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     const std::vector<std::string>& object_keys, const std::string& tenant_id) {
+    KVSessionDiagnosticBatch diagnostic("master_batch_query", this,
+                                        object_keys.size());
+    diagnostic.Field("logical_master_calls", 1);
     std::chrono::steady_clock::time_point start_time =
         std::chrono::steady_clock::now();
     auto response = master_client_.BatchGetReplicaList(object_keys, tenant_id);
+    diagnostic.Elapsed("master_rpc_us", start_time);
+    diagnostic.Field("returned_keys", response.size());
+    if (KVSessionTraceEnabled()) {
+        for (size_t i = 0; i < response.size() && i < object_keys.size(); ++i) {
+            const bool failed = !response[i];
+            if (!diagnostic.Admit(failed,
+                                  failed ? "query_error" : "query_lease"))
+                continue;
+            std::ostringstream details;
+            details << " site=" << __FILE__ << ":" << __LINE__
+                    << " key_hash=" << KVSessionKeyHash(object_keys[i])
+                    << " key_index=" << i;
+            if (response[i]) {
+                const auto ttl = response[i].value().lease_ttl_ms;
+                const auto deadline =
+                    start_time + std::chrono::milliseconds(ttl);
+                details
+                    << " lease_ttl_ms=" << ttl
+                    << " lease_base=query_start deadline_mono_us="
+                    << std::chrono::duration_cast<std::chrono::microseconds>(
+                           deadline.time_since_epoch())
+                           .count()
+                    << " remaining_at_response_us="
+                    << std::chrono::duration_cast<std::chrono::microseconds>(
+                           deadline - std::chrono::steady_clock::now())
+                           .count();
+            } else {
+                details << " rc="
+                        << static_cast<int>(toInt(response[i].error()));
+            }
+            diagnostic.Sample(details.str());
+        }
+    }
 
     // Check if we got the expected number of responses
     if (response.size() != object_keys.size()) {
@@ -4040,7 +4077,13 @@ tl::expected<bool, ErrorCode> Client::IsExist(const std::string& key) {
 
 std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
     const std::vector<std::string>& keys) {
+    KVSessionDiagnosticBatch diagnostic("master_batch_exists", this,
+                                        keys.size());
+    diagnostic.Field("logical_master_calls", 1);
+    const auto started = std::chrono::steady_clock::now();
     auto response = master_client_.BatchExistKey(keys);
+    diagnostic.Elapsed("master_rpc_us", started);
+    diagnostic.Field("returned_keys", response.size());
 
     // Check if we got the expected number of responses
     if (response.size() != keys.size()) {

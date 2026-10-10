@@ -1,3 +1,4 @@
+#include "session_diagnostics.h"
 #include <pybind11/gil.h>  // For GIL management
 #include <pybind11/stl.h>
 #include <numa.h>
@@ -3061,6 +3062,11 @@ PYBIND11_MODULE(store, m) {
             "until run completes. By default the plan starts and ends get "
             "sessions; borrowed_sessions=True requires the caller to keep "
             "sessions for all keys active until run completes.")
+        .def("set_session_trace_context",
+             [](MooncakeStorePyWrapper&, const std::string& context) {
+                 return std::exchange(mooncake::KVSessionTraceContext(), context);
+             }, py::arg("context"),
+             "Set this calling thread's diagnostic correlation ID; return previous ID")
         .def(
             "batch_get_session_start",
             [](MooncakeStorePyWrapper &self,

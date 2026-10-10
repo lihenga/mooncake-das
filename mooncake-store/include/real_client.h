@@ -24,6 +24,7 @@
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
+#include "session_diagnostics.h"
 #if defined(USE_SUNRISE)
 #include "sunrise_allocator.h"
 #endif
@@ -1114,6 +1115,7 @@ class RealClient : public PyClient {
     mutable std::mutex session_mutex_;
     std::condition_variable session_cv_;
     std::unordered_map<std::string, QueryResult> get_sessions_;
+    KVSessionDiagnosticHistory get_session_diagnostics_;
     struct GetSessionAccessRecord {
         std::string source;
         bool success{true};
