@@ -46,7 +46,7 @@ SGLang 使用 Mooncake 作为 L3 KV Cache。KV 对象位于 DFS 时，当前 ran
 5. xDS 不可用或请求不适用时，安全回退现有路径。
 6. xDS 已接触目标显存后，只有确认 DMA 已停止，才允许整 key fallback【*某个range读失败，则整体回退】。
 7. 当前 Mooncake 代码没有独立的 DFS/xDS worker 进程。RealClient、Client、DistributedStorageBackend 以及 BUCKET BatchRead 使用的线程池都位于同一个承载进程内；停止某个 backend 线程、线程池任务或 RPC handler 不能终止已经提交的设备 DMA。若 xDS read 已提交但无法证明 DMA 已停止，首版必须禁止 host fallback，并禁止释放、覆盖或复用对应的目标 KV block；同时将 xDS backend 和当前承载进程标记为 fatal/unhealthy，由外部 supervisor 终止并重启整个承载进程（没自动拉起，就人为操作重启）。SGLang 内嵌模式下，该进程是承载 RealClient 的 SGLang worker 进程；独立 RPC 模式下，该进程是 mooncake_client。新进程启动后必须重新初始化 xDS driver、file handle、buffer registration、连接和 session。只有未来将 xDS 放入独立 helper process 后，该 helper process 才能成为单独的故障隔离和重启边界。
-8. 生产数据面首版只实现 read；`hipFileWrite` 仅用于启动 preflight（小规模的端到端自检xDS读写功能的可用性）。
+8. 生产数据面和 preflight 都只使用 xDS read；preflight 通过 POSIX 写入已知数据，再用 `hipFileRead` 读入 DCU 并校验。
 
 本文所称“零拷贝”仅表示 Mooncake 不分配 host staging buffer，也不显式执行 H2D payload copy。hipFileRead 返回成功并不能证明 libhyfile.so、DFS client 或内核驱动内部未使用临时 host/device bounce buffer。除非厂商提供可区分 direct-DMA bytes 与 bounce bytes 的可信计数器、trace 或正式语义保证，本文只将该路径称为“Mooncake 零 host staging”，不宣称端到端完全零拷贝。。
 
@@ -349,8 +349,10 @@ hipFileHandleDeregister
 hipFileBufRegister
 hipFileBufDeregister
 hipFileRead
-hipFileWrite        # 仅 preflight 使用
 ```
+
+preflight 使用 POSIX 写入已知测试数据，再通过 `hipFileRead` 读入 DCU
+buffer 并回读校验；首版不要求也不加载 `hipFileWrite`。
 
 可选加载但首版不调用：
 
@@ -366,15 +368,18 @@ hipFileDriverSetMaxPinnedMemSize
 
 #### 2.2.3 ABI 规则
 
-生产构建优先使用目标环境正式 SDK header。所有结构体大小、padding、enum 值、整数宽度、calling convention 和返回值语义以正式 header 为准。
+首版只维护一套最小手工 ABI 声明，不依赖或探测 `hipfile.h`。ABI 声明集中在
+`hyfile_abi.h`，生产实现只能通过该声明和 `dlopen`/`dlsym` 调用
+`libhyfile.so`，其他编译单元不得重复声明 vendor 类型或函数。
 
-如果部署环境只有动态库：
+规则如下：
 
-1. 只允许在 `hyfile_api_shim.cpp` 中维护最小 ABI mirror；
-2. ABI mirror 必须绑定明确的 DTK、driver 和 `libhyfile.so` build-id/版本；
-3. 支持矩阵之外的版本 fail closed；
-4. 必须执行真实 mount round-trip preflight；
-5. 不通过数值阈值猜测 errno 与 HyFile error domain。
+1. 只声明首版 read-only 路径实际使用的类型、常量和 7 个 required symbols；
+2. 对错误结构体和文件描述符执行编译期 size、alignment、offset 校验；
+3. required symbol 缺失时 fail closed，但不做 build-id/hash 强制拒绝；
+4. 部署清单仍必须记录 DTK、driver 和 `libhyfile.so` 版本/build-id，便于定位兼容性问题；
+5. 启用业务流量前必须执行真实 mount、逐 device 的已知数据读回 preflight；
+6. 错误码映射以已确认的当前 ABI 为准，未知错误按保守策略处理。
 
 在厂商确认前，以下问题是生产 backend 的阻塞项：
 
@@ -463,7 +468,7 @@ enum class DeviceXdsState {
 };
 ```
 
-动态库、driver 和 DFS mount 兼容性属于 backend 级状态；preflight 结果、可用性和失败原因属于 per-device 状态。backend 维护 `device_id -> DeviceXdsState`，不能用一个全局 `capabilities.available` 代表所有 device。能力在对应 device 完成初始化和 preflight 后冻结，I/O 热路径不重新 probe。首版 alignment 来自经过验证的版本 profile，固定为 4096，不允许普通用户覆盖。
+动态库、driver 和 DFS mount 兼容性属于 backend 级状态；preflight 结果、可用性和失败原因属于 per-device 状态。backend 维护 `device_id -> DeviceXdsState`，不能用一个全局 `capabilities.available` 代表所有 device。能力在对应 device 完成初始化和 preflight 后冻结，I/O 热路径不重新 probe。首版 alignment 来自经过验证的部署 ABI，固定为 4096，不允许普通用户覆盖。
 
 #### 3.2.2 错误和目标状态
 
@@ -958,7 +963,7 @@ ssize_t ret = api.hipFileRead(
     op.device_offset);
 ```
 
-精确原型必须来自厂商 header；以上代码仅表示参数语义。
+精确原型固定在 `hyfile_abi.h` 的手工 ABI 声明中；以上代码表示参数语义。
 
 #### 5.1.4 成功和同步
 
@@ -978,7 +983,7 @@ exact-length + synchronize failure
 
 ```text
 synchronize success
-    → 根据正式 SDK 映射错误类别
+    → 根据已确认的手工 ABI 映射错误类别
     → target_state = kStoppedSafeToOverwrite
 
 synchronize failure
@@ -987,7 +992,7 @@ synchronize failure
     → worker fail-stop
 ```
 
-首版不在 SDK 层自动重试 `hipFileRead`，避免目标状态不清时重复写入。
+首版不在 HyFile adapter 层自动重试 `hipFileRead`，避免目标状态不清时重复写入。
 
 ### 5.2 完整读取执行流程
 
@@ -996,14 +1001,14 @@ synchronize failure
 ```text
 解析配置
 → dlopen/dlsym libhyfile.so
-→ 验证版本/profile/required symbols
+→ 记录部署版本并验证 required symbols
 → hipFileDriverOpen
 → 对每个目标 device 执行 round-trip preflight
 → 初始化 buffer registry 和 file cache
 → 发布 backend 基础能力和逐 device DeviceXdsState
 ```
 
-driver open、版本/profile 或目标 mount 的公共检查失败属于 backend 级失败。单个 device 的 probe 失败只更新该 device 的状态；是否继续启动由 `xds-auto`/`xds-required` 模式决定，详见 7.1.3。
+driver open、required symbols 或目标 mount 的公共检查失败属于 backend 级失败。单个 device 的 probe 失败只更新该 device 的状态；是否继续启动由 `xds-auto`/`xds-required` 模式决定，详见 7.1.3。
 
 #### 5.2.2 一次 batch
 
@@ -1180,8 +1185,8 @@ deadline 根据真实 DFS 尾延迟确定，不能把普通慢 I/O 误判为 hun
 - driver、file handle、buffer registration 都是进程资源；
 - 每个 owner 和 pin 保存创建 PID；
 - 检测到 PID 改变时，不调用继承资源的 vendor deregister；
-- 子进程把继承对象标记为 abandoned，清空可查询 registry；
-- 子进程从 `hipFileDriverOpen`、preflight、buffer registration 和 file registration 完整重建；
+- 子进程把继承对象标记为 abandoned，清空可查询 registry，并拒绝继续使用继承的 HyFile runtime；
+- 由 fresh exec 启动的新 worker 从 `hipFileDriverOpen`、preflight、buffer registration 和 file registration 完整重建；
 - 每个 device pool 分别注册并保存 device id；
 - 每次 register/read/synchronize/deregister 前设置正确 device context；
 - 首版同一 key 的 ranges 必须位于同一 device；一个 batch 可以包含不同 device 的不同 key，但 HyFile API 仍全进程串行。
@@ -1203,29 +1208,27 @@ MOONCAKE_XDS_PREFLIGHT_DIR
 - `xds-auto`：禁用 xDS 并记录结构化原因；
 - `xds-required`：启动失败。
 
-#### 7.1.2 每 device round-trip
+#### 7.1.2 每 device 已知数据读回
 
 对每个目标 device：
 
 1. 分配一个 4096 对齐、长度 4096 的 device probe buffer；
-2. `hipSetDevice(device_id)`；
-3. `hipFileBufRegister`；
-4. 在 preflight 目录以随机唯一名和 `0600` 创建文件：
+2. 分配一个同样对齐的 host probe buffer并填充 `0xA5`；
+3. `hipSetDevice(device_id)`；
+4. `hipFileBufRegister`；
+5. 在 preflight 目录以随机唯一名和 `0600` 创建文件：
 
    ```text
    O_RDWR | O_CREAT | O_EXCL | O_DIRECT | O_CLOEXEC
    ```
 
-5. `ftruncate` 到 4096；
-6. 注册 opaque fd handle；
-7. device probe buffer 写入 `0xA5`；
-8. `hipFileWrite` 写文件，要求 exact-length；
-9. 使用独立 buffered fd 从 CPU 逐字节校验；
-10. 清零 device buffer；
-11. `hipFileRead` 读回；
-12. `hipDeviceSynchronize`；
-13. D2H 读取 probe buffer并逐字节比较；
-14. 逆序 deregister/close/delete。
+6. 用 POSIX `pwrite` 写入 host probe buffer，要求 exact-length，并完成必要的文件同步；
+7. 注册 opaque fd handle；
+8. 清零 device probe buffer；
+9. `hipFileRead` 读回，要求 exact-length；
+10. `hipDeviceSynchronize`；
+11. D2H 读取 device probe buffer并与 host probe buffer 逐字节比较；
+12. 逆序 deregister/close/delete。
 
 任一步失败都使该 device 不可用，但不自动覆盖其他 device 的结果。每个 device 分别记录 `kAvailable` 或带结构化原因的 `kUnavailable`。
 
@@ -1237,7 +1240,7 @@ MOONCAKE_XDS_PREFLIGHT_DIR
 
 `xds-auto` 采用逐 device 降级：
 
-- 公共的 `dlopen`、driver open、版本/profile 或 mount 检查失败时，整个 xDS backend 禁用并继续使用 POSIX；
+- 公共的 `dlopen`、required symbols、driver open 或 mount 检查失败时，整个 xDS backend 禁用并继续使用 POSIX；
 - 单个 device preflight 失败时，仅将该 device 标为 `kUnavailable`，其他 `kAvailable` device 继续使用 xDS；
 - 失败 device 上的 buffer 按 3.3.2 发布为 TE-only、xDS-ineligible；
 - 请求按 key 所属 device 独立分类，该 device 不可用时整个 key 走 host fallback；
@@ -1260,7 +1263,7 @@ MOONCAKE_XDS_PREFLIGHT_DIR
 |---|---|
 | DFS → DCU KV | 实现 xDS direct read |
 | DCU KV → DFS | 保持现有 D2H staging + `BatchWrite` |
-| `hipFileWrite` | 仅 preflight 使用 |
+| `hipFileWrite` | 首版不加载、不调用 |
 | 生产 direct write | 不支持 |
 
 业务 `DistributedStorageBackend::BatchWrite` 不得调用 `AcceleratorFileIo::Write`；首版接口甚至不暴露业务 `Write` 方法。
@@ -1326,7 +1329,7 @@ xds-required:
     backend fatal → worker fail-stop / 服务 unhealthy
 ```
 
-启动日志输出最终配置、capabilities、版本 profile、对齐和 preflight 结果，不输出业务数据。
+启动日志输出最终配置、capabilities、部署版本信息、对齐和 preflight 结果，不输出业务数据。
 
 ## 8. 可观测性与测试
 
@@ -1440,7 +1443,7 @@ first_error_operation
 - 原始 registered base 与 pool-relative device offset；
 - exact-length success；
 - 正短读；
-- SDK 定义的各种错误；
+- 当前手工 ABI 已定义及未知的 vendor 错误；
 - read error 后 synchronize success → safe fallback；
 - read error 后 synchronize failure → fatal；
 - success read 后 synchronize failure → fatal；
@@ -1547,7 +1550,7 @@ DIRECT range 出现上述任意行为都不能计为 direct success。允许控�
 Phase 0～2 可以作为一个开发任务、一个分支和一个生产候选版本一次性交付，但必须保持独立模块、逻辑提交和验收门禁，不得将 PoC、生命周期基础设施和 `RealClient` 热路径写成不可拆分的一体化实现。推荐至少拆分为以下逻辑提交；是否拆成多个 PR 由项目协作方式决定：
 
 ```text
-Commit 1: reusable HyFile ABI shim/backend + thin standalone PoC
+Commit 1: reusable HyFile ABI declaration/backend + thin standalone PoC
 Commit 2: planner/registry/file owner/session lifecycle + fake tests
 Commit 3: BUCKET RealClient integration + E2E/metrics/fallback
 ```
@@ -1562,20 +1565,20 @@ Phase 0 → Phase 0.5 → Phase 1 → Phase 2
 
 #### Phase 0：ABI 和独立 PoC
 
-- 获取正式 SDK header、许可和版本矩阵；
-- 确认 `libhyfile.so` 路径、build-id 和 required symbols；
-- 确认 `hipFileRead/Write` 精确原型和错误语义；
-- 在生产目录中实现可复用的 `hyfile_api_shim`、最小 `HyFileBackend` 和 RAII file/buffer handles；
+- 固化并评审 `hyfile_abi.h` 的最小手工 ABI 声明和版本矩阵；
+- 确认 `libhyfile.so` 路径和 required symbols，记录版本/build-id 但不做硬编码拒绝；
+- 确认 `hipFileRead` 精确原型和错误语义；
+- 在生产目录中实现可复用的 `hyfile_abi.h`、最小 `HyFileBackend` 和 RAII file/buffer handles；
 - PoC 仅提供独立的薄 `main()`，复用上述生产模块，不维护第二套 vendor 调用实现；
 - 独立程序验证 O_DIRECT opaque fd；
 - 每 device 整 pool/subrange 注册语义；
-- exact-length read/write；
+- POSIX 写入已知数据，xDS exact-length read，并逐字节校验；
 - 4096 对齐；
 - 进程级串行压力；
-- fork 后重建；
+- fork 子进程拒绝继承的 vendor 资源，由 fresh exec 的新 worker 重建；
 - hung-I/O 和 synchronize 语义。
 
-退出条件：在目标版本矩阵上稳定完成逐字节正确的 round-trip，错误注入语义明确，且没有 Mooncake CPU fallback。
+退出条件：在目标版本矩阵上稳定完成逐字节正确的已知数据读回，错误注入语义明确，且没有 Mooncake CPU fallback。
 
 #### Phase 0.5：Planner dry-run
 
@@ -1604,7 +1607,7 @@ Phase 0 → Phase 0.5 → Phase 1 → Phase 2
 
 #### Phase 2：BUCKET fully-aligned read-only MVP
 
-- 固化并启用 Phase 0/1 的 `hyfile_api_shim` 和 `HyFileBackend`；
+- 固化并启用 Phase 0/1 的手工 ABI 声明和 `HyFileBackend`；
 - per-device preflight；
 - 新增 `BatchReadDfsRanges`；
 - 接入 `batch_get_into_multi_buffer_ranges`；
@@ -1642,7 +1645,7 @@ Phase 0 → Phase 0.5 → Phase 1 → Phase 2
 - 根据厂商正式语义评估减少 synchronize 次数；
 - 评估异步/batch API；
 - 独立设计业务 xDS write、durability 和 publish 顺序；
-- 不复用未经确认的影子 ABI。
+- 不扩展未经确认的 vendor ABI。
 
 ### 9.2 代码改动清单
 
@@ -1655,8 +1658,8 @@ Phase 0 → Phase 0.5 → Phase 1 → Phase 2
 | `fs_adapter.*` | 保持普通 I/O；仅补充安全获得 canonical identity/fstat 信息的接口 |
 | `device/*` | 注册阶段解析 device metadata；DeviceGuard；sync/fail-stop hook |
 | `registered_pinned_memory.*` 或新 registry | composite TE+xDS registration、generation、pin、drain、quarantine |
-| `storage/distributed/xds/*` | interface、HyFile backend、ABI shim、file cache、breaker、preflight |
-| CMake/wheel | `USE_XDS` 可选构建；SDK header/profile 探测；不打包 vendor runtime |
+| `storage/distributed/xds/*` | interface、HyFile backend、手工 ABI 声明、file cache、breaker、preflight |
+| CMake/wheel | `USE_XDS` 可选构建；Linux/HIP 约束；不要求 SDK header；不打包 vendor runtime |
 | metrics | planner/direct/fallback/registration/lock/sync/fatal 指标 |
 | tests | planner、registry、fake backend、真实 DTK、SGLang E2E、性能和 soak |
 
@@ -1669,7 +1672,7 @@ mooncake-store/include/storage/distributed/xds/xds_buffer_registry.h
 mooncake-store/include/storage/distributed/xds/xds_read_planner.h
 
 mooncake-store/src/storage/distributed/xds/hyfile_backend.cpp
-mooncake-store/src/storage/distributed/xds/hyfile_api_shim.cpp
+mooncake-store/include/storage/distributed/xds/hyfile_abi.h
 mooncake-store/src/storage/distributed/xds/xds_buffer_registry.cpp
 mooncake-store/src/storage/distributed/xds/xds_read_planner.cpp
 
@@ -1678,7 +1681,8 @@ mooncake-store/tests/xds_buffer_registry_test.cpp
 mooncake-store/tests/xds_backend_fake_test.cpp
 ```
 
-`hyfile_api_shim.cpp` 是唯一直接了解 vendor ABI 的编译单元。
+`hyfile_abi.h` 是唯一的 vendor ABI 声明源，`hyfile_backend.cpp` 是唯一执行
+`dlopen`/`dlsym` 和调用 vendor 函数的编译单元。
 
 ### 9.3 构建
 
@@ -1686,15 +1690,13 @@ mooncake-store/tests/xds_backend_fake_test.cpp
 
 ```text
 -DUSE_XDS=ON
--DXDS_ROOT=/path/to/xds-sdk
--DXDS_INCLUDE_DIR=/path/to/xds-sdk/include
 ```
 
 规则：
 
 - 普通构建默认 `USE_XDS=OFF`；
-- `USE_XDS=ON` 且有 SDK header 时使用正式类型；
-- 无 header 时只允许编译经过版本钉住和静态 size/alignment 校验的 ABI profile；
+- `USE_XDS=ON` 要求 Linux、HIP 构建环境，但不要求 SDK header；
+- 始终使用仓库内唯一的最小手工 ABI 声明，并执行静态布局校验；
 - 动态库运行时加载；
 - fake backend CI 不依赖海光硬件；
 - 真实 DTK 测试使用单独硬件 CI/验收环境。
@@ -1743,8 +1745,8 @@ mooncake-store/tests/xds_backend_fake_test.cpp
 
 | 风险 | 缓解措施 |
 |---|---|
-| `libhyfile.so` ABI 随 DTK 变化 | 单一 shim、正式 SDK header 优先、ABI profile/build-id 钉住、真实 round-trip preflight |
-| SDK 对目标 DFS 不支持或在驱动内部静默 bounce | mount 白名单、preflight、direct/fallback 指标；没有厂商 counter 时不宣称驱动内部零 bounce |
+| `libhyfile.so` ABI 随 DTK 变化 | 单一手工 ABI 声明、最小 required symbols、版本清单、真实 mount preflight；不兼容时 fail closed |
+| HyFile/driver 对目标 DFS 不支持或在内部静默 bounce | mount 白名单、preflight、direct/fallback 指标；没有厂商 counter 时不宣称驱动内部零 bounce |
 | DCU buffer 生命周期错误 | eager composite registration、generation、owner/pin、unregister drain 和 quarantined 状态 |
 | BUCKET 动态文件被淘汰、替换或 FD 被复用 | canonical identity、file owner/inflight pin、有界 LRU、淘汰 drain、重新注册 |
 | 大量小 range 的调用与同步开销超过收益 | `MIN_READ_SIZE`、双向连续 coalescing、Phase 0.5 telemetry 和性能门槛 |
@@ -1756,8 +1758,8 @@ mooncake-store/tests/xds_backend_fake_test.cpp
 
 ### 10.3 实现前仍需厂商确认
 
-1. 正式 SDK header、soname/路径、calling convention 和 ABI 演进规则。
-2. `hipFileRead/Write` 的精确参数类型、返回类型和错误传递方式。
+1. 厂商对 soname/路径、calling convention 和 ABI 演进规则的正式说明。
+2. 首版 `hipFileRead` 的精确参数类型、返回类型和错误传递方式；后续若设计 write，再单独确认 `hipFileWrite`。
 3. Parastor/HYFS 支持的 client、服务端、mount 模式和版本范围。
 4. FUSE 是否明确不支持。
 5. 4096 对齐是硬要求还是当前版本限制。
@@ -1811,5 +1813,5 @@ mooncake-store/tests/xds_backend_fake_test.cpp
 
 - 当前代码基线：`mooncake-das` 的 `feat/optimize_prefetch`，以及 `sglang-das` 的 `feature/optimize_the_direct_linker`/`588405a92a`。
 - LMCache xDS/HyFile 适配代码审阅记录（本设计输入，2026-09）。
-- [LMCache GDS backend documentation](https://github.com/LMCache/LMCache/blob/dev/docs/source/kv_cache/storage_backends/gds.rst)：用于对照 direct-storage backend 的配置和测试思路；HyFile ABI 仍以本项目厂商 header、版本钉住和真实 preflight 为准。
+- [LMCache GDS backend documentation](https://github.com/LMCache/LMCache/blob/dev/docs/source/kv_cache/storage_backends/gds.rst)：用于对照 direct-storage backend 的配置和测试思路；HyFile ABI 由本项目的最小手工声明、部署版本清单和真实 preflight 共同约束。
 - [LMCache GDS context tests](https://github.com/LMCache/LMCache/blob/dev/tests/v1/gpu_connector/test_gds_context.py)：用于对照 GPU buffer/context 生命周期测试。

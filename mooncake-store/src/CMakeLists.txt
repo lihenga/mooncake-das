@@ -111,12 +111,8 @@ if(USE_XDS)
   if(NOT USE_HIP)
     message(FATAL_ERROR "USE_XDS=ON requires USE_HIP=ON")
   endif()
-  find_path(
-    XDS_INCLUDE_DIR
-    NAMES hipfile.h
-    HINTS ${XDS_ROOT}/include)
-  if(NOT XDS_INCLUDE_DIR)
-    message(FATAL_ERROR "USE_XDS=ON requires the official hipfile.h SDK header")
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "USE_XDS=ON is supported only on 64-bit Linux")
   endif()
   list(APPEND MOONCAKE_STORE_CLIENT_SOURCES
        storage/distributed/xds/hyfile_backend.cpp)
@@ -444,8 +440,10 @@ elseif(USE_HIP)
 endif()
 if(USE_XDS)
   target_compile_definitions(mooncake_store_client_objects PRIVATE USE_XDS)
-  target_include_directories(mooncake_store_client_objects
-                             PRIVATE ${XDS_INCLUDE_DIR})
+  if(BUILD_UNIT_TESTS)
+    target_compile_definitions(mooncake_store_client_objects
+                               PRIVATE MOONCAKE_ENABLE_XDS_TEST_HOOKS=1)
+  endif()
 endif()
 if(USE_ASCEND
    OR USE_ASCEND_DIRECT
