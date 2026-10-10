@@ -348,6 +348,9 @@ class PyClient {
         return "unsupported";
     }
 
+    // Lease TTL (ms) learned from successful replica queries; 0 if unknown.
+    virtual uint64_t get_lease_ttl_ms() const { return 0; }
+
     virtual void record_prefetched_tokens(uint64_t /*tokens*/) {}
 
     virtual std::vector<int> batch_get_into_multi_buffer_ranges(

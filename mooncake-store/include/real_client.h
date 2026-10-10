@@ -319,6 +319,8 @@ class RealClient : public PyClient {
     // "ready" or the reason the prefetch arena is unavailable.
     std::string dfs_prefetch_arena_status() const override;
 
+    uint64_t get_lease_ttl_ms() const override;
+
     void record_prefetched_tokens(uint64_t tokens) override;
 
     std::vector<int> batch_get_into_multi_buffer_ranges(

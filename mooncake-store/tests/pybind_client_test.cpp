@@ -2078,6 +2078,8 @@ TEST_F(RealClientTest, TestGetSessionLeaseExpiredDropsSession) {
 
 TEST_F(RealClientTest, TestGetSessionRefreshRenewsLease) {
     constexpr uint64_t kLeaseTtlMs = 300;
+    // The lease TTL stays unknown until a replica query reports it.
+    EXPECT_EQ(py_client_->get_lease_ttl_ms(), 0u);
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
                                   .set_default_kv_lease_ttl(kLeaseTtlMs)
                                   .build()));
@@ -2091,6 +2093,7 @@ TEST_F(RealClientTest, TestGetSessionRefreshRenewsLease) {
                                16 * 1024 * 1024, 16 * 1024 * 1024,
                                FLAGS_protocol, rdma_devices, master_address_),
         0);
+    EXPECT_EQ(py_client_->get_lease_ttl_ms(), 0u);
 
     constexpr size_t kSize = 128;
     const int kInvalidParams =
@@ -2131,6 +2134,7 @@ TEST_F(RealClientTest, TestGetSessionRefreshRenewsLease) {
     ASSERT_EQ(get_rcs.size(), 1u);
     EXPECT_EQ(get_rcs[0], static_cast<int>(kSize));
     EXPECT_EQ(dst, src);
+    EXPECT_EQ(py_client_->get_lease_ttl_ms(), kLeaseTtlMs);
 
     EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
     EXPECT_EQ(py_client_->batch_get_session_refresh(keys)[0], kInvalidParams);
