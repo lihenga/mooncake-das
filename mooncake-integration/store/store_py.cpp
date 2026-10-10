@@ -3071,6 +3071,21 @@ PYBIND11_MODULE(store, m) {
             py::arg("keys"),
             "Start a get session: query replicas once and cache them")
         .def(
+            "batch_get_session_refresh",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int>{};
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_get_session_refresh(keys);
+            },
+            py::arg("keys"),
+            "Refresh leases for active get sessions while preserving cached "
+            "session objects; incompatible refreshed replicas fail and "
+            "invalidate that session")
+        .def(
             "batch_get_session_start_with_sources",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys) {

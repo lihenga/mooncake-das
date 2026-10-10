@@ -54,6 +54,7 @@ struct SessionRangeReadRequest {
 
 struct SessionRangeReadPlan {
     std::vector<SessionRangeReadRequest> memory_requests;
+    std::vector<SessionRangeReadRequest> local_disk_requests;
     std::vector<SessionRangeReadRequest> dfs_requests;
 };
 
@@ -299,6 +300,9 @@ class RealClient : public PyClient {
     std::vector<int> batch_get_session_start(
         const std::vector<std::string> &keys) override;
 
+    std::vector<int> batch_get_session_refresh(
+        const std::vector<std::string> &keys) override;
+
     std::pair<std::vector<int>, std::vector<std::string>>
     batch_get_session_start_with_sources(
         const std::vector<std::string> &keys) override;
@@ -332,6 +336,11 @@ class RealClient : public PyClient {
 
     void execute_session_memory_range_reads(
         const std::vector<SessionRangeReadRequest> &requests,
+        std::vector<int> &results);
+
+    void process_session_local_disk_reads(
+        std::unordered_map<std::string, std::vector<SessionRangeReadRequest *>>
+            &local_disk_by_endpoint,
         std::vector<int> &results);
 
     void execute_session_dfs_range_reads(

@@ -1770,6 +1770,68 @@ TEST_F(RealClientTest, TestGetSessionLeaseExpiredDropsSession) {
     ASSERT_EQ(py_client_->unregister_buffer(dst.data()), 0);
 }
 
+TEST_F(RealClientTest, TestGetSessionRefreshRenewsLease) {
+    constexpr uint64_t kLeaseTtlMs = 300;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_default_kv_lease_ttl(kLeaseTtlMs)
+                                  .build()));
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17820", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    constexpr size_t kSize = 128;
+    const int kInvalidParams =
+        static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+    std::string src(kSize, 'R');
+    std::string dst(kSize, '?');
+    ASSERT_EQ(py_client_->register_buffer(src.data(), src.size()), 0);
+    ASSERT_EQ(py_client_->register_buffer(dst.data(), dst.size()), 0);
+
+    const std::vector<std::string> keys = {"refresh_get_session_key"};
+    ASSERT_EQ(py_client_->batch_put_session_start(keys, {kSize})[0], 0);
+    ASSERT_EQ(py_client_->batch_put_from_multi_buffer_ranges(
+                  keys, {{src.data()}}, {{kSize}}, {{0}})[0],
+              static_cast<int>(kSize));
+    ASSERT_EQ(py_client_->batch_put_session_end(keys)[0], 0);
+    ASSERT_EQ(py_client_->batch_get_session_start(keys)[0], 0);
+    const auto original_session_start_returned =
+        std::chrono::steady_clock::now();
+    std::this_thread::sleep_until(
+        original_session_start_returned + std::chrono::milliseconds(200));
+    auto refresh_rcs = py_client_->batch_get_session_refresh(keys);
+    ASSERT_EQ(refresh_rcs.size(), 1u);
+    ASSERT_EQ(refresh_rcs[0], 0);
+    const auto refresh_completed = std::chrono::steady_clock::now();
+    ASSERT_LT(refresh_completed,
+              original_session_start_returned +
+                  std::chrono::milliseconds(kLeaseTtlMs));
+
+    // Read after the original lease deadline but within the renewed lease.
+    std::this_thread::sleep_until(
+        original_session_start_returned +
+        std::chrono::milliseconds(kLeaseTtlMs + 25));
+    EXPECT_GT(std::chrono::steady_clock::now(),
+              original_session_start_returned +
+                  std::chrono::milliseconds(kLeaseTtlMs));
+    auto get_rcs = py_client_->batch_get_into_multi_buffer_ranges(
+        keys, {{dst.data()}}, {{kSize}}, {{0}});
+    ASSERT_EQ(get_rcs.size(), 1u);
+    EXPECT_EQ(get_rcs[0], static_cast<int>(kSize));
+    EXPECT_EQ(dst, src);
+
+    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+    EXPECT_EQ(py_client_->batch_get_session_refresh(keys)[0], kInvalidParams);
+    ASSERT_EQ(py_client_->unregister_buffer(src.data()), 0);
+    ASSERT_EQ(py_client_->unregister_buffer(dst.data()), 0);
+}
+
 TEST_F(RealClientTest, TestGetSessionDoesNotRecordWhenMetricsDisabled) {
     ScopedEnv metrics_env("MC_STORE_CLIENT_METRIC");
     setenv("MC_STORE_CLIENT_METRIC", "0", 1);

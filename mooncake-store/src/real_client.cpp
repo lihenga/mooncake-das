@@ -461,6 +461,83 @@ inline QueryResult FilterQueryResult(const QueryResult &qr,
         include_object_checksum ? qr.object_checksum : std::nullopt);
 }
 
+inline bool SameAllocatedBufferDescriptor(
+    const AllocatedBuffer::Descriptor &lhs,
+    const AllocatedBuffer::Descriptor &rhs) {
+    return lhs.size_ == rhs.size_ &&
+           lhs.buffer_address_ == rhs.buffer_address_ &&
+           lhs.protocol_ == rhs.protocol_ &&
+           lhs.transport_endpoint_ == rhs.transport_endpoint_;
+}
+
+// Session-cached bytes can survive a lease refresh only when the fresh query
+// still identifies the exact same replica generation and storage location.
+// The object key alone is not an immutable-content contract.
+inline bool SameReplicaForSessionCache(const Replica::Descriptor &lhs,
+                                      const Replica::Descriptor &rhs) {
+    if (lhs.id != rhs.id || lhs.status != rhs.status) return false;
+    if (lhs.is_memory_replica() && rhs.is_memory_replica()) {
+        return SameAllocatedBufferDescriptor(
+            lhs.get_memory_descriptor().buffer_descriptor,
+            rhs.get_memory_descriptor().buffer_descriptor);
+    }
+    if (lhs.is_nof_replica() && rhs.is_nof_replica()) {
+        return SameAllocatedBufferDescriptor(
+            lhs.get_nof_descriptor().buffer_descriptor,
+            rhs.get_nof_descriptor().buffer_descriptor);
+    }
+    if (lhs.is_disk_replica() && rhs.is_disk_replica()) {
+        const auto &left = lhs.get_disk_descriptor();
+        const auto &right = rhs.get_disk_descriptor();
+        return left.file_path == right.file_path &&
+               left.object_size == right.object_size;
+    }
+    if (lhs.is_local_disk_replica() && rhs.is_local_disk_replica()) {
+        const auto &left = lhs.get_local_disk_descriptor();
+        const auto &right = rhs.get_local_disk_descriptor();
+        return left.client_id == right.client_id &&
+               left.object_size == right.object_size &&
+               left.transport_endpoint == right.transport_endpoint;
+    }
+    if (lhs.is_dfs_replica() && rhs.is_dfs_replica()) {
+        const auto &left = lhs.get_dfs_descriptor();
+        const auto &right = rhs.get_dfs_descriptor();
+        return left.file_path == right.file_path &&
+               left.offset == right.offset &&
+               left.object_size == right.object_size &&
+               left.aligned_size == right.aligned_size &&
+               left.shard_idx == right.shard_idx;
+    }
+    return false;
+}
+
+inline bool CompatibleSessionCacheRefresh(const QueryResult &old_session,
+                                          const QueryResult &fresh_session) {
+    if (old_session.replicas.size() != 1 ||
+        fresh_session.replicas.size() != 1 ||
+        !SameReplicaForSessionCache(old_session.replicas.front(),
+                                    fresh_session.replicas.front())) {
+        return false;
+    }
+    return !old_session.object_checksum || !fresh_session.object_checksum ||
+           *old_session.object_checksum == *fresh_session.object_checksum;
+}
+
+inline bool SameGetSessionSnapshot(const QueryResult &lhs,
+                                   const QueryResult &rhs) {
+    if (lhs.lease_timeout != rhs.lease_timeout ||
+        lhs.object_checksum != rhs.object_checksum ||
+        lhs.replicas.size() != rhs.replicas.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < lhs.replicas.size(); ++i) {
+        if (!SameReplicaForSessionCache(lhs.replicas[i], rhs.replicas[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Shared object-byte range overflow check (same semantics as
 // execute_ranged_read / session ranged get-put).
 inline bool is_object_range_overflow(size_t offset, size_t size, size_t limit) {
@@ -6232,6 +6309,9 @@ RealClient::batch_get_session_start_with_sources(
         if (record_access) {
             get_session_access_records_.erase(keys[i]);
         }
+        // A get session owns its object cache. Starting a new lease must not
+        // inherit pinned bytes from an older lookup of the same key.
+        get_session_object_cache_.erase(keys[i]);
         if (!query_results[i]) {
             results[i] = static_cast<int>(toInt(query_results[i].error()));
             get_sessions_.erase(keys[i]);
@@ -6263,6 +6343,144 @@ RealClient::batch_get_session_start_with_sources(
         results[i] = 0;
     }
     return {std::move(results), std::move(sources)};
+}
+
+std::vector<int> RealClient::batch_get_session_refresh(
+    const std::vector<std::string> &keys) {
+    std::vector<int> results(
+        keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return results;
+    }
+    if (keys.empty()) return {};
+
+    struct PendingRefresh {
+        std::string key;
+        size_t result_index;
+        QueryResult old_session;
+    };
+    std::vector<PendingRefresh> pending;
+    pending.reserve(keys.size());
+    std::vector<size_t> duplicate_of(keys.size(), keys.size());
+    std::unordered_map<std::string, size_t> first_index_by_key;
+    first_index_by_key.reserve(keys.size());
+
+    {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        for (size_t i = 0; i < keys.size(); ++i) {
+            const auto [first_it, inserted] =
+                first_index_by_key.emplace(keys[i], i);
+            if (!inserted) {
+                duplicate_of[i] = first_it->second;
+                continue;
+            }
+
+            auto session_it = get_sessions_.find(keys[i]);
+            if (session_it == get_sessions_.end()) {
+                // Do not leave an orphaned pinned object if the session was
+                // already retired by a concurrent expiry/end path.
+                get_session_object_cache_.erase(keys[i]);
+                continue;
+            }
+            pending.push_back(
+                PendingRefresh{keys[i], i, session_it->second});
+        }
+    }
+
+    if (!pending.empty()) {
+        std::vector<std::string> query_keys;
+        query_keys.reserve(pending.size());
+        for (const auto &entry : pending) query_keys.push_back(entry.key);
+
+        // Unlike batch_get_session_start, this fresh metadata query is only
+        // committed after checking that the existing session is unchanged.
+        const auto fresh_queries = client_->BatchQuery(query_keys);
+        const auto local_endpoints = client_->GetLocalEndpoints();
+        for (size_t i = 0; i < pending.size(); ++i) {
+            const auto &entry = pending[i];
+            ErrorCode refresh_error = ErrorCode::OK;
+            std::optional<QueryResult> refreshed_session;
+
+            if (fresh_queries.size() != pending.size()) {
+                refresh_error = ErrorCode::INTERNAL_ERROR;
+            } else if (!fresh_queries[i]) {
+                refresh_error = fresh_queries[i].error();
+            } else {
+                const auto &fresh_query = fresh_queries[i].value();
+                if (fresh_query.IsLeaseExpired()) {
+                    refresh_error = ErrorCode::LEASE_EXPIRED;
+                } else {
+                    const auto *replica = SelectSessionReplica(
+                        fresh_query.replicas, local_endpoints);
+                    if (!replica) {
+                        refresh_error = ErrorCode::INVALID_REPLICA;
+                    } else {
+                        refreshed_session.emplace(
+                            FilterQueryResult(fresh_query, *replica));
+                    }
+                }
+            }
+
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            auto current = get_sessions_.find(entry.key);
+            if (current == get_sessions_.end() ||
+                !SameGetSessionSnapshot(current->second,
+                                        entry.old_session)) {
+                // A concurrent end/start/refresh owns the current map entry.
+                // Never erase or overwrite that newer session.
+                results[entry.result_index] =
+                    static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+                continue;
+            }
+
+            if (refresh_error == ErrorCode::OK &&
+                refreshed_session->IsLeaseExpired()) {
+                refresh_error = ErrorCode::LEASE_EXPIRED;
+            }
+
+            auto cache_it = get_session_object_cache_.find(entry.key);
+            if (refresh_error == ErrorCode::OK &&
+                cache_it != get_session_object_cache_.end()) {
+                const auto &cached = cache_it->second;
+                if (!cached.buffer_handle || !cached.buffer_handle->ptr() ||
+                    cached.total_size > cached.buffer_handle->size() ||
+                    !CompatibleSessionCacheRefresh(current->second,
+                                                   *refreshed_session)) {
+                    // Cached host bytes belong to the old exact replica
+                    // generation. Fail closed instead of pairing them with a
+                    // new replica or an unverifiable descriptor.
+                    refresh_error = ErrorCode::INVALID_REPLICA;
+                }
+            }
+
+            if (refresh_error != ErrorCode::OK) {
+                get_sessions_.erase(current);
+                get_session_object_cache_.erase(entry.key);
+                get_session_access_records_.erase(entry.key);
+                results[entry.result_index] =
+                    static_cast<int>(toInt(refresh_error));
+                continue;
+            }
+
+            const std::string source =
+                DirectSourceForReplica(refreshed_session->replicas.front());
+            get_sessions_.erase(current);
+            get_sessions_.emplace(entry.key, std::move(*refreshed_session));
+            auto access_it = get_session_access_records_.find(entry.key);
+            if (access_it != get_session_access_records_.end()) {
+                access_it->second.source = source;
+            }
+            results[entry.result_index] = 0;
+        }
+    }
+
+    for (size_t i = 0; i < duplicate_of.size(); ++i) {
+        if (duplicate_of[i] < keys.size()) {
+            results[i] = results[duplicate_of[i]];
+        }
+    }
+    return results;
 }
 
 void RealClient::record_prefetched_tokens(uint64_t tokens) {
@@ -6356,10 +6574,12 @@ RealClient::prepare_session_range_read_requests(
         if (replica.is_memory_replica()) {
             replica_limit =
                 replica.get_memory_descriptor().buffer_descriptor.size_;
-        } else if (replica.is_dfs_replica()) {
+        } else if (replica.is_local_disk_replica() ||
+                   replica.is_dfs_replica()) {
             replica_limit = calculate_total_size(replica);
         }
-        if (replica.is_memory_replica() || replica.is_dfs_replica()) {
+        if (replica.is_memory_replica() || replica.is_local_disk_replica() ||
+            replica.is_dfs_replica()) {
             bool overflow = false;
             for (size_t j = 0; j < buffers.size(); ++j) {
                 if (is_object_range_overflow(offsets[j], sizes[j],
@@ -6390,10 +6610,13 @@ SessionRangeReadPlan RealClient::classify_session_range_read_requests(
     std::vector<int> &results) const {
     SessionRangeReadPlan plan;
     plan.memory_requests.reserve(requests.size());
+    plan.local_disk_requests.reserve(requests.size());
     plan.dfs_requests.reserve(requests.size());
     for (auto &request : requests) {
         if (request.replica.is_memory_replica()) {
             plan.memory_requests.push_back(std::move(request));
+        } else if (request.replica.is_local_disk_replica()) {
+            plan.local_disk_requests.push_back(std::move(request));
         } else if (request.replica.is_dfs_replica()) {
             plan.dfs_requests.push_back(std::move(request));
         } else {
@@ -6594,6 +6817,14 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         classify_session_range_read_requests(std::move(requests), results);
     execute_session_memory_range_reads(plan.memory_requests, results);
     context.memory_done = std::chrono::steady_clock::now();
+    std::unordered_map<std::string, std::vector<SessionRangeReadRequest *>>
+        local_disk_by_endpoint;
+    for (auto &request : plan.local_disk_requests) {
+        const auto &endpoint =
+            request.replica.get_local_disk_descriptor().transport_endpoint;
+        local_disk_by_endpoint[endpoint].push_back(&request);
+    }
+    process_session_local_disk_reads(local_disk_by_endpoint, results);
     execute_session_dfs_range_reads(plan.dfs_requests, results,
                                     context.trace_id);
     record_session_range_accesses(keys, all_buffers, all_sizes, all_src_offsets,
@@ -6642,6 +6873,89 @@ int RealClient::batch_get_session_end(const std::vector<std::string> &keys) {
                                      observation.bytes);
     }
     return 0;
+}
+
+void RealClient::process_session_local_disk_reads(
+    std::unordered_map<std::string, std::vector<SessionRangeReadRequest *>>
+        &local_disk_by_endpoint,
+    std::vector<int> &results) {
+    for (auto &[endpoint, ep_entries] : local_disk_by_endpoint) {
+        std::unordered_map<std::string, std::vector<Slice>> miss_objects;
+        std::unordered_map<std::string, std::unique_ptr<BufferHandle>>
+            miss_handles;
+
+        for (auto *entry_ptr : ep_entries) {
+            auto &entry = *entry_ptr;
+            const uint64_t total_size = calculate_total_size(entry.replica);
+            if (!client_buffer_allocator_) {
+                results[entry.original_idx] =
+                    static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+                continue;
+            }
+            auto alloc_result = client_buffer_allocator_->allocate(total_size);
+            if (!alloc_result) {
+                results[entry.original_idx] =
+                    static_cast<int>(toInt(ErrorCode::NO_AVAILABLE_HANDLE));
+                continue;
+            }
+            auto handle =
+                std::make_unique<BufferHandle>(std::move(*alloc_result));
+            miss_objects.emplace(
+                entry.key, std::vector<Slice>{Slice{handle->ptr(), total_size}});
+            miss_handles.emplace(entry.key, std::move(handle));
+        }
+
+        if (miss_objects.empty()) continue;
+        auto read_result =
+            batch_get_into_offload_object_internal(endpoint, miss_objects);
+        client_->ObserveDirectIo(
+            "read", DirectStorageMetricSource(ReplicaType::LOCAL_DISK),
+            read_result.has_value(),
+            read_result ? SumSliceBytes(miss_objects) : 0, 0.0);
+
+        for (auto *entry_ptr : ep_entries) {
+            auto &entry = *entry_ptr;
+            if (results[entry.original_idx] != 0) continue;
+            auto handle_it = miss_handles.find(entry.key);
+            if (handle_it == miss_handles.end()) continue;
+            if (!read_result) {
+                results[entry.original_idx] =
+                    static_cast<int>(toInt(read_result.error()));
+                continue;
+            }
+            auto shared_handle =
+                std::shared_ptr<BufferHandle>(std::move(handle_it->second));
+            if (session_cache_enabled()) {
+                std::lock_guard<std::mutex> lock(session_mutex_);
+                if (get_sessions_.find(entry.key) != get_sessions_.end()) {
+                    get_session_object_cache_.insert_or_assign(
+                        entry.key,
+                        SessionCachedObject{shared_handle,
+                                            calculate_total_size(entry.replica)});
+                }
+            }
+            bool scatter_succeeded = true;
+            size_t transferred = 0;
+            for (size_t j = 0; j < entry.buffers.size(); ++j) {
+                const void *src =
+                    static_cast<const char *>(shared_handle->ptr()) +
+                    entry.src_offsets[j];
+                if (auto scatter_result = scatter_host_to_maybe_device(
+                        entry.buffers[j], src, entry.sizes[j],
+                        "session local-disk range read, key: " + entry.key);
+                    !scatter_result) {
+                    results[entry.original_idx] =
+                        static_cast<int>(toInt(scatter_result.error()));
+                    scatter_succeeded = false;
+                    break;
+                }
+                transferred += entry.sizes[j];
+            }
+            if (scatter_succeeded) {
+                results[entry.original_idx] = static_cast<int>(transferred);
+            }
+        }
+    }
 }
 
 void RealClient::execute_session_dfs_range_reads(
@@ -6698,9 +7012,14 @@ void RealClient::execute_session_dfs_range_reads(
     auto valid_source_handle = [](const SessionRangeReadRequest *entry,
                                   const std::shared_ptr<BufferHandle> &handle) {
         const uint64_t total_size = calculate_total_size(entry->replica);
+        const auto &descriptor = entry->replica.get_dfs_descriptor();
+        const uint64_t source_size = descriptor.aligned_size > 0
+                                         ? descriptor.aligned_size
+                                         : descriptor.object_size;
         return handle && handle->ptr() &&
-               total_size <= std::numeric_limits<size_t>::max() &&
-               static_cast<size_t>(total_size) <= handle->size();
+               source_size >= total_size &&
+               source_size <= std::numeric_limits<size_t>::max() &&
+               static_cast<size_t>(source_size) <= handle->size();
     };
 
     auto queue_scatter = [&](SessionRangeReadRequest *entry,
@@ -6800,7 +7119,12 @@ void RealClient::execute_session_dfs_range_reads(
     for (auto *entry_ptr : entries) {
         auto &entry = *entry_ptr;
         const uint64_t total_size = calculate_total_size(entry.replica);
-        if (total_size > std::numeric_limits<size_t>::max()) {
+        const auto &descriptor = entry.replica.get_dfs_descriptor();
+        const uint64_t source_size = descriptor.aligned_size > 0
+                                         ? descriptor.aligned_size
+                                         : descriptor.object_size;
+        if (source_size < total_size ||
+            source_size > std::numeric_limits<size_t>::max()) {
             LOG(ERROR) << "DFS object is too large for a host arena, key: "
                        << entry.key << ", size: " << total_size;
             results[entry.original_idx] =
@@ -6809,12 +7133,11 @@ void RealClient::execute_session_dfs_range_reads(
         }
 
         size_t aligned_offset = 0;
-        const size_t object_size = static_cast<size_t>(total_size);
-        // Reserve aligned_size so the arena slot (and the iovec built from it)
-        // covers the value plus trailing alignment padding.
-        size_t aligned_object_size = 0;
+        // DFS iovecs read aligned_size, including trailing padding. Keep that
+        // full range in the view while aligning each slot for O_DIRECT.
+        const size_t source_bytes = static_cast<size_t>(source_size);
+        const size_t aligned_object_size = source_bytes;
         if (dfs_alignment == 0 ||
-            !AlignUp(object_size, dfs_alignment, &aligned_object_size) ||
             !AlignUp(arena_size, dfs_alignment, &aligned_offset) ||
             aligned_object_size >
                 std::numeric_limits<size_t>::max() - aligned_offset) {
