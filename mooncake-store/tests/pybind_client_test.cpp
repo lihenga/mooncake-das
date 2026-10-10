@@ -23,6 +23,7 @@
 #endif
 
 #include "config.h"
+#include "read_plan.h"
 #include "real_client.h"
 #include "test_server_helpers.h"
 
@@ -1254,6 +1255,38 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
     int unreg_result_upsert = py_client_->unregister_buffer(upsert_data.data());
     ASSERT_EQ(unreg_result_upsert, 0)
         << "Upsert data buffer unregistration should succeed";
+}
+
+TEST_F(RealClientTest, ReadPlanAdaptsMemorySourceToLayerwiseReads) {
+    ScopedEnvVar adaptive_source("MOONCAKE_READ_PLAN_ADAPTIVE_SOURCE", "1");
+    StartMasterAndSetupClient();
+
+    const std::string key = "read_plan_adaptive_memory";
+    const std::string source = "abcdefgh";
+    std::string destination(source.size(), '?');
+    ASSERT_EQ(py_client_->put(key, source), 0);
+    const auto replicas = py_client_->get_replica_desc(key);
+    ASSERT_EQ(replicas.size(), 1u);
+    ASSERT_TRUE(replicas.front().is_memory_replica());
+    ASSERT_EQ(py_client_->register_buffer(destination.data(),
+                                          destination.size()),
+              0);
+
+    std::vector<ReadLayout> layouts;
+    layouts.emplace_back(
+        std::vector<std::string>{key}, std::vector<size_t>{0}, true,
+        std::vector<std::vector<ReadComponent>>{
+            {ReadComponent{reinterpret_cast<size_t>(destination.data()), 0, 4,
+                           0}},
+            {ReadComponent{reinterpret_cast<size_t>(destination.data() + 4),
+                           0, 4, 4}}});
+    ReadPlan plan(py_client_, std::move(layouts), 2, false, true);
+    ASSERT_NO_THROW(plan.run());
+    EXPECT_EQ(destination, source);
+    EXPECT_EQ(plan.stats()[0], 2u)
+        << "memory-backed plans should issue one range call per layer";
+
+    EXPECT_EQ(py_client_->unregister_buffer(destination.data()), 0);
 }
 
 TEST_F(RealClientTest, TestPutGetSessionRanges) {
