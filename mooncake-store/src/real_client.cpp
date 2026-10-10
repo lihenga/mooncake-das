@@ -643,13 +643,137 @@ class RealClient::DfsH2dStreamPool {
     };
 
     struct DeviceState {
+        struct SyncWorker {
+            std::mutex mutex;
+            std::condition_variable task_cv;
+            std::condition_variable completion_cv;
+            std::thread thread;
+            bool has_task = false;
+            bool stopping = false;
+            bool ready = false;
+            bool result = false;
+        };
+
         DeviceState(const device::AcceleratorDevice *device, int32_t device_id)
             : device(device), device_id(device_id) {}
+
+        ~DeviceState() { StopSyncWorkers(); }
+
+        bool StartSyncWorkers() {
+            try {
+                sync_workers.reserve(streams.size());
+                for (void *stream : streams) {
+                    auto worker = std::make_unique<SyncWorker>();
+                    SyncWorker *worker_ptr = worker.get();
+                    worker->thread = std::thread([this, worker_ptr, stream] {
+                        device->SetContext(device_id);
+                        {
+                            std::lock_guard<std::mutex> lock(
+                                worker_ptr->mutex);
+                            worker_ptr->ready = true;
+                        }
+                        worker_ptr->completion_cv.notify_one();
+                        while (true) {
+                            std::unique_lock<std::mutex> lock(
+                                worker_ptr->mutex);
+                            worker_ptr->task_cv.wait(lock, [worker_ptr] {
+                                return worker_ptr->has_task ||
+                                       worker_ptr->stopping;
+                            });
+                            if (worker_ptr->stopping &&
+                                !worker_ptr->has_task) {
+                                break;
+                            }
+                            lock.unlock();
+                            bool result = false;
+                            try {
+                                result = device->SynchronizeStream(stream);
+                            } catch (const std::exception &error) {
+                                LOG(ERROR)
+                                    << "Persistent DFS H2D sync worker failed: "
+                                    << error.what();
+                            } catch (...) {
+                                LOG(ERROR) << "Persistent DFS H2D sync worker "
+                                              "failed";
+                            }
+                            lock.lock();
+                            worker_ptr->result = result;
+                            worker_ptr->has_task = false;
+                            lock.unlock();
+                            worker_ptr->completion_cv.notify_one();
+                        }
+                    });
+                    sync_workers.push_back(std::move(worker));
+                    std::unique_lock<std::mutex> lock(worker_ptr->mutex);
+                    worker_ptr->completion_cv.wait(
+                        lock, [worker_ptr] { return worker_ptr->ready; });
+                }
+            } catch (const std::exception &error) {
+                LOG(ERROR) << "Failed to create persistent DFS H2D sync "
+                              "worker: "
+                           << error.what();
+                StopSyncWorkers();
+                return false;
+            } catch (...) {
+                LOG(ERROR) << "Failed to create persistent DFS H2D sync "
+                              "worker";
+                StopSyncWorkers();
+                return false;
+            }
+            return true;
+        }
+
+        bool SynchronizeStreams(const std::vector<uint8_t> &used_streams,
+                                std::vector<uint8_t> *results) {
+            if (!results || used_streams.size() != sync_workers.size()) {
+                return false;
+            }
+            results->assign(sync_workers.size(), 1);
+            for (size_t i = 0; i < sync_workers.size(); ++i) {
+                if (!used_streams[i]) continue;
+                auto &worker = *sync_workers[i];
+                std::lock_guard<std::mutex> lock(worker.mutex);
+                if (worker.stopping || worker.has_task) return false;
+            }
+            for (size_t i = 0; i < sync_workers.size(); ++i) {
+                if (!used_streams[i]) continue;
+                auto &worker = *sync_workers[i];
+                std::lock_guard<std::mutex> lock(worker.mutex);
+                worker.has_task = true;
+            }
+            for (size_t i = 0; i < sync_workers.size(); ++i) {
+                if (used_streams[i]) sync_workers[i]->task_cv.notify_one();
+            }
+            for (size_t i = 0; i < sync_workers.size(); ++i) {
+                if (!used_streams[i]) continue;
+                auto &worker = *sync_workers[i];
+                std::unique_lock<std::mutex> lock(worker.mutex);
+                worker.completion_cv.wait(
+                    lock, [&worker] { return !worker.has_task; });
+                (*results)[i] = worker.result;
+            }
+            return true;
+        }
+
+        void StopSyncWorkers() {
+            for (auto &worker : sync_workers) {
+                {
+                    std::lock_guard<std::mutex> lock(worker->mutex);
+                    worker->stopping = true;
+                }
+                worker->task_cv.notify_one();
+            }
+            for (auto &worker : sync_workers) {
+                if (worker->thread.joinable()) worker->thread.join();
+            }
+            sync_workers.clear();
+        }
 
         const device::AcceleratorDevice *device;
         int32_t device_id;
         std::mutex mutex;
         std::vector<void *> streams;
+        std::vector<std::unique_ptr<SyncWorker>> sync_workers;
         bool initialized = false;
     };
 
@@ -665,6 +789,10 @@ class RealClient::DfsH2dStreamPool {
         }
         int32_t device_id() const { return state_->device_id; }
         const std::vector<void *> &streams() const { return state_->streams; }
+        bool SynchronizeStreams(const std::vector<uint8_t> &used_streams,
+                                std::vector<uint8_t> *results) {
+            return state_->SynchronizeStreams(used_streams, results);
+        }
 
        private:
         std::shared_ptr<DeviceState> state_;
@@ -706,6 +834,13 @@ class RealClient::DfsH2dStreamPool {
                 if (!state->device->CreateStream(&stream)) break;
                 state->streams.push_back(stream);
             }
+            if (!state->StartSyncWorkers()) {
+                for (void *stream : state->streams) {
+                    state->device->DestroyStream(stream);
+                }
+                state->streams.clear();
+                return nullptr;
+            }
             state->initialized = true;
         }
         return std::make_unique<Lease>(state, std::move(state_lock));
@@ -727,9 +862,16 @@ class RealClient::DfsH2dStreamPool {
         bool succeeded = true;
         for (auto &[_, state] : states) {
             std::lock_guard<std::mutex> state_lock(state->mutex);
+            std::vector<uint8_t> results;
+            const std::vector<uint8_t> used_streams(state->streams.size(), 1);
+            if (!state->SynchronizeStreams(used_streams, &results)) {
+                succeeded = false;
+            } else {
+                for (uint8_t result : results) succeeded &= result != 0;
+            }
+            state->StopSyncWorkers();
             state->device->SetContext(state->device_id);
             for (void *stream : state->streams) {
-                succeeded &= state->device->SynchronizeStream(stream);
                 state->device->DestroyStream(stream);
             }
             state->streams.clear();
@@ -805,12 +947,11 @@ class RealClient::DfsAsyncScatterContext {
     ~DfsAsyncScatterContext() {
         if (!submitted_ || synchronized_) return;
         for (auto &active : active_devices_) {
-            active.lease->device()->SetContext(active.lease->device_id());
-            const auto &streams = active.lease->streams();
-            for (size_t i = 0; i < streams.size(); ++i) {
-                if (active.used_streams[i]) {
-                    active.lease->device()->SynchronizeStream(streams[i]);
-                }
+            std::vector<uint8_t> stream_results;
+            if (!active.lease->SynchronizeStreams(active.used_streams,
+                                                  &stream_results)) {
+                LOG(ERROR) << "Failed to dispatch DFS H2D stream "
+                              "synchronization during cleanup";
             }
         }
     }
@@ -974,21 +1115,19 @@ class RealClient::DfsAsyncScatterContext {
         if (!submitted_) Submit();
 
         for (auto &active : active_devices_) {
-            const auto &streams = active.lease->streams();
-            std::vector<uint8_t> stream_results(streams.size(), 1);
-            std::vector<std::thread> sync_workers;
-            sync_workers.reserve(streams.size());
-            for (size_t i = 0; i < streams.size(); ++i) {
-                if (!active.used_streams[i]) continue;
-                sync_workers.emplace_back([&, i] {
-                    active.lease->device()->SetContext(
-                        active.lease->device_id());
-                    stream_results[i] =
-                        active.lease->device()->SynchronizeStream(streams[i]);
-                });
+            std::vector<uint8_t> stream_results;
+            if (!active.lease->SynchronizeStreams(active.used_streams,
+                                                  &stream_results)) {
+                for (size_t i = 0; i < active.used_streams.size(); ++i) {
+                    if (!active.used_streams[i]) continue;
+                    for (size_t operation_index :
+                         active.operations_by_stream[i]) {
+                        MarkFailed(operation_index);
+                    }
+                }
+                continue;
             }
-            for (auto &worker : sync_workers) worker.join();
-            for (size_t i = 0; i < streams.size(); ++i) {
+            for (size_t i = 0; i < stream_results.size(); ++i) {
                 if (!active.used_streams[i] || stream_results[i]) continue;
                 for (size_t operation_index :
                      active.operations_by_stream[i]) {

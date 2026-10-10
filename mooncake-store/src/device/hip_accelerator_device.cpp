@@ -8,6 +8,7 @@
 #include <fstream>
 #include <limits>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -18,7 +19,30 @@ namespace mooncake {
 namespace device {
 namespace {
 
-void FreeHipPinnedHostBuffer(void* addr) { hipHostFree(addr); }
+std::shared_mutex &HipRuntimeStateMutex() {
+    // Pinned-buffer deleters may run during static teardown after this device
+    // singleton starts destructing, so the lock must remain valid until exit.
+    static auto *mutex = new std::shared_mutex();
+    return *mutex;
+}
+
+hipError_t AllocateHipPinnedHost(void **addr, size_t size,
+                                 unsigned int flags) {
+    std::unique_lock<std::shared_mutex> lock(HipRuntimeStateMutex());
+    return hipHostMalloc(addr, size, flags);
+}
+
+hipError_t GetHipHostDevicePointer(void **device_addr, void *host_addr) {
+    std::unique_lock<std::shared_mutex> lock(HipRuntimeStateMutex());
+    return hipHostGetDevicePointer(device_addr, host_addr, 0);
+}
+
+void FreeHipPinnedHost(void *addr) {
+    std::unique_lock<std::shared_mutex> lock(HipRuntimeStateMutex());
+    (void)hipHostFree(addr);
+}
+
+void FreeHipPinnedHostBuffer(void *addr) { FreeHipPinnedHost(addr); }
 
 class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
    public:
@@ -48,7 +72,9 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
     }
 
     void SetContext(int32_t device_id) const override {
-        if (device_id >= 0) hipSetDevice(device_id);
+        if (device_id < 0) return;
+        std::unique_lock<std::shared_mutex> lock(HipRuntimeStateMutex());
+        hipSetDevice(device_id);
     }
 
     bool Copy(void* dst, const void* src, size_t size,
@@ -120,8 +146,8 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
         // consumed the kernel, at which point SynchronizeStream releases it.
         const size_t descriptor_bytes = ranges.size() * sizeof(DeviceRange);
         void *host_descriptors = nullptr;
-        if (hipHostMalloc(&host_descriptors, descriptor_bytes,
-                          hipHostMallocMapped) != hipSuccess) {
+        if (AllocateHipPinnedHost(&host_descriptors, descriptor_bytes,
+                                  hipHostMallocMapped) != hipSuccess) {
             hipGetLastError();
             return AcceleratorDevice::CopyFromHostBatchAsync(ranges, stream);
         }
@@ -134,10 +160,10 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
         }
 
         void *device_descriptors = nullptr;
-        if (hipHostGetDevicePointer(&device_descriptors, host_descriptors, 0) !=
+        if (GetHipHostDevicePointer(&device_descriptors, host_descriptors) !=
             hipSuccess) {
             hipGetLastError();
-            hipHostFree(host_descriptors);
+            FreeHipPinnedHost(host_descriptors);
             return AcceleratorDevice::CopyFromHostBatchAsync(ranges, stream);
         }
 
@@ -150,7 +176,7 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
             1, 1, 0, hip_stream, args, nullptr);
         if (launch_result != hipSuccess) {
             hipGetLastError();
-            hipHostFree(host_descriptors);
+            FreeHipPinnedHost(host_descriptors);
             return AcceleratorDevice::CopyFromHostBatchAsync(ranges, stream);
         }
 
@@ -176,7 +202,11 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
 
     bool SynchronizeStream(void* stream) const override {
         const auto hip_stream = static_cast<hipStream_t>(stream);
-        const bool success = hipStreamSynchronize(hip_stream) == hipSuccess;
+        bool success = false;
+        {
+            std::shared_lock<std::shared_mutex> lock(HipRuntimeStateMutex());
+            success = hipStreamSynchronize(hip_stream) == hipSuccess;
+        }
 #if defined(USE_HYGON)
         // Synchronization establishes that the kernel no longer dereferences
         // the mapped descriptor array. Free it even when the stream reports a
@@ -191,7 +221,7 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
             }
         }
         for (void *descriptor : descriptors) {
-            hipHostFree(descriptor);
+            FreeHipPinnedHost(descriptor);
         }
 #endif
         return success;
@@ -203,7 +233,7 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
 
     PinnedHostBuffer AllocatePinnedHost(size_t size) const override {
         void* addr = nullptr;
-        if (hipHostMalloc(&addr, size, 0) != hipSuccess) {
+        if (AllocateHipPinnedHost(&addr, size, 0) != hipSuccess) {
             hipGetLastError();
             return PinnedHostBuffer();
         }
@@ -213,15 +243,16 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
 #if defined(USE_HYGON)
     PinnedHostBuffer AllocateMappedPinnedHost(size_t size) const override {
         void *addr = nullptr;
-        if (hipHostMalloc(&addr, size, hipHostMallocMapped) != hipSuccess) {
+        if (AllocateHipPinnedHost(&addr, size, hipHostMallocMapped) !=
+            hipSuccess) {
             hipGetLastError();
             return PinnedHostBuffer();
         }
 
         void *device_addr = nullptr;
-        if (hipHostGetDevicePointer(&device_addr, addr, 0) != hipSuccess) {
+        if (GetHipHostDevicePointer(&device_addr, addr) != hipSuccess) {
             hipGetLastError();
-            hipHostFree(addr);
+            FreeHipPinnedHost(addr);
             return PinnedHostBuffer();
         }
         return PinnedHostBuffer(addr, size, FreeHipPinnedHostBuffer,
@@ -231,16 +262,22 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
 
     ~HipAcceleratorDevice() override {
 #if defined(USE_HYGON)
+        std::vector<void *> descriptors;
+        {
+            std::lock_guard<std::mutex> descriptor_lock(descriptor_mutex_);
+            for (auto &[_, pending] : pending_descriptors_) {
+                descriptors.insert(descriptors.end(), pending.begin(),
+                                   pending.end());
+            }
+            pending_descriptors_.clear();
+        }
+        for (void *descriptor : descriptors) {
+            FreeHipPinnedHost(descriptor);
+        }
+
         std::lock_guard<std::mutex> lock(module_mutex_);
         for (const auto &[_, module] : copy_modules_) {
             hipModuleUnload(module);
-        }
-        {
-            std::lock_guard<std::mutex> descriptor_lock(descriptor_mutex_);
-            for (auto &[_, descriptors] : pending_descriptors_) {
-                for (void *descriptor : descriptors) hipHostFree(descriptor);
-            }
-            pending_descriptors_.clear();
         }
 #endif
     }
