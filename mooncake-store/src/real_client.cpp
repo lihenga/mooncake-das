@@ -6397,6 +6397,10 @@ std::string RealClient::dfs_prefetch_arena_status() const {
     return file_storage_->PinnedPrefetchArenaStatus();
 }
 
+uint64_t RealClient::get_lease_ttl_ms() const {
+    return client_ ? client_->lease_ttl_ms() : 0;
+}
+
 std::shared_ptr<BufferHandle> RealClient::AllocatePrefetchArenaRegion(
     size_t size, size_t alignment) {
     auto stats = prefetch_arena_stats_;

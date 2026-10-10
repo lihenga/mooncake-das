@@ -1248,6 +1248,29 @@ Client::QueryByRegex(const std::string& str) {
     return result;
 }
 
+void Client::UpdateLeaseTtl(LeaseTtlState& state, uint64_t ttl_ms,
+                            std::chrono::steady_clock::time_point now) {
+    if (ttl_ms == 0) return;
+    now = std::max(now, state.last_now);
+    state.last_now = now;
+    if (state.ttl_ms == 0 || ttl_ms <= state.ttl_ms) {
+        state.ttl_ms = ttl_ms;
+        state.candidate_ms = 0;
+    } else if (ttl_ms != state.candidate_ms) {
+        state.candidate_ms = ttl_ms;
+        state.candidate_start = now;
+    } else if (now - state.candidate_start >=
+               std::chrono::milliseconds(ttl_ms)) {
+        state.ttl_ms = ttl_ms;
+        state.candidate_ms = 0;
+    }
+}
+
+void Client::RecordLeaseTtl(uint64_t ttl_ms) {
+    std::lock_guard<std::mutex> lock(lease_ttl_mutex_);
+    UpdateLeaseTtl(lease_ttl_, ttl_ms, std::chrono::steady_clock::now());
+}
+
 tl::expected<QueryResult, ErrorCode> Client::Query(
     const std::string& object_key) {
     std::chrono::steady_clock::time_point start_time =
@@ -1256,6 +1279,7 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
     if (!result) {
         return tl::unexpected(result.error());
     }
+    RecordLeaseTtl(result.value().lease_ttl_ms);
     return QueryResult(
         std::move(result.value().replicas),
         start_time + std::chrono::milliseconds(result.value().lease_ttl_ms),
@@ -1289,6 +1313,7 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     results.reserve(response.size());
     for (size_t i = 0; i < response.size(); ++i) {
         if (response[i]) {
+            RecordLeaseTtl(response[i].value().lease_ttl_ms);
             results.emplace_back(QueryResult(
                 std::move(response[i].value().replicas),
                 start_time +

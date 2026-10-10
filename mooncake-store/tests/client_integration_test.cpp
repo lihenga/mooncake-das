@@ -106,6 +106,148 @@ TEST(ObjectChecksumTest, BatchPutStopsAfterChecksumPrecomputeFailure) {
     EXPECT_EQ(results[0].error(), ErrorCode::INVALID_PARAMS);
 }
 
+struct LeaseTtlStep {
+    int64_t at_ns;             // Time of the reply since an arbitrary origin.
+    uint64_t reply_ttl_ms;     // 0: the reply carries no TTL.
+    uint64_t expected_ttl_ms;  // TTL in effect afterwards.
+};
+
+constexpr int64_t kMs = 1000 * 1000;
+constexpr int64_t kSec = 1000 * kMs;
+
+// Replays replies through UpdateLeaseTtl. Each reply with a TTL may have leased
+// a session at its time, so whenever the TTL in effect exceeds a session's own,
+// that session must be at least as old as the TTL in effect: then neither
+// age < q * TTL (q < 1) nor age < AGE (AGE < TTL) skips its refresh.
+void ReplayLeaseTtl(const std::vector<LeaseTtlStep>& steps) {
+    const auto origin =
+        std::chrono::steady_clock::time_point(std::chrono::hours(1));
+    Client::LeaseTtlState state;
+    std::vector<LeaseTtlStep> sessions;
+    for (const auto& step : steps) {
+        Client::UpdateLeaseTtl(state, step.reply_ttl_ms,
+                               origin + std::chrono::nanoseconds(step.at_ns));
+        EXPECT_EQ(state.ttl_ms, step.expected_ttl_ms) << "at " << step.at_ns;
+        if (step.reply_ttl_ms > 0) sessions.push_back(step);
+        for (const auto& session : sessions) {
+            if (session.reply_ttl_ms >= state.ttl_ms) continue;
+            const int64_t age_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    state.last_now - origin)
+                    .count() -
+                session.at_ns;
+            EXPECT_GE(age_ns, static_cast<int64_t>(state.ttl_ms) * kMs)
+                << "session of " << session.reply_ttl_ms << " ms leased at "
+                << session.at_ns << " is too young at " << step.at_ns;
+        }
+    }
+}
+
+TEST(ClientLeaseTtlTest, UpdateLowersAtOnceAndRaisesAfterAStableCandidate) {
+    const std::vector<std::pair<std::string, std::vector<LeaseTtlStep>>> cases{
+        {"first TTL, then 0 and equal ones",
+         {{0, 0, 0},
+          {1 * kSec, 5000, 5000},
+          {2 * kSec, 0, 5000},
+          {3 * kSec, 5000, 5000}}},
+        // A reply with the intermediate TTL also leases a session; the sglang
+        // test replays the same sequence.
+        {"5 -> 15 -> 20",
+         {{0, 5000, 5000},
+          {14900 * kMs, 15000, 5000},
+          {20 * kSec, 20000, 5000},
+          {40 * kSec, 20000, 20000},
+          {41 * kSec, 5000, 5000}}},
+        {"same candidate keeps its start, up to T - 1 ns and T",
+         {{0, 5000, 5000},
+          {1 * kSec, 20000, 5000},
+          {10 * kSec, 20000, 5000},
+          {21 * kSec - 1, 20000, 5000},
+          {21 * kSec, 20000, 20000}}},
+        {"T + 1 ns",
+         {{0, 5000, 5000},
+          {1 * kSec, 20000, 5000},
+          {21 * kSec + 1, 20000, 20000}}},
+        {"equal TTL cancels the candidate",
+         {{0, 10000, 10000},
+          {1 * kSec, 20000, 10000},
+          {2 * kSec, 10000, 10000},
+          {21 * kSec, 20000, 10000},
+          {41 * kSec, 20000, 20000}}},
+        {"smaller TTL applies at once and cancels the candidate",
+         {{0, 10000, 10000},
+          {1 * kSec, 20000, 10000},
+          {2 * kSec, 5000, 5000},
+          {21 * kSec, 20000, 5000},
+          {41 * kSec, 20000, 20000}}},
+        // Counting from the first candidate would raise at 31 s, while the
+        // 15 s session leased at 16 s is still young.
+        {"changing candidates restart the wait",
+         {{0, 5000, 5000},
+          {1 * kSec, 15000, 5000},
+          {10 * kSec, 20000, 5000},
+          {16 * kSec, 15000, 5000},
+          {30 * kSec, 20000, 5000},
+          {31 * kSec, 20000, 5000},
+          {50 * kSec, 20000, 20000}}},
+        {"raises in a row, a late old reply, then a new candidate",
+         {{0, 5000, 5000},
+          {1 * kSec, 15000, 5000},
+          {16 * kSec, 15000, 15000},
+          {17 * kSec, 30000, 15000},
+          {47 * kSec, 30000, 30000},
+          {48 * kSec, 5000, 5000},
+          {49 * kSec, 15000, 5000},
+          {64 * kSec, 15000, 15000}}},
+        {"one batch: TTLs and a 0 at the same time",
+         {{0, 5000, 5000},
+          {1 * kSec, 20000, 5000},
+          {1 * kSec, 0, 5000},
+          {1 * kSec, 20000, 5000},
+          {21 * kSec, 20000, 20000}}},
+        // A time older than the latest one counts as the latest: the stale
+        // reply at 0.5 s must not start the candidate before the 9 s session.
+        {"earlier times are raised to the latest",
+         {{0, 5000, 5000},
+          {1 * kSec, 10000, 5000},
+          {9 * kSec, 5000, 5000},
+          {500 * kMs, 10000, 5000},
+          {10600 * kMs, 10000, 5000},
+          {19 * kSec, 10000, 10000}}},
+    };
+    for (const auto& [name, steps] : cases) {
+        SCOPED_TRACE(name);
+        ReplayLeaseTtl(steps);
+    }
+}
+
+class LeaseTtlClient : public Client {
+   public:
+    LeaseTtlClient() : Client("localhost", "", "tcp") {}
+    using Client::RecordLeaseTtl;
+};
+
+TEST(ClientLeaseTtlTest, ConcurrentRecordsApplySmallerTtls) {
+    LeaseTtlClient client;
+    EXPECT_EQ(client.lease_ttl_ms(), 0u);
+    constexpr uint64_t kThreads = 8;
+    std::vector<std::thread> threads;
+    for (uint64_t t = 0; t < kThreads; ++t) {
+        // Distinct, ever smaller TTLs apply at once; the hour-long ones in
+        // between can never stay the only candidate long enough.
+        threads.emplace_back([&client, t] {
+            for (uint64_t i = 10000; i > 0; --i) {
+                client.RecordLeaseTtl(i * kThreads + t);
+                client.RecordLeaseTtl(3600 * 1000 + t);
+            }
+        });
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    EXPECT_EQ(client.lease_ttl_ms(), kThreads);
+}
+
 class ClientIdCaptureSink : public google::LogSink {
    public:
     std::string captured_client_id;
@@ -512,6 +654,39 @@ TEST_F(ClientIntegrationTest, RemoveOperation) {
     auto get_result = test_client_->Get(key, slices);
     ASSERT_FALSE(get_result.has_value()) << "Get should fail for removed key";
     client_buffer_allocator_->deallocate(buffer, test_data.size());
+}
+
+// Query and BatchQuery each record the TTL of successful replies; failed
+// lookups leave it unknown. Fresh clients keep the two entry points apart.
+TEST_F(ClientIntegrationTest, QueryAndBatchQueryRecordLeaseTtl) {
+    const std::string key = "lease_ttl_key";
+    const std::string missing = "lease_ttl_missing_key";
+    const std::string test_data = "lease ttl";
+    void* buffer = client_buffer_allocator_->allocate(test_data.size());
+    memcpy(buffer, test_data.data(), test_data.size());
+    std::vector<Slice> slices{{buffer, test_data.size()}};
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_result = test_client_->Put(key, slices, config);
+    client_buffer_allocator_->deallocate(buffer, test_data.size());
+    ASSERT_TRUE(put_result.has_value()) << toString(put_result.error());
+
+    auto query_client = CreateClient("localhost:17816");
+    auto batch_client = CreateClient("localhost:17817");
+    ASSERT_TRUE(query_client != nullptr && batch_client != nullptr);
+    EXPECT_EQ(query_client->lease_ttl_ms(), 0u);
+    EXPECT_FALSE(query_client->Query(missing).has_value());
+    EXPECT_FALSE(batch_client->BatchQuery({missing})[0].has_value());
+    EXPECT_EQ(query_client->lease_ttl_ms(), 0u);
+    EXPECT_EQ(batch_client->lease_ttl_ms(), 0u);
+
+    ASSERT_TRUE(query_client->Query(key).has_value());
+    EXPECT_EQ(query_client->lease_ttl_ms(), default_kv_lease_ttl_);
+    auto batch = batch_client->BatchQuery({missing, key});
+    ASSERT_EQ(batch.size(), 2u);
+    EXPECT_FALSE(batch[0].has_value());
+    ASSERT_TRUE(batch[1].has_value());
+    EXPECT_EQ(batch_client->lease_ttl_ms(), default_kv_lease_ttl_);
 }
 
 // Test local preferred allocation strategy

@@ -741,6 +741,28 @@ class Client {
 
     bool is_ping_healthy() const { return last_ping_success_.load(); }
 
+    // Lease TTL learned from successful Query/BatchQuery replies. A TTL no
+    // larger than the one in effect applies at once; a larger one only after
+    // it has been the only TTL seen for its own length, by when every session
+    // leased under another TTL is at least that old.
+    struct LeaseTtlState {
+        uint64_t ttl_ms = 0;        // In effect; 0 = unknown.
+        uint64_t candidate_ms = 0;  // Waiting to take effect; 0 = none.
+        std::chrono::steady_clock::time_point candidate_start{};
+        // Latest time an update used; earlier times are raised to it.
+        std::chrono::steady_clock::time_point last_now{};
+    };
+
+    // Applies a reply's TTL seen at now; a ttl_ms of 0 is ignored.
+    static void UpdateLeaseTtl(LeaseTtlState& state, uint64_t ttl_ms,
+                               std::chrono::steady_clock::time_point now);
+
+    // Lease TTL (ms) in effect; 0 until a successful reply has reported one.
+    uint64_t lease_ttl_ms() const {
+        std::lock_guard<std::mutex> lock(lease_ttl_mutex_);
+        return lease_ttl_.ttl_ms;
+    }
+
     /**
      * @brief Get current frequency admission count for a key.
      * @return estimated count, or 0 if admission sketch is disabled.
@@ -805,6 +827,10 @@ class Client {
                                     const std::string& fsdir,
                                     bool enable_eviction = true,
                                     uint64_t quota_bytes = 0);
+
+    // Applies a successful reply's TTL; reads the clock under the lock so
+    // that updates see their times in order.
+    void RecordLeaseTtl(uint64_t ttl_ms);
 
    private:
     /**
@@ -1065,6 +1091,10 @@ class Client {
     size_t dfs_inflight_writes_{0};
     // Set during destruction: no new async DFS writes are accepted afterwards.
     std::atomic<bool> dfs_writes_shutting_down_{false};
+
+    // Guarded by lease_ttl_mutex_; see RecordLeaseTtl().
+    mutable std::mutex lease_ttl_mutex_;
+    LeaseTtlState lease_ttl_;
 
     // For high availability
     std::unique_ptr<ha::LeaderCoordinator> leader_coordinator_;

@@ -3143,6 +3143,16 @@ PYBIND11_MODULE(store, m) {
             },
             "\"ready\" or the reason the DFS prefetch arena is unavailable.")
         .def(
+            "get_lease_ttl_ms",
+            [](MooncakeStorePyWrapper &self) -> uint64_t {
+                if (!self.is_client_initialized()) return 0;
+                return self.store_->get_lease_ttl_ms();
+            },
+            "Lease TTL in ms in effect, learned from successful replica "
+            "queries: a smaller TTL takes effect at once, a larger one after "
+            "it has been the only one seen for its own length. 0 means "
+            "unknown, not that the master grants no lease.")
+        .def(
             "record_prefetched_tokens",
             [](MooncakeStorePyWrapper &self, uint64_t tokens) {
                 if (!self.is_client_initialized()) return;
