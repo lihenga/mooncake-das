@@ -52,6 +52,9 @@ struct FdGuard {
 
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
+#ifdef USE_XDS
+#include "storage/distributed/xds/hyfile_backend.h"
+#endif
 #ifdef USE_3FS
 #include "storage/distributed/hf3fs_adapter.h"
 #endif
@@ -5713,8 +5716,36 @@ CreateStorageBackend(const FileStorageConfig& config) {
             } else {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
-            return std::make_shared<DistributedStorageBackend>(
+            auto backend = std::make_shared<DistributedStorageBackend>(
                 config, distributed_config, std::move(adapter));
+            if (distributed_config.xds_mode != XdsMode::kPosix) {
+#ifdef USE_XDS
+                auto accelerator = CreateHyFileAcceleratorFileIo(
+                    distributed_config.xds_library_path);
+                if (accelerator) {
+                    backend->SetAcceleratorFileIo(std::move(*accelerator));
+                } else if (distributed_config.xds_mode == XdsMode::kRequired) {
+                    LOG(ERROR) << "Required xDS backend initialization failed: "
+                               << accelerator.error().operation
+                               << ", code=" << accelerator.error().raw_code;
+                    return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+                } else {
+                    LOG(WARNING)
+                        << "xDS backend unavailable; using POSIX fallback: "
+                        << accelerator.error().operation
+                        << ", code=" << accelerator.error().raw_code;
+                }
+#else
+                if (distributed_config.xds_mode == XdsMode::kRequired) {
+                    LOG(ERROR) << "xds-required was configured, but Mooncake "
+                                  "was built without USE_XDS";
+                    return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+                }
+                LOG(WARNING) << "xds-auto was configured, but Mooncake was "
+                                "built without USE_XDS; using POSIX fallback";
+#endif
+            }
+            return backend;
         }
         default: {
             LOG(ERROR) << "Unsupported backend type: "

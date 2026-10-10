@@ -199,6 +199,10 @@ bool DistributedStorageConfig::Validate() const {
                       "read size must be positive";
         return false;
     }
+    if (xds_mode != XdsMode::kPosix && xds_library_path.empty()) {
+        LOG(ERROR) << "DistributedStorageConfig: xDS library path is empty";
+        return false;
+    }
     return true;
 }
 
@@ -370,6 +374,8 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
                                        ToString(config.xds_mode)),
                                    &parsed_xds_mode);
     config.xds_mode_valid = parsed_xds_mode;
+    config.xds_library_path = Environ::GetString(
+        "MOONCAKE_XDS_LIBRARY_PATH", config.xds_library_path);
     config.xds_min_read_size = Environ::GetUInt64(
         "MOONCAKE_XDS_MIN_READ_SIZE", config.xds_min_read_size);
     config.xds_file_cache_size = static_cast<size_t>(Environ::GetUInt64(
@@ -403,6 +409,7 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", batch_read_merge_enabled=" << batch_read_merge_enabled
         << ", direct_read_enabled=" << direct_read_enabled
         << ", xds_mode=" << ToString(xds_mode)
+        << ", xds_library_path=" << xds_library_path
         << ", xds_min_read_size=" << xds_min_read_size
         << ", xds_file_cache_size=" << xds_file_cache_size
         << ", xds_allow_request_fallback=" << xds_allow_request_fallback;

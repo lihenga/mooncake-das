@@ -29,6 +29,9 @@ option(
   OFF)
 option(WITH_EP "build mooncake with expert parallelism support" OFF)
 option(USE_NOF "build mooncake store with NoF SSD pool support" OFF)
+option(USE_XDS "build Mooncake Store with the optional hipFile/xDS backend" OFF)
+set(XDS_ROOT "" CACHE PATH "hipFile/xDS SDK installation prefix")
+set(XDS_INCLUDE_DIR "" CACHE PATH "directory containing hipfile.h")
 option(MOONCAKE_ENABLE_TEST_FAILPOINTS
        "Enable file-handshake failpoints for integration tests" OFF)
 if(MOONCAKE_ENABLE_TEST_FAILPOINTS)

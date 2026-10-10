@@ -69,6 +69,7 @@ struct DistributedStorageConfig {
     // POSIX). When false, reads go through the regular cached handles.
     bool direct_read_enabled = true;
     XdsMode xds_mode = XdsMode::kPosix;
+    std::string xds_library_path = "/opt/hyhal/lib/libhyfile.so";
     uint64_t xds_min_read_size = 16384;
     size_t xds_file_cache_size = 1024;
     bool xds_allow_request_fallback = true;

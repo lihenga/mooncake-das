@@ -107,6 +107,21 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     ssd_register_client.cpp
     engram/engram_store.cpp)
 
+if(USE_XDS)
+  if(NOT USE_HIP)
+    message(FATAL_ERROR "USE_XDS=ON requires USE_HIP=ON")
+  endif()
+  find_path(
+    XDS_INCLUDE_DIR
+    NAMES hipfile.h
+    HINTS ${XDS_ROOT}/include)
+  if(NOT XDS_INCLUDE_DIR)
+    message(FATAL_ERROR "USE_XDS=ON requires the official hipfile.h SDK header")
+  endif()
+  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES
+       storage/distributed/xds/hyfile_backend.cpp)
+endif()
+
 if(BUILD_UNIT_TESTS)
   list(APPEND MOONCAKE_STORE_CLIENT_SOURCES nvme_kv_executor_stub.cpp)
 endif()
@@ -427,6 +442,11 @@ elseif(USE_HIP)
   message(STATUS "mooncake_store: HIP enabled, enabling D2H staging")
   target_compile_definitions(mooncake_store_client_objects PRIVATE USE_HIP)
 endif()
+if(USE_XDS)
+  target_compile_definitions(mooncake_store_client_objects PRIVATE USE_XDS)
+  target_include_directories(mooncake_store_client_objects
+                             PRIVATE ${XDS_INCLUDE_DIR})
+endif()
 if(USE_ASCEND
    OR USE_ASCEND_DIRECT
    OR USE_UBSHMEM)
@@ -502,6 +522,9 @@ if(USE_CUDA)
   target_link_libraries(mooncake_store PRIVATE CUDA::cudart)
 elseif(USE_HIP)
   target_link_libraries(mooncake_store PRIVATE hip::host)
+endif()
+if(USE_XDS)
+  target_link_libraries(mooncake_store PRIVATE ${CMAKE_DL_LIBS})
 endif()
 if(USE_ASCEND
    OR USE_ASCEND_DIRECT
