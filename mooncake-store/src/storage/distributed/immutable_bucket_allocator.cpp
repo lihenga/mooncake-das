@@ -647,6 +647,7 @@ void ImmutableBucketAllocator::BucketCreateWorker() {
         }
 
         std::optional<BucketCreationReservation> reservation;
+        int64_t reserved_bucket_id = -1;
         BucketPtr bucket;
         const bool initialization_attempt =
             initialization_creations_remaining_ > 0;
@@ -654,6 +655,7 @@ void ImmutableBucketAllocator::BucketCreateWorker() {
         try {
             reservation = ReserveBucketCreationLocked();
             if (!reservation) continue;
+            reserved_bucket_id = reservation->bucket_id;
             if (initialization_attempt) {
                 --initialization_creations_remaining_;
                 initialization_consumed = true;
@@ -662,7 +664,7 @@ void ImmutableBucketAllocator::BucketCreateWorker() {
             lock.unlock();
             const auto create_started = std::chrono::steady_clock::now();
             auto preallocated = fs_adapter_->PreallocateFile(
-                BucketDataPath(reservation->bucket_id), bucket_capacity_);
+                BucketDataPath(reserved_bucket_id), bucket_capacity_);
             const auto create_latency_us =
                 std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - create_started)
@@ -684,7 +686,7 @@ void ImmutableBucketAllocator::BucketCreateWorker() {
             const char* result = "failure";
             if (publish) {
                 bucket = std::make_shared<BucketState>();
-                bucket->bucket_id = reservation->bucket_id;
+                bucket->bucket_id = reserved_bucket_id;
                 bucket->capacity = bucket_capacity_;
                 bucket->last_access_ns = CurrentTimeNs();
                 bucket->ready = true;
@@ -707,7 +709,6 @@ void ImmutableBucketAllocator::BucketCreateWorker() {
             }
 
             FinishBucketCreationLocked(/*synchronous=*/false);
-            const auto completed = *reservation;
             reservation.reset();
             const size_t ready_count = ready_bucket_ids_.size();
             const size_t in_flight = bucket_creations_in_flight_;
@@ -718,7 +719,7 @@ void ImmutableBucketAllocator::BucketCreateWorker() {
             MasterMetricManager::instance().inc_dfs_bucket_create_total(result);
             if (!preallocated) {
                 LOG(WARNING) << "Failed to precreate DFS bucket, bucket_id="
-                             << completed.bucket_id
+                             << reserved_bucket_id
                              << ", error=" << preallocated.error()
                              << ", ready_count=" << ready_count
                              << ", in_flight=" << in_flight
@@ -726,9 +727,9 @@ void ImmutableBucketAllocator::BucketCreateWorker() {
             } else if (!publish) {
                 VLOG(1)
                     << "Discarded precreated DFS bucket after state change, "
-                    << "bucket_id=" << completed.bucket_id;
+                    << "bucket_id=" << reserved_bucket_id;
             }
-            if (delete_file) DeleteBucketFiles(completed.bucket_id);
+            if (delete_file) DeleteBucketFiles(reserved_bucket_id);
 
             lock.lock();
         } catch (...) {
@@ -737,7 +738,7 @@ void ImmutableBucketAllocator::BucketCreateWorker() {
                 --initialization_creations_remaining_;
             }
             if (reservation) {
-                RollbackBucketPublicationLocked(reservation->bucket_id, bucket);
+                RollbackBucketPublicationLocked(reserved_bucket_id, bucket);
                 FinishBucketCreationLocked(/*synchronous=*/false);
             }
             ++bucket_creation_failure_sequence_;
@@ -746,7 +747,7 @@ void ImmutableBucketAllocator::BucketCreateWorker() {
                 std::chrono::steady_clock::now() + kBucketCreationRetryDelay;
             bucket_pool_cv_.notify_all();
             lock.unlock();
-            if (reservation) DeleteBucketFiles(reservation->bucket_id);
+            if (reservation) DeleteBucketFiles(reserved_bucket_id);
             LOG(ERROR) << "Unexpected exception while creating DFS bucket; "
                           "the ready bucket pool will retry";
             lock.lock();
@@ -1568,6 +1569,77 @@ ImmutableBucketAllocator::TakeRecoveredReplicas() {
 ImmutableBucketAllocator::PendingEviction
 ImmutableBucketAllocator::PrepareEviction() {
     return PrepareEvictionInternal(/*force_one=*/false);
+}
+
+ImmutableBucketAllocator::PendingEviction
+ImmutableBucketAllocator::PrepareInvalidation(int64_t bucket_id) {
+    return PrepareInvalidationInternal(bucket_id);
+}
+
+bool ImmutableBucketAllocator::HasBucket(int64_t bucket_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return buckets_.contains(bucket_id);
+}
+
+ImmutableBucketAllocator::PendingEviction
+ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
+    PendingEviction pending;
+    if (!initialized_.load(std::memory_order_acquire) || bucket_id < 0) {
+        return pending;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto bucket_it = buckets_.find(bucket_id);
+        if (bucket_it == buckets_.end() || bucket_it->second->frozen) {
+            return pending;
+        }
+        const bool was_active = active_bucket_id_ == bucket_id;
+        const BucketPtr& victim = bucket_it->second;
+        const bool has_pending = std::any_of(
+            victim->entries.begin(), victim->entries.end(), [](const auto& item) {
+                return item.second.state == BucketEntryState::PENDING;
+            });
+        if (has_pending) return pending;
+
+        std::vector<DfsAllocatorInterface::EvictionCandidate> candidates;
+        for (const auto& [key, entry] : victim->entries) {
+            if (!IsLive(entry.state)) continue;
+            auto layout = RebuildBucketEntryLayout(entry.entry_offset,
+                                                   entry.value_size, alignment_);
+            if (!layout) {
+                LOG(ERROR) << "Skipping DFS invalidation of bucket " << bucket_id
+                           << ": entry for key " << key
+                           << " has an inconsistent layout";
+                return pending;
+            }
+            DfsAllocatorInterface::EvictionCandidate candidate;
+            candidate.key = key;
+            candidate.shard_idx = static_cast<int>(bucket_id);
+            candidate.offset = layout->offset;
+            candidate.descriptor =
+                MakeBucketDescriptor(BucketDataPath(bucket_id), *layout, bucket_id);
+            candidates.push_back(std::move(candidate));
+        }
+
+        victim->frozen = true;
+        RemoveFromLruLocked(bucket_id);
+        if (!victim->sealed) {
+            victim->sealed = true;
+            victim->meta_dirty = true;
+        }
+        if (was_active) {
+            active_bucket_id_ = -1;
+            RequestRefillLocked(/*urgent=*/true);
+        }
+        pending.owner_ = this;
+        pending.bucket_id_ = bucket_id;
+        pending.bucket_identity_ = victim;
+        pending.candidates_ = std::move(candidates);
+    }
+
+    FlushDirtyMetadata();
+    return pending;
 }
 
 ImmutableBucketAllocator::PendingEviction

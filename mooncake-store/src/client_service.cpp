@@ -1415,6 +1415,18 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         err = TransferRead(replica, slices);
     }
 
+    if (replica.is_dfs_replica() && err == ErrorCode::FILE_NOT_FOUND) {
+        const std::vector<DfsMissingBucketReport> reports{{
+            replica.get_dfs_descriptor().shard_idx}};
+        const auto invalidation_results =
+            master_client_.BatchInvalidateDfsBuckets(reports);
+        if (invalidation_results.size() != 1 ||
+            !invalidation_results.front()) {
+            LOG(WARNING) << "Failed to report missing DFS bucket "
+                         << reports.front().bucket_id;
+        }
+    }
+
     // Release the cache block after transfer completes (memcpy is done)
     if (hot_cache_ && cache_used) {
         hot_cache_->ReleaseHotKey(object_key);
@@ -1767,6 +1779,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
     if (!dfs_read_requests.empty()) {
         auto dfs_results = dfs_storage_backend_->BatchRead(dfs_read_requests);
+        std::vector<DfsMissingBucketReport> missing_bucket_reports;
         if (dfs_results.size() != dfs_read_requests.size()) {
             LOG(ERROR) << "DFS BatchRead response size mismatch: expected "
                        << dfs_read_requests.size() << ", got "
@@ -1779,6 +1792,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 const size_t index = dfs_read_indices[i];
                 const auto& request = dfs_read_requests[i];
                 if (!dfs_results[i]) {
+                    if (dfs_results[i].error() == ErrorCode::FILE_NOT_FOUND) {
+                        if (missing_bucket_reports.empty()) {
+                            missing_bucket_reports.reserve(
+                                dfs_read_requests.size());
+                        }
+                        missing_bucket_reports.push_back(
+                            DfsMissingBucketReport{request.descriptor.shard_idx});
+                    }
                     results[index] = tl::unexpected(dfs_results[i].error());
                     continue;
                 }
@@ -1790,6 +1811,42 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                     continue;
                 }
                 results[index] = {};
+            }
+            if (!missing_bucket_reports.empty()) {
+                std::sort(
+                    missing_bucket_reports.begin(), missing_bucket_reports.end(),
+                    [](const auto& lhs, const auto& rhs) {
+                        return lhs.bucket_id < rhs.bucket_id;
+                    });
+                missing_bucket_reports.erase(
+                    std::unique(missing_bucket_reports.begin(),
+                                missing_bucket_reports.end(),
+                                [](const auto& lhs, const auto& rhs) {
+                                    return lhs.bucket_id == rhs.bucket_id;
+                                }),
+                    missing_bucket_reports.end());
+                const auto invalidation_results =
+                    master_client_.BatchInvalidateDfsBuckets(
+                        missing_bucket_reports);
+                if (invalidation_results.size() !=
+                    missing_bucket_reports.size()) {
+                    LOG(WARNING)
+                        << "DFS bucket invalidation response size mismatch: "
+                        << "expected " << missing_bucket_reports.size()
+                        << ", got "
+                        << invalidation_results.size();
+                }
+                const size_t result_count = std::min(
+                    invalidation_results.size(), missing_bucket_reports.size());
+                for (size_t i = 0; i < result_count; ++i) {
+                    if (!invalidation_results[i]) {
+                        LOG(WARNING)
+                            << "Failed to invalidate missing DFS bucket: "
+                            << missing_bucket_reports[i].bucket_id
+                            << ", error: "
+                            << toString(invalidation_results[i].error());
+                    }
+                }
             }
         }
     }

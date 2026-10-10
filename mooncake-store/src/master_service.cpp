@@ -5856,6 +5856,56 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchEvictDiskReplica(
     return results;
 }
 
+std::vector<tl::expected<void, ErrorCode>>
+MasterService::BatchInvalidateDfsBuckets(
+    const UUID& client_id, const std::vector<DfsMissingBucketReport>& reports,
+    const TenantId& tenant_id) {
+    (void)client_id;
+    assert(tenant_id.IsValid());
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.reserve(reports.size());
+    if (bucket_allocator_ == nullptr || !tenant_id.IsDefault()) {
+        results.assign(reports.size(),
+                       tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+        return results;
+    }
+
+    std::unordered_set<int64_t> bucket_ids;
+    for (const auto& report : reports) {
+        if (report.bucket_id < 0 ||
+            !bucket_allocator_->HasBucket(report.bucket_id)) {
+            results.emplace_back(tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+        bucket_ids.insert(report.bucket_id);
+        results.emplace_back();
+    }
+
+    if (!bucket_ids.empty()) {
+        std::lock_guard<std::mutex> lock(invalidated_dfs_buckets_mutex_);
+        invalidated_dfs_buckets_.insert(bucket_ids.begin(), bucket_ids.end());
+    }
+    return results;
+}
+
+void MasterService::ProcessInvalidatedDfsBuckets() {
+    std::unordered_set<int64_t> pending;
+    {
+        std::lock_guard<std::mutex> lock(invalidated_dfs_buckets_mutex_);
+        pending.swap(invalidated_dfs_buckets_);
+    }
+    for (const int64_t bucket_id : pending) {
+        if (!RunBucketDfsEvictionInternal(/*force_one=*/false, bucket_id)) {
+            if (bucket_allocator_ != nullptr &&
+                bucket_allocator_->HasBucket(bucket_id)) {
+                std::lock_guard<std::mutex> lock(
+                    invalidated_dfs_buckets_mutex_);
+                invalidated_dfs_buckets_.insert(bucket_id);
+            }
+        }
+    }
+}
+
 tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
     const std::string& src_segment,
@@ -7333,8 +7383,10 @@ bool MasterService::TryRecoverDfsSpaceAfterAllocationFailure() {
     return RunBucketDfsEvictionInternal(/*force_one=*/true);
 }
 
-bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
+bool MasterService::RunBucketDfsEvictionInternal(
+    bool force_one, std::optional<int64_t> invalidated_bucket_id) {
     if (bucket_allocator_ == nullptr) return false;
+    const bool invalidating_missing_bucket = invalidated_bucket_id.has_value();
 
     // Free() defers its metadata write so it never fsyncs under a metadata
     // shard lock. This tick holds no master lock, so it is the right place to
@@ -7348,9 +7400,13 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
     bool evicted = false;
 
     while (true) {
-        auto pending = force_one
-                           ? bucket_allocator_->PrepareEvictionForAllocationFailure()
-                           : bucket_allocator_->PrepareEviction();
+        auto pending = invalidated_bucket_id.has_value()
+                           ? bucket_allocator_->PrepareInvalidation(
+                                 *invalidated_bucket_id)
+                           : (force_one
+                                  ? bucket_allocator_
+                                        ->PrepareEvictionForAllocationFailure()
+                                  : bucket_allocator_->PrepareEviction());
         // Nothing is evictable right now (below watermark, or every bucket is
         // active/frozen).
         if (pending.bucket_id() < 0) return evicted;
@@ -7366,7 +7422,7 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
             // master to validate, so it can be reclaimed immediately.
             bucket_allocator_->CommitEviction(std::move(pending));
             evicted = true;
-            if (force_one) return true;
+            if (invalidating_missing_bucket || force_one) return true;
             continue;
         }
 
@@ -7428,7 +7484,8 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
                 const bool acceptable =
                     !candidate_is_processing &&
                     !tenant_state.processing_keys.contains(candidate.key) &&
-                    !metadata.IsHardPinned() && metadata.IsLeaseExpired(now);
+                    (invalidating_missing_bucket ||
+                     (!metadata.IsHardPinned() && metadata.IsLeaseExpired(now)));
                 if (!acceptable) {
                     // Whole-bucket eviction is all-or-nothing: one protected
                     // entry vetoes the bucket, and no metadata was touched.
@@ -7440,6 +7497,7 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
 
         if (!all_accepted) {
             bucket_allocator_->AbortEviction(std::move(pending));
+            if (invalidating_missing_bucket) return false;
             continue;
         }
 
@@ -7509,6 +7567,7 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
         }
         if (!phase2_accepted) {
             bucket_allocator_->AbortEviction(std::move(pending));
+            if (invalidating_missing_bucket) return false;
             continue;
         }
 
@@ -9662,6 +9721,7 @@ void MasterService::EvictionThreadFunc() {
 #endif
 
         if (dfs_allocator_ && dfs_allocator_->IsEvictionEnabled()) {
+            ProcessInvalidatedDfsBuckets();
             const auto steady_now = std::chrono::steady_clock::now();
             if (steady_now >= next_dfs_eviction_time) {
                 RunDfsEviction();
@@ -9670,6 +9730,7 @@ void MasterService::EvictionThreadFunc() {
                     dfs_allocator_->GetEvictionCheckInterval();
             }
         } else if (bucket_allocator_ != nullptr && dfs_allocator_) {
+            ProcessInvalidatedDfsBuckets();
             // Even with eviction disabled, deferred bucket tombstones still
             // need a lock-free context in which to become durable.
             const auto steady_now = std::chrono::steady_clock::now();

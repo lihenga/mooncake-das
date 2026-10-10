@@ -1035,7 +1035,6 @@ void DistributedStorageBackend::ExecuteSingleReadTask(
     // adapter's staged bounce. The trailing padding lands in the arena slot but
     // is never scattered to the caller.
     const uint64_t read_size = task.total_size;
-    const auto start = std::chrono::steady_clock::now();
 
     const uint64_t alignment = distributed_config_.alignment;
     std::vector<char> sink(alignment == 0 ? 1 : alignment);
