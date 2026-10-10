@@ -7,33 +7,43 @@
 - 首个可合并版本：从 BUCKET allocator 的 DFS 文件读取对齐的 KV Cache range，直接写入海光 DCU 显存
 - 业务写路径：首版不实现 xDS 写，继续使用现有 Mooncake DFS 写路径
 - xDS 运行时：海光 DTK/xDS、`libhyfile.so`
-- DFS 首期范围：经过真实 round-trip preflight 的 Parastor/HYFS mount
+- DFS 首期范围：在部署前通过独立 round-trip 验收的 Parastor/HYFS mount
 - 对齐要求：首版固定 4096 字节，不提供生产覆盖开关
 - 当前代码校验基线：
-  - `mooncake-das`：`feat/optimize_prefetch`，commit `3292232f2a296409fe3bf88096b31e7fa037df05`
+  - `mooncake-das`：commit `dded8f87051d537ba677193cb22941f564f1a330`
   - `sglang-das`：`feature/optimize_the_direct_linker`，commit `c4257ce7b190710b953504645aea1cdd7a53035e`
 
 本文是代码实现依据。实现若需要改变本文标为“首版契约”的行为，必须先更新设计和对应测试，不得通过隐式 fallback 或未记录的兼容逻辑改变语义。
+
+本文以当前首版代码为实现标准，只描述已采用的数据结构、调用路径和必要安全契约。
+部署验收与运行时代码分开：真实 mount/DCU round-trip 由独立验收程序执行，不在
+Mooncake 启动路径中增加 probe 状态机。本文范围之外的能力必须另行设计和评审，本文
+不预设其实现结构。
 
 ### 阅读指南
 
 | 阅读目的                               | 重点章节                           |
 | ---------------------------------- | ------------------------------ |
 | 快速理解做什么、为什么做                       | 1.1～1.4、2.1、10.4               |
+| 核对当前代码已经实现到哪里                     | 1.3.6、3.2～3.4、7.3、9.1          |
 | 实现 Phase 0～2 的核心代码                 | 2～7、9.1～9.3                    |
 | 实现 `RealClient` direct/fallback 路由 | 3.3～6.1                        |
 | 实现 `libhyfile.so` shim/backend     | 2.2、3.2、5.1、6、7.1              |
 | 实现 BUCKET-first MVP                | 1.3.5、4.2.3～4.2.4、5、6、9.1      |
 | 编写测试和验收                            | 8、10.1、10.4                    |
-| 只关注后续优化                            | 5.3.2、7.2.2、9.1 中的 Phase 2.5～4 |
 
-本次 Phase 0～2 直接相关的实现核心是第 3～7 章；第 1～2 章定义背景、范围和不可违反的契约，第 8～10 章定义观测、测试、实施和验收。标明“后续”的 GPU bounce、业务 xDS write、异步/batch 以及可选 SHARD compatibility 不阻塞 BUCKET MVP。
+本次 Phase 0～2 直接相关的实现核心是第 3～7 章；第 1～2 章定义背景、范围和不可违反的
+契约，第 8～10 章定义观测、测试、实施和验收。本文只规定 BUCKET fully-aligned read-only
+路径，其他 allocator、非对齐处理、异步/batch 和业务 xDS write 不在本文范围内。
 
 ## 1. 背景、现状与目标
 
 ### 1.1 摘要
 
-SGLang 使用 Mooncake 作为 L3 KV Cache。KV 对象位于 DFS 时，当前 range-get 路径即使只需要对象的一部分，也会把完整对象读入 Mooncake pinned host arena，再异步 H2D scatter 到 SGLang 的 DCU KV pool。
+SGLang 使用 Mooncake 作为 L3 KV Cache。原有 host fallback 路径在只需要对象一部分时，
+仍会把完整对象读入 Mooncake pinned host arena，再异步 H2D scatter 到 SGLang 的 DCU
+KV pool。当前代码已在这条路径前加入 BUCKET xDS direct 尝试；不适用或可安全降级的
+key 仍使用该 host fallback。
 
 本文引入一条 xDS/HyFile 直接读取路径：Mooncake 把 DFS 文件的绝对 offset、已注册 DCU KV pool 的原始基址以及目标 pool-relative offset 传给 `hipFileRead`，使满足条件的 KV range 从 DFS 直接进入最终 DCU 地址。
 
@@ -44,11 +54,14 @@ SGLang 使用 Mooncake 作为 L3 KV Cache。KV 对象位于 DFS 时，当前 ran
 3. 每个 key 在一次调用中选择全 direct 或全 fallback。
 4. xDS direct range 不分配 Mooncake host staging，也不执行 H2D。
 5. xDS 不可用或请求不适用时，安全回退现有路径。
-6. xDS 已接触目标显存后，只有确认 DMA 已停止，才允许整 key fallback【*某个range读失败，则整体回退】。
-7. 当前 Mooncake 代码没有独立的 DFS/xDS worker 进程。RealClient、Client、DistributedStorageBackend 以及 BUCKET BatchRead 使用的线程池都位于同一个承载进程内；停止某个 backend 线程、线程池任务或 RPC handler 不能终止已经提交的设备 DMA。若 xDS read 已提交但无法证明 DMA 已停止，首版必须禁止 host fallback，并禁止释放、覆盖或复用对应的目标 KV block；同时将 xDS backend 和当前承载进程标记为 fatal/unhealthy，由外部 supervisor 终止并重启整个承载进程（没自动拉起，就人为操作重启）。SGLang 内嵌模式下，该进程是承载 RealClient 的 SGLang worker 进程；独立 RPC 模式下，该进程是 mooncake_client。新进程启动后必须重新初始化 xDS driver、file handle、buffer registration、连接和 session。只有未来将 xDS 放入独立 helper process 后，该 helper process 才能成为单独的故障隔离和重启边界。
-8. 生产数据面首版只实现 read；`hipFileWrite` 仅用于启动 preflight（小规模的端到端自检xDS读写功能的可用性）。
+6. 某个 direct op 失败时，只有确认 DMA 已停止，才允许整个 key 走 fallback。
+7. 当前 Mooncake 没有独立 DFS/xDS helper 进程。若 xDS read 已提交但无法证明 DMA 已停止，
+   必须禁止 host fallback，并把 backend 置为 sticky fatal。恢复方式是由外部 supervisor 或
+   人工重启整个承载进程；新进程重新初始化 driver、file handle、buffer registration、
+   连接和 session。
+8. 部署前由独立验收程序通过 POSIX 写入已知数据，再用 `hipFileRead` 读入 DCU 并校验；业务数据面只使用 xDS read。
 
-本文所称“零拷贝”仅表示 Mooncake 不分配 host staging buffer，也不显式执行 H2D payload copy。hipFileRead 返回成功并不能证明 libhyfile.so、DFS client 或内核驱动内部未使用临时 host/device bounce buffer。除非厂商提供可区分 direct-DMA bytes 与 bounce bytes 的可信计数器、trace 或正式语义保证，本文只将该路径称为“Mooncake 零 host staging”，不宣称端到端完全零拷贝。。
+本文所称“零拷贝”仅表示 Mooncake 不分配 host staging buffer，也不显式执行 H2D payload copy。hipFileRead 返回成功并不能证明 libhyfile.so、DFS client 或内核驱动内部未使用临时 host/device bounce buffer。除非厂商提供可区分 direct-DMA bytes 与 bounce bytes 的可信计数器、trace 或正式语义保证，本文只将该路径称为“Mooncake 零 host staging”，不宣称端到端完全零拷贝。
 
 ### 1.2 术语
 
@@ -57,11 +70,7 @@ SGLang 使用 Mooncake 作为 L3 KV Cache。KV 对象位于 DFS 时，当前 ran
 | xDS                | 海光 DCU 软件栈提供的 GDS 类直接存储能力                    |
 | HyFile             | 本设计使用的 xDS 用户态接口，符号以 `hipFile*` 命名           |
 | direct range       | 通过 `hipFileRead` 直接写入最终 DCU KV 地址的 range     |
-| GPU bounce         | 先读入已注册的对齐 DCU bounce buffer，再 D2D 到最终地址      |
 | host fallback      | 当前 DFS → pinned host arena → H2D 路径          |
-| registration owner | 负责最终 deregister 的唯一、move-only 资源所有者          |
-| registration pin   | 一次 I/O 持有的共享引用，阻止 owner 在 I/O 完成前 deregister |
-| session generation | 区分同一 key 的新旧 get session 的单调递增编号             |
 | publish            | 将一次 range-get 对外报告为成功，使 SGLang 可以消费目标 KV     |
 | target state       | xDS 失败后，目标显存是否未触碰、可安全覆盖或状态未知                 |
 
@@ -92,7 +101,7 @@ batch_get_into_multi_buffer_ranges(keys, ptrs, sizes, offsets)
 
 公开返回语义为逐 key 返回实际读取字节数；负数表示错误。调用是同步的：返回成功前，目标 range 必须已经可安全消费。
 
-#### 1.3.2 当前 DFS 读取路径
+#### 1.3.2 现有 DFS host fallback 路径
 
 当前 DFS replica 的 range-get 路径如下：
 
@@ -116,13 +125,16 @@ Distributed filesystem
 1. `batch_get_session_start` 查询并缓存一个完整 replica 和 lease。
 2. `batch_get_into_multi_buffer_ranges` 校验参数、session、lease 和对象边界。
 3. memory replica 走现有 Transfer Engine range read。
-4. DFS replica 先查询 `get_session_object_cache_`。
+4. DFS replica 先查询 `get_session_prefetch_cache_`。
 5. session cache miss 时，为完整对象分配 aligned pinned host arena view。
 6. `Client::BatchGet` 构造现有 `DfsReadRequest`，由 backend 读取完整对象。
 7. `DfsAsyncScatterContext` 合并相邻 H2D copy，并同步使用过的 stream。
 8. 完成后填写逐 key 字节数并返回。
 
-当前校验基线中不存在 Mooncake `DfsPrefetcher` 或 `TryConsume`。本文不把不存在的 prefetcher 纳入首版路由。SGLang 业务层所称“prefetch”指 L3 KV 恢复行为，不等同于 Mooncake 内部 host-object prefetcher。
+当前校验基线中不存在 Mooncake `DfsPrefetcher` 或 `TryConsume`。本文不把不存在的
+prefetcher 纳入首版路由。上图描述 fallback；实际 DFS cache miss 会先执行 1.3.6 的 xDS
+资格筛选，只有未进入 direct 或安全回退的 key 才继续执行步骤 5～8。SGLang 业务层所称
+“prefetch”指 L3 KV 恢复行为，不等同于一个名为 `DfsPrefetcher` 的组件。
 
 #### 1.3.3 当前 POSIX direct-read 的准确语义
 
@@ -180,6 +192,43 @@ length
 ```
 
 三者是否满足 xDS 对齐约束，而不是取决于 header/key 前缀。首版不修改 BUCKET 磁盘格式，也不引入 layout v2。
+
+#### 1.3.6 当前 xDS 实现状态
+
+当前代码已经打通以下软件调用链：
+
+```text
+SGLang MooncakeDirectLinker
+  → RealClient::batch_get_into_multi_buffer_ranges
+  → RealClient::execute_session_dfs_range_reads
+  → Client::BatchReadDfsRanges
+  → DistributedStorageBackend::BatchReadRanges
+  → AcceleratorFileIo::Read
+  → HyFileAcceleratorFileIo::Read
+  → hipFileRead + hipDeviceSynchronize
+  → 最终 DCU KV range
+```
+
+当前方法归属固定为：`BatchReadDfsRanges` 属于 `Client`，`BatchReadRanges` 属于
+`DistributedStorageBackend`。前者只做转发，后者负责文件定位、buffer pin、对齐检查、
+coalescing 和逐 op 执行。
+
+当前实现状态如下：
+
+| 能力 | 当前首版行为 |
+|---|---|
+| HyFile ABI/runtime | 最小手工 ABI；`dlopen`/`dlsym` 7 个 required symbols；进程级 runtime；fork PID 防护 |
+| BUCKET direct read | 已接入 RealClient 热路径；完全对齐 range 可直接进入最终 DCU 地址 |
+| SHARD direct read | 不支持；`GetXdsFile` 返回 `allocator-not-supported` 并按策略 fallback |
+| buffer registry | `std::map<base, shared_ptr<XdsBufferEntry>>`；使用 `logical_refs`、`inflight`、`accepting`、`quarantined` |
+| file registry | `xds_files_` 缓存 registration、`shared_ptr<OpenFileHandle>` 和 dev/inode identity；缓存满时返回 `xds-file-cache-full` |
+| session 安全 | `get_sessions_` 保存 `QueryResult` 快照；完成后比较 replica/checksum 并复查 lease；同 key 不允许并发 end/start/read |
+| fallback | 安全错误整 key fallback；unknown target state 禁止 fallback |
+| fatal | backend 设置 sticky `xds_fatal_` 并拒绝当前及后续 xDS 请求 |
+| 部署验收 | 目标环境逐 device、真实 mount round-trip 由独立程序执行，不属于 Mooncake runtime 初始化 |
+
+因此当前可以称为“BUCKET read-only xDS 软件路径已打通”。是否生产启用，由第 7.1 节的
+独立部署验收和第 10 章的正确性/性能标准决定。
 
 ### 1.4 问题与目标
 
@@ -262,8 +311,7 @@ DistributedStorageBackend::BatchReadRanges(
 - 不经过 `TransferSubmitter`；
 - backend 对每个 key 聚合其全部 direct op，只有全部 exact-length 且完成同步才返回成功；
 - 返回结果必须与各自输入等长、同序；内部排序和 coalescing 不得改变外部结果顺序；
-- 只返回逐 key 成功或带 `target_state` 的失败，不计算公开 API 的业务成功字节数；
-- 记录 xDS/fallback I/O metrics。
+- 只返回逐 key 成功或带 `target_state` 的失败，不计算公开 API 的业务成功字节数。
 
 `AcceleratorFileIo::Read` 仍返回底层实际完成字节数，用于强制校验 `actual == requested`；这个字节数是单个物理 direct op 的完成信息，不直接作为 Python API 返回值。`RealClient` 是唯一计算公开逐 key 成功字节数的层：它保留现有 `SessionRangeReadRequest::original_idx`，为 direct/fallback 子计划维护局部 `request_index -> original_idx` 映射，并且仅在该 key 的全部 ranges、设备同步和发布检查均成功后返回 `sum(all_sizes[original_idx])`。`DfsRangeReadRequest` 不携带公开请求下标，backend 不依赖调用方的结果数组布局。
 
@@ -280,15 +328,19 @@ DistributedStorageBackend::BatchReadRanges(
 一次 `Read` 内部负责：
 
 ```text
-PID/generation/边界复核
+PID/registration id/边界复核
 → DeviceGuard / hipSetDevice
 → 获取进程级 HyFile mutex
 → hipFileRead
-→ exact-length 校验
 → hipDeviceSynchronize
+→ exact-length 校验
 → 生成稳定错误分类和 target state
 → 释放 HyFile mutex
 ```
+
+必须先同步、再根据返回字节数分类。原因是短读或 vendor error 之后也要先证明 DMA 已经
+停止，才能把目标状态标记为 `kStoppedSafeToOverwrite`。当前
+`HyFileAcceleratorFileIo::Read` 已按该顺序实现。
 
 上层不得直接调用 vendor synchronize，也不得直接解释 vendor 返回码。
 
@@ -302,7 +354,7 @@ PID/generation/边界复核
 - 不假设 SGLang compute stream 与 HyFile DMA 自动有序；
 - 不使用未确认的 batch/event/poll 结构体或函数。
 
-#### 2.1.5 fatal 状态 fail-stop
+#### 2.1.5 fatal 状态
 
 如果 `hipDeviceSynchronize` 失败，无法证明驱动不再访问目标显存。首版行为固定为：
 
@@ -310,11 +362,13 @@ PID/generation/边界复核
 标记 backend fatal
 → 拒绝新 xDS 请求
 → 当前请求不 fallback、不发布成功
-→ 当前 worker fail-stop
-→ 外部 supervisor 重启 worker
 ```
 
 首版不实现 SGLang KV allocator 的 poisoned-block quarantine 协议。
+
+当前代码设置 `xds_fatal_` 并拒绝当前及后续 xDS 请求，不主动终止 worker，也不实现新的
+supervisor 协议。部署侧应把 fatal 错误或进程卡死纳入已有健康检查，并通过重启承载进程
+恢复；不得在原进程中清除 fatal 后继续复用 vendor 资源。
 
 ### 2.2 依赖和兼容性
 
@@ -327,7 +381,7 @@ PID/generation/边界复核
 - Parastor/HYFS client 和受支持的 mount；
 - 支持 `O_DIRECT` 的路径；
 - HIP device/context 和 synchronize API；
-- 能重启失效 worker 的外部 supervisor/watchdog。
+- 用于进程级恢复的现有外部 supervisor，或明确的人工重启流程。
 
 默认动态库路径：
 
@@ -349,15 +403,12 @@ hipFileHandleDeregister
 hipFileBufRegister
 hipFileBufDeregister
 hipFileRead
-hipFileWrite        # 仅 preflight 使用
 ```
 
-可选加载但首版不调用：
+独立部署验收使用 POSIX 写入已知测试数据，再通过 `hipFileRead` 读入 DCU buffer 并
+回读校验；业务首版不要求也不加载 `hipFileWrite`。
 
-```text
-hipFileDriverSetMaxCacheSize
-hipFileDriverSetMaxPinnedMemSize
-```
+首版不声明、不加载其他 vendor 符号。
 
 任一 required symbol 缺失时：
 
@@ -366,17 +417,21 @@ hipFileDriverSetMaxPinnedMemSize
 
 #### 2.2.3 ABI 规则
 
-生产构建优先使用目标环境正式 SDK header。所有结构体大小、padding、enum 值、整数宽度、calling convention 和返回值语义以正式 header 为准。
+首版只维护一套最小手工 ABI 声明，不依赖或探测 `hipfile.h`。ABI 声明集中在
+`hyfile_abi.h`，生产实现只能通过该声明和 `dlopen`/`dlsym` 调用
+`libhyfile.so`，其他编译单元不得重复声明 vendor 类型或函数。
 
-如果部署环境只有动态库：
+规则如下：
 
-1. 只允许在 `hyfile_api_shim.cpp` 中维护最小 ABI mirror；
-2. ABI mirror 必须绑定明确的 DTK、driver 和 `libhyfile.so` build-id/版本；
-3. 支持矩阵之外的版本 fail closed；
-4. 必须执行真实 mount round-trip preflight；
-5. 不通过数值阈值猜测 errno 与 HyFile error domain。
+1. 只声明首版 read-only 路径实际使用的类型、常量和 7 个 required symbols；
+2. 对错误结构体和文件描述符执行编译期 size、alignment、offset 校验；
+3. required symbol 缺失时 fail closed，但不做 build-id/hash 强制拒绝；
+4. 部署清单仍必须记录 DTK、driver 和 `libhyfile.so` 版本/build-id，便于定位兼容性问题；
+5. 启用业务流量前必须用独立验收程序完成真实 mount、逐 device 的已知数据读回；
+6. 错误码映射以已确认的当前 ABI 为准，未知错误按保守策略处理。
 
-在厂商确认前，以下问题是生产 backend 的阻塞项：
+当前 `hyfile_abi.h` 已按现有参考实现固化并用于编码；以下问题不阻塞软件路径开发，
+但仍是目标环境生产验收项：
 
 - `hipFileRead` 的精确 C 原型；
 - 错误是 `-errno`、`-1 + errno` 还是独立 HyFile code；
@@ -402,6 +457,9 @@ mount 类型和参数
 
 ## 3. 架构、核心类型与生命周期
 
+本章是首版实现规范，类型、生命周期和调用关系均以当前代码为准。首版使用 backend
+registry 中已有的 `shared_ptr + inflight` 保护 buffer，不再定义另一套抽象资源类型。
+
 ### 3.1 总体架构
 
 ```text
@@ -412,10 +470,9 @@ SGLang Mooncake Direct Linker
                   |
                   v
 RealClient
-  - session generation/pin
+  - session snapshot、replica compatibility 和 lease 复查
   - session cache routing
-  - batch target-overlap validation
-  - registration interval pinning
+  - device pointer / same-device / INT_MAX 粗筛
   - per-key direct/fallback classification
                   |
                   v
@@ -424,14 +481,16 @@ Client::BatchReadDfsRanges
                   v
 DistributedStorageBackend
   - descriptor validation
-  - SHARD/BUCKET target resolution
+  - BUCKET target resolution
   - value/file offset calculation
+  - batch target-overlap validation
+  - registration interval pinning
   - range coalescing
-  - xDS file-cache pinning
+  - 有界 xDS file registration cache
           |                         |
           v                         v
 AcceleratorFileIo              FileSystemAdapter
-  HyFileBackend                 existing fallback
+  HyFile adapter                existing fallback
   libhyfile shim                full object → host
           |                         |
           v                         v
@@ -463,7 +522,11 @@ enum class DeviceXdsState {
 };
 ```
 
-动态库、driver 和 DFS mount 兼容性属于 backend 级状态；preflight 结果、可用性和失败原因属于 per-device 状态。backend 维护 `device_id -> DeviceXdsState`，不能用一个全局 `capabilities.available` 代表所有 device。能力在对应 device 完成初始化和 preflight 后冻结，I/O 热路径不重新 probe。首版 alignment 来自经过验证的版本 profile，固定为 4096，不允许普通用户覆盖。
+动态库和 driver 初始化结果属于 backend 级状态，device 是否存在和是否已进入 fatal 属于
+per-device 状态。`BuildAdapter` 在 `hipGetDeviceCount` 成功后把枚举范围内的 device 初始化为
+`kAvailable`；I/O 热路径不重新探测。首版 alignment 来自已验证的部署 ABI，固定为 4096，
+不允许普通用户覆盖。真实 DFS mount 与每张目标 DCU 的兼容性由 7.1 的独立部署验收确认，
+不在 Mooncake 进程内维护额外 probe 状态机。
 
 #### 3.2.2 错误和目标状态
 
@@ -493,47 +556,53 @@ struct DirectReadCompletion {
 };
 ```
 
-#### 3.2.3 owner 与 pin 分离
+#### 3.2.3 注册对象与 `DirectReadOp`
 
-资源类型分为：
+当前仓库使用两个轻量 registration value：
 
-```text
-RegisteredFileOwner     唯一、move-only，负责最终 handle deregister + fd close
-RegisteredFilePin       可复制的在途 keepalive，不负责清理
+```cpp
+struct XdsFileRegistration {
+    uint64_t id;
+    int fd;
+};
 
-RegisteredBufferOwner   唯一、move-only，负责最终 buffer deregister
-RegisteredBufferPin     可复制的在途 keepalive，携带 generation/bounds/device
+struct XdsBufferRegistration {
+    uint64_t id;
+    void* base;
+    size_t length;
+    int32_t device_id;
+};
 ```
 
-`DirectReadOp` 只持有 pin，不持有 owner：
+`id` 是 adapter 在当前进程内分配的注册实例标识，用于拒绝失效或不匹配的句柄。一次
+vendor read 所需参数由 `DirectReadOp` 传递：
 
 ```cpp
 struct DirectReadOp {
-    RegisteredFilePin file;
-    RegisteredBufferPin buffer;
-
+    XdsFileRegistration file;
+    XdsBufferRegistration buffer;
     uint64_t file_offset = 0;
-    void* registered_base = nullptr;
     uint64_t device_offset = 0;
     uint64_t length = 0;
     int32_t device_id = -1;
-
-    size_t request_index = 0;
-    size_t first_range_index = 0;
-    size_t covered_range_count = 1;
 };
 ```
 
 必须满足：
 
 ```text
-registered_base == hipFileBufRegister 使用的原始 base
-registered_base + device_offset == 最终 dst
-dst + length 完全位于 registration 内
-pin generation 与 registry 当前 generation 相同
+buffer.base == hipFileBufRegister 使用的原始 base
+buffer.base + device_offset == 最终 dst
+device_offset + length 不越过 buffer.length
+file.id、buffer.id、device_id 与 adapter 当前注册表一致
 ```
 
-#### 3.2.4 `AcceleratorFileIo` 接口
+buffer 的在途保护不嵌入 `DirectReadOp`，而是由 backend 的 `PlannedRequest::pins` 保存
+`shared_ptr<XdsBufferEntry>` 并增加 `inflight`。file registration 由 `XdsFileEntry` 和
+`shared_ptr<OpenFileHandle>` 保持有效；首版运行期间不淘汰已注册文件，backend 析构时统一
+deregister 并释放 fd。
+
+#### 3.2.4 `AcceleratorFileIo` 当前接口
 
 ```cpp
 class AcceleratorFileIo {
@@ -543,67 +612,61 @@ class AcceleratorFileIo {
     virtual DirectIoCapabilities Capabilities() const = 0;
     virtual DeviceXdsState DeviceState(int32_t device_id) const = 0;
 
-    virtual tl::expected<RegisteredFileOwner, XdsError> RegisterFile(
-        UniqueFd direct_fd, const FileIdentity& identity) = 0;
+    virtual tl::expected<XdsFileRegistration, XdsError> RegisterFile(
+        int fd, const XdsFileIdentity& identity) = 0;
 
-    virtual tl::expected<RegisteredBufferOwner, XdsError> RegisterBuffer(
+    virtual tl::expected<XdsBufferRegistration, XdsError> RegisterBuffer(
         void* base, size_t length, int32_t device_id) = 0;
 
     virtual tl::expected<DirectReadCompletion, XdsError> Read(
         const DirectReadOp& op) = 0;
 
     virtual tl::expected<void, XdsError> DeregisterFile(
-        RegisteredFileOwner&& owner) = 0;
+        XdsFileRegistration registration) = 0;
 
     virtual tl::expected<void, XdsError> DeregisterBuffer(
-        RegisteredBufferOwner&& owner) = 0;
+        XdsBufferRegistration registration) = 0;
 };
 ```
 
-`UniqueFd` 的所有权在 `RegisterFile` 成功时转移给 `RegisteredFileOwner`；失败时由调用方或返回对象保证关闭，不允许泄漏或双重关闭。
+`XdsFileRegistration` 包含进程内唯一 `id` 和 `fd`；`XdsBufferRegistration` 包含 `id`、
+原始 base、length 和 device id。fd 所有权当前不转移给 adapter，而由
+`XdsFileEntry::file` 的 `shared_ptr<OpenFileHandle>` 保持存活。adapter 只保存并校验 fd，
+backend 析构时先 deregister vendor handle，再释放文件 keepalive。
 
 ### 3.3 Buffer registry
 
 #### 3.3.1 entry 数据
 
+当前 backend 中真实存在的 entry 为：
+
 ```cpp
-enum class RegistrationState {
-    kRegistering,
-    kActive,
-    kDraining,
-    kQuarantined,
-};
-
-enum class XdsIneligibleReason {
-    kNone,
-    kModeDisabled,
-    kUnsupportedMemoryKind,
-    kDeviceUnavailable,
-    kRegistrationFailedSafe,
-};
-
-struct RegisteredDeviceRegion {
-    uintptr_t base;
-    size_t length;
-    MemoryKind memory_kind;
-    int32_t device_id;
-    pid_t pid;
-    uint64_t generation;
-    RegistrationState state;
-    uint64_t logical_refcount;
-    uint64_t inflight_refcount;
-    TransferEngineRegistration transfer_registration;
-    std::optional<RegisteredBufferOwner> xds_owner;
-    bool xds_eligible;
-    XdsIneligibleReason xds_ineligible_reason;
+struct XdsBufferEntry {
+    uintptr_t base = 0;
+    size_t length = 0;
+    int32_t device_id = -1;
+    pid_t pid = 0;
+    uint64_t logical_refs = 1;
+    uint64_t inflight = 0;
+    bool accepting = true;
+    bool quarantined = false;
+    XdsBufferRegistration registration;
+    std::condition_variable drained;
 };
 ```
 
-使用有序 interval registry，而不是热路径线性扫描所有 base。
+它存放在 `std::map<uintptr_t, shared_ptr<XdsBufferEntry>> xds_buffers_` 中，使用
+`upper_bound` 查找覆盖目标地址的 allocation，不线性扫描所有 base。
+
+当前 TE registration、`registered_buffer_sizes_` 和 xDS registry 分属现有层次。首版不把
+它们合并为新的复合注册对象。
 
 #### 3.3.2 注册规则
 
-公开接口保持 `register_buffer(base, size)`。Mooncake 在注册阶段允许查询一次 pointer/device 属性，得到实际 memory kind 和 device id；热路径不查询。公开注册成功表示该区域至少可继续服务现有 Transfer Engine/host fallback 路径，不表示它一定具备 xDS 能力。
+公开接口保持 `register_buffer(base, size)`。当前 `RealClient` 先执行
+`Client::RegisterLocalMemory` 注册 Transfer Engine，再查询 pointer 的 memory kind 和
+device id；device memory 才调用 `Client::RegisterXdsBuffer`。公开注册成功表示该区域至少
+可继续服务现有 Transfer Engine/host fallback 路径，不表示它一定具备 xDS 能力。
 
 规则：
 
@@ -613,110 +676,103 @@ struct RegisteredDeviceRegion {
 - 相同 base、size、device、PID 的重复注册：只增加 logical refcount；
 - 相同 base 但 size/device 不同：contract violation；
 - fork 后 PID 改变：继承 entry 一律不可用；
-- xDS 注册成功前不得发布为 direct eligible。
+- xDS 注册成功前不得写入 `xds_buffers_`，因此不会被 direct planner 查到。
 
 通用事务顺序：
 
 ```text
-validate interval/memory kind/device/PID
-→ state = registering
-→ Transfer Engine register（需要时）
-→ 查询对应 device 的 xDS 状态
-→ 可用时 hipSetDevice + hipFileBufRegister
-→ 按运行模式发布 composite 或 TE-only entry
+Transfer Engine register
+→ 查询 memory kind/device
+→ device memory 且 mode != posix 时调用 RegisterXdsBuffer
+→ backend 校验 interval/PID/device
+→ hipSetDevice + hipFileBufRegister
+→ 成功后写入 xds_buffers_
+→ RealClient 记录 registered_buffer_sizes_
 ```
 
 各模式行为固定为：
 
 | 模式 | 单个 buffer 的 xDS 注册失败行为 |
 |---|---|
-| `posix` | 不调用 HyFile，发布 TE-only active entry。 |
-| `xds-auto` | 若 xDS 未创建残留资源，或失败后的 deregister/回滚已确定成功，则发布 TE-only active entry，`xds_owner=nullopt`、`xds_eligible=false`，并记录结构化原因；`register_buffer` 对调用方仍返回成功。 |
-| `xds-required` | 逆序回滚 Transfer Engine registration，`register_buffer` 返回失败，不发布 entry。 |
+| `posix` | 不调用 HyFile，保留现有 TE registration。 |
+| `xds-auto` | xDS 注册失败时不创建 `XdsBufferEntry`，保留 TE registration，`register_buffer` 对调用方仍返回成功并记录日志。 |
+| `xds-required` | xDS 注册失败时回滚 Transfer Engine registration，`register_buffer` 返回失败。 |
 
-不支持的 memory kind、对应 device 未通过 preflight，以及确定失败且已安全清理的 `hipFileBufRegister`，在 `xds-auto` 下均属于 TE-only 降级。不得在每次 range read 时重新尝试临时注册；恢复 xDS eligibility 必须经过显式重新注册或 backend/device 重建。
-
-如果 `hipFileBufRegister` 可能部分成功，而后续 deregister/回滚失败或无法证明 driver 不再引用该显存，则任何模式都不得发布 TE-only entry。entry 进入 `kQuarantined`，`register_buffer` 返回失败，调用方必须保持 storage 存活，首版使 worker fail-stop 并由外部 supervisor 重建。
+不支持的 memory kind、device 不可用以及确定失败的 `hipFileBufRegister`，在
+`xds-auto` 下均属于 TE-only 降级。当前代码不会为 TE-only buffer 保存
+`XdsIneligibleReason` entry，也不会在每次 range read 时临时重试；恢复 xDS eligibility
+必须显式重新注册或重建 backend/device。adapter 按当前 vendor 契约把注册调用返回错误视为
+`target_state=kUntouched`；这一契约必须由部署所用 `libhyfile.so` 的验收结果确认。
 
 #### 3.3.3 pin
 
 planner 查找 `[dst, dst + length)` 时：
 
-1. entry 必须为 `kActive`；
+1. entry 必须 `accepting == true` 且 `quarantined == false`；
 2. range 必须完全位于一个 entry；
-3. direct plan 还要求 `xds_eligible=true` 且 `xds_owner` 存在；TE-only entry 只能进入现有 fallback 路径；
-4. PID 和 generation 必须匹配；
-5. 增加 inflight refcount；
-6. 返回 `RegisteredBufferPin`。
+3. PID、device id 和可选 `registration_id` 必须匹配；
+4. 增加 `inflight`；
+5. 返回 `shared_ptr<XdsBufferEntry>` 作为当前 pin。
 
 pin 生命周期覆盖：
 
 - xDS read；
 - read 后 device synchronize；
-- 必要的 GPU bounce D2D；
-- 错误分类；
-- publish 或 fallback 决策。
+- 当前 backend 中的错误分类和 direct op 执行。
+
+当前 pin 在 backend 返回给 `RealClient` 前释放，因此不覆盖 `RealClient` 的 session 发布
+复查和之后的 fallback 决策。buffer 注销安全依赖 `Read()` 返回前已经完成
+`hipDeviceSynchronize`，此时 direct DMA 已结束。
 
 #### 3.3.4 解除注册
 
 ```text
-logical_refcount--
+logical_refs--
 → 非零：返回成功
-→ 归零：state = draining
-→ 从 active interval lookup 中移除
-→ 等待 inflight_refcount == 0
-→ xds_owner 存在时 hipSetDevice + hipFileBufDeregister(base)
-→ Transfer Engine deregister
-→ 删除 entry
+→ 归零：accepting = false
+→ 等待 inflight == 0
+→ hipSetDevice + hipDeviceSynchronize
+→ hipFileBufDeregister(base)
+→ 成功后从 xds_buffers_ 删除 entry
 ```
 
-TE-only entry 跳过 HyFile deregister。`xds_owner` 存在且 `hipFileBufDeregister` 失败时，entry 进入 `kQuarantined`。运行期不得把同一地址重新注册为正常可用。首版生产策略为使 worker 退出，避免 Python/PyTorch 释放仍可能被驱动引用的显存。
+随后 `RealClient::unregister_buffer_internal` 再注销 Transfer Engine registration，并从
+`registered_buffer_sizes_` 删除记录。TE-only buffer 在 backend 中没有 entry，xDS 注销
+直接成功。`hipFileBufDeregister` 或其前置同步失败时，entry 进入 `quarantined` 且不从
+registry 删除；当前调用返回错误，entry 保持 quarantined，禁止后续 direct read。
 
 #### 3.3.5 SGLang 生命周期
 
-SGLang Direct Linker 保存成功注册的 `(base, size)` 列表。关闭顺序：
-
-```text
-停止接收新 load/offload
-→ join load/offload/read-plan worker
-→ 结束所有 session
-→ 对成功注册的 buffer 调用 unregister_buffer
-→ storage.close()
-→ Direct Linker/pool 对象才可析构
-```
-
-Mooncake `close()` 同时执行 defensive drain，清理调用方遗漏的 registration，但这不替代 SGLang 的显式顺序。
+`MooncakeDirectLinker.register_buffers()` 遍历 storage allocation 并注册整块 GPU KV pool。
+`close()` 先停止并 join load/offload/read-plan 线程，再调用 `storage.close()`；当前 Python
+`MooncakeStore.close()` 没有逐项注销接口，最终由 C++ 对象和 backend 析构执行清理。首版
+要求 KV pool 的实际显存生命周期长于 Direct Linker 和 Mooncake storage 对象，不能在这些
+对象仍可能执行读取时提前释放或复用显存。
 
 ### 3.4 Session 和可见性
 
-#### 3.4.1 session state
+#### 3.4.1 当前 session state
 
-同一 key 的每次 `batch_get_session_start` 创建新的内部 generation：
+当前实现为：
 
 ```cpp
-struct GetSessionState {
-    std::string key;
-    uint64_t generation;
-    QueryResult query_result;
-    time_point lease_deadline;
-    bool closing;
-    uint64_t inflight_reads;
-};
-
-struct SessionReadPin {
-    std::shared_ptr<GetSessionState> state;
-    uint64_t generation;
-};
+std::unordered_map<std::string, QueryResult> get_sessions_;
 ```
+
+`batch_get_session_start` 查询并选择一个完整 replica，把过滤后的 `QueryResult` 写入 map；
+同 key 再次 start 会替换旧 entry。range read 在锁内复制 `QueryResult`、descriptor 和
+lease deadline 到 `SessionRangeReadRequest`，I/O 期间不持有 session mutex。
+
+完成后通过 `CompatibleSessionCacheRefresh(old, current)` 比较 replica 身份和可用
+checksum，并重新检查 lease。
 
 #### 3.4.2 提交前检查
 
-创建 `SessionReadPin` 时检查：
+创建 `SessionRangeReadRequest` 快照时检查：
 
 - session 存在；
 - replica 完整且类型受支持；
 - lease 未过期；
-- `closing == false`；
 - range 不越过对象边界。
 
 #### 3.4.3 完成前发布检查
@@ -724,9 +780,7 @@ struct SessionReadPin {
 direct、session-cache H2D 和 host fallback 完成后，在填写成功返回码前再次检查：
 
 ```text
-当前 key 仍指向同一个 shared session state
-generation 未改变
-closing == false
+当前 key 仍存在且 replica 与发起 I/O 时兼容
 lease 未过期
 所有设备操作已完成
 ```
@@ -735,14 +789,18 @@ lease 未过期
 
 #### 3.4.4 session end
 
-`batch_get_session_end`：
+`batch_get_session_end` 在 `session_mutex_` 下删除 map entry 和 prefetch cache，不等待
+in-flight get。首版调用契约要求同一个 key 遵守：
 
-1. 在 `session_mutex_` 下标记 `closing=true`；
-2. 从当前 session map 中移除；
-3. 删除 session object cache map entry；
-4. 不持锁等待可能阻塞的 I/O；
-5. in-flight `SessionReadPin` 保持 state 和 cache source owner 存活；
-6. 旧 generation 的完成结果不得发布给之后的新 session。
+```text
+batch_get_session_start
+→ 一个或多个 range read 完成并返回
+→ batch_get_session_end
+```
+
+同一 key 的 `start`、range read 和 `end` 不得并发，也不得在旧 range read 未返回时重新
+start 同名 key。完成前的 replica compatibility 和 lease 复查用于防止已经失效的读取结果
+被报告成功，但不替代该调用顺序契约。
 
 Session 生命周期与 KV pool xDS registration 生命周期独立。session end 不等于可以 deregister KV pool。
 
@@ -769,8 +827,8 @@ Session 生命周期与 KV pool xDS registration 生命周期独立。session en
 #### 4.1.2 路由顺序
 
 ```text
-创建 SessionReadPin 并校验 ranges
-  → session object cache 命中？
+复制 session/replica 快照并校验 ranges
+  → get_session_prefetch_cache_ 命中？
       是：加入 host-source H2D plan
       否：
   → 整 key direct eligibility
@@ -788,9 +846,8 @@ Session 生命周期与 KV pool xDS registration 生命周期独立。session en
 xDS backend 基础能力可用
 request device 的 DeviceXdsState == kAvailable
 capabilities.supports_distributed_fs
-range 完全位于 active registration
-registration.xds_eligible 且 xds_owner 存在
-registration PID/generation 有效
+range 完全位于 accepting 且未 quarantined 的 XdsBufferEntry
+registration id、PID 和 device 有效
 registration device 与 request device 一致
 同一 key 的 ranges 属于同一 device（首版限制）
 file_offset = value_offset + object_offset 无溢出
@@ -799,7 +856,6 @@ uintptr(dst) % 4096 == 0
 length % 4096 == 0
 0 < length <= SSIZE_MAX
 coalescing 后每个 DirectReadOp.length >= MIN_READ_SIZE
-circuit breaker 允许提交
 ```
 
 普通 eligibility 不满足属于 `kNotEligible`，直接加入 host fallback，不调用 HyFile，不计 backend 故障。
@@ -809,8 +865,8 @@ circuit breaker 允许提交
 首版只合并 request 中相邻、同时满足以下条件的 range：
 
 ```text
-相同 file pin
-相同 buffer registration pin
+相同 file registration
+相同 buffer registration
 相同 device
 前一 file range 末尾 == 后一 file range 起点
 前一 device range 末尾 == 后一 device range 起点
@@ -819,26 +875,6 @@ circuit breaker 允许提交
 ```
 
 不为了合并而跨对象读取，不读取相邻 key 数据，不重排可能改变覆盖关系的 range。
-
-#### 4.1.5 planner-only telemetry
-
-在真实 backend 上线前提供 dry-run 模式：执行完整 planner，但所有读取仍走现有 fallback。至少记录：
-
-```text
-eligible keys/ranges/bytes
-coalesced DirectReadOp 数量
-file-offset unaligned
-device-address unaligned
-length unaligned
-unregistered range
-mixed-device key
-below-min-read
-目标区间冲突
-full-object read amplification
-预计 device synchronize 次数
-```
-
-该数据决定是否进入真实 HyFile 接入阶段。
 
 ### 4.2 文件和 allocator 地址解析
 
@@ -857,8 +893,10 @@ file_offset = resolved_value_offset + object_offset
 - `descriptor.shard_idx` 必须落在初始化 shard 表内；
 - `descriptor.file_path` 必须与固定 shard path 一致；
 - `descriptor.offset/object_size/aligned_size` 必须落在 shard capacity 内；
-- 首版 xDS direct fd 在 backend 初始化阶段以 `O_RDONLY | O_DIRECT | O_CLOEXEC` 打开并注册；
 - `resolved_value_offset = descriptor.offset`。
+
+当前 BUCKET-first 首版不对 SHARD 执行 xDS：`GetXdsFile` 在非 BUCKET allocator 下返回
+`kNotEligible/allocator-not-supported`，由 `RealClient` 按模式和安全策略走原 host 路径。
 
 #### 4.2.3 BUCKET
 
@@ -867,22 +905,22 @@ file_offset = resolved_value_offset + object_offset
 - 不直接信任 descriptor 中的任意路径打开文件；
 - 使用当前 `BucketEntryLayout` 验证 offset、object size、aligned size 和 bucket capacity；
 - `resolved_value_offset = descriptor.offset`；
-- BUCKET 文件按需注册并放入有界 LRU xDS file cache。
+- BUCKET 文件按需注册并放入有上限的 `xds_files_` registration cache。
+- 达到 `MOONCAKE_XDS_FILE_CACHE_SIZE` 后返回 `xds-file-cache-full`，由上层按模式和策略
+  fallback 或报错；首版不在运行时淘汰已注册文件。
 
 #### 4.2.4 File identity 和 cache
 
-`FileIdentity` 至少包含：
+当前 `XdsFileIdentity` 包含：
 
 ```text
-allocator type
-shard index 或 bucket id
 canonical reconstructed path
 st_dev
 st_ino
-可用时的 generation/version
 ```
 
 禁止仅以 POSIX fd 数字作为 identity，因为 fd 会被复用。
+allocator type 和 bucket id 由 resolver 与 canonical path 间接约束。
 
 xDS direct fd 与 fallback fd 分离：
 
@@ -891,17 +929,8 @@ xDS:      O_RDONLY | O_DIRECT | O_CLOEXEC
 fallback: 现有 buffered/direct adapter 自己管理的 fd
 ```
 
-关闭顺序：
-
-```text
-从 cache 摘除
-→ 禁止新 pin
-→ 等待 file inflight pin 归零
-→ hipFileHandleDeregister
-→ close(direct_fd)
-```
-
-SHARD owner 在 backend shutdown 时清理。BUCKET LRU eviction 使用同样顺序。
+当前缓存项持有 `shared_ptr<OpenFileHandle>`，并使用 path + `st_dev/st_ino` 防止 fd/path
+身份变化。缓存项在 backend 析构时先调用 `DeregisterFile`，随后释放文件 keepalive。
 
 ## 5. xDS 调用与完整读取流程
 
@@ -919,7 +948,8 @@ open(path, O_RDONLY | O_DIRECT | O_CLOEXEC)
        fs_ops = nullptr)
 ```
 
-成功后 vendor handle 与 fd 由 `RegisteredFileOwner` 共同持有。
+成功后 adapter 的 `files_` 以 registration id 保存 vendor handle/fd，backend 的
+`XdsFileEntry` 通过 `shared_ptr<OpenFileHandle>` 保持 fd 存活。
 
 #### 5.1.2 buffer 注册
 
@@ -950,15 +980,17 @@ bytes         = length
 DeviceGuard guard(op.device_id);
 std::lock_guard<std::mutex> lock(hyfile_api_mutex);
 
+auto file_handle = files_.at(op.file.id).handle;
+void* registered_base = buffers_.at(op.buffer.id).base;
 ssize_t ret = api.hipFileRead(
-    op.file.vendor_handle(),
-    op.registered_base,
+    file_handle,
+    registered_base,
     op.length,
     op.file_offset,
     op.device_offset);
 ```
 
-精确原型必须来自厂商 header；以上代码仅表示参数语义。
+精确原型固定在 `hyfile_abi.h` 的手工 ABI 声明中；以上代码表示参数语义。
 
 #### 5.1.4 成功和同步
 
@@ -974,68 +1006,74 @@ exact-length + synchronize failure
 
 #### 5.1.5 非成功 read
 
-任何短读或 vendor error 都视为失败。保持 file pin、buffer pin 和 session pin，先执行 `hipDeviceSynchronize()`：
+任何短读或 vendor error 都视为失败。保持当前 file handle 和 buffer `inflight` 保护，先执行
+`hipDeviceSynchronize()`：
 
 ```text
 synchronize success
-    → 根据正式 SDK 映射错误类别
+    → 根据已确认的手工 ABI 映射错误类别
     → target_state = kStoppedSafeToOverwrite
 
 synchronize failure
     → kBackendFatal
     → target_state = kUnknownMayStillBeWritten
-    → worker fail-stop
+    → backend sticky fatal，禁止 fallback 和后续 xDS read
 ```
 
-首版不在 SDK 层自动重试 `hipFileRead`，避免目标状态不清时重复写入。
+首版不在 HyFile adapter 层自动重试 `hipFileRead`，避免目标状态不清时重复写入。
 
 ### 5.2 完整读取执行流程
 
 #### 5.2.1 初始化
 
+当前初始化流程为：
+
 ```text
 解析配置
 → dlopen/dlsym libhyfile.so
-→ 验证版本/profile/required symbols
+→ 验证 7 个 required symbols
 → hipFileDriverOpen
-→ 对每个目标 device 执行 round-trip preflight
-→ 初始化 buffer registry 和 file cache
-→ 发布 backend 基础能力和逐 device DeviceXdsState
+→ hipGetDeviceCount
+→ 将枚举到的 device 初始标记为 kAvailable
+→ 创建 HyFileAcceleratorFileIo 并注入 DistributedStorageBackend
 ```
 
-driver open、版本/profile 或目标 mount 的公共检查失败属于 backend 级失败。单个 device 的 probe 失败只更新该 device 的状态；是否继续启动由 `xds-auto`/`xds-required` 模式决定，详见 7.1.3。
+`xds-auto` 初始化失败时不注入 adapter并继续 POSIX；`xds-required` 初始化失败时 backend
+创建失败。运行 xDS 业务前，部署侧必须先完成 7.1 的真实 mount、逐 device 独立验收；
+Mooncake 初始化流程不重复执行该验收。
 
 #### 5.2.2 一次 batch
 
 首版为便于证明安全，执行顺序固定为：
 
 1. 校验所有参数、session、对象边界和 batch 目标地址无重叠。
-2. 查询 session object cache，为命中项构建 host-source H2D plan，但暂不提交。
+2. 查询 `get_session_prefetch_cache_`，为命中项构建 host-source H2D plan，但暂不提交。
 3. 对 cache miss 做 direct eligibility 和 coalescing。
-4. pin 所有 direct key 的 buffer registrations 和 file registrations。
+4. 对所有 direct key 增加 buffer entry 的 `inflight` 并保存 `shared_ptr`；文件由
+   `XdsFileEntry` 和 `OpenFileHandle` keepalive 持有。
 5. 在专用 worker 或当前同步上下文中逐个执行 direct ops；HyFile 内部仍全进程串行。
 6. direct key 全部 op 成功后标记为 direct-complete 候选。
 7. direct key 任一 op 失败：
    - `kUntouched` 或 `kStoppedSafeToOverwrite` 且策略允许：把整 key 加入 fallback；
-   - `kUnknownMayStillBeWritten`：fail-stop；
+   - `kUnknownMayStillBeWritten`：禁止 fallback，backend 进入 sticky fatal；
    - contract violation：请求失败，不掩盖为普通 fallback。
 8. direct 阶段结束后，只为 initial fallback 和 safe failed-direct keys 分配 host arena。
 9. 调用现有 `Client::BatchGet` 读取完整对象。
 10. 为 session-cache 和 fallback key 构建并提交 `DfsAsyncScatterContext`。
 11. 同步所有已使用 H2D streams。
-12. 对所有成功候选执行 session generation/lease 发布检查。
+12. 对所有成功候选执行 replica compatibility 和 lease 发布检查。
 13. `RealClient` 通过每个计划项保存的 `original_idx` 回填原始结果数组；成功值为该原始 key 的 `sum(all_sizes[original_idx])`，失败值为稳定负错误码。
-14. 释放 session pin、file pin、buffer pin、source handle 和 arena。
+14. 释放 buffer `inflight`/`shared_ptr`、source handle 和 arena。
 
-首版不追求 xDS 与 H2D 并行；先建立可证明的顺序和故障语义。后续只有在测试覆盖完成后才允许并行不同 key 的 direct 与 fallback。
+首版不并行执行 xDS 与 H2D，保持上述可证明的顺序和故障语义。
 
 #### 5.2.3 session cache
 
-- 有效完整对象 cache 命中优先于 xDS，继续走 H2D；
+- 有效 `get_session_prefetch_cache_` 完整对象命中优先于 xDS，继续走 H2D；
 - cache source `shared_ptr<BufferHandle>` 持有到 H2D stream synchronize 完成；
 - xDS range 成功不创建伪造 host handle，不填充完整对象 cache；
 - fallback 完整对象成功后，可以按现有策略进入 session cache；
-- session generation 不匹配时不得插入 cache；
+- 当前 session/replica 不再兼容时不得发布或插入 cache；
 - `batch_get_session_end` 删除 map entry，但不能提前释放被在途 H2D 持有的 source。
 
 #### 5.2.4 返回语义
@@ -1046,12 +1084,13 @@ driver open、版本/profile 或目标 mount 的公共检查失败属于 backend
 该 key 的全部 ranges 已完成
 direct synchronize 或 H2D synchronize 成功
 没有 range 失败
-session generation 仍有效
+当前 replica 快照仍兼容
 lease 未过期
-目标 registration generation 仍有效
+目标 registration id 仍有效
 ```
 
-混合 batch 中某个 key 的失败不自动覆盖其他 key 的结果，但 backend fatal 会触发 worker fail-stop。
+混合 batch 中某个 key 的失败不自动覆盖其他 key 的结果。当前 backend fatal 会设置
+sticky `xds_fatal_` 并拒绝后续 xDS。服务恢复依赖外部 supervisor 重启承载进程。
 
 返回与索引映射必须满足：
 
@@ -1062,9 +1101,7 @@ lease 未过期
 - 任一子层返回数量不匹配时，该子批次全部以 `INTERNAL_ERROR` 失败；
 - 每 key 请求字节总和超过 `INT_MAX` 时在提交任何 I/O 前返回 `INVALID_PARAMS`。
 
-### 5.3 对齐和 GPU bounce
-
-#### 5.3.1 首个版本
+### 5.3 对齐处理
 
 首个版本只支持完全对齐 direct range：
 
@@ -1076,32 +1113,9 @@ length % 4096 == 0
 
 不对齐 key 走 host fallback。
 
-#### 5.3.2 后续 GPU bounce
-
-Phase 3 可以增加每 device 预分配、预注册的 GPU bounce pool：
-
-```text
-对齐覆盖窗口 DFS range
-    ↓ xDS
-registered GPU bounce slot
-    ↓ D2D
-最终 DCU KV range
-```
-
-必须保证：
-
-- 覆盖窗口完全位于当前对象合法 `[value_offset, value_offset + aligned_size)`；
-- 不读取相邻 key 或相邻租户数据；
-- bounce slot pin 覆盖 xDS read、synchronize 和 D2D completion；
-- D2D 失败时 key 不发布成功；
-- GPU bounce 不计入 host staging/cache 容量；
-- BUCKET 尾部 padding 可作为合法覆盖窗口，但不能写越最终目标 buffer。
-
-GPU bounce 不属于首个可合并版本。
-
 ## 6. 错误处理、回退与运行时恢复
 
-### 6.1 错误、fallback 和 circuit breaker
+### 6.1 错误和 fallback
 
 #### 6.1.1 阶段化处理
 
@@ -1109,13 +1123,13 @@ GPU bounce 不属于首个可合并版本。
 |---|---|---|
 | 参数、range、registration eligibility | untouched | host fallback 或参数错误 |
 | `dlopen`/`dlsym` | untouched | auto 禁用；required 启动失败 |
-| driver open/preflight | untouched | auto 禁用；required 启动失败 |
+| driver open | untouched | auto 禁用；required 启动失败 |
 | direct fd open/file register | untouched | 策略允许时该 key fallback |
 | buffer register | untouched | registration 不发布，启动/注册失败 |
 | `hipSetDevice` before read | untouched | contract/fatal，禁止调用 read |
 | `hipFileRead` 短读或错误，sync 成功 | stopped-safe | 整 key fallback |
-| `hipFileRead` 后 sync 失败 | unknown | backend fatal，worker fail-stop |
-| 成功 read 后 sync 失败 | unknown | backend fatal，worker fail-stop |
+| `hipFileRead` 后 sync 失败 | unknown | backend sticky fatal，禁止 fallback，当前请求失败 |
+| 成功 read 后 sync 失败 | unknown | backend sticky fatal，禁止 fallback，当前请求失败 |
 | H2D fallback 失败 | stopped | key 失败，不发布 |
 | session/lease 发布检查失败 | stopped | 返回 session/lease 错误，不发布 |
 
@@ -1124,7 +1138,7 @@ GPU bounce 不属于首个可合并版本。
 - descriptor/path 校验失败；
 - object range 越界；
 - batch 目标地址重叠；
-- session 不存在或 generation 不匹配；
+- session 不存在或当前 replica 快照不兼容；
 - lease expired；
 - `FILE_NOT_FOUND`；
 - internal contract violation；
@@ -1142,115 +1156,49 @@ direct key 任何 op 失败且可安全 fallback 时：
 - H2D 覆盖该 key 的全部请求 ranges；
 - 不只补写失败 range。
 
-#### 6.1.4 Circuit breaker
-
-状态：
-
-```text
-CLOSED → OPEN → HALF_OPEN → CLOSED
-```
-
-规则：
-
-- `kNotEligible` 不计 backend 失败；
-- contract violation 计独立 bug metric，不用普通重试掩盖；
-- safe transient I/O 失败计 breaker failure；
-- 达到阈值后 OPEN，后续 key 直接 fallback；
-- 冷却后只允许一个健康 probe 进入 HALF_OPEN；
-- probe 成功恢复 CLOSED；
-- backend fatal 不进入普通 cooldown 恢复，直接 fail-stop。
-
-Circuit breaker 不能取消已经卡住的 `hipFileRead`。
-
 ### 6.2 Hung I/O 和进程恢复
 
 首版 vendor ABI 没有经过验证的 request timeout/cancel。进入 `hipFileRead` 后不能从另一个线程强制 deregister buffer 或 file。
 
-生产部署必须提供外部 watchdog：
-
-1. worker 定期上报 heartbeat 和当前 xDS op 开始时间；
-2. 超过部署配置的 hung-I/O deadline 后，supervisor 终止整个 worker 进程；
-3. supervisor 启动新 worker，重新初始化 driver、file handle 和 buffer registration；
-4. 不尝试在原进程中恢复未知 DMA 状态。
+当前 Mooncake 不提供 vendor request timeout/cancel，也不在进程内尝试恢复未知 DMA 状态。
+生产部署应由现有外部 supervisor 监控承载进程；发现进程卡死或 backend fatal 后终止并
+启动新进程，由新进程重新初始化 driver、file handle 和 buffer registration。本文不规定
+额外的 Mooncake watchdog 或健康状态机实现。
 
 deadline 根据真实 DFS 尾延迟确定，不能把普通慢 I/O 误判为 hung。该阈值属于部署配置，不由 `AcceleratorFileIo` 自行中断系统调用。
 
 ### 6.3 Fork 和多 device
 
 - driver、file handle、buffer registration 都是进程资源；
-- 每个 owner 和 pin 保存创建 PID；
+- 当前进程级 runtime、buffer entry 和 adapter 操作保存/检查创建 PID；
 - 检测到 PID 改变时，不调用继承资源的 vendor deregister；
-- 子进程把继承对象标记为 abandoned，清空可查询 registry；
-- 子进程从 `hipFileDriverOpen`、preflight、buffer registration 和 file registration 完整重建；
+- 子进程把继承对象标记为 abandoned，清空可查询 registry，并拒绝继续使用继承的 HyFile runtime；
+- 由 fresh exec 启动的新 worker 从 `hipFileDriverOpen`、buffer registration 和 file registration 完整重建；
 - 每个 device pool 分别注册并保存 device id；
 - 每次 register/read/synchronize/deregister 前设置正确 device context；
 - 首版同一 key 的 ranges 必须位于同一 device；一个 batch 可以包含不同 device 的不同 key，但 HyFile API 仍全进程串行。
 
 ## 7. 初始化、配置与写路径边界
 
-### 7.1 启动 preflight
+### 7.1 独立部署验收
 
-#### 7.1.1 配置和权限
+真实 DFS mount 与 `libhyfile.so`/驱动/device 的组合必须在启用业务 xDS 前通过独立验收。
+该验收不是 Mooncake 初始化流程的一部分，不增加环境变量、运行时状态机或业务请求内 probe。
 
-生产必须配置位于真实目标 Parastor/HYFS mount 上的可写 preflight 目录：
+对每张业务会使用的目标 DCU、每个目标 Parastor/HYFS mount，独立验收程序执行：
 
-```text
-MOONCAKE_XDS_PREFLIGHT_DIR
-```
+1. 分配并注册 4096 对齐、长度至少 4096 的 device buffer；
+2. 在真实 mount 上以唯一临时文件名创建文件，用 POSIX exact-length write 写入已知数据，
+   完成必要同步后关闭写 fd；
+3. 以 `O_RDONLY | O_DIRECT | O_CLOEXEC` 重新打开 read fd；
+4. 把 read fd 注册为 opaque fd file handle；
+5. 使用 `hipFileRead` 把数据读入目标 device buffer；
+6. `hipDeviceSynchronize`，再 D2H 并逐字节比较；
+7. 逆序注销 buffer/file、关闭 read fd 并删除临时文件。
 
-目录不可用时：
-
-- `xds-auto`：禁用 xDS 并记录结构化原因；
-- `xds-required`：启动失败。
-
-#### 7.1.2 每 device round-trip
-
-对每个目标 device：
-
-1. 分配一个 4096 对齐、长度 4096 的 device probe buffer；
-2. `hipSetDevice(device_id)`；
-3. `hipFileBufRegister`；
-4. 在 preflight 目录以随机唯一名和 `0600` 创建文件：
-
-   ```text
-   O_RDWR | O_CREAT | O_EXCL | O_DIRECT | O_CLOEXEC
-   ```
-
-5. `ftruncate` 到 4096；
-6. 注册 opaque fd handle；
-7. device probe buffer 写入 `0xA5`；
-8. `hipFileWrite` 写文件，要求 exact-length；
-9. 使用独立 buffered fd 从 CPU 逐字节校验；
-10. 清零 device buffer；
-11. `hipFileRead` 读回；
-12. `hipDeviceSynchronize`；
-13. D2H 读取 probe buffer并逐字节比较；
-14. 逆序 deregister/close/delete。
-
-任一步失败都使该 device 不可用，但不自动覆盖其他 device 的结果。每个 device 分别记录 `kAvailable` 或带结构化原因的 `kUnavailable`。
-
-清理失败单独记录 cleanup metric，并使 preflight 失败。日志可以记录 probe 文件名和错误码，不记录 probe 数据。
-
-#### 7.1.3 多 device 发布和降级
-
-目标 device 集合来自显式程序配置或 SGLang KV pool 初始化时确定的实际 device 集合。若 backend 初始化时尚不能确定全部目标 device，则某个新 device 的第一个 KV pool buffer 注册之前必须同步完成该 device 的 preflight；在 preflight 完成前不得把其 registration 发布为 xDS eligible。
-
-`xds-auto` 采用逐 device 降级：
-
-- 公共的 `dlopen`、driver open、版本/profile 或 mount 检查失败时，整个 xDS backend 禁用并继续使用 POSIX；
-- 单个 device preflight 失败时，仅将该 device 标为 `kUnavailable`，其他 `kAvailable` device 继续使用 xDS；
-- 失败 device 上的 buffer 按 3.3.2 发布为 TE-only、xDS-ineligible；
-- 请求按 key 所属 device 独立分类，该 device 不可用时整个 key 走 host fallback；
-- 同一个 key 的全部 ranges 仍必须属于同一 device，一个 batch 可以包含不同 device 的不同 key。
-
-`xds-required` 对目标 device 集合采用全有或全无：
-
-- 初始化时已知的任一目标 device preflight 失败，则 backend 初始化失败；
-- 初始化后首次出现的新目标 device 必须先通过同步 preflight，否则该 device 的 `register_buffer` 失败；
-- 已发布 device 在运行期进入 `kFatal` 时，不静默降级为 auto，backend/worker 进入 unhealthy 或 fail-stop；
-- 普通请求因 range 对齐或长度条件不适用时是否允许 host fallback，仍由 `MOONCAKE_XDS_ALLOW_REQUEST_FALLBACK` 控制，这与 preflight 的全有或全无语义分开。
-
-因此 backend 只保留动态库、driver 和 mount 的全局基础能力；实际 direct eligibility 必须同时查询对应 `device_id` 的 `DeviceXdsState`，不能依赖一个全局 `available` 布尔值。
+验收报告至少记录 DCU、DTK、`libhyfile.so` build-id、驱动、DFS client、mount 参数、device
+id、对齐值和结果。任一目标组合失败时不得在该组合上启用 `xds-auto` 或
+`xds-required`。独立程序可复用 `hyfile_abi.h` 和 adapter 代码，但不形成第二套业务实现。
 
 ### 7.2 业务写路径
 
@@ -1260,43 +1208,27 @@ MOONCAKE_XDS_PREFLIGHT_DIR
 |---|---|
 | DFS → DCU KV | 实现 xDS direct read |
 | DCU KV → DFS | 保持现有 D2H staging + `BatchWrite` |
-| `hipFileWrite` | 仅 preflight 使用 |
+| `hipFileWrite` | 首版不加载、不调用 |
 | 生产 direct write | 不支持 |
 
 业务 `DistributedStorageBackend::BatchWrite` 不得调用 `AcceleratorFileIo::Write`；首版接口甚至不暴露业务 `Write` 方法。
 
-#### 7.2.2 后续评估
-
-未来业务 xDS write 必须另行设计：
-
-- partial write；
-- checksum；
-- durability 和 fsync；
-- 写完成后再向 Master publish；
-- revoke/rollback；
-- BUCKET padding；
-- 后台写期间源 KV block pin；
-- crash consistency；
-- write/read 并发和 driver lock。
-
-不得仅把 `hipFileRead` 替换为 `hipFileWrite` 就进入生产。
+业务 xDS write 不属于本文范围；如果后续需要，必须单独设计和评审，不能直接把
+`hipFileRead` 替换为 `hipFileWrite`。
 
 ### 7.3 配置
 
 配置优先级：显式程序配置 > 环境变量 > 默认值。
 
+当前代码实际解析的配置：
+
 | 配置 | 默认值 | 含义 |
 |---|---:|---|
 | `MOONCAKE_DFS_DIRECT_IO_BACKEND` | `posix` | `posix`、`xds-auto`、`xds-required` |
 | `MOONCAKE_XDS_LIBRARY_PATH` | `/opt/hyhal/lib/libhyfile.so` | 显式动态库路径 |
-| `MOONCAKE_XDS_PREFLIGHT_DIR` | 空 | 真实 mount 上的可写 probe 目录；启用 xDS 时必需 |
 | `MOONCAKE_XDS_ALLOW_REQUEST_FALLBACK` | `true` | safe request failure 是否允许整 key fallback |
-| `MOONCAKE_XDS_MIN_READ_SIZE` | `65536` | 每个 coalesced DirectReadOp 的最小长度 |
-| `MOONCAKE_XDS_FILE_CACHE_SIZE` | `1024` | BUCKET xDS file owner LRU 上限 |
-| `MOONCAKE_XDS_BREAKER_FAILURE_THRESHOLD` | `3` | safe transient failure 打开 breaker 的阈值 |
-| `MOONCAKE_XDS_BREAKER_COOLDOWN_MS` | `30000` | HALF_OPEN 前冷却时间 |
-| `MOONCAKE_XDS_PLANNER_DRY_RUN` | `false` | 只分类和记录，不执行 xDS |
-| `MOONCAKE_XDS_GPU_BOUNCE_BYTES` | `0` | 首版必须为 0；Phase 3 才支持非零 |
+| `MOONCAKE_XDS_MIN_READ_SIZE` | `16384` | 每个 coalesced DirectReadOp 的最小长度 |
+| `MOONCAKE_XDS_FILE_CACHE_SIZE` | `1024` | BUCKET xDS file registration cache 上限；达到上限后不再注册新文件 |
 
 首版不提供：
 
@@ -1315,88 +1247,39 @@ posix:
     不加载 libhyfile.so，不注册 xDS buffer
 
 xds-auto:
-    初始化/preflight 失败 → 使用 POSIX
+    初始化失败 → 使用 POSIX
     普通不适用请求 → POSIX fallback
     safe transient request failure → 策略允许时 fallback
-    backend fatal → worker fail-stop
+    backend fatal → sticky 拒绝后续 xDS，当前请求失败，不做 host fallback
 
 xds-required:
-    初始化/preflight 失败 → 启动失败
+    初始化失败 → 启动失败
     不适用请求 → 只有 ALLOW_REQUEST_FALLBACK=true 才允许 fallback
-    backend fatal → worker fail-stop / 服务 unhealthy
+    backend fatal → sticky 拒绝后续 xDS，当前请求失败，不做 host fallback
 ```
 
-启动日志输出最终配置、capabilities、版本 profile、对齐和 preflight 结果，不输出业务数据。
+当前启动日志输出最终 `DistributedStorageConfig` 和 adapter 初始化错误，不输出业务数据。
 
 ## 8. 可观测性与测试
 
 ### 8.1 可观测性
 
-metrics 标签只能使用有限枚举，不得把 key、路径、错误文本作为常驻 label。
+首版复用现有日志和请求返回码，至少能够区分 adapter 初始化失败、request ineligible、safe
+fallback、contract violation、short read、device synchronize 失败和 backend fatal。日志不得记录
+完整 KV key、payload 或其他敏感业务数据。部署验收报告与 Mooncake 运行日志分开保存。
 
-至少增加：
-
-```text
-mooncake_dfs_read_requests_total{backend,allocator,result}
-mooncake_dfs_read_bytes_total{backend,allocator}
-mooncake_dfs_read_latency_seconds{backend,allocator}
-
-mooncake_xds_planned_keys_total{classification,reason}
-mooncake_xds_planned_ranges_total{classification,reason}
-mooncake_xds_planned_bytes_total{classification,reason}
-mooncake_xds_coalesced_ops_total
-
-mooncake_xds_read_calls_total{result,error_class}
-mooncake_xds_read_bytes_total
-mooncake_xds_discarded_direct_bytes_total{reason}
-mooncake_xds_dma_seconds
-mooncake_xds_device_sync_seconds{result}
-mooncake_xds_driver_lock_wait_seconds
-mooncake_xds_pending_ops
-
-mooncake_xds_fallback_keys_total{reason}
-mooncake_xds_fallback_ranges_total{reason}
-mooncake_xds_fallback_bytes_total{reason}
-
-mooncake_xds_registered_device_bytes{device_id}
-mooncake_xds_registered_buffers{device_id,state}
-mooncake_xds_buffer_registration_mode_total{device_id,mode,reason}
-mooncake_xds_registered_files{allocator}
-mooncake_xds_registration_failures_total{operation}
-mooncake_xds_cleanup_failures_total{operation}
-
-mooncake_xds_circuit_breaker_state
-mooncake_xds_backend_fatal_total{operation}
-mooncake_xds_preflight_total{device_id,result,stage}
-mooncake_xds_device_state{device_id,state}
-```
-
-一次 batch trace 建议包含：
-
-```text
-trace_id
-keys
-ranges
-requested_bytes
-eligible_bytes
-direct_bytes
-discarded_direct_bytes
-fallback_bytes
-coalesced_ops
-driver_lock_wait_us
-dma_us
-device_sync_us
-h2d_us
-total_us
-first_error_class
-first_error_operation
-```
-
-不记录完整 key 或敏感业务数据。需要 key 关联时只使用当前 trace 范围内的不可逆短 hash。
-
-端到端继续保留 SGLang prefetch latency、TTFT、ITL、CPU 使用率、host memory bandwidth 和 DCU copy-engine 利用率。
+端到端评估继续使用现有 SGLang prefetch latency、TTFT、ITL、CPU 使用率、host memory
+bandwidth 和 DCU copy-engine 利用率。新增专用 metrics 不作为首版路径正确性的前置条件。
 
 ### 8.2 测试方案
+
+当前已经存在：
+
+- `hyfile_backend_test.cpp`：缺库/缺符号、driver 单次开关、buffer 注销同步、quarantine、
+  exact read、短读、同步失败和 fork 防护；
+- `xds_buffer_registry_test.cpp`：重复逻辑注册、部分重叠拒绝和 batch 目标重叠拒绝。
+
+下列各小节是完整验收测试矩阵；未在上述文件或其他现有测试中覆盖的条目仍需实现。
 
 #### 8.2.1 Planner 单元测试
 
@@ -1406,8 +1289,8 @@ first_error_operation
 - object range 越界；
 - batch 重复 key；
 - 同 key和跨 key目标地址重叠；
-- 未注册、跨 registration、draining registration；
-- PID/generation mismatch；
+- 未注册、跨 registration、`accepting=false` 的 registration；
+- PID 或 registration id mismatch；
 - mixed-device key；
 - 每 key 请求字节总和超过 `INT_MAX`；
 - file/device/length alignment；
@@ -1422,16 +1305,15 @@ first_error_operation
 - 相同 base 不同 size/device 拒绝；
 - 部分重叠拒绝；
 - 注册各阶段失败时逆序回滚；
-- `posix` 发布 TE-only entry；
-- `xds-auto` 中安全的 xDS 注册失败发布 TE-only entry 且公开注册成功；
+- `posix` 不创建 xDS entry，现有 TE registration 正常工作；
+- `xds-auto` 中安全的 xDS 注册失败不创建 xDS entry，TE registration 保留且公开注册成功；
 - `xds-required` 中 xDS 注册失败回滚 TE registration 且公开注册失败；
-- xDS 注册或回滚状态未知时不得发布 TE-only entry，并进入 quarantined/fail-stop；
-- unsupported memory kind 和 preflight 失败 device 在 auto 模式下标记 xDS-ineligible；
+- unsupported memory kind 在 auto 模式下只保留 TE registration；
 - pin 与 unregister 并发；
-- draining 后拒绝新 pin；
+- `accepting=false` 后拒绝新 pin；
 - inflight 归零后才 deregister；
-- deregister 失败进入 quarantined/fail-stop；
-- fork/PID 改变后不调用继承 owner 的 vendor cleanup；
+- deregister 失败进入 quarantined 并返回错误；
+- fork/PID 改变后不调用继承资源的 vendor cleanup；
 - 多 device 分别注册。
 
 #### 8.2.3 Fake backend 单元测试
@@ -1440,18 +1322,17 @@ first_error_operation
 - 原始 registered base 与 pool-relative device offset；
 - exact-length success；
 - 正短读；
-- SDK 定义的各种错误；
+- 当前手工 ABI 已定义及未知的 vendor 错误；
 - read error 后 synchronize success → safe fallback；
 - read error 后 synchronize failure → fatal；
 - success read 后 synchronize failure → fatal；
 - 任意时刻最多一个 HyFile API 临界区；
 - DeviceGuard 选择正确 device；
-- owner/pin 生命周期；
-- file cache eviction 与 fd reuse；
+- buffer `inflight` 生命周期、file handle keepalive 与 fd identity；
+- file cache 达到上限后返回 `xds-file-cache-full`；
 - backend 返回结果与输入等长同序，内部 coalescing 后仍能按局部 request index 聚合；
 - 返回数量不匹配时子批次全部得到 `INTERNAL_ERROR`；
 - `RealClient` 使用 `original_idx` 回填混合 direct/fallback batch，并且只有它计算公开成功字节数；
-- circuit breaker 状态转换。
 
 #### 8.2.4 Session 和路由测试
 
@@ -1461,39 +1342,33 @@ first_error_operation
 - safe failed-direct 整 key fallback；
 - direct 不分配 host arena、不提交 H2D、不写完整对象 cache；
 - fallback 成功后按现有配置写 session cache；
-- session end 与 direct I/O 并发；
-- 同 key 新 session generation 不接受旧完成；
+- start → range read → end 的正常顺序；
+- session 或 replica 在完成检查时已变化则不发布成功；
 - lease 在 I/O 中过期时不发布成功；
 - mixed batch 等待全部 direct/H2D completion 后返回；
-- backend fatal 触发 fail-stop hook。
+- backend fatal 后 sticky 拒绝后续 xDS 请求。
 
 #### 8.2.5 真实 DTK/xDS 集成测试
 
 在真实海光节点和 Parastor/HYFS mount 上覆盖：
 
-1. 每 device 启动 round-trip preflight；
-2. `xds-auto` 中一个 device preflight 失败时仅该 device fallback，其他 device 保持 direct；
-3. `xds-required` 中任一目标 device preflight 失败时初始化或对应首次注册失败；
-4. 初始化后首次出现的新 device 在 buffer 发布前完成同步 preflight；
-5. 单文件、单 device、单 aligned range；
-6. 单文件、多 range；
-7. 多文件；
-8. 多 device batch；
-9. SHARD；
-10. BUCKET fully-aligned range；
-11. 不对齐 file/device/length 的 fallback；
-12. 不支持的 mount；
-13. `libhyfile.so` 缺失和 required symbol 缺失；
-14. runtime/driver 版本不匹配；
-15. direct fd 必须包含 `O_DIRECT`；
-16. fallback 使用独立 fd；
-17. fork 后完整重建；
-18. handle/buffer 重复注册和解除注册；
-19. read 短返回和错误注入；
-20. synchronize 失败触发 worker 退出；
-21. hung-I/O watchdog 重启；
-22. 多线程压力下仍只有一个 HyFile 临界区；
-23. 24 小时 soak 检查 fd、registration、显存和 driver 资源。
+1. 按 7.1 对每个目标 device/mount 完成独立 round-trip 验收；
+2. 单文件、单 device、单 aligned range；
+3. 单文件、多 range；
+4. 多文件和 file cache 达到上限；
+5. 多 device batch；
+6. BUCKET fully-aligned range；
+7. SHARD 请求确认为 ineligible 并按策略 fallback；
+8. 不对齐 file/device/length 的 fallback；
+9. `libhyfile.so` 缺失和 required symbol 缺失；
+10. runtime/driver 版本不匹配；
+11. direct fd 必须包含 `O_DIRECT`，fallback 使用独立 fd；
+12. fork 后由 fresh exec 完整重建；
+13. handle/buffer 重复注册和解除注册；
+14. read 短返回和错误注入；
+15. synchronize 失败使 backend sticky fatal，目标状态 unknown 时禁止 fallback；
+16. 多线程压力下仍只有一个 HyFile 临界区；
+17. 24 小时 soak 检查 fd、registration、显存和 driver 资源。
 
 所有读取与 POSIX 基准逐字节比较，不能只验证返回长度。
 
@@ -1518,7 +1393,7 @@ DIRECT range 出现上述任意行为都不能计为 direct success。允许控�
 - tensor/data/pipeline parallel；
 - 连续 prefill/decode；
 - session end、取消、lease 到期；
-- cache eviction；
+- 多 BUCKET 文件和 file cache 达到上限后的 fallback/错误；
 - 开启/关闭 session cache；
 - 同模型、prompt、KV layout 和请求序列对比输出；
 - load 失败后目标 block 不被消费；
@@ -1533,8 +1408,8 @@ DIRECT range 出现上述任意行为都不能计为 direct success。允许控�
 | batch keys | 1、8、32、128 |
 | ranges/key | 1、2、8、32 |
 | planner/调用线程 | 1、8、32、128 |
-| allocator | SHARD、BUCKET |
-| path | POSIX buffered、O_DIRECT host、xDS direct、后续 xDS bounce |
+| allocator | BUCKET |
+| path | POSIX buffered、O_DIRECT host、xDS direct |
 | device count | 1、2、4、8 |
 | SGLang mode | layer-wise、page-wise、ReadPlan |
 
@@ -1544,157 +1419,109 @@ DIRECT range 出现上述任意行为都不能计为 direct success。允许控�
 
 ### 9.1 分阶段实施计划
 
-Phase 0～2 可以作为一个开发任务、一个分支和一个生产候选版本一次性交付，但必须保持独立模块、逻辑提交和验收门禁，不得将 PoC、生命周期基础设施和 `RealClient` 热路径写成不可拆分的一体化实现。推荐至少拆分为以下逻辑提交；是否拆成多个 PR 由项目协作方式决定：
+当前代码已经一次性接入 adapter、registry、BUCKET planner 和 `RealClient` 热路径。阶段
+只用于表达验证顺序，不再为未确定的优化预设额外实现。
 
-```text
-Commit 1: reusable HyFile ABI shim/backend + thin standalone PoC
-Commit 2: planner/registry/file owner/session lifecycle + fake tests
-Commit 3: BUCKET RealClient integration + E2E/metrics/fallback
-```
+| 阶段 | 当前状态 | 仍需完成 |
+|---|---|---|
+| Phase 0 | 最小手工 ABI、动态加载、真实 HyFile adapter、fake 函数表测试已完成 | 目标硬件/真实 mount 独立 round-trip、版本矩阵和错误语义确认 |
+| Phase 1 | 接口、buffer interval registry、有界文件缓存、planner、overlap/fork/错误处理已接入 | 补齐 8.2 中与当前实现直接对应的单元测试 |
+| Phase 2 | BUCKET fully-aligned 软件调用链、同步 read、safe fallback、sticky fatal 已完成 | 真实硬件 E2E、零 host payload staging 验证、soak 和性能验收 |
 
 一次性交付不表示可以跳过中间验证。验收顺序固定为：
 
 ```text
-Phase 0 → Phase 0.5 → Phase 1 → Phase 2
+Phase 0 → Phase 1 → Phase 2
 ```
 
-后续阶段代码可以提前存在于同一分支，但前一阶段退出条件未满足时，不能启用后一阶段的数据面；默认 backend 始终为 `posix`。Phase 2 是 BUCKET 生产场景首个真正打通 xDS read 的阶段。Phase 2.5 的 SHARD 支持不阻塞 BUCKET MVP，可以独立后置。
+前一阶段退出条件未满足时不能启用后一阶段的数据面；默认 backend 始终为 `posix`。
+Phase 2 是 BUCKET 场景首个真正打通 xDS read 的阶段。只有 Phase 0 的独立验收和 Phase 2
+的真实硬件 E2E 均通过，才能称为可用并开始受控灰度。
 
 #### Phase 0：ABI 和独立 PoC
 
-- 获取正式 SDK header、许可和版本矩阵；
-- 确认 `libhyfile.so` 路径、build-id 和 required symbols；
-- 确认 `hipFileRead/Write` 精确原型和错误语义；
-- 在生产目录中实现可复用的 `hyfile_api_shim`、最小 `HyFileBackend` 和 RAII file/buffer handles；
-- PoC 仅提供独立的薄 `main()`，复用上述生产模块，不维护第二套 vendor 调用实现；
+- 固化并评审 `hyfile_abi.h` 的最小手工 ABI 声明和版本矩阵；
+- 确认 `libhyfile.so` 路径和 required symbols，记录版本/build-id 但不做硬编码拒绝；
+- 确认 `hipFileRead` 精确原型和错误语义；
+- 在生产目录中实现可复用的 `hyfile_abi.h` 和 `HyFileAcceleratorFileIo`；
+- 独立验收程序复用上述生产模块，不维护第二套 vendor 调用实现；
 - 独立程序验证 O_DIRECT opaque fd；
 - 每 device 整 pool/subrange 注册语义；
-- exact-length read/write；
+- POSIX 写入已知数据，xDS exact-length read，并逐字节校验；
 - 4096 对齐；
 - 进程级串行压力；
-- fork 后重建；
+- fork 子进程拒绝继承的 vendor 资源，由 fresh exec 的新 worker 重建；
 - hung-I/O 和 synchronize 语义。
 
-退出条件：在目标版本矩阵上稳定完成逐字节正确的 round-trip，错误注入语义明确，且没有 Mooncake CPU fallback。
-
-#### Phase 0.5：Planner dry-run
-
-- 以 BUCKET 为主要 allocator，在当前生产型 SGLang workload 中运行 planner；
-- 不调用 HyFile；
-- 收集 allocator 分布、eligible bytes、op count、alignment failure 和 read amplification；
-- 按模型、dtype、page size 和并行配置形成报告。
-
-退出条件：典型 BUCKET workload 有足够 direct eligible bytes，预计调用/同步开销不会明显抵消读放大收益。若覆盖率不足，Phase 2 仍可用于功能打通和受限灰度，但不得把低覆盖率包装成生产性能收益。
+退出条件：在目标版本矩阵上稳定完成逐字节正确的已知数据读回，错误语义明确，且验收
+程序确认 payload 未经过 Mooncake host staging。
 
 #### Phase 1：内部抽象和生命周期
 
 - `AcceleratorFileIo`；
 - fake backend；
-- owner/pin 类型；
-- composite buffer registry；
-- BUCKET canonical path、file identity、动态 file owner/LRU 和 xDS registration cache；
-- BUCKET eviction/recovery/fd reuse 与 inflight read 的生命周期协调；
-- session generation/pin；
+- buffer interval registry 的 `shared_ptr + inflight` 生命周期；
+- BUCKET canonical path、file identity 和有界 xDS registration cache；
 - batch target-overlap validation；
 - planner；
-- metrics/circuit breaker；
-- SGLang 显式 unregister 顺序。
+- session snapshot/replica/lease 发布检查；
+- safe fallback 和 sticky fatal 错误模型。
 
-退出条件：所有单元测试和故障路径通过，不接真实热路径。
+退出条件：接口、规划、生命周期和故障路径的单元测试通过。
 
 #### Phase 2：BUCKET fully-aligned read-only MVP
 
-- 固化并启用 Phase 0/1 的 `hyfile_api_shim` 和 `HyFileBackend`；
-- per-device preflight；
+- 固化并启用 Phase 0/1 的手工 ABI 声明和 `HyFileAcceleratorFileIo`；
 - 新增 `BatchReadDfsRanges`；
 - 接入 `batch_get_into_multi_buffer_ranges`；
 - 只支持 BUCKET、完全对齐、达到阈值的 key；
 - 复用当前对齐的 `BucketEntryLayout`，不改变磁盘格式；
 - bucket id → canonical path 重建和 descriptor/range 校验；
-- BUCKET file owner/LRU、xDS file registration cache 和 inflight pin；
-- bucket eviction 时停止新 pin、等待 inflight drain，再 deregister/close；
-- 验证 restart recovery、cache eviction 和 fd reuse；
+- BUCKET xDS file registration cache、fd identity 和 buffer inflight；
+- cache 达到上限时按模式和策略 fallback 或报错；
 - 同步 read、global mutex、exact-length、per-op device synchronize；
 - safe failure 整 key fallback；
-- unknown target state fail-stop。
+- unknown target state 禁止 fallback，并将 backend 置为 sticky fatal。
 
-退出条件：真实 BUCKET 硬件 E2E correctness、fallback、fail-stop、零 host payload staging、cache eviction、fd reuse、灰度开关和 soak 全部通过。达到此条件即视为 BUCKET xDS read 路径真正可用，可开始受控灰度。
+退出条件：真实 BUCKET 硬件 E2E correctness、fallback、sticky fatal、零 host payload staging、
+file cache 上限、fork/fresh-exec、灰度开关和 soak 全部通过。达到此条件即视为 BUCKET xDS
+read 路径真正可用，可开始受控灰度。
 
-#### Phase 2.5：SHARD fully-aligned read-only compatibility（可选后置）
-
-- 为固定、预分配的 shard 文件建立长生命周期 file owner 和 xDS registration；
-- 校验 `shard_idx`、descriptor path 与配置的 shard path 完全一致；
-- 复用 Phase 2 的 planner、buffer/session pin、执行器、fallback 和 fail-stop 语义；
-- 不改变 SHARD 磁盘格式或 allocator 协议。
-
-退出条件：SHARD 真实硬件 E2E correctness、文件生命周期、fallback 和 soak 通过。生产无 SHARD 需求时，本阶段不阻塞 BUCKET 版本发布。
-
-#### Phase 3：GPU bounce
-
-- 每 device 对齐 GPU bounce pool；
-- 不对齐覆盖窗口验证；
-- xDS → bounce → D2D；
-- slot pin 和 D2D completion；
-- 根据 Phase 0.5/2 metrics 决定是否启用。
-
-#### Phase 4：优化和独立写设计
-
-- 根据厂商正式语义评估减少 synchronize 次数；
-- 评估异步/batch API；
-- 独立设计业务 xDS write、durability 和 publish 顺序；
-- 不复用未经确认的影子 ABI。
+SHARD direct read、不对齐 bounce、异步/batch 和业务 xDS write 均不属于本实施计划；若有
+明确需求，另行建立设计文档和验收标准。
 
 ### 9.2 代码改动清单
 
-| 模块 | 改动 |
+当前实现的主要代码落点：
+
+| 当前文件 | 已实现入口 |
 |---|---|
-| SGLang `mooncake_direct_linker.py` | 跟踪成功注册的 storage allocation；shutdown 显式 unregister；保持 pool owner 存活 |
-| `real_client.cpp/.h` | session generation/pin；cache/direct/fallback 路由；batch 目标冲突校验；registration pin；发布检查 |
-| `client_service.cpp/.h` | `BatchReadDfsRanges`；结果和 metrics 合并；保持现有业务写路径 |
-| `distributed_storage_backend.cpp/.h` | descriptor/value offset 解析；planner；SHARD/BUCKET direct file owner；串行 direct 执行 |
-| `fs_adapter.*` | 保持普通 I/O；仅补充安全获得 canonical identity/fstat 信息的接口 |
-| `device/*` | 注册阶段解析 device metadata；DeviceGuard；sync/fail-stop hook |
-| `registered_pinned_memory.*` 或新 registry | composite TE+xDS registration、generation、pin、drain、quarantine |
-| `storage/distributed/xds/*` | interface、HyFile backend、ABI shim、file cache、breaker、preflight |
-| CMake/wheel | `USE_XDS` 可选构建；SDK header/profile 探测；不打包 vendor runtime |
-| metrics | planner/direct/fallback/registration/lock/sync/fatal 指标 |
-| tests | planner、registry、fake backend、真实 DTK、SGLang E2E、性能和 soak |
+| `real_client.cpp/.h` | `register_buffer_internal`、`batch_get_session_start_with_sources`、`batch_get_into_multi_buffer_ranges`、`execute_session_dfs_range_reads`、`batch_get_session_end` |
+| `client_service.cpp/.h` | `RegisterXdsBuffer`、`UnregisterXdsBuffer`、`BatchReadDfsRanges` |
+| `distributed_storage_backend.cpp/.h` | `RegisterXdsBuffer`、`UnregisterXdsBuffer`、`PinXdsBuffer`、`GetXdsFile`、`BatchReadRanges` |
+| `accelerator_file_io.h` | vendor-neutral registration、capability、`DirectReadOp`、`XdsError` 接口 |
+| `xds/hyfile_abi.h` | 唯一的最小手工 ABI 声明 |
+| `xds/hyfile_backend.cpp` | runtime 获取、`dlopen`/`dlsym`、文件/显存注册、真实 read/sync、fork 防护 |
+| `storage_backend.cpp` | 按 mode 创建并注入 HyFile adapter |
+| `hyfile_backend_test.cpp` | adapter/runtime/fork/错误状态测试 |
+| `xds_buffer_registry_test.cpp` | buffer registry 和 batch overlap 测试 |
 
-建议文件结构：
-
-```text
-mooncake-store/include/storage/distributed/accelerator_file_io.h
-mooncake-store/include/storage/distributed/xds/hyfile_backend.h
-mooncake-store/include/storage/distributed/xds/xds_buffer_registry.h
-mooncake-store/include/storage/distributed/xds/xds_read_planner.h
-
-mooncake-store/src/storage/distributed/xds/hyfile_backend.cpp
-mooncake-store/src/storage/distributed/xds/hyfile_api_shim.cpp
-mooncake-store/src/storage/distributed/xds/xds_buffer_registry.cpp
-mooncake-store/src/storage/distributed/xds/xds_read_planner.cpp
-
-mooncake-store/tests/xds_read_planner_test.cpp
-mooncake-store/tests/xds_buffer_registry_test.cpp
-mooncake-store/tests/xds_backend_fake_test.cpp
-```
-
-`hyfile_api_shim.cpp` 是唯一直接了解 vendor ABI 的编译单元。
+`hyfile_abi.h` 是唯一的 vendor ABI 声明源，`hyfile_backend.cpp` 是唯一执行
+`dlopen`/`dlsym` 和调用 vendor 函数的编译单元。
 
 ### 9.3 构建
 
 建议构建参数：
 
 ```text
--DUSE_XDS=ON
--DXDS_ROOT=/path/to/xds-sdk
--DXDS_INCLUDE_DIR=/path/to/xds-sdk/include
+-DUSE_HIP=ON -DUSE_XDS=ON
 ```
 
 规则：
 
 - 普通构建默认 `USE_XDS=OFF`；
-- `USE_XDS=ON` 且有 SDK header 时使用正式类型；
-- 无 header 时只允许编译经过版本钉住和静态 size/alignment 校验的 ABI profile；
+- `USE_XDS=ON` 要求 Linux、HIP 构建环境，但不要求 SDK header；
+- 始终使用仓库内唯一的最小手工 ABI 声明，并执行静态布局校验；
 - 动态库运行时加载；
 - fake backend CI 不依赖海光硬件；
 - 真实 DTK 测试使用单独硬件 CI/验收环境。
@@ -1711,8 +1538,8 @@ mooncake-store/tests/xds_backend_fake_test.cpp
 - direct path H2D payload bytes 为 0；
 - 短读从不被视为成功；
 - safe failure 只执行整 key fallback；
-- unknown target state 必定 fail-stop；
-- session generation/lease 失效时不发布成功；
+- unknown target state 必定使 backend sticky fatal，且不执行 fallback；
+- session replica 不再兼容或 lease 失效时不发布成功；
 - target overlap 在任何 I/O 前被拒绝；
 - fork 后不访问继承的 vendor 资源；
 - 24 小时 soak 无 fd、registration、显存或 driver 资源增长。
@@ -1724,11 +1551,11 @@ mooncake-store/tests/xds_backend_fake_test.cpp
 - SGLang 公开 API不变；
 - Master 元数据协议不变；
 - 当前业务 DFS 写路径不变；
-- auto 模式缺少库、符号或不支持 mount 时可安全回退。
+- auto 模式缺少库或符号时使用 POSIX；运行期 safe request failure 可整 key fallback。
 
 #### 10.1.3 性能
 
-平台和模型的数值门槛在 Phase 0.5 后固化，但至少必须满足：
+平台和模型的数值门槛由真实硬件 E2E 和性能验收确定，但至少必须满足：
 
 - 典型大块 aligned L3 hit 的端到端带宽稳定优于当前路径；
 - TTFT 的 p50/p95/p99 不因 device-wide synchronize 出现不可接受回退；
@@ -1743,21 +1570,21 @@ mooncake-store/tests/xds_backend_fake_test.cpp
 
 | 风险 | 缓解措施 |
 |---|---|
-| `libhyfile.so` ABI 随 DTK 变化 | 单一 shim、正式 SDK header 优先、ABI profile/build-id 钉住、真实 round-trip preflight |
-| SDK 对目标 DFS 不支持或在驱动内部静默 bounce | mount 白名单、preflight、direct/fallback 指标；没有厂商 counter 时不宣称驱动内部零 bounce |
-| DCU buffer 生命周期错误 | eager composite registration、generation、owner/pin、unregister drain 和 quarantined 状态 |
-| BUCKET 动态文件被淘汰、替换或 FD 被复用 | canonical identity、file owner/inflight pin、有界 LRU、淘汰 drain、重新注册 |
-| 大量小 range 的调用与同步开销超过收益 | `MIN_READ_SIZE`、双向连续 coalescing、Phase 0.5 telemetry 和性能门槛 |
+| `libhyfile.so` ABI 随 DTK 变化 | 单一手工 ABI 声明、最小 required symbols、部署版本清单和独立真实 mount 验收；不兼容时 fail closed |
+| HyFile/driver 对目标 DFS 不支持或在内部静默 bounce | 逐 device/mount 独立验收；没有厂商 counter 时不宣称驱动内部零 bounce |
+| DCU buffer 生命周期错误 | 整 pool eager registration、`shared_ptr + inflight`、unregister drain 和 quarantined 状态 |
+| BUCKET 文件被替换或 FD 被复用 | canonical path + `st_dev/st_ino` identity、`OpenFileHandle` keepalive；缓存满时不淘汰已有项 |
+| 大量小 range 的调用与同步开销超过收益 | `MIN_READ_SIZE`、双向连续 coalescing 和真实 workload 性能验收 |
 | HyFile 非线程安全 | 首版使用进程级 mutex 串行全部 vendor API，实机并发压力测试 |
-| 部分完成或未知 DMA 状态使错误 KV 可见 | exact-length、device synchronize、每 key 聚合结果；未知 target state 必须 fail-stop |
-| 同步 I/O 永久阻塞 worker | circuit breaker 阻止后续调用，外部 watchdog/supervisor 重启进程 |
+| 部分完成或未知 DMA 状态使错误 KV 可见 | exact-length、device synchronize、每 key 聚合结果；未知 target state 禁止 fallback 并使 backend sticky fatal |
+| 同步 I/O 永久阻塞 worker | vendor 无 timeout/cancel；由部署已有 supervisor 检测并重启整个承载进程 |
 | 注册显存或文件句柄资源过高 | 整 pool 注册、注册字节数指标、有界 file cache、启动 fail-fast 和 soak |
-| direct path 绕过 descriptor、路径或 lease 校验 | 强制复用 canonical resolver，提交前和发布前分别校验 session generation/lease |
+| direct path 绕过 descriptor、路径或 lease 校验 | 强制复用 canonical resolver，提交前和发布前分别校验 replica compatibility/lease |
 
-### 10.3 实现前仍需厂商确认
+### 10.3 部署前仍需厂商确认
 
-1. 正式 SDK header、soname/路径、calling convention 和 ABI 演进规则。
-2. `hipFileRead/Write` 的精确参数类型、返回类型和错误传递方式。
+1. 厂商对 soname/路径、calling convention 和 ABI 演进规则的正式说明。
+2. 首版 `hipFileRead` 的精确参数类型、返回类型和错误传递方式；后续若设计 write，再单独确认 `hipFileWrite`。
 3. Parastor/HYFS 支持的 client、服务端、mount 模式和版本范围。
 4. FUSE 是否明确不支持。
 5. 4096 对齐是硬要求还是当前版本限制。
@@ -1771,23 +1598,25 @@ mooncake-store/tests/xds_backend_fake_test.cpp
 13. 是否有 direct-DMA bytes、CPU-bounce bytes 或队列 trace。
 14. file/buffer register/deregister 与 read/write 是否全部要求串行。
 
-未绑定实际函数的 IO params、event、poll 或 batch 结构一律视为影子 ABI，首版不得使用。上述待确认项按照默认的定。
+未绑定实际函数的 IO params、event、poll 或 batch 结构一律视为影子 ABI，首版不得使用。
+上述待确认项在厂商确认和实机验证前一律按保守策略处理。
 
-### 10.4 首个可合并版本的最终契约
+### 10.4 首版最终契约
 
-第一个生产候选版本严格限定为：
+当前代码和后续验收均以以下范围为准：
 
 - 业务 read-only xDS；
 - BUCKET allocator；
-- 仅真实 preflight 成功的 Parastor/HYFS mount；
+- 仅通过 7.1 独立验收的 Parastor/HYFS mount/device 组合；
 - `libhyfile.so` 显式 `dlopen`；
 - `O_DIRECT` opaque fd；
 - SGLang KV pool eager registration；
 - 注册阶段解析 device id；
 - 完全对齐且达到阈值的 ranges；
 - bucket id → canonical path 重建和 descriptor/range 校验；
-- BUCKET file owner/LRU、xDS registration cache 和 inflight pin；
-- bucket eviction、restart recovery 和 fd reuse 生命周期安全；
+- BUCKET 有界 xDS file registration cache、canonical identity 和 fd keepalive；
+- cache 满时不淘汰已有项，按模式和策略 fallback 或报错；
+- buffer `shared_ptr + inflight` 和 unregister drain；
 - batch key 唯一且目标地址不重叠；
 - 每 key 全 direct 或全 fallback；
 - 同步 `hipFileRead`；
@@ -1795,9 +1624,10 @@ mooncake-store/tests/xds_backend_fake_test.cpp
 - 全进程 HyFile API mutex；
 - 每 op 返回前 device synchronize；
 - safe failure 整 key fallback；
-- unknown target state worker fail-stop；
-- session generation 和完成前 lease 校验；
-- 不实现 GPU bounce；
+- unknown target state 禁止 fallback并使 backend sticky fatal；
+- 完成前 replica compatibility 和 lease 校验；
+- 同一 key 的 session start/range read/end 不并发；
+- 不实现非对齐 bounce；
 - 不实现业务 xDS write；
 - 不实现 async/batch/event/poll；
 - 不实现进程内 timeout/cancel；
@@ -1809,7 +1639,7 @@ mooncake-store/tests/xds_backend_fake_test.cpp
 
 ### 10.5 参考资料
 
-- 当前代码基线：`mooncake-das` 的 `feat/optimize_prefetch`，以及 `sglang-das` 的 `feature/optimize_the_direct_linker`/`588405a92a`。
+- 当前代码基线：`mooncake-das` commit `dded8f87051d537ba677193cb22941f564f1a330`，以及 `sglang-das` 的 `feature/optimize_the_direct_linker` commit `c4257ce7b190710b953504645aea1cdd7a53035e`。
 - LMCache xDS/HyFile 适配代码审阅记录（本设计输入，2026-09）。
-- [LMCache GDS backend documentation](https://github.com/LMCache/LMCache/blob/dev/docs/source/kv_cache/storage_backends/gds.rst)：用于对照 direct-storage backend 的配置和测试思路；HyFile ABI 仍以本项目厂商 header、版本钉住和真实 preflight 为准。
+- [LMCache GDS backend documentation](https://github.com/LMCache/LMCache/blob/dev/docs/source/kv_cache/storage_backends/gds.rst)：用于对照 direct-storage backend 的配置和测试思路；HyFile ABI 由本项目的最小手工声明、部署版本清单和独立真实 mount 验收共同约束。
 - [LMCache GDS context tests](https://github.com/LMCache/LMCache/blob/dev/tests/v1/gpu_connector/test_gds_context.py)：用于对照 GPU buffer/context 生命周期测试。

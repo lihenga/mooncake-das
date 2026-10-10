@@ -150,6 +150,8 @@ add_store_test(dfs_posix_test dfs_posix_test.cpp)
 add_store_test(xds_buffer_registry_test xds_buffer_registry_test.cpp)
 if(USE_XDS)
   add_store_test(hyfile_backend_test hyfile_backend_test.cpp)
+  target_compile_definitions(hyfile_backend_test
+                             PRIVATE MOONCAKE_ENABLE_XDS_TEST_HOOKS=1)
 endif()
 add_store_test(dfs_sync_client_test dfs_sync_client_test.cpp)
 add_test(NAME dfs_batch_read_checksum_test
