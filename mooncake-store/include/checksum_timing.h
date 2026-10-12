@@ -38,6 +38,13 @@ enum class ChecksumStage {
     DFS_READ_IO,
     DFS_PREFETCH_READ_IO,
     DFS_FOREGROUND_READ_IO,
+    BATCH_QUERY,
+    SESSION_PREFETCH,
+    SESSION_RANGE_GET,
+    SESSION_MEMORY_GET,
+    DFS_PREFETCH_BATCH_GET,
+    DFS_FOREGROUND_BATCH_GET,
+    DFS_SCATTER,
     COUNT,
 };
 
@@ -89,8 +96,9 @@ class ChecksumTiming {
         return uint64_t(value.tv_sec) * 1000000000 + value.tv_nsec;
     }
 
-    explicit ChecksumTiming(ChecksumStage stage, uint64_t bytes = 0)
-        : enabled_(Enabled()), stage_(stage), bytes_(bytes) {
+    explicit ChecksumTiming(ChecksumStage stage, uint64_t bytes = 0,
+                            uint64_t objects = 0)
+        : enabled_(Enabled()), stage_(stage), bytes_(bytes), objects_(objects) {
         if (!enabled_) return;
         started_ = Now();
         cpu_started_ = ThreadCpuNow();
@@ -115,20 +123,35 @@ class ChecksumTiming {
     void AddStaging(uint64_t start) {
         if (enabled_) staging_ns_ += Now() - start;
     }
+    void AddLockWait(uint64_t start) {
+        if (enabled_) lock_wait_ns_ += Now() - start;
+    }
 
     void Finish() {
         if (!enabled_ || finished_) return;
         finished_ = true;
         const auto end = Now();
         const auto cpu_end = ThreadCpuNow();
+        const auto wall_ns = end - started_;
+        const auto cpu_ns = cpu_started_ != 0 && cpu_end >= cpu_started_
+                                ? cpu_end - cpu_started_
+                                : 0;
         auto& state = Get();
         auto& c = state.stages[static_cast<size_t>(stage_)];
-        c.wall_ns.fetch_add(end - started_, std::memory_order_relaxed);
-        if (cpu_started_ != 0 && cpu_end >= cpu_started_) {
-            c.cpu_ns.fetch_add(cpu_end - cpu_started_,
-                               std::memory_order_relaxed);
-        }
+        c.wall_ns.fetch_add(wall_ns, std::memory_order_relaxed);
+        c.cpu_ns.fetch_add(cpu_ns, std::memory_order_relaxed);
         c.bytes.fetch_add(bytes_, std::memory_order_relaxed);
+        if (objects_ != 0)
+            c.objects.fetch_add(objects_, std::memory_order_relaxed);
+        if (lock_wait_ns_ != 0) {
+            c.lock_wait_ns.fetch_add(lock_wait_ns_, std::memory_order_relaxed);
+        }
+        if (wall_ns >= 100000000ULL) {
+            c.slow_calls.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (wall_ns >= 1000000000ULL) {
+            c.over_1s_calls.fetch_add(1, std::memory_order_relaxed);
+        }
         c.crc_ns.fetch_add(crc_ns_, std::memory_order_relaxed);
         c.d2h_ns.fetch_add(d2h_ns_, std::memory_order_relaxed);
         c.staging_ns.fetch_add(staging_ns_, std::memory_order_relaxed);
@@ -141,6 +164,22 @@ class ChecksumTiming {
         c.calls.fetch_add(1, std::memory_order_relaxed);
         c.active_bytes.fetch_sub(bytes_, std::memory_order_relaxed);
         c.active.fetch_sub(1, std::memory_order_relaxed);
+        // Only batch scopes have objects: never emit per-key slow logs.
+        if (objects_ != 0 && wall_ns >= 500000000ULL) {
+            auto deadline = c.next_slow_log_ns.load(std::memory_order_relaxed);
+            if (end >= deadline && c.next_slow_log_ns.compare_exchange_strong(
+                                       deadline, end + 10000000000ULL,
+                                       std::memory_order_relaxed)) {
+                LOG(WARNING)
+                    << "checksum_slow pid=" << getpid()
+                    << " stage=" << StageName(stage_) << " objects=" << objects_
+                    << " bytes=" << bytes_ << " wall_us=" << wall_ns / 1000
+                    << " cpu_us=" << cpu_ns / 1000
+                    << " crc_us=" << crc_ns_ / 1000
+                    << " d2h_us=" << d2h_ns_ / 1000
+                    << " lock_wait_us=" << lock_wait_ns_ / 1000;
+            }
+        }
         ReportIfDue(state, end);
     }
 
@@ -154,11 +193,14 @@ class ChecksumTiming {
     }
 
    private:
+    friend class ChecksumTimingTestPeer;
     struct Counters {
         std::atomic<uint64_t> calls{0}, bytes{0}, wall_ns{0}, cpu_ns{0},
             max_ns{0};
         std::atomic<uint64_t> crc_ns{0}, d2h_ns{0}, staging_ns{0}, gpu_bytes{0};
         std::atomic<uint64_t> active{0}, active_bytes{0};
+        std::atomic<uint64_t> objects{0}, lock_wait_ns{0}, slow_calls{0},
+            over_1s_calls{0}, next_slow_log_ns{0};
     };
     struct State {
         const uint64_t started = Now();
@@ -170,13 +212,7 @@ class ChecksumTiming {
         static State state;
         return state;
     }
-    static void ReportIfDue(State& state, uint64_t now) {
-        auto deadline = state.next_report.load(std::memory_order_relaxed);
-        if (now < deadline ||
-            !state.next_report.compare_exchange_strong(
-                deadline, now + 10000000000ULL, std::memory_order_relaxed)) {
-            return;
-        }
+    static const char* StageName(ChecksumStage stage) {
         static constexpr const char* names[] = {"write_checksum",
                                                 "write_checksum_reused",
                                                 "read_checksum",
@@ -196,9 +232,25 @@ class ChecksumTiming {
                                                 "write_finalize",
                                                 "dfs_read_io",
                                                 "dfs_prefetch_read_io",
-                                                "dfs_foreground_read_io"};
+                                                "dfs_foreground_read_io",
+                                                "batch_query",
+                                                "session_prefetch",
+                                                "session_range_get",
+                                                "session_memory_get",
+                                                "dfs_prefetch_batch_get",
+                                                "dfs_foreground_batch_get",
+                                                "dfs_scatter"};
         static_assert(std::size(names) ==
                       static_cast<size_t>(ChecksumStage::COUNT));
+        return names[static_cast<size_t>(stage)];
+    }
+    static void ReportIfDue(State& state, uint64_t now) {
+        auto deadline = state.next_report.load(std::memory_order_relaxed);
+        if (now < deadline ||
+            !state.next_report.compare_exchange_strong(
+                deadline, now + 10000000000ULL, std::memory_order_relaxed)) {
+            return;
+        }
         const auto elapsed_ms = (now - state.started) / 1000000;
         // Snapshots are approximate under concurrency. Interval costs can be
         // derived by subtracting successive cumulative totals for each stage.
@@ -213,7 +265,8 @@ class ChecksumTiming {
             const auto active = c.active.load(std::memory_order_relaxed);
             if (calls == 0 && active == 0) continue;
             LOG(INFO) << "checksum_timing pid=" << getpid()
-                      << " elapsed_ms=" << elapsed_ms << " stage=" << names[i]
+                      << " elapsed_ms=" << elapsed_ms
+                      << " stage=" << StageName(static_cast<ChecksumStage>(i))
                       << " calls=" << calls
                       << " bytes=" << c.bytes.load(std::memory_order_relaxed)
                       << " wall_us=" << c.wall_ns.load() / 1000
@@ -223,6 +276,10 @@ class ChecksumTiming {
                       << " d2h_us=" << c.d2h_ns.load() / 1000
                       << " staging_us=" << c.staging_ns.load() / 1000
                       << " gpu_bytes=" << c.gpu_bytes.load()
+                      << " objects=" << c.objects.load()
+                      << " lock_wait_us=" << c.lock_wait_ns.load() / 1000
+                      << " slow_calls=" << c.slow_calls.load()
+                      << " over_1s_calls=" << c.over_1s_calls.load()
                       << " active_calls=" << active
                       << " active_bytes=" << c.active_bytes.load();
         }
@@ -231,9 +288,11 @@ class ChecksumTiming {
     const bool enabled_;
     const ChecksumStage stage_;
     const uint64_t bytes_;
+    const uint64_t objects_;
     bool finished_ = false;
     uint64_t started_ = 0, cpu_started_ = 0;
     uint64_t crc_ns_ = 0, d2h_ns_ = 0, staging_ns_ = 0, gpu_bytes_ = 0;
+    uint64_t lock_wait_ns_ = 0;
 };
 
 }  // namespace mooncake

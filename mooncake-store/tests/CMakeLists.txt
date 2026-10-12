@@ -66,6 +66,14 @@ add_store_test(master_service_scenario_test master_service_scenario_test.cpp)
 target_link_libraries(master_service_scenario_test
                       PRIVATE master_service_test_dsl)
 add_store_test(config_helper_test config_helper_test.cpp)
+add_store_test(checksum_timing_test checksum_timing_test.cpp)
+set_tests_properties(checksum_timing_test
+                     PROPERTIES ENVIRONMENT "MC_STORE_CHECKSUM_TIMING=1")
+add_test(NAME checksum_timing_disabled_test
+         COMMAND checksum_timing_test
+                 --gtest_filter=ChecksumTimingTest.DisabledDoesNotRecord)
+set_tests_properties(checksum_timing_disabled_test
+                     PROPERTIES ENVIRONMENT "MC_STORE_CHECKSUM_TIMING=0")
 add_store_test(master_service_config_test master_service_config_test.cpp)
 add_store_test(master_service_processing_key_double_erase_test
                master_service_processing_key_double_erase_test.cpp)

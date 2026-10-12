@@ -1274,6 +1274,7 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
 
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     const std::vector<std::string>& object_keys, const std::string& tenant_id) {
+    ChecksumTiming timing(ChecksumStage::BATCH_QUERY, 0, object_keys.size());
     std::chrono::steady_clock::time_point start_time =
         std::chrono::steady_clock::now();
     auto response = master_client_.BatchGetReplicaList(object_keys, tenant_id);
@@ -3759,7 +3760,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
             diagnostic_bytes += CalculateSliceSize(slices);
         }
     }
-    ChecksumTiming batch_timing(ChecksumStage::BATCH_PUT, diagnostic_bytes);
+    ChecksumTiming batch_timing(ChecksumStage::BATCH_PUT, diagnostic_bytes,
+                                keys.size());
     ReplicateConfig client_cfg = AttachConfig(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;

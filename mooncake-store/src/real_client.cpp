@@ -6626,6 +6626,7 @@ std::shared_ptr<BufferHandle> RealClient::AllocatePrefetchArenaRegion(
 
 std::vector<int> RealClient::batch_get_session_prefetch(
     const std::vector<std::string> &keys) {
+    ChecksumTiming timing(ChecksumStage::SESSION_PREFETCH, 0, keys.size());
     std::vector<int> results(
         keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     if (!client_) {
@@ -6644,7 +6645,9 @@ std::vector<int> RealClient::batch_get_session_prefetch(
     first_index_by_key.reserve(keys.size());
 
     {
+        const auto lock_started = timing.StartPart();
         std::lock_guard<std::mutex> lock(session_mutex_);
+        timing.AddLockWait(lock_started);
         for (size_t i = 0; i < keys.size(); ++i) {
             const auto [first_it, inserted] =
                 first_index_by_key.emplace(keys[i], i);
@@ -6701,7 +6704,9 @@ std::vector<int> RealClient::batch_get_session_prefetch(
     // the DFS read is in progress. Never report READY unless the session
     // still owns a complete object view when this method returns.
     {
+        const auto lock_started = timing.StartPart();
         std::lock_guard<std::mutex> lock(session_mutex_);
+        timing.AddLockWait(lock_started);
         auto completed_at = std::chrono::steady_clock::now();
         for (const auto &entry : entries) {
             const size_t i = entry.original_idx;
@@ -7082,6 +7087,7 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
     const std::vector<std::vector<size_t>> &all_src_offsets) {
+    ChecksumTiming timing(ChecksumStage::SESSION_RANGE_GET, 0, keys.size());
     std::vector<int> results(
         keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     if (!validate_session_range_batch_arguments(keys, all_buffers, all_sizes,
@@ -7100,7 +7106,11 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         keys, all_buffers, all_sizes, all_src_offsets, results, context);
     auto plan =
         classify_session_range_read_requests(std::move(requests), results);
-    execute_session_memory_range_reads(plan.memory_requests, results);
+    {
+        ChecksumTiming memory_timing(ChecksumStage::SESSION_MEMORY_GET, 0,
+                                     plan.memory_requests.size());
+        execute_session_memory_range_reads(plan.memory_requests, results);
+    }
     context.memory_done = std::chrono::steady_clock::now();
     std::unordered_map<std::string, std::vector<NonMemReadEntry *>>
         local_disk_by_endpoint;
@@ -7570,8 +7580,13 @@ void RealClient::execute_session_dfs_range_reads(
     if (!disk_batch_keys.empty()) {
         const auto io_start = std::chrono::steady_clock::now();
         ChecksumTiming::ReadScope checksum_scope(prefetch_only);
+        ChecksumTiming batch_get_timing(
+            prefetch_only ? ChecksumStage::DFS_PREFETCH_BATCH_GET
+                          : ChecksumStage::DFS_FOREGROUND_BATCH_GET,
+            arena_size, disk_batch_keys.size());
         auto disk_results = client_->BatchGet(disk_batch_keys, disk_batch_qrs,
                                               disk_batch_slices);
+        batch_get_timing.Finish();
         const double io_duration =
             std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                           io_start)
@@ -7655,6 +7670,8 @@ void RealClient::execute_session_dfs_range_reads(
     t_scatter_submit_start = t_scatter_plan_done;
     bool scatter_succeeded = true;
     if (!prefetch_only) {
+        ChecksumTiming scatter_timing(ChecksumStage::DFS_SCATTER, scatter_bytes,
+                                      pending_scatter_results.size());
         async_scatter.Submit();
         t_scatter_submit_done = std::chrono::steady_clock::now();
         t_scatter_sync_start = t_scatter_submit_done;

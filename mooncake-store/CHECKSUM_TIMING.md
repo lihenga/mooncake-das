@@ -103,3 +103,95 @@ pre-commit run --files mooncake-common/tests/crc_checksum_test.cpp mooncake-stor
 
 CTest runs the bucket suite in separate processes with checksum explicitly off
 and on. Then deploy manually and compare the cumulative diagnostic deltas above.
+
+## Decode timeout diagnostics (2026-10-12 follow-up)
+
+The two supplied prefill logs and their matching decode logs were inspected
+read-only on 10.211.11.24. No inference service was started or stopped.
+
+| Run directory suffix | Unique D timeout rooms | Matching P records | P records with forward time | Queue + forward over 300 s |
+| --- | ---: | ---: | ---: | ---: |
+| `20261012_161532_204-pd-multi-turn-qa_100` | 122 | 122 | 41 | 36 of 41 |
+| `20261012_140157_204-pd-multi-turn-qa_100` | 126 | 126 | 43 | 39 of 43 |
+
+D reports `timed out after 300.0s in KVPoll.WaitingForInput`. Correlation uses
+`bootstrap_room`, since P and D request IDs differ. In the first run, room
+5492594264339385507 timed out on D at 16:27:42; its P completion at 16:27:50
+reports queue 277736.10 ms and forward 29284.29 ms. In the second run, room
+5742558300886468828 timed out on D at 14:14:37; P completes at 14:14:45 with
+queue 278299.68 ms and forward 29064.52 ms. Both examples have cached tokens 0.
+This verifies that queueing consumed most of these requests' deadline; it does
+not establish why the queue grew or that checksum caused the timeout.
+
+P CQ warnings have `outstanding_age_ms=0` throughout both supplied logs. Their
+large `poll_gap_ms` alone does not establish a stuck RDMA operation. Do not use
+those warnings to conclude that the Decode transfer itself blocked for 300 s.
+
+Additional stages use the existing default-on `MC_STORE_CHECKSUM_TIMING` switch:
+
+| Stage | Scope |
+| --- | --- |
+| `batch_query` | Master replica-list RPC and result construction for a batch. |
+| `session_prefetch` | Entire session prefetch batch, including planning, query, DFS read and final readiness checks. `lock_wait_us` covers its initial and final session mutex acquisition only. |
+| `session_range_get` | Entire foreground session range-read batch. |
+| `session_memory_get` | Foreground memory replica reads and their completion wait. |
+| `dfs_prefetch_batch_get` / `dfs_foreground_batch_get` | DFS Client::BatchGet, including I/O and checksum verification, excluding subsequent result processing and GPU scatter. `bytes` is allocated aligned staging arena size. |
+| `dfs_scatter` | Foreground GPU scatter submission and synchronization, excluding scatter planning. |
+
+Existing `prefetch_checksum` / `foreground_checksum` measure each object's
+verification, and `dfs_prefetch_read_io` / `dfs_foreground_read_io` isolate
+filesystem read calls. Compare the new batch stages with these children to
+separate whole-batch delay from per-object CRC. A per-object checksum average
+cannot be interpreted as the latency of a complete prefetch batch.
+
+Summaries remain cumulative, approximately every 10 s when instrumented calls
+finish. New fields are `objects` (completed scopes' input object count),
+`lock_wait_us`, `slow_calls` (wall time >=100 ms) and `over_1s_calls` (>=1 s).
+`objects` includes duplicate input keys in the outer session scopes. For each
+PID and stage, subtract consecutive summaries before comparing averages or
+slow-call rates. Parent stages include children: never sum them together.
+`wall_us - cpu_us` includes I/O, locks and thread descheduling; it is not a
+measurement of I/O alone. Early failures are also timed.
+
+Completed batch scopes taking >=500 ms additionally emit `checksum_slow` with
+stage, objects, bytes, wall/CPU time and available CRC/D2H/lock parts. A per-stage,
+per-process atomic deadline limits these warnings to one every 10 s. No object
+keys are logged, and per-object CRC never emits slow warnings. The fast path
+adds batch timing and aggregate counters, without per-key clocks, polling,
+extra transfers, RPCs or a reporter thread. Existing CRC timing clocks remain.
+Warnings describe completed operations; an entirely stuck process cannot
+produce a new summary without another instrumented operation finishing.
+
+On the next run, correlate D timeout `bootstrap_room` with P `ReqTimeStats`
+queue/forward times first. Near that timestamp, inspect `checksum_slow` and
+summary deltas from each P PID: query delays point toward metadata access;
+prefetch delays with high checksum CPU time point toward CRC; DFS I/O or scatter
+delays identify other storage stages. Large `session_prefetch.lock_wait_us`
+identifies contention at the two measured locks. Mooncake logs do not measure
+SGLang scheduler queueing or cross-rank readiness waits directly. Compare
+checksum off/on runs at identical load to test the checksum hypothesis.
+
+Follow-up validation:
+
+- VERIFIED: The actual diagnostic header and production `environ.cpp` compiled
+  with Linux g++ C++17 and GoogleTest/glog in a temporary directory. Two enabled
+  tests and one separate disabled-process test passed: idempotent completion,
+  active/byte/object counters, slow thresholds, lock wait accounting, per-stage
+  warning rate limiting/expiry, no per-key warning and the disable switch.
+- VERIFIED: The repository's changed-line C++ formatter script passed using
+  Linux clang-format 20.1.8 on the touched sources. Scoped pre-commit generic,
+  codespell and CMake checks passed on Windows with its unavailable C++ hook
+  explicitly skipped; the equivalent C++ script was checked on Linux.
+- INFERRED: Added RAII scopes leave storage, checksum and readiness behavior
+  unchanged. Diagnostics have bounded batch overhead and rate-limited output.
+- BLOCKED: Full Store build/integration execution on the Windows workspace;
+  the remote check compiled only the independent diagnostics test and helpers.
+- UNTESTED: Live workload overhead, full GPU/DFS integration and a causal
+  explanation of queue growth. Deployment and inference retesting remain manual.
+
+Linux build commands for the registered tests:
+
+```sh
+cmake --build build --target checksum_timing_test
+ctest --test-dir build -R '^checksum_timing(_disabled)?_test$' --output-on-failure
+```
