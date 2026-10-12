@@ -3039,16 +3039,13 @@ std::shared_ptr<Client::AsyncDfsWriteContext> Client::PrepareDfsWriteData(
     std::vector<const std::vector<Slice>*> slice_lists;
     for (size_t i = 0; i < ops.size(); ++i) {
         const auto& op = ops[i];
-        if (op.IsResolved() || op.transfer_summary.allocated_dfs_replicas == 0 ||
-            !HasExpectedReplicaAllocation(op.ToReplicateConfig(),
-                                          op.transfer_summary)) {
-            continue;
-        }
         auto dfs_it = std::find_if(op.replicas.begin(), op.replicas.end(),
                                    [](const Replica::Descriptor& replica) {
                                        return replica.is_dfs_replica();
                                    });
-        if (dfs_it == op.replicas.end()) continue;
+        if (op.IsResolved() || dfs_it == op.replicas.end()) {
+            continue;
+        }
         context->keys.push_back(op.key);
         context->descriptors.push_back(dfs_it->get_dfs_descriptor());
         context->op_indices.push_back(i);
@@ -3133,7 +3130,10 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
 
         for (size_t i = 0; i < prepared->op_indices.size(); ++i) {
             const size_t index = prepared->op_indices[i];
-            if (!NonDfsTransfersSucceeded(ops[index].transfer_summary)) {
+            if (!NonDfsTransfersSucceeded(ops[index].transfer_summary) ||
+                (bucket_mode &&
+                 !HasExpectedReplicaAllocation(ops[index].ToReplicateConfig(),
+                                                ops[index].transfer_summary))) {
                 continue;
             }
             successful_keys.push_back(std::move(prepared->keys[i]));
