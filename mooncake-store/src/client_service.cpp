@@ -46,6 +46,7 @@
 #include "gpu_vendor/intra_nvlink.h"
 #endif
 #include "crc_checksum.h"
+#include "checksum_timing.h"
 #include "environ.h"
 #include "storage/distributed/distributed_storage_backend.h"
 
@@ -457,6 +458,10 @@ Client::Client(const std::string& local_hostname,
     }
     if (object_checksum_enabled_) {
         LOG(INFO) << "Object checksum validation is enabled";
+    }
+    if (ChecksumTiming::Enabled()) {
+        LOG(INFO) << "checksum_timing enabled=1 interval_s=10 cumulative=1"
+                  << " checksum_enabled=" << object_checksum_enabled_;
     }
 
     if (metrics_) {
@@ -1303,7 +1308,10 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
 
 tl::expected<uint64_t, ErrorCode> Client::ComputeObjectChecksumForSlices(
     const std::string& object_key, const std::vector<Slice>& slices,
-    size_t object_size) {
+    size_t object_size, bool for_read) {
+    ChecksumTiming timing(
+        for_read ? ChecksumTiming::ReadStage() : ChecksumStage::WRITE_CHECKSUM,
+        object_size);
     CrcChecksum checksum;
     size_t remaining = object_size;
     auto runtime_accelerator =
@@ -1321,28 +1329,37 @@ tl::expected<uint64_t, ErrorCode> Client::ComputeObjectChecksumForSlices(
         }
 
         if (!runtime_accelerator.FindDeviceForPointer(slice.ptr)) {
+            const auto crc_started = timing.StartPart();
             checksum.Update(slice.ptr, bytes);
+            timing.AddCrc(crc_started);
             remaining -= bytes;
             continue;
         }
 
         if (!staging) {
+            const auto staging_started = timing.StartPart();
             staging = std::make_unique<ScopedObjectChecksumBuffer>(
                 *pinned_buffer_pool_,
                 std::min(kObjectChecksumD2HChunkSize, object_size));
+            timing.AddStaging(staging_started);
         }
         size_t offset = 0;
         while (offset < bytes) {
             const size_t chunk =
                 std::min(kObjectChecksumD2HChunkSize, bytes - offset);
             const auto* source = static_cast<const char*>(slice.ptr) + offset;
-            if (!runtime_accelerator.CopyToHost(staging->data(), source,
-                                                chunk)) {
+            const auto d2h_started = timing.StartPart();
+            const bool copied =
+                runtime_accelerator.CopyToHost(staging->data(), source, chunk);
+            timing.AddD2h(d2h_started, chunk);
+            if (!copied) {
                 LOG(ERROR) << "object_checksum_d2h_failed key=" << object_key
                            << " size=" << chunk;
                 return tl::unexpected(ErrorCode::TRANSFER_FAIL);
             }
+            const auto crc_started = timing.StartPart();
             checksum.Update(staging->data(), chunk);
+            timing.AddCrc(crc_started);
             offset += chunk;
         }
         remaining -= bytes;
@@ -1363,21 +1380,25 @@ tl::expected<void, ErrorCode> Client::VerifyObjectChecksum(
         return {};
     }
     if (!expected_checksum.has_value()) {
+        ChecksumTiming::ReadResult(false, false);
         VLOG(1) << "object_checksum_absent key=" << object_key;
         return {};
     }
 
     auto actual_checksum =
-        ComputeObjectChecksumForSlices(object_key, slices, object_size);
+        ComputeObjectChecksumForSlices(object_key, slices, object_size, true);
     if (!actual_checksum) {
+        ChecksumTiming::ReadResult(true, false);
         return tl::unexpected(actual_checksum.error());
     }
     if (*actual_checksum != *expected_checksum) {
+        ChecksumTiming::ReadResult(true, false);
         LOG(ERROR) << "object_checksum_mismatch key=" << object_key
                    << " expected=" << *expected_checksum
                    << " actual=" << *actual_checksum;
         return tl::unexpected(ErrorCode::CHECKSUM_MISMATCH);
     }
+    ChecksumTiming::ReadResult(true, true);
     return {};
 }
 
@@ -1778,7 +1799,16 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     }
 
     if (!dfs_read_requests.empty()) {
+        uint64_t diagnostic_bytes = 0;
+        if (ChecksumTiming::Enabled()) {
+            for (const auto& request : dfs_read_requests) {
+                diagnostic_bytes += request.descriptor.object_size;
+            }
+        }
+        ChecksumTiming io_timing(ChecksumTiming::ReadIoStage(),
+                                 diagnostic_bytes);
         auto dfs_results = dfs_storage_backend_->BatchRead(dfs_read_requests);
+        io_timing.Finish();
         std::vector<DfsMissingBucketReport> missing_bucket_reports;
         if (dfs_results.size() != dfs_read_requests.size()) {
             LOG(ERROR) << "DFS BatchRead response size mismatch: expected "
@@ -2232,6 +2262,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
+    uint64_t diagnostic_bytes = 0;
+    if (ChecksumTiming::Enabled()) {
+        for (const auto& slices : batched_slices) {
+            diagnostic_bytes += CalculateSliceSize(slices);
+        }
+    }
+    ChecksumTiming batch_timing(ChecksumStage::BATCH_UPSERT, diagnostic_bytes);
     ReplicateConfig client_cfg = AttachConfig(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -2416,6 +2453,7 @@ void Client::ComputeBatchObjectChecksums(std::vector<PutOperation>& ops) {
 
 void Client::StartBatchPut(std::vector<PutOperation>& ops,
                            const ReplicateConfig& config) {
+    ChecksumTiming timing(ChecksumStage::WRITE_ALLOCATION);
     std::vector<std::string> keys;
     std::vector<std::vector<uint64_t>> slice_lengths;
     std::vector<size_t> active_indices;
@@ -2495,6 +2533,7 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
 
 void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
                               const ReplicateConfig& config) {
+    ChecksumTiming timing(ChecksumStage::WRITE_ALLOCATION);
     std::vector<std::string> keys;
     std::vector<std::vector<uint64_t>> slice_lengths;
     std::vector<size_t> active_indices;
@@ -2571,6 +2610,7 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
 }
 
 void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
+    ChecksumTiming timing(ChecksumStage::WRITE_TRANSFER_SUBMIT);
     if (std::all_of(ops.begin(), ops.end(),
                     [](const PutOperation& op) { return op.IsResolved(); })) {
         return;
@@ -2665,6 +2705,7 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
 }
 
 void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
+    ChecksumTiming timing(ChecksumStage::WRITE_TRANSFER_WAIT);
     for (auto& op : ops) {
         // Skip operations that already failed or completed
         if (op.IsResolved()) {
@@ -2718,6 +2759,7 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
     requests.reserve(keys.size());
     request_indices.reserve(keys.size());
 
+    ChecksumTiming staging_timing(ChecksumStage::DFS_STAGE);
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -2762,8 +2804,11 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
         request_indices.push_back(i);
     }
 
+    staging_timing.Finish();
+    ChecksumTiming io_timing(ChecksumStage::DFS_WRITE_IO);
     const auto write_started = std::chrono::steady_clock::now();
     auto write_results = dfs_storage_backend_->BatchWrite(requests);
+    io_timing.Finish();
     const double write_duration_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                       write_started)
@@ -2815,6 +2860,7 @@ Client::AsyncDfsWriteContext::~AsyncDfsWriteContext() {
 bool Client::StageDfsWriteData(
     AsyncDfsWriteContext& context,
     const std::vector<const std::vector<Slice>*>& slice_lists) {
+    ChecksumTiming timing(ChecksumStage::DFS_STAGE);
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
 
@@ -2891,8 +2937,10 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
     // Every request gets a definite outcome: a missing or short result vector is
     // treated as failure for the affected keys rather than silently ignored.
     std::vector<ErrorCode> outcomes(requests.size(), ErrorCode::INTERNAL_ERROR);
+    ChecksumTiming io_timing(ChecksumStage::DFS_WRITE_IO);
     const auto write_started = std::chrono::steady_clock::now();
     auto results = context->backend->BatchWrite(requests);
+    io_timing.Finish();
     const double write_duration_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                       write_started)
@@ -2968,6 +3016,7 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
 
 void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
                              bool allow_async) {
+    ChecksumTiming timing(ChecksumStage::DFS_SUBMIT);
     std::vector<std::string> keys;
     std::vector<const std::vector<Slice>*> slice_lists;
     std::vector<DistributedFSDescriptor> descriptors;
@@ -3128,6 +3177,7 @@ void Client::DrainAsyncDfsWrites() {
 }
 
 void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
+    ChecksumTiming timing(ChecksumStage::WRITE_FINALIZE);
     struct BatchFinalizeGroup {
         std::vector<std::string> keys;
         std::vector<size_t> indices;
@@ -3331,6 +3381,7 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
 }
 
 void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
+    ChecksumTiming timing(ChecksumStage::WRITE_FINALIZE);
     std::vector<ObjectMeta> successful_object_metas;
     std::vector<size_t> successful_indices;
     std::vector<std::string> failed_keys;
@@ -3494,6 +3545,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
 
 void Client::StageWriteBuffersForRemoteReplicas(
     std::vector<PutOperation>& ops, const WriteBufferStager& stager) {
+    ChecksumTiming timing(ChecksumStage::WRITE_BUFFER_STAGE);
     if (!stager) return;
 
     for (auto& op : ops) {
@@ -3517,6 +3569,7 @@ void Client::StageWriteBuffersForRemoteReplicas(
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
     std::vector<PutOperation>& ops, bool is_upsert) {
+    ChecksumTiming transfer_timing(ChecksumStage::WRITE_TRANSFER_MERGED);
     auto t0 = std::chrono::steady_clock::now();
     std::unordered_map<std::string, PutOperation> seg_to_ops{};
     for (auto& op : ops) {
@@ -3606,6 +3659,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
         op.failure_context = seg_to_ops.at(seg).failure_context;
     }
     // Puts may write asynchronously in bucket mode.
+    transfer_timing.Finish();
     SubmitDfsWrites(ops, /*is_upsert=*/false, /*allow_async=*/true);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
@@ -3632,6 +3686,15 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
+    // Logical source bytes in active calls, not allocated GPU memory. Source
+    // buffers cannot be reused by the caller until this synchronous call ends.
+    uint64_t diagnostic_bytes = 0;
+    if (ChecksumTiming::Enabled()) {
+        for (const auto& slices : batched_slices) {
+            diagnostic_bytes += CalculateSliceSize(slices);
+        }
+    }
+    ChecksumTiming batch_timing(ChecksumStage::BATCH_PUT, diagnostic_bytes);
     ReplicateConfig client_cfg = AttachConfig(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -4933,6 +4996,8 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
 ErrorCode Client::ReadDfsReplica(const std::string& key,
                                  const Replica::Descriptor& replica_descriptor,
                                  std::vector<Slice>& slices) {
+    ChecksumTiming timing(ChecksumTiming::ReadIoStage(),
+                          calculate_total_size(replica_descriptor));
     if (!replica_descriptor.is_dfs_replica()) {
         return ErrorCode::INVALID_REPLICA;
     }

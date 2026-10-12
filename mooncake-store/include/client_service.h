@@ -843,7 +843,7 @@ class Client {
                              std::vector<Slice>& slices);
     tl::expected<uint64_t, ErrorCode> ComputeObjectChecksumForSlices(
         const std::string& object_key, const std::vector<Slice>& slices,
-        size_t object_size);
+        size_t object_size, bool for_read = false);
 
     void PutToLocalFile(const std::string& object_key,
                         const std::vector<Slice>& slices,

@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "real_client.h"
+#include "checksum_timing.h"
 #include "scatter_utils.h"
 #include "registered_pinned_memory.h"
 #include "client_buffer.h"
@@ -7568,6 +7569,7 @@ void RealClient::execute_session_dfs_range_reads(
     auto t_io_done = std::chrono::steady_clock::now();
     if (!disk_batch_keys.empty()) {
         const auto io_start = std::chrono::steady_clock::now();
+        ChecksumTiming::ReadScope checksum_scope(prefetch_only);
         auto disk_results = client_->BatchGet(disk_batch_keys, disk_batch_qrs,
                                               disk_batch_slices);
         const double io_duration =
