@@ -2072,15 +2072,18 @@ class MasterService {
         const std::chrono::system_clock::time_point& now);
     void FreeDfsReplicas(const std::string& key,
                          const std::vector<Replica>& replicas);
-    void RunDfsEviction();
+    // Returns true when DFS eviction stopped at its per-tick budget and should
+    // be scheduled again without waiting for the normal maintenance interval.
+    bool RunDfsEviction();
     void ProcessInvalidatedDfsBuckets();
     // Whole-bucket eviction (BUCKET mode). Uses a strict two-phase protocol:
     // validate every candidate first and only mutate metadata once all of them
     // are accepted, so a bucket file is never deleted while the master still
     // hands out a descriptor into it.
-    void RunBucketDfsEviction();
+    bool RunBucketDfsEviction();
     bool RunBucketDfsEvictionInternal(
         bool force_one,
+        bool* more_work = nullptr,
         std::optional<int64_t> invalidated_bucket_id = std::nullopt);
     bool TryRecoverDfsSpaceAfterAllocationFailure();
     // Shard-mode per-key eviction (unchanged behaviour).
