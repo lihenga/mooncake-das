@@ -375,6 +375,11 @@ DistributedStorageBackend::DistributedStorageBackend(
     }
 }
 
+void DistributedStorageBackend::SetReadTaskSizeObserver(
+    std::function<void(uint64_t)> observer) {
+    read_task_size_observer_ = std::move(observer);
+}
+
 DistributedStorageBackend::~DistributedStorageBackend() {
     for (auto& shard : shard_files_) {
         if (shard && fs_adapter_) {
@@ -1017,6 +1022,9 @@ DistributedStorageBackend::PrepareReadTasks(
 void DistributedStorageBackend::ExecuteReadTask(
     const ReadTask& task, const std::vector<DfsReadRequest>& requests,
     std::vector<tl::expected<void, ErrorCode>>& results) {
+    if (IsBucketMode() && read_task_size_observer_) {
+        read_task_size_observer_(task.total_size);
+    }
     if (task.merged || task.entries.size() > 1) {
         ExecuteMergedReadTask(task, requests, results);
     } else {

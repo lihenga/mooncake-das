@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -131,6 +132,8 @@ class DistributedStorageBackend : public StorageBackendInterface {
 
     std::vector<tl::expected<void, ErrorCode>> BatchRead(
         const std::vector<DfsReadRequest>& requests);
+
+    void SetReadTaskSizeObserver(std::function<void(uint64_t)> observer);
 
     // Key-only storage backend operations cannot safely address DFS objects;
     // callers must use BatchRead/BatchWrite with request-scoped descriptors.
@@ -295,6 +298,7 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::unordered_map<int64_t, std::shared_ptr<OpenFileHandle>>
         bucket_id_direct_cache_;
     std::unique_ptr<ThreadPool> batch_read_pool_;
+    std::function<void(uint64_t)> read_task_size_observer_;
 
     bool initialized_ = false;
 };

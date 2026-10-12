@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <iomanip>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -35,6 +36,15 @@ const std::vector<double> kStorageLatencySecondsBucket = {
     0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01,
     0.025,  0.05,    0.1,    0.25,  0.5,    1,     2.5,
     5,      10,      20};
+
+inline const std::vector<double> kDfsBucketReadTaskSizeBytesBucket = [] {
+    std::vector<double> buckets;
+    for (uint64_t size = 16 * 1024; size <= 4 * 1024 * 1024;
+         size += 16 * 1024) {
+        buckets.push_back(static_cast<double>(size));
+    }
+    return buckets;
+}();
 
 static inline std::string get_env_or_default(
     const char* env_var, const std::string& default_val = "") {
@@ -748,12 +758,29 @@ struct SsdMetric {
     }
 };
 
+struct DfsBucketMetric {
+    explicit DfsBucketMetric(std::map<std::string, std::string> labels = {})
+        : read_task_size_bytes(
+              "mooncake_dfs_bucket_read_task_size_bytes",
+              "DFS bucket-file read task size distribution in bytes",
+              kDfsBucketReadTaskSizeBytesBucket, labels) {}
+
+    ylt::metric::histogram_t read_task_size_bytes;
+
+    void ObserveReadTaskSize(uint64_t bytes) {
+        read_task_size_bytes.observe(bytes);
+    }
+
+    void serialize(std::string& str) { read_task_size_bytes.serialize(str); }
+};
+
 struct ClientMetric {
     TransferMetric transfer_metric;
     MasterClientMetric master_client_metric;
     TransferOperationMetric transfer_operation_metric;
     DirectStorageMetric direct_storage_metric;
     SsdMetric ssd_metric;
+    std::shared_ptr<DfsBucketMetric> dfs_bucket_metric;
 
     /**
      * @brief Creates a ClientMetric instance based on environment variables
@@ -798,6 +825,10 @@ struct ClientMetric {
                          uint64_t bytes, double duration_seconds) {
         direct_storage_metric.ObserveIo(operation, source, success, bytes,
                                         duration_seconds);
+    }
+
+    void ObserveDfsBucketReadTaskSize(uint64_t bytes) {
+        dfs_bucket_metric->ObserveReadTaskSize(bytes);
     }
 
     void serialize(std::string& str);

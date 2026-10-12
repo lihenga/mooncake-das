@@ -4219,6 +4219,14 @@ tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
 
 void Client::SetDfsStorageBackend(
     std::shared_ptr<DistributedStorageBackend> backend) {
+    if (backend && metrics_) {
+        std::weak_ptr<DfsBucketMetric> metric = metrics_->dfs_bucket_metric;
+        backend->SetReadTaskSizeObserver([metric](uint64_t bytes) {
+            if (auto locked = metric.lock()) {
+                locked->ObserveReadTaskSize(bytes);
+            }
+        });
+    }
     dfs_storage_backend_ = std::move(backend);
     EnsureStorageControlPlaneStarted();
 }
