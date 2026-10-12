@@ -27,6 +27,7 @@
 #include "count_min_sketch.h"
 #include "local_hot_cache.h"
 #include "pinned_buffer_pool.h"
+#include "client_buffer.h"
 
 namespace mooncake {
 
@@ -920,6 +921,9 @@ class Client {
                                             const WriteBufferStager& stager);
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
+    struct AsyncDfsWriteContext;
+    std::shared_ptr<AsyncDfsWriteContext> PrepareDfsWriteData(
+        const std::vector<PutOperation>& ops);
 
     /**
      * @brief Perform the DFS writes for a batch.
@@ -937,7 +941,8 @@ class Client {
      *        ReplicaType::ALL and would collide with a deferred completion.
      */
     void SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert = false,
-                         bool allow_async = true);
+                         bool allow_async = true,
+                         std::shared_ptr<AsyncDfsWriteContext> prepared = nullptr);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
     void StartBatchUpsert(std::vector<PutOperation>& ops,
                           const ReplicateConfig& config);
@@ -948,7 +953,9 @@ class Client {
     std::vector<ErrorCode> WriteDfsReplicas(
         const std::vector<std::string>& keys,
         const std::vector<const std::vector<Slice>*>& slice_lists,
-        const std::vector<DistributedFSDescriptor>& descriptors);
+        const std::vector<DistributedFSDescriptor>& descriptors,
+        const std::shared_ptr<ClientBufferAllocator>& arena_allocator =
+            nullptr);
 
     /**
      * @brief Everything one asynchronous DFS write batch needs, owned outright.
@@ -959,17 +966,25 @@ class Client {
      * GPU is involved, plain host memory otherwise) before the task is queued,
      * and `slices` points into that storage.
      *
-     * `backend` and `pinned_pool` are held by shared_ptr so the task keeps them
-     * alive even if the Client is torn down while the write is in flight.
+     * The dedicated DFS write arena is preferred for GPU staging. The pinned
+     * pool remains a fallback when the arena has insufficient free space.
+     *
+     * `backend`, `pinned_pool`, and `dfs_write_arena_allocator` are held by
+     * shared_ptr so the task keeps its backing resources alive until the
+     * write completes.
      */
     struct AsyncDfsWriteContext {
         std::vector<std::string> keys;
         std::vector<DistributedFSDescriptor> descriptors;
+        std::vector<size_t> op_indices;
         std::vector<std::vector<Slice>> slices;
+        bool staging_succeeded = true;
         std::vector<PinnedBufferPool::Buffer> staging;
+        std::vector<BufferHandle> arena_staging;
         std::vector<std::vector<char>> host_staging;
         std::shared_ptr<DistributedStorageBackend> backend;
         std::shared_ptr<PinnedBufferPool> pinned_pool;
+        std::shared_ptr<ClientBufferAllocator> dfs_write_arena_allocator;
         bool is_upsert = false;
 
         ~AsyncDfsWriteContext();
@@ -1050,10 +1065,12 @@ class Client {
     const bool object_checksum_enabled_;
 
     // Client persistent thread pool for async operations
-    // Pinned host memory pool for GPU D2H staging. Held by shared_ptr so an
-    // in-flight async DFS write keeps it alive even while the Client is being
-    // destroyed.
+    // Pinned host memory pool and dedicated DFS write arena for GPU staging.
+    // The arena is allocated once at Client startup when configured; the pool
+    // handles requests that do not fit in the arena.
     std::shared_ptr<PinnedBufferPool> pinned_buffer_pool_;
+    PinnedBufferPool::Buffer dfs_write_arena_;
+    std::shared_ptr<ClientBufferAllocator> dfs_write_arena_allocator_;
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;

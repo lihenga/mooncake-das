@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <future>
 #include <iomanip>
 #include <limits>
 #ifdef USE_NOF
@@ -457,6 +458,25 @@ Client::Client(const std::string& local_hostname,
     }
     if (object_checksum_enabled_) {
         LOG(INFO) << "Object checksum validation is enabled";
+    }
+
+    const size_t dfs_write_arena_size = Environ::GetSizeT(
+        "MC_STORE_DFS_WRITE_ARENA_SIZE_BYTES", 0);
+    if (dfs_write_arena_size > 0) {
+        auto arena = PinnedBufferPool::AllocatePinned(dfs_write_arena_size);
+        if (arena.data) {
+            dfs_write_arena_allocator_ = ClientBufferAllocator::create(
+                arena.data, arena.capacity, protocol_, arena.device_data);
+            // Keep the arena allocation alive through the allocator. The
+            // allocator only owns subranges, so the backing buffer must remain
+            // attached to the Client for its entire lifetime.
+            dfs_write_arena_ = std::move(arena);
+            LOG(INFO) << "Initialized DFS write pinned arena, size="
+                      << dfs_write_arena_.capacity;
+        } else {
+            LOG(WARNING) << "Failed to allocate DFS write pinned arena, size="
+                         << dfs_write_arena_size;
+        }
     }
 
     if (metrics_) {
@@ -2033,7 +2053,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             dfs_descriptors.push_back(replica.get_dfs_descriptor());
         }
         for (auto dfs_result :
-             WriteDfsReplicas(dfs_keys, dfs_slices, dfs_descriptors)) {
+             WriteDfsReplicas(dfs_keys, dfs_slices, dfs_descriptors,
+                              dfs_write_arena_allocator_)) {
             if (dfs_result == ErrorCode::OK) {
                 transfer_summary.RecordSuccess(ReplicaType::DFS);
             } else {
@@ -2171,7 +2192,8 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
             dfs_descriptors.push_back(replica.get_dfs_descriptor());
         }
         for (auto dfs_result :
-             WriteDfsReplicas(dfs_keys, dfs_slices, dfs_descriptors)) {
+             WriteDfsReplicas(dfs_keys, dfs_slices, dfs_descriptors,
+                              dfs_write_arena_allocator_)) {
             if (dfs_result == ErrorCode::OK) {
                 transfer_summary.RecordSuccess(ReplicaType::DFS);
             } else {
@@ -2697,7 +2719,8 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
 std::vector<ErrorCode> Client::WriteDfsReplicas(
     const std::vector<std::string>& keys,
     const std::vector<const std::vector<Slice>*>& slice_lists,
-    const std::vector<DistributedFSDescriptor>& descriptors) {
+    const std::vector<DistributedFSDescriptor>& descriptors,
+    const std::shared_ptr<ClientBufferAllocator>& arena_allocator) {
     if (keys.size() != slice_lists.size() ||
         keys.size() != descriptors.size()) {
         return std::vector<ErrorCode>(keys.size(), ErrorCode::INVALID_PARAMS);
@@ -2715,6 +2738,7 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
     std::vector<DfsWriteRequest> requests;
     std::vector<size_t> request_indices;
     std::vector<PinnedBufferPool::Buffer> staging_buffers;
+    std::vector<BufferHandle> arena_staging_buffers;
     requests.reserve(keys.size());
     request_indices.reserve(keys.size());
 
@@ -2741,17 +2765,39 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
             }
 
             device->SetContext(info.device_id);
-            auto buffer = pinned_buffer_pool_->Acquire(slice.size);
-            if (!device->Copy(buffer.data, slice.ptr, slice.size,
-                              device::CopyDirection::kDeviceToHost)) {
-                LOG(ERROR) << "DFS D2H staging failed for key " << keys[i];
-                pinned_buffer_pool_->Release(std::move(buffer));
+            std::optional<BufferHandle> buffer;
+            if (arena_allocator) {
+                buffer = arena_allocator->allocate_aligned(slice.size, 64);
+            }
+            if (buffer) {
+                if (!device->Copy(buffer->ptr(), slice.ptr, slice.size,
+                                  device::CopyDirection::kDeviceToHost)) {
+                    results[i] = ErrorCode::TRANSFER_FAIL;
+                    staging_succeeded = false;
+                    break;
+                }
+                host_slices.emplace_back(Slice{buffer->ptr(), slice.size});
+                arena_staging_buffers.push_back(std::move(*buffer));
+                continue;
+            }
+            auto pinned_buffer = pinned_buffer_pool_->AcquirePinned(slice.size);
+            if (!pinned_buffer.data) {
+                LOG(ERROR) << "Failed to acquire pinned staging buffer for key "
+                           << keys[i];
                 results[i] = ErrorCode::TRANSFER_FAIL;
                 staging_succeeded = false;
                 break;
             }
-            host_slices.emplace_back(Slice{buffer.data, slice.size});
-            staging_buffers.push_back(std::move(buffer));
+            if (!device->Copy(pinned_buffer.data, slice.ptr, slice.size,
+                              device::CopyDirection::kDeviceToHost)) {
+                LOG(ERROR) << "DFS D2H staging failed for key " << keys[i];
+                pinned_buffer_pool_->Release(std::move(pinned_buffer));
+                results[i] = ErrorCode::TRANSFER_FAIL;
+                staging_succeeded = false;
+                break;
+            }
+            host_slices.emplace_back(Slice{pinned_buffer.data, slice.size});
+            staging_buffers.push_back(std::move(pinned_buffer));
         }
         if (!staging_succeeded) {
             continue;
@@ -2849,7 +2895,23 @@ bool Client::StageDfsWriteData(
                 // GPU source: the D2H copy must complete now, while the
                 // caller's device buffer is still guaranteed to be alive.
                 device->SetContext(info.device_id);
-                auto buffer = pinned_buffer_pool_->Acquire(slice.size);
+                auto arena_buffer = context.dfs_write_arena_allocator
+                                        ? context.dfs_write_arena_allocator
+                                              ->allocate_aligned(slice.size, 64)
+                                        : std::nullopt;
+                if (arena_buffer) {
+                    if (!device->Copy(arena_buffer->ptr(), slice.ptr, slice.size,
+                                      device::CopyDirection::kDeviceToHost)) {
+                        LOG(ERROR) << "DFS D2H staging failed for key "
+                                   << context.keys[i];
+                        return false;
+                    }
+                    context.slices[i].push_back(
+                        Slice{arena_buffer->ptr(), slice.size});
+                    context.arena_staging.push_back(std::move(*arena_buffer));
+                    continue;
+                }
+                auto buffer = pinned_buffer_pool_->AcquirePinned(slice.size);
                 if (buffer.data == nullptr) {
                     LOG(ERROR) << "Failed to acquire pinned staging buffer for "
                                   "async DFS write of key "
@@ -2966,8 +3028,46 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
     }
 }
 
+std::shared_ptr<Client::AsyncDfsWriteContext> Client::PrepareDfsWriteData(
+    const std::vector<PutOperation>& ops) {
+    if (!dfs_storage_backend_ ||
+        dfs_storage_backend_->GetAllocatorType() != DfsAllocatorType::BUCKET) {
+        return nullptr;
+    }
+
+    auto context = std::make_shared<AsyncDfsWriteContext>();
+    std::vector<const std::vector<Slice>*> slice_lists;
+    for (size_t i = 0; i < ops.size(); ++i) {
+        const auto& op = ops[i];
+        if (op.IsResolved() || op.transfer_summary.allocated_dfs_replicas == 0 ||
+            !HasExpectedReplicaAllocation(op.ToReplicateConfig(),
+                                          op.transfer_summary)) {
+            continue;
+        }
+        auto dfs_it = std::find_if(op.replicas.begin(), op.replicas.end(),
+                                   [](const Replica::Descriptor& replica) {
+                                       return replica.is_dfs_replica();
+                                   });
+        if (dfs_it == op.replicas.end()) continue;
+        context->keys.push_back(op.key);
+        context->descriptors.push_back(dfs_it->get_dfs_descriptor());
+        context->op_indices.push_back(i);
+        slice_lists.push_back(&op.slices);
+    }
+
+    if (!context->keys.empty()) {
+        context->backend = dfs_storage_backend_;
+        context->pinned_pool = pinned_buffer_pool_;
+        context->dfs_write_arena_allocator = dfs_write_arena_allocator_;
+        context->staging_succeeded =
+            StageDfsWriteData(*context, slice_lists);
+    }
+    return context;
+}
+
 void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
-                             bool allow_async) {
+                             bool allow_async,
+                             std::shared_ptr<AsyncDfsWriteContext> prepared) {
     std::vector<std::string> keys;
     std::vector<const std::vector<Slice>*> slice_lists;
     std::vector<DistributedFSDescriptor> descriptors;
@@ -2978,6 +3078,7 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
 
     for (size_t i = 0; i < ops.size(); ++i) {
         auto& op = ops[i];
+        if (prepared) break;
         if (op.IsResolved() ||
             op.transfer_summary.allocated_dfs_replicas == 0 ||
             !NonDfsTransfersSucceeded(op.transfer_summary)) {
@@ -3008,6 +3109,49 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
         op_indices.push_back(i);
     }
 
+    if (prepared) {
+        if (!prepared->staging_succeeded) {
+            for (const size_t index : prepared->op_indices) {
+                if (NonDfsTransfersSucceeded(ops[index].transfer_summary)) {
+                    ops[index].transfer_summary.RecordFailure(
+                        ReplicaType::DFS, ErrorCode::TRANSFER_FAIL);
+                    ops[index].AppendFailureContext(
+                        "Failed to stage DFS write data");
+                }
+            }
+            return;
+        }
+
+        std::vector<std::string> successful_keys;
+        std::vector<DistributedFSDescriptor> successful_descriptors;
+        std::vector<size_t> successful_indices;
+        std::vector<std::vector<Slice>> successful_slices;
+        successful_keys.reserve(prepared->keys.size());
+        successful_descriptors.reserve(prepared->descriptors.size());
+        successful_indices.reserve(prepared->op_indices.size());
+        successful_slices.reserve(prepared->slices.size());
+
+        for (size_t i = 0; i < prepared->op_indices.size(); ++i) {
+            const size_t index = prepared->op_indices[i];
+            if (!NonDfsTransfersSucceeded(ops[index].transfer_summary)) {
+                continue;
+            }
+            successful_keys.push_back(std::move(prepared->keys[i]));
+            successful_descriptors.push_back(prepared->descriptors[i]);
+            successful_indices.push_back(index);
+            successful_slices.push_back(std::move(prepared->slices[i]));
+        }
+        prepared->keys = std::move(successful_keys);
+        prepared->descriptors = std::move(successful_descriptors);
+        prepared->op_indices = std::move(successful_indices);
+        prepared->slices = std::move(successful_slices);
+
+        keys = prepared->keys;
+        descriptors = prepared->descriptors;
+        op_indices = prepared->op_indices;
+        slice_lists.clear();
+    }
+
     if (keys.empty()) return;
 
     auto backend = dfs_storage_backend_;
@@ -3030,7 +3174,8 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
     const bool async_write =
         allow_async && backend->GetAllocatorType() == DfsAllocatorType::BUCKET;
     if (!async_write) {
-        auto results = WriteDfsReplicas(keys, slice_lists, descriptors);
+        auto results = WriteDfsReplicas(keys, slice_lists, descriptors,
+                                        dfs_write_arena_allocator_);
         for (size_t i = 0; i < results.size(); ++i) {
             auto& op = ops[op_indices[i]];
             if (results[i] == ErrorCode::OK) {
@@ -3044,23 +3189,28 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
         return;
     }
 
-    auto context = std::make_shared<AsyncDfsWriteContext>();
-    context->keys = keys;
-    context->descriptors = descriptors;
-    context->backend = std::move(backend);
-    context->pinned_pool = pinned_buffer_pool_;
+    auto context = prepared ? std::move(prepared)
+                            : std::make_shared<AsyncDfsWriteContext>();
     context->is_upsert = is_upsert;
+    if (!context->backend) {
+        context->keys = keys;
+        context->descriptors = descriptors;
+        context->op_indices = op_indices;
+        context->backend = backend;
+        context->pinned_pool = pinned_buffer_pool_;
+        context->dfs_write_arena_allocator = dfs_write_arena_allocator_;
 
-    // Copy all payload bytes before returning, so the task never touches the
-    // caller's memory. A staging failure is reported synchronously.
-    if (!StageDfsWriteData(*context, slice_lists)) {
-        for (const size_t index : op_indices) {
-            auto& op = ops[index];
-            op.transfer_summary.RecordFailure(ReplicaType::DFS,
-                                              ErrorCode::TRANSFER_FAIL);
-            op.AppendFailureContext("Failed to stage DFS write data");
+        // Copy all payload bytes before returning, so the task never touches
+        // the caller's memory. A staging failure is reported synchronously.
+        if (!StageDfsWriteData(*context, slice_lists)) {
+            for (const size_t index : op_indices) {
+                auto& op = ops[index];
+                op.transfer_summary.RecordFailure(ReplicaType::DFS,
+                                                  ErrorCode::TRANSFER_FAIL);
+                op.AppendFailureContext("Failed to stage DFS write data");
+            }
+            return;
         }
-        return;
     }
 
     {
@@ -3652,8 +3802,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
 
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
+    auto prepared_dfs = std::async(std::launch::async, [this, &ops] {
+        return PrepareDfsWriteData(ops);
+    });
     WaitForTransfers(ops);
-    SubmitDfsWrites(ops);
+    SubmitDfsWrites(ops, /*is_upsert=*/false, /*allow_async=*/true,
+                    prepared_dfs.get());
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
                   .count();
