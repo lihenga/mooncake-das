@@ -16,8 +16,10 @@ namespace mooncake {
 // Enabled by default; set MC_STORE_CHECKSUM_TIMING=0 to disable diagnostics.
 // Process-wide counters, with no background thread or per-key logging.
 // Counters are cumulative; stages nest, so their times must not be summed.
+// dfs_submit excludes staging, CRC and I/O; dfs_enqueue measures queue handoff.
 enum class ChecksumStage {
     WRITE_CHECKSUM,
+    WRITE_CHECKSUM_REUSED,
     READ_CHECKSUM,
     PREFETCH_CHECKSUM,
     FOREGROUND_CHECKSUM,
@@ -29,6 +31,7 @@ enum class ChecksumStage {
     WRITE_TRANSFER_WAIT,
     WRITE_TRANSFER_MERGED,
     DFS_SUBMIT,
+    DFS_ENQUEUE,
     DFS_STAGE,
     DFS_WRITE_IO,
     WRITE_FINALIZE,
@@ -175,6 +178,7 @@ class ChecksumTiming {
             return;
         }
         static constexpr const char* names[] = {"write_checksum",
+                                                "write_checksum_reused",
                                                 "read_checksum",
                                                 "prefetch_checksum",
                                                 "foreground_checksum",
@@ -186,6 +190,7 @@ class ChecksumTiming {
                                                 "write_transfer_wait",
                                                 "write_transfer_merged",
                                                 "dfs_submit",
+                                                "dfs_enqueue",
                                                 "dfs_stage",
                                                 "dfs_write_io",
                                                 "write_finalize",

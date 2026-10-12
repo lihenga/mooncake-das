@@ -1308,9 +1308,11 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
 
 tl::expected<uint64_t, ErrorCode> Client::ComputeObjectChecksumForSlices(
     const std::string& object_key, const std::vector<Slice>& slices,
-    size_t object_size, bool for_read) {
+    size_t object_size, bool for_read, bool staged_for_dfs) {
     ChecksumTiming timing(
-        for_read ? ChecksumTiming::ReadStage() : ChecksumStage::WRITE_CHECKSUM,
+        for_read ? ChecksumTiming::ReadStage()
+                 : (staged_for_dfs ? ChecksumStage::WRITE_CHECKSUM_REUSED
+                                   : ChecksumStage::WRITE_CHECKSUM),
         object_size);
     CrcChecksum checksum;
     size_t remaining = object_size;
@@ -1328,7 +1330,8 @@ tl::expected<uint64_t, ErrorCode> Client::ComputeObjectChecksumForSlices(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
 
-        if (!runtime_accelerator.FindDeviceForPointer(slice.ptr)) {
+        if (staged_for_dfs ||
+            !runtime_accelerator.FindDeviceForPointer(slice.ptr)) {
             const auto crc_started = timing.StartPart();
             checksum.Update(slice.ptr, bytes);
             timing.AddCrc(crc_started);
@@ -2435,19 +2438,38 @@ std::vector<PutOperation> Client::CreatePutOperations(
 }
 
 void Client::ComputeBatchObjectChecksums(std::vector<PutOperation>& ops) {
-    if (!object_checksum_enabled_) {
+    for (auto& op : ops) {
+        ComputePutObjectChecksum(op, op.slices);
+    }
+}
+
+void Client::ComputePutObjectChecksum(PutOperation& op,
+                                     const std::vector<Slice>& slices,
+                                     bool staged_for_dfs) {
+    if (!object_checksum_enabled_ || op.IsResolved() ||
+        op.object_checksum.has_value()) {
         return;
     }
-    for (auto& op : ops) {
+    try {
         auto checksum_result = ComputeObjectChecksumForSlices(
-            op.key, op.slices, CalculateSliceSize(op.slices));
+            op.key, slices, CalculateSliceSize(op.slices), false,
+            staged_for_dfs);
         if (!checksum_result) {
             op.SetTerminalError(checksum_result.error(),
-                                PutOperationState::MASTER_FAILED,
+                                op.replicas.empty()
+                                    ? PutOperationState::MASTER_FAILED
+                                    : PutOperationState::TRANSFER_FAILED,
                                 "Object checksum calculation failed");
-            continue;
+            return;
         }
         op.object_checksum = *checksum_result;
+    } catch (const std::exception& e) {
+        op.SetTerminalError(ErrorCode::INTERNAL_ERROR,
+                            op.replicas.empty()
+                                ? PutOperationState::MASTER_FAILED
+                                : PutOperationState::TRANSFER_FAILED,
+                            "Object checksum calculation threw: " +
+                                std::string(e.what()));
     }
 }
 
@@ -2860,7 +2882,13 @@ Client::AsyncDfsWriteContext::~AsyncDfsWriteContext() {
 bool Client::StageDfsWriteData(
     AsyncDfsWriteContext& context,
     const std::vector<const std::vector<Slice>*>& slice_lists) {
-    ChecksumTiming timing(ChecksumStage::DFS_STAGE);
+    uint64_t diagnostic_bytes = 0;
+    if (ChecksumTiming::Enabled()) {
+        for (const auto* slices : slice_lists) {
+            if (slices) diagnostic_bytes += CalculateSliceSize(*slices);
+        }
+    }
+    ChecksumTiming timing(ChecksumStage::DFS_STAGE, diagnostic_bytes);
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
 
@@ -2895,31 +2923,40 @@ bool Client::StageDfsWriteData(
                 // GPU source: the D2H copy must complete now, while the
                 // caller's device buffer is still guaranteed to be alive.
                 device->SetContext(info.device_id);
+                const auto staging_started = timing.StartPart();
                 auto buffer = pinned_buffer_pool_->Acquire(slice.size);
+                timing.AddStaging(staging_started);
                 if (buffer.data == nullptr) {
                     LOG(ERROR) << "Failed to acquire pinned staging buffer for "
                                   "async DFS write of key "
                                << context.keys[i];
                     return false;
                 }
-                if (!device->Copy(buffer.data, slice.ptr, slice.size,
-                                  device::CopyDirection::kDeviceToHost)) {
+                // Own the buffer before any later allocation can throw.
+                context.staging.push_back(std::move(buffer));
+                const auto& owned = context.staging.back();
+                const auto d2h_started = timing.StartPart();
+                const bool copied = device->Copy(
+                    owned.data, slice.ptr, slice.size,
+                    device::CopyDirection::kDeviceToHost);
+                timing.AddD2h(d2h_started, slice.size);
+                if (!copied) {
                     LOG(ERROR) << "DFS D2H staging failed for key "
                                << context.keys[i];
-                    pinned_buffer_pool_->Release(std::move(buffer));
                     return false;
                 }
-                context.slices[i].push_back(Slice{buffer.data, slice.size});
-                context.staging.push_back(std::move(buffer));
+                context.slices[i].push_back(Slice{owned.data, slice.size});
                 continue;
             }
 
             // Host source: still copy. The caller may free or overwrite its
             // buffer as soon as BatchPut returns, so referencing it from the
             // background task would be a use-after-free.
+            const auto staging_started = timing.StartPart();
             context.host_staging.emplace_back(slice.size);
             auto& owned = context.host_staging.back();
             std::memcpy(owned.data(), slice.ptr, slice.size);
+            timing.AddStaging(staging_started);
             context.slices[i].push_back(Slice{owned.data(), owned.size()});
         }
     }
@@ -2980,13 +3017,15 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
 
         tl::expected<void, ErrorCode> completion =
             tl::make_unexpected(ErrorCode::RPC_FAIL);
-        std::optional<uint64_t> object_checksum;
+        const auto object_checksum = context->object_checksums[i];
         for (int attempt = 0; attempt < kMaxCompletionAttempts; ++attempt) {
             if (succeeded) {
                 completion =
                     context->is_upsert
-                        ? master_client_.UpsertEnd(ObjectMeta{key, object_checksum}, ReplicaType::DFS)
-                        : master_client_.PutEnd(ObjectMeta{key, object_checksum}, ReplicaType::DFS);
+                        ? master_client_.UpsertEnd(
+                              ObjectMeta{key, object_checksum}, ReplicaType::DFS)
+                        : master_client_.PutEnd(ObjectMeta{key, object_checksum},
+                                                ReplicaType::DFS);
             } else {
                 completion =
                     context->is_upsert
@@ -3078,6 +3117,8 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
     // once the DFS copy is durable. Asynchronous writes are a BUCKET feature.
     const bool async_write =
         allow_async && backend->GetAllocatorType() == DfsAllocatorType::BUCKET;
+    // Staging, CRC and I/O have separate counters; dfs_submit only selects work.
+    timing.Finish();
     if (!async_write) {
         auto results = WriteDfsReplicas(keys, slice_lists, descriptors);
         for (size_t i = 0; i < results.size(); ++i) {
@@ -3093,16 +3134,21 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
         return;
     }
 
-    auto context = std::make_shared<AsyncDfsWriteContext>();
-    context->keys = keys;
-    context->descriptors = descriptors;
-    context->backend = std::move(backend);
-    context->pinned_pool = pinned_buffer_pool_;
-    context->is_upsert = is_upsert;
-
-    // Copy all payload bytes before returning, so the task never touches the
-    // caller's memory. A staging failure is reported synchronously.
-    if (!StageDfsWriteData(*context, slice_lists)) {
+    std::shared_ptr<AsyncDfsWriteContext> context;
+    bool staged = false;
+    try {
+        context = std::make_shared<AsyncDfsWriteContext>();
+        context->keys = keys;
+        context->descriptors = descriptors;
+        context->backend = std::move(backend);
+        context->pinned_pool = pinned_buffer_pool_;
+        context->is_upsert = is_upsert;
+        context->object_checksums.resize(keys.size());
+        staged = StageDfsWriteData(*context, slice_lists);
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to stage async DFS write: " << e.what();
+    }
+    if (!staged) {
         for (const size_t index : op_indices) {
             auto& op = ops[index];
             op.transfer_summary.RecordFailure(ReplicaType::DFS,
@@ -3111,6 +3157,25 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
         }
         return;
     }
+
+    // No End may run until the foreground CRC is ready, even if DFS I/O
+    // finishes before the memory replicas are finalized.
+    bool checksums_ready = true;
+    for (size_t i = 0; i < op_indices.size(); ++i) {
+        auto& op = ops[op_indices[i]];
+        ComputePutObjectChecksum(op, context->slices[i], true);
+        context->object_checksums[i] = op.object_checksum;
+        if (op.IsResolved()) checksums_ready = false;
+    }
+    if (!checksums_ready) {
+        for (const size_t index : op_indices) {
+            ops[index].transfer_summary.RecordFailure(
+                ReplicaType::DFS, ErrorCode::TRANSFER_FAIL);
+        }
+        // FinalizeBatchPut revokes all allocations for terminal CRC errors.
+        return;
+    }
+    ChecksumTiming enqueue_timing(ChecksumStage::DFS_ENQUEUE);
 
     {
         std::lock_guard<std::mutex> lock(dfs_inflight_mutex_);
@@ -3700,7 +3765,25 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         client_cfg.preferred_segment = local_hostname_;
     }
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
-    ComputeBatchObjectChecksums(ops);
+    const bool reuse_dfs_staging =
+        object_checksum_enabled_ && !client_cfg.prefer_alloc_in_same_node &&
+        client_cfg.dfs_replica_num > 0 && dfs_storage_backend_ &&
+        dfs_storage_backend_->GetAllocatorType() == DfsAllocatorType::BUCKET;
+    if (!reuse_dfs_staging) {
+        ComputeBatchObjectChecksums(ops);
+    } else {
+        // Keep checksum's input validation ahead of memory transfers.
+        for (auto& op : ops) {
+            for (const auto& slice : op.slices) {
+                if (slice.size != 0 && slice.ptr == nullptr) {
+                    op.SetTerminalError(ErrorCode::INVALID_PARAMS,
+                                        PutOperationState::MASTER_FAILED,
+                                        "Object checksum has a null slice");
+                    break;
+                }
+            }
+        }
+    }
     if (client_cfg.prefer_alloc_in_same_node) {
         if (auto err = ValidatePreferSameNodeWriteConfig(client_cfg)) {
             return std::vector<tl::expected<void, ErrorCode>>(
@@ -3717,6 +3800,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     SubmitTransfers(ops);
     WaitForTransfers(ops);
     SubmitDfsWrites(ops);
+    // Covers missing DFS allocations, staging/enqueue failures and skipped
+    // DFS writes. Already computed checksums (including zero) are preserved.
+    if (reuse_dfs_staging) ComputeBatchObjectChecksums(ops);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
                   .count();
