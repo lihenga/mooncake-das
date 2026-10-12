@@ -68,6 +68,9 @@ namespace mooncake {
 namespace {
 
 constexpr int kMaxTenantQuotaEvictionRetries = 2;
+constexpr size_t kMaxDfsBucketsPerEvictionTick = 2;
+constexpr size_t kMaxDfsCandidatesPerEvictionTick = 64 * 1024;
+constexpr auto kMaxDfsEvictionTickDuration = std::chrono::milliseconds(20);
 
 // Per-cycle offload cap as a fraction of `offloading_queue_limit_`. Used only
 // when offload-on-evict mode is active. Defers memory eviction for at most
@@ -762,7 +765,10 @@ void MasterService::RunNoFBatchEvictForTesting(double evict_ratio_target,
     NoFBatchEvict(evict_ratio_target, evict_ratio_lowerbound);
 }
 
-void MasterService::RunDfsEvictionForTesting() { RunDfsEviction(); }
+void MasterService::RunDfsEvictionForTesting() {
+    while (RunDfsEviction()) {
+    }
+}
 
 void MasterService::SetNoFProbeFnForTesting(NoFProbeFn fn) {
 #ifdef USE_NOF
@@ -3674,13 +3680,14 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
 auto MasterService::GetReplicaList(const std::string& key,
                                    const TenantId& tenant_id)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
 
     GetReplicaListResponse resp({}, default_kv_lease_ttl_);
     bool promotion_eligible = false;
     bool dynamic_replication_observed = false;
+    std::vector<DistributedFSDescriptor> dfs_accesses;
     {
+        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
         MetadataAccessorRO accessor(this, object_id);
 
         MasterMetricManager::instance().inc_total_get_nums();
@@ -3696,11 +3703,10 @@ auto MasterService::GetReplicaList(const std::string& key,
             [this](const Replica& replica) {
                 return IsReplicaReadable(replica);
             },
-            [this, &key, &replica_list](const Replica& replica) {
+            [&dfs_accesses, &replica_list](const Replica& replica) {
                 replica_list.emplace_back(replica.get_descriptor());
-                if (replica.is_dfs_replica() && dfs_allocator_) {
-                    dfs_allocator_->UpdateAccess(key,
-                                                 replica.get_dfs_descriptor());
+                if (replica.is_dfs_replica()) {
+                    dfs_accesses.push_back(replica.get_dfs_descriptor());
                 }
             });
 
@@ -3762,6 +3768,14 @@ auto MasterService::GetReplicaList(const std::string& key,
         resp = GetReplicaListResponse(std::move(replica_list),
                                       default_kv_lease_ttl_,
                                       metadata.object_checksum);
+    }
+    // Allocator LRU maintenance can wait on bucket/shard allocator locks. Keep
+    // that wait outside the metadata shard lock so a busy DFS allocator does not
+    // block unrelated readers and writers hashed to the same metadata shard.
+    if (dfs_allocator_) {
+        for (const auto& descriptor : dfs_accesses) {
+            dfs_allocator_->UpdateAccess(key, descriptor);
+        }
     }
     // RO accessor released. Safe to take a fresh RW accessor now.
     if (promotion_eligible) {
@@ -5895,7 +5909,8 @@ void MasterService::ProcessInvalidatedDfsBuckets() {
         pending.swap(invalidated_dfs_buckets_);
     }
     for (const int64_t bucket_id : pending) {
-        if (!RunBucketDfsEvictionInternal(/*force_one=*/false, bucket_id)) {
+        if (!RunBucketDfsEvictionInternal(/*force_one=*/false, nullptr,
+                                          bucket_id)) {
             if (bucket_allocator_ != nullptr &&
                 bucket_allocator_->HasBucket(bucket_id)) {
                 std::lock_guard<std::mutex> lock(
@@ -7354,17 +7369,19 @@ void MasterService::RestoreRecoveredDfsReplicas() {
               << " candidates)";
 }
 
-void MasterService::RunDfsEviction() {
-    if (!dfs_allocator_) return;
+bool MasterService::RunDfsEviction() {
+    if (!dfs_allocator_) return false;
     if (bucket_allocator_ != nullptr) {
-        RunBucketDfsEviction();
-        return;
+        return RunBucketDfsEviction();
     }
     RunShardDfsEviction();
+    return false;
 }
 
-void MasterService::RunBucketDfsEviction() {
-    (void)RunBucketDfsEvictionInternal(/*force_one=*/false);
+bool MasterService::RunBucketDfsEviction() {
+    bool more_work = false;
+    (void)RunBucketDfsEvictionInternal(/*force_one=*/false, &more_work);
+    return more_work;
 }
 
 bool MasterService::TryRecoverDfsSpaceAfterAllocationFailure() {
@@ -7384,9 +7401,15 @@ bool MasterService::TryRecoverDfsSpaceAfterAllocationFailure() {
 }
 
 bool MasterService::RunBucketDfsEvictionInternal(
-    bool force_one, std::optional<int64_t> invalidated_bucket_id) {
+    bool force_one, bool* more_work,
+    std::optional<int64_t> invalidated_bucket_id) {
+    if (more_work != nullptr) *more_work = false;
     if (bucket_allocator_ == nullptr) return false;
     const bool invalidating_missing_bucket = invalidated_bucket_id.has_value();
+
+    const auto started_at = std::chrono::steady_clock::now();
+    size_t processed_buckets = 0;
+    size_t candidate_keys = 0;
 
     // Free() defers its metadata write so it never fsyncs under a metadata
     // shard lock. This tick holds no master lock, so it is the right place to
@@ -7400,6 +7423,14 @@ bool MasterService::RunBucketDfsEvictionInternal(
     bool evicted = false;
 
     while (true) {
+        if (!force_one && !invalidating_missing_bucket && processed_buckets > 0 &&
+            (processed_buckets >= kMaxDfsBucketsPerEvictionTick ||
+             candidate_keys >= kMaxDfsCandidatesPerEvictionTick ||
+             std::chrono::steady_clock::now() - started_at >=
+                 kMaxDfsEvictionTickDuration)) {
+            if (more_work != nullptr) *more_work = evicted;
+            return evicted;
+        }
         auto pending = invalidated_bucket_id.has_value()
                            ? bucket_allocator_->PrepareInvalidation(
                                  *invalidated_bucket_id)
@@ -7417,6 +7448,8 @@ bool MasterService::RunBucketDfsEvictionInternal(
         }
 
         const auto& candidates = pending.Candidates();
+        ++processed_buckets;
+        candidate_keys += candidates.size();
         if (candidates.empty()) {
             // A bucket whose entries are all tombstoned has no replicas for the
             // master to validate, so it can be reclaimed immediately.
@@ -9724,10 +9757,12 @@ void MasterService::EvictionThreadFunc() {
             ProcessInvalidatedDfsBuckets();
             const auto steady_now = std::chrono::steady_clock::now();
             if (steady_now >= next_dfs_eviction_time) {
-                RunDfsEviction();
+                const bool more_work = RunDfsEviction();
                 next_dfs_eviction_time =
-                    std::chrono::steady_clock::now() +
-                    dfs_allocator_->GetEvictionCheckInterval();
+                    more_work
+                        ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::now() +
+                              dfs_allocator_->GetEvictionCheckInterval();
             }
         } else if (bucket_allocator_ != nullptr && dfs_allocator_) {
             ProcessInvalidatedDfsBuckets();
