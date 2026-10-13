@@ -29,6 +29,9 @@ struct HipRuntimeApi {
     int (*set_device)(int) = nullptr;
     int (*device_synchronize)() = nullptr;
     int success = 0;
+    int (*malloc_device)(void**, size_t) = nullptr;
+    int (*free_device)(void*) = nullptr;
+    int (*copy_device)(void*, const void*, size_t) = nullptr;
 };
 
 tl::expected<std::shared_ptr<AcceleratorFileIo>, XdsError>

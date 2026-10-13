@@ -163,8 +163,13 @@ class DistributedStorageBackend : public StorageBackendInterface {
     tl::expected<void, XdsError> RegisterXdsBuffer(void* base, size_t length,
                                                   int32_t device_id);
     tl::expected<void, XdsError> UnregisterXdsBuffer(void* base);
+    struct XdsReadStats {
+        uint64_t direct_bytes = 0;
+        uint64_t staging_bytes = 0;
+    };
     std::vector<tl::expected<void, XdsError>> BatchReadRanges(
-        const std::vector<DfsRangeReadRequest>& requests);
+        const std::vector<DfsRangeReadRequest>& requests,
+        XdsReadStats* stats = nullptr);
 
     // Key-only storage backend operations cannot safely address DFS objects;
     // callers must use BatchRead/BatchWrite with request-scoped descriptors.

@@ -40,6 +40,7 @@ struct DirectIoCapabilities {
     uint64_t file_offset_alignment = 4096;
     uint64_t device_address_alignment = 4096;
     uint64_t length_alignment = 4096;
+    bool supports_gpu_staging = false;
 };
 
 struct XdsFileIdentity {
@@ -67,6 +68,9 @@ struct DirectReadOp {
     uint64_t device_offset = 0;
     uint64_t length = 0;
     int32_t device_id = -1;
+    bool staged = false;
+    uint64_t extent_begin = 0;
+    uint64_t extent_end = 0;
 };
 
 struct DirectReadCompletion {
@@ -84,6 +88,14 @@ class AcceleratorFileIo {
         void* base, size_t length, int32_t device_id) = 0;
     virtual tl::expected<DirectReadCompletion, XdsError> Read(
         const DirectReadOp& op) = 0;
+    // op describes only the logical bytes. The covering physical read must
+    // remain in [extent_begin, extent_end); the destination is never rounded.
+    virtual tl::expected<DirectReadCompletion, XdsError> ReadStaged(
+        const DirectReadOp&) {
+        return tl::make_unexpected(XdsError{
+            XdsErrorClass::kNotEligible, XdsTargetState::kUntouched, 0,
+            "gpu-staging-not-supported"});
+    }
     virtual tl::expected<void, XdsError> DeregisterFile(
         XdsFileRegistration registration) = 0;
     virtual tl::expected<void, XdsError> DeregisterBuffer(

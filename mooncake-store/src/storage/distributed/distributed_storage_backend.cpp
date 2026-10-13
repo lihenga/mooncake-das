@@ -1726,7 +1726,8 @@ DistributedStorageBackend::GetXdsFile(
 
 std::vector<tl::expected<void, XdsError>>
 DistributedStorageBackend::BatchReadRanges(
-    const std::vector<DfsRangeReadRequest>& requests) {
+    const std::vector<DfsRangeReadRequest>& requests, XdsReadStats* stats) {
+    if (stats) *stats = {};
     std::vector<tl::expected<void, XdsError>> results(
         requests.size(), tl::make_unexpected(XdsFailure(
                              XdsErrorClass::kContractViolation,
@@ -1860,14 +1861,46 @@ DistributedStorageBackend::BatchReadRanges(
                 break;
             }
             const uintptr_t address = reinterpret_cast<uintptr_t>(range.dst);
-            if (file_offset % capabilities.file_offset_alignment != 0 ||
+            const bool staged =
+                file_offset % capabilities.file_offset_alignment != 0 ||
                 address % capabilities.device_address_alignment != 0 ||
-                range.length % capabilities.length_alignment != 0 ||
-                range.length >
-                    static_cast<uint64_t>(
-                        std::numeric_limits<ssize_t>::max())) {
+                range.length % capabilities.length_alignment != 0;
+            if ((staged && !capabilities.supports_gpu_staging) ||
+                range.length > static_cast<uint64_t>(
+                                   std::numeric_limits<ssize_t>::max())) {
                 error = XdsFailure(XdsErrorClass::kNotEligible,
                                    XdsTargetState::kUntouched, "alignment");
+                valid = false;
+                break;
+            }
+            // Bucket padding is readable, but never cross this object's
+            // allocation or the actual file, even when the logical range fits.
+            constexpr uint64_t alignment = 4096;
+            const auto& descriptor = request.descriptor;
+            const uint64_t max = std::numeric_limits<uint64_t>::max();
+            uint64_t physical_begin = file_offset;
+            uint64_t physical_end = file_offset + range.length;
+            if (staged && physical_end <= max - (alignment - 1)) {
+                physical_begin = file_offset / alignment * alignment;
+                physical_end = (physical_end + alignment - 1) /
+                               alignment * alignment;
+            } else if (staged) {
+                error = XdsFailure(XdsErrorClass::kContractViolation,
+                                   XdsTargetState::kUntouched,
+                                   "covering-range-overflow");
+                valid = false;
+                break;
+            }
+            struct stat info {};
+            if (descriptor.aligned_size > max - descriptor.offset ||
+                physical_begin < descriptor.offset ||
+                physical_end > descriptor.offset + descriptor.aligned_size ||
+                ::fstat(file->registration.fd, &info) != 0 ||
+                info.st_size < 0 ||
+                physical_end > static_cast<uint64_t>(info.st_size)) {
+                error = XdsFailure(XdsErrorClass::kContractViolation,
+                                   XdsTargetState::kUntouched,
+                                   "physical-range-bounds");
                 valid = false;
                 break;
             }
@@ -1878,10 +1911,12 @@ DistributedStorageBackend::BatchReadRanges(
             }
             DirectReadOp operation{
                 file->registration, pin->registration, file_offset,
-                address - pin->base, range.length, range.device_id};
+                address - pin->base, range.length, range.device_id, staged,
+                descriptor.offset, descriptor.offset + descriptor.aligned_size};
             if (!plan.operations.empty()) {
                 auto& previous = plan.operations.back();
                 const bool contiguous =
+                    previous.staged == operation.staged &&
                     previous.file.id == operation.file.id &&
                     previous.buffer.id == operation.buffer.id &&
                     previous.device_id == operation.device_id &&
@@ -1905,7 +1940,9 @@ DistributedStorageBackend::BatchReadRanges(
         }
         if (valid) {
             for (const auto& operation : plan.operations) {
-                if (operation.length < distributed_config_.xds_min_read_size) {
+                if (operation.length < distributed_config_.xds_min_read_size &&
+                    !(distributed_config_.xds_mode == XdsMode::kRequired &&
+                      !distributed_config_.xds_allow_request_fallback)) {
                     error = XdsFailure(XdsErrorClass::kNotEligible,
                                        XdsTargetState::kUntouched,
                                        "below-min-read");
@@ -1942,10 +1979,18 @@ DistributedStorageBackend::BatchReadRanges(
                 "xds-backend-fatal");
         }
         if (!plan.error) {
+            bool wrote_target = false;
             for (const auto& operation : plan.operations) {
-                auto completion = accelerator->Read(operation);
+                auto completion = operation.staged
+                    ? accelerator->ReadStaged(operation)
+                    : accelerator->Read(operation);
                 if (!completion) {
                     plan.error = completion.error();
+                    if (wrote_target && plan.error->target_state ==
+                                            XdsTargetState::kUntouched) {
+                        plan.error->target_state =
+                            XdsTargetState::kStoppedSafeToOverwrite;
+                    }
                     const auto& error = *plan.error;
                     if (error.error_class == XdsErrorClass::kBackendFatal ||
                         error.target_state ==
@@ -1953,6 +1998,12 @@ DistributedStorageBackend::BatchReadRanges(
                         std::lock_guard<std::mutex> lock(xds_mutex_);
                         xds_fatal_ = true;
                         execution_fatal = true;
+                        if (error.target_state ==
+                            XdsTargetState::kUnknownMayStillBeWritten) {
+                            for (const auto& pin : plan.pins) {
+                                pin->quarantined = true;
+                            }
+                        }
                     }
                     break;
                 }
@@ -1961,6 +2012,11 @@ DistributedStorageBackend::BatchReadRanges(
                         XdsErrorClass::kTransientIo,
                         XdsTargetState::kStoppedSafeToOverwrite, "short-read");
                     break;
+                }
+                wrote_target = true;
+                if (stats) {
+                    (operation.staged ? stats->staging_bytes
+                                      : stats->direct_bytes) += completion->bytes;
                 }
             }
         }

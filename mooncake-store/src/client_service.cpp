@@ -4191,7 +4191,17 @@ tl::expected<void, XdsError> Client::UnregisterXdsBuffer(void* base) {
 std::vector<tl::expected<void, XdsError>> Client::BatchReadDfsRanges(
     const std::vector<DfsRangeReadRequest>& requests) {
     if (dfs_storage_backend_) {
-        return dfs_storage_backend_->BatchReadRanges(requests);
+        DistributedStorageBackend::XdsReadStats stats;
+        auto results = dfs_storage_backend_->BatchReadRanges(requests, &stats);
+        if (stats.direct_bytes) {
+            ObserveDirectIo("read", "dfs_xds_direct", true,
+                            stats.direct_bytes, 0);
+        }
+        if (stats.staging_bytes) {
+            ObserveDirectIo("read", "dfs_xds_staging", true,
+                            stats.staging_bytes, 0);
+        }
+        return results;
     }
     return std::vector<tl::expected<void, XdsError>>(
         requests.size(), tl::make_unexpected(XdsError{

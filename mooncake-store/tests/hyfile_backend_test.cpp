@@ -6,6 +6,8 @@
 #include <unistd.h>
 
 #include <cstdlib>
+#include <cstring>
+#include <vector>
 #include <limits>
 #include <memory>
 #include <string>
@@ -27,6 +29,15 @@ struct FakeState {
     int set_device_result = 0;
     int synchronize_result = 0;
     int device_count = 1;
+    int malloc_calls = 0;
+    int malloc_result = 0;
+    bool misalign_allocation = false;
+    int free_calls = 0;
+    int copy_calls = 0;
+    int copy_result = 0;
+    int fail_sync_call = 0;
+    bool fill_reads = false;
+    std::vector<void*> allocations;
     bool return_requested_length = true;
     ssize_t read_result = 0;
 
@@ -89,10 +100,20 @@ abi::Error BufferDeregister(void* base) {
     return fake_state->buffer_deregister_result;
 }
 
-ssize_t Read(abi::FileHandle, void*, size_t size,
+ssize_t Read(abi::FileHandle, void* base, size_t size,
              unsigned long long file_offset,
              unsigned long long device_offset) {
     ++fake_state->read_calls;
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(base) % 4096, 0u);
+    EXPECT_EQ(size % 4096, 0u);
+    EXPECT_EQ(file_offset % 4096, 0u);
+    EXPECT_EQ(device_offset % 4096, 0u);
+    if (fake_state->fill_reads) {
+        for (size_t i = 0; i < size; ++i) {
+            static_cast<unsigned char*>(base)[device_offset + i] =
+                static_cast<unsigned char>((file_offset + i) % 251);
+        }
+    }
     fake_state->last_size = size;
     fake_state->last_file_offset = file_offset;
     fake_state->last_device_offset = device_offset;
@@ -114,7 +135,34 @@ int SetDevice(int device_id) {
 
 int DeviceSynchronize() {
     ++fake_state->synchronize_calls;
-    return fake_state->synchronize_result;
+    return fake_state->fail_sync_call == fake_state->synchronize_calls
+               ? 9 : fake_state->synchronize_result;
+}
+
+int MallocDevice(void** base, size_t length) {
+    ++fake_state->malloc_calls;
+    EXPECT_EQ(length, 4u * 1024 * 1024);
+    if (fake_state->malloc_result != 0) return fake_state->malloc_result;
+    const int result = ::posix_memalign(base, 4096, length + 4096);
+    if (result == 0) {
+        fake_state->allocations.push_back(*base);
+        if (fake_state->misalign_allocation) {
+            *base = static_cast<char*>(*base) + 1;
+        }
+    }
+    return result;
+}
+
+int FreeDevice(void*) {
+    ++fake_state->free_calls;
+    // The fixture owns fake allocations, including quarantined ones.
+    return 0;
+}
+
+int CopyDevice(void* dst, const void* src, size_t length) {
+    ++fake_state->copy_calls;
+    if (fake_state->copy_result == 0) std::memcpy(dst, src, length);
+    return fake_state->copy_result;
 }
 
 abi::Api CompleteApi() {
@@ -125,7 +173,8 @@ abi::Api CompleteApi() {
 
 xds::testing::HipRuntimeApi CompleteHipApi() {
     return xds::testing::HipRuntimeApi{GetDeviceCount, SetDevice,
-                                       DeviceSynchronize, 0};
+                                       DeviceSynchronize, 0, MallocDevice,
+                                       FreeDevice, CopyDevice};
 }
 
 std::string RuntimeIdentity() {
@@ -157,6 +206,7 @@ class DirectFile {
         const int temporary_fd = ::mkstemp(path);
         if (temporary_fd < 0) return;
         path_ = path;
+        (void)::ftruncate(temporary_fd, 16 * 1024 * 1024);
         (void)::close(temporary_fd);
         fd_ = ::open(path_.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
     }
@@ -186,6 +236,7 @@ class HyFileBackendTest : public ::testing::Test {
     void SetUp() override { fake_state = &state_; }
     void TearDown() override {
         xds::testing::ResetHyFileProcessRuntimeForTesting();
+        for (void* allocation : state_.allocations) std::free(allocation);
         fake_state = nullptr;
     }
 
@@ -348,6 +399,246 @@ TEST_F(HyFileBackendTest, ReadSyncFailureMarksTargetStateUnknown) {
     state_.synchronize_result = 0;
     ASSERT_TRUE((*backend)->DeregisterFile(*file_registration));
     ASSERT_TRUE((*backend)->DeregisterBuffer(*buffer_registration));
+}
+
+TEST_F(HyFileBackendTest, StagingChunksExactLogicalBytesAndReusesScratch) {
+    DirectFile file;
+    if (!file.valid()) GTEST_SKIP() << "O_DIRECT is unavailable";
+    constexpr size_t capacity = 4 * 1024 * 1024;
+    AlignedMemory memory(capacity + 8192);
+    ASSERT_NE(memory.data(), nullptr);
+    std::memset(memory.data(), 0xff, memory.size());
+    auto backend = Create();
+    ASSERT_TRUE(backend);
+    auto fr = (*backend)->RegisterFile(file.fd(), file.identity());
+    auto br = (*backend)->RegisterBuffer(memory.data(), memory.size(), 0);
+    ASSERT_TRUE(fr);
+    ASSERT_TRUE(br);
+    state_.fill_reads = true;
+    DirectReadOp op{*fr, *br, 4095, 13, capacity + 7, 0,
+                    true, 0, 16 * 1024 * 1024};
+    auto result = (*backend)->ReadStaged(op);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->bytes, op.length);
+    EXPECT_EQ(state_.read_calls, 2);
+    EXPECT_EQ(state_.copy_calls, 2);
+    EXPECT_EQ(state_.malloc_calls, 1);
+    const auto* bytes = static_cast<unsigned char*>(memory.data());
+    for (size_t i = 0; i < memory.size(); ++i) {
+        const unsigned char expected = i >= 13 && i < 13 + op.length
+            ? static_cast<unsigned char>((op.file_offset + i - 13) % 251)
+            : 0xff;
+        ASSERT_EQ(bytes[i], expected) << i;
+    }
+    op.file_offset = 0;
+    op.length = 1;
+    ASSERT_TRUE((*backend)->ReadStaged(op));
+    op.file_offset = op.extent_end - 1;
+    ASSERT_TRUE((*backend)->ReadStaged(op));
+    EXPECT_EQ(state_.malloc_calls, 1);
+    backend->reset();
+    EXPECT_EQ(state_.free_calls, 1);
+    EXPECT_EQ(state_.buffer_deregister_calls, 2);
+}
+
+TEST_F(HyFileBackendTest, StagingRejectsExtentFileBoundsAndUnknownTarget) {
+    DirectFile file;
+    if (!file.valid()) GTEST_SKIP() << "O_DIRECT is unavailable";
+    AlignedMemory memory(4096);
+    auto backend = Create();
+    ASSERT_TRUE(backend);
+    auto fr = (*backend)->RegisterFile(file.fd(), file.identity());
+    auto br = (*backend)->RegisterBuffer(memory.data(), memory.size(), 0);
+    ASSERT_TRUE(fr);
+    ASSERT_TRUE(br);
+    DirectReadOp op{*fr, *br, 1, 0, 1, 0, true, 1, 4096};
+    EXPECT_FALSE((*backend)->ReadStaged(op));
+    op.extent_begin = 0;
+    op.extent_end = 4095;
+    EXPECT_FALSE((*backend)->ReadStaged(op));
+    op.extent_end = 32 * 1024 * 1024;
+    op.file_offset = 16 * 1024 * 1024;
+    EXPECT_FALSE((*backend)->ReadStaged(op));
+    op.file_offset = 1;
+    ++op.buffer.id;
+    EXPECT_FALSE((*backend)->ReadStaged(op));
+    EXPECT_EQ(state_.malloc_calls, 0);
+    EXPECT_EQ(state_.read_calls, 0);
+}
+
+TEST_F(HyFileBackendTest, StagingShortReadNeverCopiesTarget) {
+    DirectFile file;
+    if (!file.valid()) GTEST_SKIP() << "O_DIRECT is unavailable";
+    AlignedMemory memory(4096);
+    auto backend = Create();
+    ASSERT_TRUE(backend);
+    auto fr = (*backend)->RegisterFile(file.fd(), file.identity());
+    auto br = (*backend)->RegisterBuffer(memory.data(), memory.size(), 0);
+    ASSERT_TRUE(fr);
+    ASSERT_TRUE(br);
+    state_.return_requested_length = false;
+    state_.read_result = 2048;
+    DirectReadOp op{*fr, *br, 1, 1, 2000, 0, true, 0, 4096};
+    auto result = (*backend)->ReadStaged(op);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().target_state, XdsTargetState::kUntouched);
+    EXPECT_EQ(state_.copy_calls, 0);
+}
+
+TEST_F(HyFileBackendTest, StagingCopyFailureSynchronizesBeforeReturning) {
+    DirectFile file;
+    if (!file.valid()) GTEST_SKIP() << "O_DIRECT is unavailable";
+    AlignedMemory memory(4096);
+    auto backend = Create();
+    ASSERT_TRUE(backend);
+    auto fr = (*backend)->RegisterFile(file.fd(), file.identity());
+    auto br = (*backend)->RegisterBuffer(memory.data(), memory.size(), 0);
+    ASSERT_TRUE(fr);
+    ASSERT_TRUE(br);
+    state_.copy_result = 7;
+    DirectReadOp op{*fr, *br, 1, 1, 2000, 0, true, 0, 4096};
+    auto result = (*backend)->ReadStaged(op);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().operation, "hipMemcpy:staging");
+    EXPECT_EQ(result.error().target_state,
+              XdsTargetState::kStoppedSafeToOverwrite);
+    EXPECT_EQ(state_.synchronize_calls, 2);
+}
+
+TEST_F(HyFileBackendTest, StagingReadSyncFailureQuarantinesScratch) {
+    DirectFile file;
+    if (!file.valid()) GTEST_SKIP() << "O_DIRECT is unavailable";
+    AlignedMemory memory(4096);
+    auto backend = Create();
+    ASSERT_TRUE(backend);
+    auto fr = (*backend)->RegisterFile(file.fd(), file.identity());
+    auto br = (*backend)->RegisterBuffer(memory.data(), memory.size(), 0);
+    ASSERT_TRUE(fr);
+    ASSERT_TRUE(br);
+    state_.synchronize_result = 9;
+    DirectReadOp op{*fr, *br, 1, 1, 2000, 0, true, 0, 4096};
+    auto result = (*backend)->ReadStaged(op);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().target_state, XdsTargetState::kUntouched);
+    EXPECT_EQ(state_.copy_calls, 0);
+    EXPECT_FALSE((*backend)->ReadStaged(op));
+    EXPECT_EQ(state_.read_calls, 1);
+    EXPECT_FALSE((*backend)->DeregisterFile(*fr));
+    backend->reset();
+    EXPECT_EQ(state_.free_calls, 0);
+    EXPECT_EQ(state_.handle_deregister_calls, 0);
+}
+
+TEST_F(HyFileBackendTest, StagingCopySyncFailureMarksTargetUnknown) {
+    DirectFile file;
+    if (!file.valid()) GTEST_SKIP() << "O_DIRECT is unavailable";
+    AlignedMemory memory(4096);
+    auto backend = Create();
+    ASSERT_TRUE(backend);
+    auto fr = (*backend)->RegisterFile(file.fd(), file.identity());
+    auto br = (*backend)->RegisterBuffer(memory.data(), memory.size(), 0);
+    ASSERT_TRUE(fr);
+    ASSERT_TRUE(br);
+    state_.fail_sync_call = 2;
+    DirectReadOp op{*fr, *br, 1, 1, 2000, 0, true, 0, 4096};
+    auto result = (*backend)->ReadStaged(op);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().target_state,
+              XdsTargetState::kUnknownMayStillBeWritten);
+    EXPECT_FALSE((*backend)->ReadStaged(op));
+    EXPECT_EQ(state_.read_calls, 1);
+    // A later successful sync permits safe destructor cleanup.
+    backend->reset();
+    EXPECT_EQ(state_.free_calls, 1);
+}
+
+TEST_F(HyFileBackendTest, StagingAllocationsAreBoundedPerDevice) {
+    DirectFile file;
+    if (!file.valid()) GTEST_SKIP() << "O_DIRECT is unavailable";
+    AlignedMemory first(4096);
+    AlignedMemory second(4096);
+    state_.device_count = 2;
+    auto backend = Create();
+    ASSERT_TRUE(backend);
+    auto fr = (*backend)->RegisterFile(file.fd(), file.identity());
+    auto a = (*backend)->RegisterBuffer(first.data(), first.size(), 0);
+    auto b = (*backend)->RegisterBuffer(second.data(), second.size(), 1);
+    ASSERT_TRUE(fr);
+    ASSERT_TRUE(a);
+    ASSERT_TRUE(b);
+    DirectReadOp op{*fr, *a, 1, 1, 1, 0, true, 0, 4096};
+    state_.malloc_result = 7;
+    EXPECT_FALSE((*backend)->ReadStaged(op));
+    EXPECT_EQ(state_.read_calls, 0);
+    state_.malloc_result = 0;
+    ASSERT_TRUE((*backend)->ReadStaged(op));
+    ASSERT_TRUE((*backend)->ReadStaged(op));
+    op.buffer = *b;
+    op.device_id = 1;
+    ASSERT_TRUE((*backend)->ReadStaged(op));
+    ASSERT_TRUE((*backend)->ReadStaged(op));
+    EXPECT_EQ(state_.allocations.size(), 2u);
+    backend->reset();
+    EXPECT_EQ(state_.free_calls, 2);
+}
+
+TEST_F(HyFileBackendTest, StagingChecksActualAllocationAlignment) {
+    DirectFile file;
+    if (!file.valid()) GTEST_SKIP() << "O_DIRECT is unavailable";
+    AlignedMemory memory(4096);
+    auto backend = Create();
+    ASSERT_TRUE(backend);
+    auto fr = (*backend)->RegisterFile(file.fd(), file.identity());
+    auto br = (*backend)->RegisterBuffer(memory.data(), memory.size(), 0);
+    ASSERT_TRUE(fr);
+    ASSERT_TRUE(br);
+    state_.misalign_allocation = true;
+    DirectReadOp op{*fr, *br, 1, 1, 1, 0, true, 0, 4096};
+    auto result = (*backend)->ReadStaged(op);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().operation, "hipMalloc:staging-alignment");
+    EXPECT_EQ(state_.buffer_register_calls, 1);  // Only the target.
+    EXPECT_EQ(state_.read_calls, 0);
+    backend->reset();
+    EXPECT_EQ(state_.free_calls, 1);
+}
+
+TEST_F(HyFileBackendTest, StagingRegistrationFailureRetainsUncertainMapping) {
+    DirectFile file;
+    if (!file.valid()) GTEST_SKIP() << "O_DIRECT is unavailable";
+    AlignedMemory memory(4096);
+    auto backend = Create();
+    ASSERT_TRUE(backend);
+    auto fr = (*backend)->RegisterFile(file.fd(), file.identity());
+    auto br = (*backend)->RegisterBuffer(memory.data(), memory.size(), 0);
+    ASSERT_TRUE(fr);
+    ASSERT_TRUE(br);
+    state_.buffer_register_result = {5011, 0};
+    DirectReadOp op{*fr, *br, 1, 1, 1, 0, true, 0, 4096};
+    EXPECT_FALSE((*backend)->ReadStaged(op));
+    EXPECT_FALSE((*backend)->ReadStaged(op));
+    EXPECT_EQ(state_.malloc_calls, 1);
+    EXPECT_EQ(state_.read_calls, 0);
+    backend->reset();
+    EXPECT_EQ(state_.free_calls, 0);
+}
+
+TEST_F(HyFileBackendTest, StagingCleanupFailureDoesNotFreeRegisteredMemory) {
+    DirectFile file;
+    if (!file.valid()) GTEST_SKIP() << "O_DIRECT is unavailable";
+    AlignedMemory memory(4096);
+    auto backend = Create();
+    ASSERT_TRUE(backend);
+    auto fr = (*backend)->RegisterFile(file.fd(), file.identity());
+    auto br = (*backend)->RegisterBuffer(memory.data(), memory.size(), 0);
+    ASSERT_TRUE(fr);
+    ASSERT_TRUE(br);
+    DirectReadOp op{*fr, *br, 1, 1, 1, 0, true, 0, 4096};
+    ASSERT_TRUE((*backend)->ReadStaged(op));
+    state_.buffer_deregister_result = {5011, 0};
+    backend->reset();
+    EXPECT_EQ(state_.free_calls, 0);
+    EXPECT_EQ(state_.handle_deregister_calls, 0);
 }
 
 TEST_F(HyFileBackendTest, InheritedRuntimeIsUnavailableAfterFork) {

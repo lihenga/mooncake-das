@@ -7377,7 +7377,17 @@ void RealClient::execute_session_dfs_range_reads(
                     0});
             }
             if (!eligible || request.ranges.empty()) {
-                initial_fallback.push_back(entry);
+                if (client_->GetXdsMode() == XdsMode::kRequired &&
+                    !client_->AllowXdsRequestFallback()) {
+                    results[entry->original_idx] =
+                        static_cast<int>(toInt(ErrorCode::TRANSFER_FAIL));
+                } else {
+                    uint64_t fallback_bytes = 0;
+                    for (size_t size : entry->sizes) fallback_bytes += size;
+                    client_->ObserveDirectIo("fallback", "dfs_xds_fallback",
+                                             true, fallback_bytes, 0);
+                    initial_fallback.push_back(entry);
+                }
                 continue;
             }
             direct_entries.push_back(entry);
@@ -7420,12 +7430,16 @@ void RealClient::execute_session_dfs_range_reads(
                     error.target_state ==
                         XdsTargetState::kStoppedSafeToOverwrite;
                 const bool ordinary_auto_fallback =
-                    error.error_class == XdsErrorClass::kNotEligible &&
+                    safe && error.error_class == XdsErrorClass::kNotEligible &&
                     client_->GetXdsMode() == XdsMode::kAuto;
                 const bool policy_fallback =
                     safe && client_->AllowXdsRequestFallback() &&
                     error.error_class != XdsErrorClass::kContractViolation;
                 if (ordinary_auto_fallback || policy_fallback) {
+                    uint64_t fallback_bytes = 0;
+                    for (size_t size : entry->sizes) fallback_bytes += size;
+                    client_->ObserveDirectIo("fallback", "dfs_xds_fallback",
+                                             true, fallback_bytes, 0);
                     initial_fallback.push_back(entry);
                 } else {
                     const auto public_error =

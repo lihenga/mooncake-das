@@ -9,6 +9,7 @@
 #include <glog/logging.h>
 #include <hip/hip_runtime_api.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -115,6 +116,9 @@ struct HipApi {
     int (*set_device)(int) = nullptr;
     int (*device_synchronize)() = nullptr;
     int success = 0;
+    int (*malloc_device)(void**, size_t) = nullptr;
+    int (*free_device)(void*) = nullptr;
+    int (*copy_device)(void*, const void*, size_t) = nullptr;
 };
 
 int HipGetDeviceCount(int* count) {
@@ -129,9 +133,22 @@ int HipDeviceSynchronize() {
     return static_cast<int>(::hipDeviceSynchronize());
 }
 
+int HipMallocDevice(void** base, size_t length) {
+    return static_cast<int>(::hipMalloc(base, length));
+}
+
+int HipFreeDevice(void* base) {
+    return static_cast<int>(::hipFree(base));
+}
+
+int HipCopyDevice(void* dst, const void* src, size_t length) {
+    return static_cast<int>(::hipMemcpy(dst, src, length, hipMemcpyDeviceToDevice));
+}
+
 HipApi ProductionHipApi() {
     return HipApi{HipGetDeviceCount, HipSetDevice, HipDeviceSynchronize,
-                  static_cast<int>(hipSuccess)};
+                  static_cast<int>(hipSuccess), HipMallocDevice, HipFreeDevice,
+                  HipCopyDevice};
 }
 
 bool IsHipApiComplete(const HipApi& api) {
@@ -160,6 +177,7 @@ class HyFileProcessRuntime {
             return;
         }
         std::lock_guard<std::mutex> api_lock(api_mutex_);
+        if (quarantined_) return;  // Keep vendor mappings alive until exit.
         if (driver_opened_) {
             const abi::Error result = api_.driver_close();
             if (!IsSuccess(result)) {
@@ -185,6 +203,8 @@ class HyFileProcessRuntime {
     const HipApi& Hip() const { return hip_api_; }
     std::mutex& ApiMutex() { return api_mutex_; }
     void MarkDriverOpened() { driver_opened_ = true; }
+    void Quarantine() { quarantined_ = true; }  // ApiMutex held.
+    bool IsQuarantined() const { return quarantined_; }  // ApiMutex held.
 
    private:
     std::string identity_;
@@ -194,6 +214,7 @@ class HyFileProcessRuntime {
     HipApi hip_api_;
     pid_t owner_pid_ = 0;
     bool driver_opened_ = false;
+    bool quarantined_ = false;
     std::mutex api_mutex_;
 };
 
@@ -312,6 +333,25 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
         std::lock_guard<std::mutex> api_lock(runtime_->ApiMutex());
         const auto& hip = runtime_->Hip();
         const auto& api = runtime_->Api();
+        for (const auto& [device, scratch] : scratch_) {
+            if (!scratch.base) continue;
+            if (hip.set_device(device) != hip.success ||
+                hip.device_synchronize() != hip.success ||
+                scratch.registration_uncertain) {
+                runtime_->Quarantine();
+                // Retain allocations, registrations and owned file descriptors.
+                return;
+            }
+            if (scratch.registered &&
+                !IsSuccess(api.buffer_deregister(scratch.base))) {
+                runtime_->Quarantine();
+                return;
+            }
+            if (hip.free_device(scratch.base) != hip.success) {
+                runtime_->Quarantine();
+                return;
+            }
+        }
         for (const auto& [_, buffer] : buffers_) {
             const int set_result = hip.set_device(buffer.device_id);
             const int sync_result = set_result == hip.success
@@ -321,16 +361,20 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
                 LOG(ERROR) << "Unable to synchronize xDS buffer during "
                               "shutdown, device="
                            << buffer.device_id << ", code=" << sync_result;
-                continue;
+                runtime_->Quarantine();
+                return;
             }
             const abi::Error result = api.buffer_deregister(buffer.base);
             if (!IsSuccess(result)) {
                 LOG(ERROR) << "hipFileBufDeregister failed during shutdown, "
                            << "code=" << RawCode(result);
+                runtime_->Quarantine();
+                return;
             }
         }
         for (const auto& [_, file] : files_) {
             api.handle_deregister(file.handle);
+            (void)::close(file.owned_fd);
         }
         buffers_.clear();
         files_.clear();
@@ -347,6 +391,8 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
         capabilities.file_offset_alignment = kDirectIoAlignment;
         capabilities.device_address_alignment = kDirectIoAlignment;
         capabilities.length_alignment = kDirectIoAlignment;
+        capabilities.supports_gpu_staging = runtime_->Hip().malloc_device &&
+            runtime_->Hip().free_device && runtime_->Hip().copy_device;
         return capabilities;
     }
 
@@ -389,9 +435,15 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
                 "hipFileHandleRegister:file-identity"));
         }
 
+        const int owned_fd = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
+        if (owned_fd < 0) {
+            return tl::make_unexpected(Failure(
+                XdsErrorClass::kTransientIo, XdsTargetState::kUntouched,
+                "hipFileHandleRegister:dup", errno));
+        }
         abi::FileDescriptor descriptor{};
         descriptor.type = abi::kFileHandleTypeOpaqueFd;
-        descriptor.handle.fd = fd;
+        descriptor.handle.fd = owned_fd;
         descriptor.fs_ops = nullptr;
         abi::FileHandle handle = nullptr;
 
@@ -400,12 +452,13 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
         const abi::Error result =
             runtime_->Api().handle_register(&handle, &descriptor);
         if (!IsSuccess(result)) {
+            (void)::close(owned_fd);
             return tl::make_unexpected(VendorFailure(
                 result, XdsTargetState::kUntouched,
                 "hipFileHandleRegister"));
         }
         const uint64_t id = next_id_++;
-        files_.emplace(id, FileRegistration{handle, fd});
+        files_.emplace(id, FileRegistration{handle, fd, owned_fd});
         return XdsFileRegistration{id, fd};
     }
 
@@ -414,15 +467,31 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
         if (!runtime_->IsCurrentProcess()) {
             return tl::make_unexpected(ForkFailure("hipFileBufRegister:fork"));
         }
-        if (!base || length == 0) {
+        if (!base || length == 0 ||
+            reinterpret_cast<uintptr_t>(base) >
+                std::numeric_limits<uintptr_t>::max() - length) {
             return tl::make_unexpected(Failure(
                 XdsErrorClass::kContractViolation,
                 XdsTargetState::kUntouched,
                 "hipFileBufRegister:arguments"));
         }
-        if (reinterpret_cast<uintptr_t>(base) % kDirectIoAlignment != 0 ||
-            length % kDirectIoAlignment != 0 ||
-            DeviceState(device_id) != DeviceXdsState::kAvailable) {
+        const auto address_remainder =
+            reinterpret_cast<uintptr_t>(base) % kDirectIoAlignment;
+        const auto length_remainder = length % kDirectIoAlignment;
+        const auto device_state = DeviceState(device_id);
+        if (address_remainder != 0 || length_remainder != 0 ||
+            device_state != DeviceXdsState::kAvailable) {
+            LOG(ERROR) << "hipFileBufRegister:eligibility failed"
+                       << " base=" << base << " length=" << length
+                       << " alignment=" << kDirectIoAlignment
+                       << " address_remainder=" << address_remainder
+                       << " length_remainder=" << length_remainder
+                       << " device_id=" << device_id
+                       << " device_count=" << device_states_.size()
+                       << " device_available="
+                       << (device_state == DeviceXdsState::kAvailable)
+                       << " device_state=" << static_cast<int>(device_state)
+                       << " (0=untested,1=available,2=unavailable,3=fatal)";
             return tl::make_unexpected(Failure(
                 XdsErrorClass::kNotEligible, XdsTargetState::kUntouched,
                 "hipFileBufRegister:eligibility"));
@@ -480,6 +549,14 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
 
         std::lock_guard<std::mutex> api_lock(runtime_->ApiMutex());
         const auto& hip = runtime_->Hip();
+        auto scratch = scratch_.find(op.device_id);
+        if (runtime_->IsQuarantined() ||
+            (scratch != scratch_.end() && scratch->second.quarantined)) {
+            return tl::make_unexpected(Failure(
+                XdsErrorClass::kBackendFatal,
+                XdsTargetState::kUnknownMayStillBeWritten,
+                "hipFileRead:quarantined"));
+        }
         const int set_device_result = hip.set_device(op.device_id);
         if (set_device_result != hip.success) {
             return tl::make_unexpected(Failure(
@@ -517,6 +594,158 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
         return DirectReadCompletion{static_cast<uint64_t>(bytes)};
     }
 
+    tl::expected<DirectReadCompletion, XdsError> ReadStaged(
+        const DirectReadOp& op) override {
+        if (!runtime_->IsCurrentProcess()) {
+            return tl::make_unexpected(ForkFailure("gpu-staging:fork"));
+        }
+        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        auto file = files_.find(op.file.id);
+        auto buffer = buffers_.find(op.buffer.id);
+        const uint64_t limit = std::numeric_limits<uint64_t>::max();
+        if (file == files_.end() || buffer == buffers_.end() ||
+            op.file.fd != file->second.fd ||
+            op.buffer.base != buffer->second.base ||
+            op.buffer.length != buffer->second.length ||
+            op.buffer.device_id != buffer->second.device_id ||
+            op.device_id != buffer->second.device_id || op.length == 0 ||
+            op.device_offset > buffer->second.length ||
+            op.length > buffer->second.length - op.device_offset ||
+            op.file_offset > limit - op.length ||
+            op.file_offset + op.length > limit - (kDirectIoAlignment - 1)) {
+            return tl::make_unexpected(Failure(
+                XdsErrorClass::kContractViolation, XdsTargetState::kUntouched,
+                "gpu-staging:arguments"));
+        }
+        const uint64_t begin = op.file_offset / kDirectIoAlignment *
+                               kDirectIoAlignment;
+        const uint64_t end = (op.file_offset + op.length +
+                              kDirectIoAlignment - 1) /
+                             kDirectIoAlignment * kDirectIoAlignment;
+        struct stat info {};
+        if (begin < op.extent_begin || end > op.extent_end ||
+            ::fstat(file->second.owned_fd, &info) != 0 || info.st_size < 0 ||
+            end > static_cast<uint64_t>(info.st_size)) {
+            return tl::make_unexpected(Failure(
+                XdsErrorClass::kContractViolation, XdsTargetState::kUntouched,
+                "gpu-staging:physical-bounds"));
+        }
+        std::lock_guard<std::mutex> api_lock(runtime_->ApiMutex());
+        const auto& hip = runtime_->Hip();
+        const auto& api = runtime_->Api();
+        if (!hip.malloc_device || !hip.free_device || !hip.copy_device) {
+            return tl::make_unexpected(Failure(
+                XdsErrorClass::kNotEligible, XdsTargetState::kUntouched,
+                "gpu-staging:unsupported"));
+        }
+        if (runtime_->IsQuarantined()) {
+            return tl::make_unexpected(Failure(
+                XdsErrorClass::kBackendFatal,
+                XdsTargetState::kUnknownMayStillBeWritten,
+                "gpu-staging:runtime-quarantined"));
+        }
+        auto& scratch = scratch_[op.device_id];
+        if (scratch.quarantined) {
+            return tl::make_unexpected(Failure(
+                XdsErrorClass::kBackendFatal,
+                scratch.target_unknown ? XdsTargetState::kUnknownMayStillBeWritten
+                                       : XdsTargetState::kUntouched,
+                "gpu-staging:quarantined"));
+        }
+        int result = hip.set_device(op.device_id);
+        if (result != hip.success) {
+            return tl::make_unexpected(Failure(
+                XdsErrorClass::kBackendFatal, XdsTargetState::kUntouched,
+                "hipSetDevice:staging", result));
+        }
+        if (!scratch.base) {
+            // Register the actual allocation, never an interior rounded pointer.
+            result = hip.malloc_device(&scratch.base, kScratchCapacity);
+            if (result != hip.success || !scratch.base) {
+                scratch.quarantined = scratch.base != nullptr;
+                scratch.registration_uncertain = scratch.base != nullptr;
+                return tl::make_unexpected(Failure(
+                    XdsErrorClass::kBackendFatal, XdsTargetState::kUntouched,
+                    "hipMalloc:staging", result));
+            }
+            if (reinterpret_cast<uintptr_t>(scratch.base) %
+                    kDirectIoAlignment != 0) {
+                scratch.quarantined = true;
+                return tl::make_unexpected(Failure(
+                    XdsErrorClass::kBackendFatal, XdsTargetState::kUntouched,
+                    "hipMalloc:staging-alignment"));
+            }
+            const auto registered = api.buffer_register(
+                scratch.base, kScratchCapacity, abi::kRdmaRegister);
+            if (!IsSuccess(registered)) {
+                // A failed vendor registration is not assumed to be atomic.
+                scratch.quarantined = true;
+                scratch.registration_uncertain = true;
+                return tl::make_unexpected(VendorFailure(
+                    registered, XdsTargetState::kUntouched,
+                    "hipFileBufRegister:staging"));
+            }
+            scratch.registered = true;
+        }
+        bool copied = false;
+        for (uint64_t offset = begin; offset < end;) {
+            const uint64_t length = std::min<uint64_t>(kScratchCapacity,
+                                                       end - offset);
+            errno = 0;
+            const ssize_t bytes = api.read(file->second.handle, scratch.base,
+                                           length, offset, 0);
+            const int saved_errno = errno;
+            result = hip.device_synchronize();
+            if (result != hip.success) {
+                scratch.quarantined = true;
+                return tl::make_unexpected(Failure(
+                    XdsErrorClass::kBackendFatal,
+                    copied ? XdsTargetState::kStoppedSafeToOverwrite
+                           : XdsTargetState::kUntouched,
+                    "hipDeviceSynchronize:staging-read", result));
+            }
+            if (bytes < 0 || static_cast<uint64_t>(bytes) != length) {
+                return tl::make_unexpected(Failure(
+                    bytes < -abi::kOperationErrorBase &&
+                            bytes >= -static_cast<ssize_t>(
+                                std::numeric_limits<int>::max())
+                        ? ClassifyVendorError(static_cast<int>(-bytes))
+                        : XdsErrorClass::kTransientIo,
+                    copied ? XdsTargetState::kStoppedSafeToOverwrite
+                           : XdsTargetState::kUntouched,
+                    "hipFileRead:staging", bytes == -1 && saved_errno
+                        ? -static_cast<int64_t>(saved_errno) : bytes));
+            }
+            const uint64_t copy_begin = std::max(offset, op.file_offset);
+            const uint64_t copy_end = std::min(offset + length,
+                                               op.file_offset + op.length);
+            const int copy_result = hip.copy_device(
+                static_cast<char*>(buffer->second.base) + op.device_offset +
+                    (copy_begin - op.file_offset),
+                static_cast<char*>(scratch.base) + (copy_begin - offset),
+                copy_end - copy_begin);
+            // Even a failed memcpy may have submitted work.
+            result = hip.device_synchronize();
+            if (result != hip.success) {
+                scratch.quarantined = true;
+                scratch.target_unknown = true;
+                return tl::make_unexpected(Failure(
+                    XdsErrorClass::kBackendFatal,
+                    XdsTargetState::kUnknownMayStillBeWritten,
+                    "hipDeviceSynchronize:staging-copy", result));
+            }
+            if (copy_result != hip.success) {
+                return tl::make_unexpected(Failure(
+                    XdsErrorClass::kBackendFatal,
+                    XdsTargetState::kStoppedSafeToOverwrite,
+                    "hipMemcpy:staging", copy_result));
+            }
+            copied = true;
+            offset += length;
+        }
+        return DirectReadCompletion{op.length};
+    }
+
     tl::expected<void, XdsError> DeregisterFile(
         XdsFileRegistration registration) override {
         if (!runtime_->IsCurrentProcess()) {
@@ -538,7 +767,16 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
                 "hipFileHandleDeregister:registration-mismatch"));
         }
         std::lock_guard<std::mutex> api_lock(runtime_->ApiMutex());
+        for (const auto& [_, scratch] : scratch_) {
+            if (scratch.quarantined) {
+                return tl::make_unexpected(Failure(
+                    XdsErrorClass::kBackendFatal,
+                    XdsTargetState::kUnknownMayStillBeWritten,
+                    "hipFileHandleDeregister:staging-quarantine"));
+            }
+        }
         runtime_->Api().handle_deregister(file->second.handle);
+        (void)::close(file->second.owned_fd);
         files_.erase(file);
         return {};
     }
@@ -591,9 +829,20 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
     }
 
    private:
+    static constexpr size_t kScratchCapacity = 4 * 1024 * 1024;
+    struct Scratch {
+        void* base = nullptr;
+        bool registered = false;
+        bool registration_uncertain = false;
+        bool quarantined = false;
+        bool target_unknown = false;
+    };
+    std::unordered_map<int32_t, Scratch> scratch_;
+
     struct FileRegistration {
         abi::FileHandle handle = nullptr;
         int fd = -1;
+        int owned_fd = -1;
     };
 
     std::shared_ptr<HyFileProcessRuntime> runtime_;
@@ -611,6 +860,11 @@ tl::expected<std::shared_ptr<AcceleratorFileIo>, XdsError> BuildAdapter(
             ForkFailure("hyfile-runtime-inherited-after-fork"));
     }
     std::lock_guard<std::mutex> api_lock(runtime->ApiMutex());
+    if (runtime->IsQuarantined()) {
+        return tl::make_unexpected(Failure(
+            XdsErrorClass::kBackendFatal, XdsTargetState::kUntouched,
+            "hyfile-runtime-quarantined"));
+    }
     int device_count = 0;
     const int result = runtime->Hip().get_device_count(&device_count);
     if (result != runtime->Hip().success || device_count <= 0) {
@@ -646,7 +900,10 @@ CreateHyFileAcceleratorFileIoForTesting(
     const HipApi internal_hip_api{hip_api.get_device_count,
                                   hip_api.set_device,
                                   hip_api.device_synchronize,
-                                  hip_api.success};
+                                  hip_api.success,
+                                  hip_api.malloc_device,
+                                  hip_api.free_device,
+                                  hip_api.copy_device};
     auto runtime = AcquireProcessRuntime(
         runtime_identity, [&]() -> tl::expected<RuntimeSpec, XdsError> {
             return RuntimeSpec{nullptr, false, hyfile_api, internal_hip_api};
