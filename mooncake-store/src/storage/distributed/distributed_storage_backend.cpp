@@ -2017,6 +2017,8 @@ DistributedStorageBackend::BatchReadRanges(
                 if (stats) {
                     (operation.staged ? stats->staging_bytes
                                       : stats->direct_bytes) += completion->bytes;
+                    ++(operation.staged ? stats->staging_completed_ops
+                                        : stats->direct_completed_ops);
                 }
             }
         }

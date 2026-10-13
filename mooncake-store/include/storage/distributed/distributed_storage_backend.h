@@ -166,6 +166,9 @@ class DistributedStorageBackend : public StorageBackendInterface {
     struct XdsReadStats {
         uint64_t direct_bytes = 0;
         uint64_t staging_bytes = 0;
+        // Completed backend operations, not vendor read calls or requests.
+        uint64_t direct_completed_ops = 0;
+        uint64_t staging_completed_ops = 0;
     };
     std::vector<tl::expected<void, XdsError>> BatchReadRanges(
         const std::vector<DfsRangeReadRequest>& requests,

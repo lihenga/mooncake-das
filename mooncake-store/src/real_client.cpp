@@ -7348,6 +7348,14 @@ void RealClient::execute_session_dfs_range_reads(
         std::vector<DfsRangeReadRequest> direct_requests;
         std::vector<SessionRangeReadRequest*> direct_entries;
         std::vector<SessionRangeReadRequest*> initial_fallback;
+        // Aggregate fallback decisions per batch, never per page/chunk. Bytes
+        // describe requested logical data, not completed host I/O.
+        struct FallbackStats {
+            uint64_t logical_bytes = 0;
+            size_t requests = 0;
+        };
+        std::map<std::pair<std::string, XdsTargetState>, FallbackStats>
+            fallback_stats;
         auto runtime = device::GetAcceleratorRegistry().RuntimeAccelerators();
         for (auto* entry : entries) {
             DfsRangeReadRequest request;
@@ -7386,6 +7394,10 @@ void RealClient::execute_session_dfs_range_reads(
                     for (size_t size : entry->sizes) fallback_bytes += size;
                     client_->ObserveDirectIo("fallback", "dfs_xds_fallback",
                                              true, fallback_bytes, 0);
+                    auto& stats = fallback_stats[{
+                        "initial-ineligible", XdsTargetState::kUntouched}];
+                    stats.logical_bytes += fallback_bytes;
+                    ++stats.requests;
                     initial_fallback.push_back(entry);
                 }
                 continue;
@@ -7440,6 +7452,10 @@ void RealClient::execute_session_dfs_range_reads(
                     for (size_t size : entry->sizes) fallback_bytes += size;
                     client_->ObserveDirectIo("fallback", "dfs_xds_fallback",
                                              true, fallback_bytes, 0);
+                    auto& stats =
+                        fallback_stats[{error.operation, error.target_state}];
+                    stats.logical_bytes += fallback_bytes;
+                    ++stats.requests;
                     initial_fallback.push_back(entry);
                 } else {
                     const auto public_error =
@@ -7453,6 +7469,16 @@ void RealClient::execute_session_dfs_range_reads(
                         static_cast<int>(toInt(public_error));
                 }
             }
+        }
+        for (const auto& [reason_state, stats] : fallback_stats) {
+            LOG(INFO) << "[XDS_FALLBACK] reason=" << reason_state.first
+                      << " error_state="
+                      << (reason_state.second == XdsTargetState::kUntouched
+                              ? "untouched"
+                              : "stopped_safe_to_overwrite")
+                      << " logical_bytes=" << stats.logical_bytes
+                      << " requests=" << stats.requests
+                      << " action=host_fallback_scheduled";
         }
         entries = std::move(initial_fallback);
     }

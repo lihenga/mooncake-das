@@ -180,6 +180,8 @@ TEST(XdsBufferRegistryTest, PlansStagingWithinBucketAndRejectsTruncatedCover) {
     EXPECT_EQ(fake->staged_calls, 1);
     EXPECT_EQ(fake->read_calls, 0);
     EXPECT_EQ(stats.staging_bytes, 4094u);
+    EXPECT_EQ(stats.staging_completed_ops, 1u);
+    EXPECT_EQ(stats.direct_completed_ops, 0u);
     EXPECT_EQ(fake->last_staged.file_offset, 4097u);
     EXPECT_EQ(fake->last_staged.device_offset, 1u);
     EXPECT_EQ(fake->last_staged.length, 4094u);
@@ -196,6 +198,8 @@ TEST(XdsBufferRegistryTest, PlansStagingWithinBucketAndRejectsTruncatedCover) {
     EXPECT_EQ(fake->read_calls, 1);
     EXPECT_EQ(stats.direct_bytes, 4096u);
     EXPECT_EQ(stats.staging_bytes, 0u);
+    EXPECT_EQ(stats.direct_completed_ops, 1u);
+    EXPECT_EQ(stats.staging_completed_ops, 0u);
 
     // A later invalid logical range aborts the batch before the valid first
     // request can write anything.
@@ -203,9 +207,13 @@ TEST(XdsBufferRegistryTest, PlansStagingWithinBucketAndRejectsTruncatedCover) {
     invalid.key = "invalid";
     invalid.ranges[0].dst = static_cast<char*>(allocation) + 4096;
     invalid.ranges[0].object_offset = 4095;
-    results = backend->BatchReadRanges({request, invalid});
+    results = backend->BatchReadRanges({request, invalid}, &stats);
     EXPECT_FALSE(results[0]);
     EXPECT_FALSE(results[1]);
+    EXPECT_EQ(stats.direct_completed_ops, 0u);
+    EXPECT_EQ(stats.staging_completed_ops, 0u);
+    EXPECT_EQ(stats.direct_bytes, 0u);
+    EXPECT_EQ(stats.staging_bytes, 0u);
     EXPECT_EQ(fake->staged_calls, 1);
 
     // The logical last byte exists, but its covering 4096-byte read does not.

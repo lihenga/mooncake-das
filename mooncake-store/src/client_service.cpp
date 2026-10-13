@@ -4193,6 +4193,31 @@ std::vector<tl::expected<void, XdsError>> Client::BatchReadDfsRanges(
     if (dfs_storage_backend_) {
         DistributedStorageBackend::XdsReadStats stats;
         auto results = dfs_storage_backend_->BatchReadRanges(requests, &stats);
+        size_t failed_requests = 0;
+        for (const auto& result : results) {
+            if (!result) ++failed_requests;
+        }
+        // These are completed operations, even if another operation in the
+        // same request/batch failed. They do not imply publication to a session.
+        if (stats.direct_completed_ops) {
+            LOG(INFO) << "[XDS_READ_SUCCESS] path=direct logical_bytes="
+                      << stats.direct_bytes
+                      << " completed_ops=" << stats.direct_completed_ops
+                      << " batch_requests=" << requests.size()
+                      << " failed_requests=" << failed_requests;
+        }
+        if (stats.staging_completed_ops) {
+            LOG(INFO) << "[XDS_READ_SUCCESS] path=gpu_staging logical_bytes="
+                      << stats.staging_bytes
+                      << " completed_ops=" << stats.staging_completed_ops
+                      << " batch_requests=" << requests.size()
+                      << " failed_requests=" << failed_requests;
+        }
+        if (failed_requests) {
+            LOG(INFO) << "[XDS_READ_BATCH_FAILURE] batch_requests="
+                      << requests.size()
+                      << " failed_requests=" << failed_requests;
+        }
         if (stats.direct_bytes) {
             ObserveDirectIo("read", "dfs_xds_direct", true,
                             stats.direct_bytes, 0);
