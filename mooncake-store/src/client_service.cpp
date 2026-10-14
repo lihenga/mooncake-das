@@ -447,6 +447,8 @@ Client::Client(const std::string& local_hostname,
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
       object_checksum_enabled_(Environ::Get().GetStoreChecksumEnabled()),
+      dfs_staging_mode_(Environ::GetSizeT(
+          ClientEnvironmentVariables::MC_STORE_DFS_STAGING_MODE.name, 0)),
       pinned_buffer_pool_(std::make_shared<PinnedBufferPool>(Environ::GetSizeT(
           ClientEnvironmentVariables::MC_STORE_DFS_PINNED_POOL_BYTES.name,
           PinnedBufferPool::kDefaultMaxCachedBytes))),
@@ -3819,7 +3821,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         dfs_storage_backend_ &&
         dfs_storage_backend_->GetAllocatorType() == DfsAllocatorType::BUCKET;
     const bool prepare_dfs =
-        bucket_mode && std::any_of(ops.begin(), ops.end(), [](const auto& op) {
+        bucket_mode && dfs_staging_mode_ != 1 &&
+        std::any_of(ops.begin(), ops.end(), [](const auto& op) {
             return !op.IsResolved() &&
                    HasExpectedReplicaAllocation(op.ToReplicateConfig(),
                                                 op.transfer_summary) &&
@@ -3870,7 +3873,23 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
             staging_failed = true;
         }
     }
-    if (staging_failed) {
+
+    if (dfs_staging_mode_ == 1 || dfs_staging_mode_ == 2) {
+        if (dfs_staging_mode_ == 1) {
+            LOG(INFO) << "Skipping DFS staging and write for BatchPut";
+        } else {
+            LOG(INFO) << "Skipping DFS write after DFS staging for BatchPut";
+        }
+        for (auto& op : ops) {
+            if (op.transfer_summary.allocated_dfs_replicas > 0 &&
+                NonDfsTransfersSucceeded(op.transfer_summary) &&
+                (!bucket_mode ||
+                 HasExpectedReplicaAllocation(op.ToReplicateConfig(),
+                                              op.transfer_summary))) {
+                op.transfer_summary.RecordSuccess(ReplicaType::DFS);
+            }
+        }
+    } else if (staging_failed) {
         for (auto& op : ops) {
             if (op.transfer_summary.allocated_dfs_replicas > 0 &&
                 NonDfsTransfersSucceeded(op.transfer_summary)) {

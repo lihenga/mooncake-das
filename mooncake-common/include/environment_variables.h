@@ -13,6 +13,7 @@ namespace mooncake {
 struct ClientEnvironmentVariables {
     MC_DEFINE_ENV_VAR(uint64_t, MC_STORE_DFS_WRITE_ARENA_SIZE_BYTES);
     MC_DEFINE_ENV_VAR(uint64_t, MC_STORE_DFS_PINNED_POOL_BYTES);
+    MC_DEFINE_ENV_VAR(uint64_t, MC_STORE_DFS_STAGING_MODE);
 };
 
 struct FileStorageEnvironmentVariables {

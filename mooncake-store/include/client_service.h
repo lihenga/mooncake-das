@@ -1063,6 +1063,7 @@ class Client {
     const std::string metadata_connstring_;
     const std::string protocol_;
     const bool object_checksum_enabled_;
+    const uint64_t dfs_staging_mode_;
 
     // Client persistent thread pool for async operations
     // Pinned host memory pool and dedicated DFS write arena for GPU staging.
