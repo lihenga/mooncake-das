@@ -5190,6 +5190,20 @@ void Client::StorageHeartbeatThreadMain() {
     // Use another thread to remount segments to avoid blocking the ping
     // thread
     std::future<void> remount_segment_future;
+    uint64_t slow_ping_threshold_us = 0;
+    if (const char* threshold_env =
+            std::getenv("MOONCAKE_TEST_HEARTBEAT_SLOW_PING_US");
+        threshold_env != nullptr && threshold_env[0] != '\0') {
+        char* end = nullptr;
+        const auto parsed = std::strtoull(threshold_env, &end, 10);
+        if (end != threshold_env && *end == '\0') {
+            slow_ping_threshold_us = parsed;
+        }
+    }
+    if (slow_ping_threshold_us > 0) {
+        LOG(INFO) << "[HEARTBEAT-TEST] slow_ping_threshold_us="
+                  << slow_ping_threshold_us;
+    }
 
     while (storage_heartbeat_running_.load()) {
         // Join the remount segment thread if it is ready
@@ -5200,7 +5214,18 @@ void Client::StorageHeartbeatThreadMain() {
         }
 
         // Ping master
+        const auto ping_start = std::chrono::steady_clock::now();
         auto ping_result = master_client_.Ping();
+        const auto ping_latency_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - ping_start)
+                .count();
+        if (slow_ping_threshold_us > 0 &&
+            static_cast<uint64_t>(ping_latency_us) >= slow_ping_threshold_us) {
+            LOG(WARNING) << "[HEARTBEAT-TEST] slow_ping latency_us="
+                         << ping_latency_us
+                         << ", success=" << ping_result.has_value();
+        }
         if (ping_result) {
             // Reset ping failure count
             ping_fail_count = 0;

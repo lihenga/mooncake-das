@@ -10900,6 +10900,20 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // followed by a second scan would cost more than the identities it saves.
     int num_threads = std::min((int)kNumShards, 16);
     size_t shards_per_thread = (kNumShards + num_threads - 1) / num_threads;
+    const char* shard_sleep_env =
+        std::getenv("MOONCAKE_TEST_EVICTION_SHARD_SLEEP_US");
+    uint64_t shard_sleep_us = 0;
+    if (shard_sleep_env != nullptr && shard_sleep_env[0] != '\0') {
+        char* end = nullptr;
+        const auto parsed = std::strtoull(shard_sleep_env, &end, 10);
+        if (end != shard_sleep_env && *end == '\0') {
+            shard_sleep_us = parsed;
+        }
+    }
+    if (shard_sleep_us > 0) {
+        LOG(INFO) << "[EVICT-TEST] shard_sleep_us=" << shard_sleep_us
+                  << ", num_threads=" << num_threads;
+    }
 
     constexpr size_t kMinReserveSlack = 1024;
     constexpr size_t kMinFrontierLimit = 64 * 1024;
@@ -10930,6 +10944,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
             for (size_t s = s_start; s < s_end; s++) {
                 MetadataShardAccessorRW shard(this, s);
                 DiscardExpiredProcessingReplicas(shard, now);
+                if (shard_sleep_us > 0) {
+                    std::this_thread::sleep_for(
+                        std::chrono::microseconds(shard_sleep_us));
+                }
 
                 size_t shard_metadata_count = 0;
                 size_t shard_evictable_count = 0;
