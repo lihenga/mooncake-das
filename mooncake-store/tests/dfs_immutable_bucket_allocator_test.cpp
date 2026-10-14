@@ -536,6 +536,23 @@ TEST(ImmutableBucketAllocatorTest, BatchAllocateRejectsBadRequestsAtomically) {
         }
         EXPECT_FALSE(alloc.GetBucketIdForKey("same").has_value());
     }
+    // Duplicate keys far apart in a larger batch are rejected atomically.
+    {
+        std::vector<BatchAllocateRequest> requests;
+        requests.reserve(4096);
+        for (size_t i = 0; i < 4095; ++i) {
+            requests.push_back({"large_" + std::to_string(i), 10});
+        }
+        requests.push_back({"large_0", 10});
+
+        auto results = alloc.BatchAllocate(requests);
+        ASSERT_EQ(results.size(), requests.size());
+        for (const auto& result : results) {
+            EXPECT_FALSE(result.success);
+            EXPECT_EQ(result.error, ErrorCode::INVALID_PARAMS);
+        }
+        EXPECT_FALSE(alloc.GetBucketIdForKey("large_0").has_value());
+    }
     // Zero size anywhere in the batch fails the whole batch.
     {
         std::vector<BatchAllocateRequest> requests{{"ok", 10}, {"bad", 0}};

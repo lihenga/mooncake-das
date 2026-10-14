@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <system_error>
 #include <tuple>
 #include <unordered_set>
@@ -1175,19 +1176,18 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
     // buckets, but one object must always fit in one bucket. Any failure here is
     // terminal for the whole batch, so the reserve loop below can iterate every
     // request that survived.
-    for (size_t i = 0; i < requests.size(); ++i) {
-        const auto& request = requests[i];
+    std::unordered_set<std::string_view> seen_keys;
+    seen_keys.reserve(requests.size());
+    for (const auto& request : requests) {
         if (request.key.empty() || request.size == 0) {
             fail_all(ErrorCode::INVALID_PARAMS);
             return results;
         }
-        for (size_t j = 0; j < i; ++j) {
-            if (requests[j].key == request.key) {
-                LOG(ERROR) << "Duplicate key " << request.key
-                           << " in DFS batch allocate request";
-                fail_all(ErrorCode::INVALID_PARAMS);
-                return results;
-            }
+        if (!seen_keys.emplace(request.key).second) {
+            LOG(ERROR) << "Duplicate key " << request.key
+                       << " in DFS batch allocate request";
+            fail_all(ErrorCode::INVALID_PARAMS);
+            return results;
         }
         auto layout = ComputeBucketEntryLayout(0, request.size, alignment_);
         if (!layout || layout->aligned_size > bucket_capacity_) {

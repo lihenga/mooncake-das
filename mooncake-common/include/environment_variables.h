@@ -10,6 +10,12 @@ namespace mooncake {
 #define MC_DEFINE_ENV_VAR(Type, Name) \
     inline static constexpr EnvironmentVariable<Type> Name { #Name }
 
+struct ClientEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(uint64_t, MC_STORE_DFS_WRITE_ARENA_SIZE_BYTES);
+    MC_DEFINE_ENV_VAR(uint64_t, MC_STORE_DFS_PINNED_POOL_BYTES);
+    MC_DEFINE_ENV_VAR(uint64_t, MC_STORE_DFS_STAGING_MODE);
+};
+
 struct FileStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_FILE_STORAGE_PATH);

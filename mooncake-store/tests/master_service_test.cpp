@@ -12,16 +12,17 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
-#include <limits>
 #include <optional>
 #include <random>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
-#include <unordered_set>
 
 #include <unistd.h>
 
@@ -87,6 +88,11 @@ class MasterServiceTest : public ::testing::Test {
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
     static constexpr size_t kDefaultSegmentSize = 1024 * 1024 * 16;
     static constexpr uint64_t kStrictTenantQuotaBytes = 4 * 1024 * 1024;
+
+    bool RunBucketDfsEvictionTick(MasterService& service, bool* more_work) {
+        return service.RunBucketDfsEvictionInternal(/*force_one=*/false,
+                                                    more_work);
+    }
 
     void PauseReplicaCleanup(MasterService& service) {
         service.replica_cleanup_worker_.Stop();
@@ -1671,6 +1677,52 @@ TEST_F(MasterServiceTest, DfsBucketEvictionRemovesWholeBucket) {
         auto kept = service.GetReplicaList(keys[2], TenantId::Default());
         ASSERT_TRUE(kept.has_value());
         EXPECT_NE(FindDfsDescriptor(kept->replicas), nullptr);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST_F(MasterServiceTest, DfsBucketEvictionLimitsBucketsPerTick) {
+    const auto root = MakeDfsTestRoot("eviction_budget");
+    ScopedBucketDfsEnv env(root, "4096", "8", "0", "0.5", "0.1");
+
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+
+        std::vector<std::string> keys;
+        for (int i = 0; i < 5; ++i) {
+            keys.push_back("budget_" + std::to_string(i));
+            ASSERT_TRUE(service
+                            .PutStart(context.client_id, keys.back(),
+                                      TenantId::Default(), 100, config)
+                            .has_value());
+            ASSERT_TRUE(service
+                            .PutEnd(context.client_id, keys.back(),
+                                    TenantId::Default(), ReplicaType::ALL)
+                            .has_value());
+        }
+
+        bool more_work = false;
+        EXPECT_TRUE(RunBucketDfsEvictionTick(service, &more_work));
+        EXPECT_TRUE(more_work);
+
+        size_t evicted_dfs_replicas = 0;
+        for (const auto& key : keys) {
+            auto query = service.GetReplicaList(key, TenantId::Default());
+            ASSERT_TRUE(query.has_value()) << key;
+            if (FindDfsDescriptor(query->replicas) == nullptr) {
+                ++evicted_dfs_replicas;
+            }
+        }
+        // The duration budget may stop after the first slow fsync; the bucket
+        // budget guarantees that no more than two complete buckets are handled.
+        EXPECT_GE(evicted_dfs_replicas, 1u);
+        EXPECT_LE(evicted_dfs_replicas, 2u);
     }
 
     std::error_code ec;
