@@ -71,8 +71,10 @@ struct DistributedStorageConfig {
     XdsMode xds_mode = XdsMode::kPosix;
     std::string xds_library_path = "/opt/hyhal/lib/libhyfile.so";
     uint64_t xds_min_read_size = 16384;
+    uint64_t xds_staging_buffer_bytes = 4 * 1024 * 1024;
     size_t xds_file_cache_size = 1024;
     bool xds_allow_request_fallback = true;
+    bool xds_staged_aggregate_dry_run = false;
     // Cleared by FromEnvironment() when the direct-I/O backend name is
     // unknown. Keep this separate from allocator validation so diagnostics
     // identify the actual invalid setting.
@@ -164,8 +166,37 @@ class DistributedStorageBackend : public StorageBackendInterface {
                                                   int32_t device_id);
     tl::expected<void, XdsError> UnregisterXdsBuffer(void* base);
     struct XdsReadStats {
+        // Planned estimates only, including plans that may later fail or never
+        // execute. Never feed these into successful-I/O metrics.
+        struct StagedAggregatePlan {
+            bool enabled = false;
+            bool estimate_valid = true;
+            uint64_t scratch_bytes = 0;
+            uint64_t evaluated_objects = 0;
+            uint64_t skipped_objects = 0;
+            uint64_t staged_ops = 0;
+            uint64_t candidate_windows = 0;
+            uint64_t baseline_calls = 0;
+            uint64_t candidate_calls = 0;
+            uint64_t baseline_physical_bytes = 0;
+            uint64_t candidate_physical_bytes = 0;
+            uint64_t gap_rejections = 0;
+            uint64_t capacity_rejections = 0;
+            uint64_t oversized_ops = 0;
+            bool scratch_unavailable = false;
+            bool arithmetic_overflow = false;
+            bool observation_failed = false;
+        } staged_aggregate_plan;
+        // Successful completed operations only; failed partial attempts are
+        // reported through their XdsError instead of these counters.
         uint64_t direct_bytes = 0;
         uint64_t staging_bytes = 0;
+        uint64_t direct_physical_bytes = 0;
+        uint64_t staging_physical_bytes = 0;
+        uint64_t direct_hipfile_read_calls = 0;
+        uint64_t staging_hipfile_read_calls = 0;
+        uint64_t staging_chunks = 0;
+        uint64_t max_staged_op_bytes = 0;
         // Completed backend operations, not vendor read calls or requests.
         uint64_t direct_completed_ops = 0;
         uint64_t staging_completed_ops = 0;

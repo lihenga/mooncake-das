@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <tuple>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -37,6 +38,97 @@ constexpr int kMaxBucketCreateConcurrency = 8;
 // BatchAllocate output to one read. Larger batches become a few contiguous
 // reads rather than one read per object.
 constexpr uint64_t kMaxMergedIo = 4ULL * 1024 * 1024;
+
+using StagedAggregatePlan =
+    DistributedStorageBackend::XdsReadStats::StagedAggregatePlan;
+
+bool AddPlanned(uint64_t& total, uint64_t value) {
+    if (value > std::numeric_limits<uint64_t>::max() - total) return false;
+    total += value;
+    return true;
+}
+
+// Only the observation copy is sorted. A failed estimate is discarded by the
+// caller, without changing operations, pins, errors, or successful-I/O stats.
+bool EstimateStagedAggregate(const std::vector<DirectReadOp>& operations,
+                             StagedAggregatePlan& stats) {
+    struct Window {
+        uint64_t file;
+        int fd;
+        int32_t device;
+        uint64_t extent_begin;
+        uint64_t extent_end;
+        uint64_t begin;
+        uint64_t end;
+        auto Group() const {
+            return std::tie(file, fd, device, extent_begin, extent_end);
+        }
+    };
+    std::vector<Window> windows;
+    const uint64_t scratch = stats.scratch_bytes;
+    for (const auto& op : operations) {
+        if (!op.staged) continue;
+        constexpr uint64_t alignment = 4096;
+        const uint64_t max = std::numeric_limits<uint64_t>::max();
+        if (op.length > max - op.file_offset) return false;
+        uint64_t end = op.file_offset + op.length;
+        if (end > max - (alignment - 1)) return false;
+        end = (end + alignment - 1) / alignment * alignment;
+        const uint64_t begin = op.file_offset / alignment * alignment;
+        if (begin < op.extent_begin || end > op.extent_end || end <= begin)
+            return false;
+        const uint64_t bytes = end - begin;
+        const uint64_t calls = bytes / scratch + (bytes % scratch != 0);
+        if (!AddPlanned(stats.staged_ops, 1) ||
+            !AddPlanned(stats.baseline_calls, calls) ||
+            !AddPlanned(stats.baseline_physical_bytes, bytes) ||
+            !AddPlanned(stats.candidate_calls, calls) ||
+            !AddPlanned(stats.candidate_physical_bytes, bytes)) return false;
+        if (bytes > scratch) {
+            if (!AddPlanned(stats.oversized_ops, 1)) return false;
+            continue;  // Preserve the exact chunk baseline; do not aggregate.
+        }
+        windows.push_back({op.file.id, op.file.fd, op.device_id, op.extent_begin,
+                           op.extent_end, begin, end});
+    }
+    std::sort(windows.begin(), windows.end(), [](const auto& a, const auto& b) {
+        return std::make_tuple(a.Group(), a.begin, a.end) <
+               std::make_tuple(b.Group(), b.begin, b.end);
+    });
+    for (size_t i = 0; i < windows.size();) {
+        const auto& first = windows[i];
+        uint64_t end = first.end;
+        uint64_t baseline_bytes = end - first.begin;
+        uint64_t count = 1;
+        size_t next = i + 1;
+        for (; next < windows.size(); ++next) {
+            const auto& window = windows[next];
+            if (window.Group() != first.Group()) break;
+            if (window.begin > end) {
+                if (!AddPlanned(stats.gap_rejections, 1)) return false;
+                break;
+            }
+            const uint64_t combined_end = std::max(end, window.end);
+            if (combined_end - first.begin > scratch) {
+                if (!AddPlanned(stats.capacity_rejections, 1)) return false;
+                break;
+            }
+            if (!AddPlanned(baseline_bytes, window.end - window.begin) ||
+                !AddPlanned(count, 1)) return false;
+            end = combined_end;
+        }
+        const uint64_t candidate_bytes = end - first.begin;
+        // Single-op windows keep their original baseline. Every accepted
+        // multi-target window must save calls without increasing bytes.
+        if (count > 1 && candidate_bytes <= baseline_bytes) {
+            if (!AddPlanned(stats.candidate_windows, 1)) return false;
+            stats.candidate_calls -= count - 1;
+            stats.candidate_physical_bytes -= baseline_bytes - candidate_bytes;
+        }
+        i = next;
+    }
+    return AddPlanned(stats.evaluated_objects, 1);
+}
 
 XdsMode ParseXdsMode(const std::string& value, bool* valid) {
     *valid = true;
@@ -197,6 +289,17 @@ bool DistributedStorageConfig::Validate() const {
     if (xds_file_cache_size == 0 || xds_min_read_size == 0) {
         LOG(ERROR) << "DistributedStorageConfig: xDS cache size and minimum "
                       "read size must be positive";
+        return false;
+    }
+    if (xds_staging_buffer_bytes == 0 ||
+        xds_staging_buffer_bytes % 4096 != 0 ||
+        xds_staging_buffer_bytes > std::numeric_limits<size_t>::max() ||
+        xds_staging_buffer_bytes >
+            static_cast<uint64_t>(std::numeric_limits<ssize_t>::max())) {
+        LOG(ERROR) << "DistributedStorageConfig: xDS staging buffer size must "
+                      "be a positive 4096-byte multiple representable by "
+                      "size_t and ssize_t, bytes="
+                   << xds_staging_buffer_bytes;
         return false;
     }
     if (xds_mode != XdsMode::kPosix && xds_library_path.empty()) {
@@ -378,11 +481,17 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
         "MOONCAKE_XDS_LIBRARY_PATH", config.xds_library_path);
     config.xds_min_read_size = Environ::GetUInt64(
         "MOONCAKE_XDS_MIN_READ_SIZE", config.xds_min_read_size);
+    config.xds_staging_buffer_bytes = Environ::GetUInt64(
+        "MOONCAKE_XDS_STAGING_BUFFER_BYTES",
+        config.xds_staging_buffer_bytes);
     config.xds_file_cache_size = static_cast<size_t>(Environ::GetUInt64(
         "MOONCAKE_XDS_FILE_CACHE_SIZE", config.xds_file_cache_size));
     config.xds_allow_request_fallback = Environ::GetBool(
         "MOONCAKE_XDS_ALLOW_REQUEST_FALLBACK",
         config.xds_allow_request_fallback);
+    config.xds_staged_aggregate_dry_run = Environ::GetBool(
+        "MOONCAKE_XDS_STAGED_AGGREGATE_DRY_RUN",
+        config.xds_staged_aggregate_dry_run);
     LOG(INFO) << config.FormatStr();
     return config;
 }
@@ -411,8 +520,10 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", xds_mode=" << ToString(xds_mode)
         << ", xds_library_path=" << xds_library_path
         << ", xds_min_read_size=" << xds_min_read_size
+        << ", xds_staging_buffer_bytes=" << xds_staging_buffer_bytes
         << ", xds_file_cache_size=" << xds_file_cache_size
-        << ", xds_allow_request_fallback=" << xds_allow_request_fallback;
+        << ", xds_allow_request_fallback=" << xds_allow_request_fallback
+        << ", xds_staged_aggregate_dry_run=" << xds_staged_aggregate_dry_run;
     return oss.str();
 }
 
@@ -1727,7 +1838,15 @@ DistributedStorageBackend::GetXdsFile(
 std::vector<tl::expected<void, XdsError>>
 DistributedStorageBackend::BatchReadRanges(
     const std::vector<DfsRangeReadRequest>& requests, XdsReadStats* stats) {
-    if (stats) *stats = {};
+    if (stats) {
+        *stats = {};
+        if (distributed_config_.xds_staged_aggregate_dry_run) {
+            auto& planned = stats->staged_aggregate_plan;
+            planned.enabled = true;
+            planned.estimate_valid = false;
+            planned.skipped_objects = requests.size();
+        }
+    }
     std::vector<tl::expected<void, XdsError>> results(
         requests.size(), tl::make_unexpected(XdsFailure(
                              XdsErrorClass::kContractViolation,
@@ -1965,6 +2084,35 @@ DistributedStorageBackend::BatchReadRanges(
         return results;
     }
 
+    if (stats && distributed_config_.xds_staged_aggregate_dry_run) {
+        auto& planned = stats->staged_aggregate_plan;
+        planned.scratch_bytes = capabilities.staging_buffer_bytes;
+        // HyFile chunks are 4K aligned. Unknown or incompatible adapter
+        // capacity cannot be inferred from the backend's configuration.
+        planned.scratch_unavailable = planned.scratch_bytes == 0 ||
+                                      planned.scratch_bytes % 4096 != 0;
+        if (!planned.scratch_unavailable) {
+            planned.estimate_valid = true;
+            for (const auto& plan : plans) {
+                if (plan.error) continue;
+                try {
+                    auto estimate = planned;
+                    if (EstimateStagedAggregate(plan.operations, estimate)) {
+                        --estimate.skipped_objects;
+                        planned = estimate;
+                    } else {
+                        planned.arithmetic_overflow = true;
+                        planned.estimate_valid = false;
+                    }
+                } catch (...) {
+                    // Observation allocation failure must never affect I/O.
+                    planned.observation_failed = true;
+                    planned.estimate_valid = false;
+                }
+            }
+        }
+    }
+
     // The first version is deliberately synchronous and serial. The vendor
     // implementation is responsible for its process-wide API lock and device
     // synchronization before returning a completion.
@@ -2015,10 +2163,24 @@ DistributedStorageBackend::BatchReadRanges(
                 }
                 wrote_target = true;
                 if (stats) {
-                    (operation.staged ? stats->staging_bytes
-                                      : stats->direct_bytes) += completion->bytes;
-                    ++(operation.staged ? stats->staging_completed_ops
-                                        : stats->direct_completed_ops);
+                    if (operation.staged) {
+                        stats->staging_bytes += completion->bytes;
+                        stats->staging_physical_bytes +=
+                            completion->physical_bytes;
+                        stats->staging_hipfile_read_calls +=
+                            completion->hipfile_read_calls;
+                        stats->staging_chunks += completion->staging_chunks;
+                        stats->max_staged_op_bytes = std::max(
+                            stats->max_staged_op_bytes, completion->bytes);
+                        ++stats->staging_completed_ops;
+                    } else {
+                        stats->direct_bytes += completion->bytes;
+                        stats->direct_physical_bytes +=
+                            completion->physical_bytes;
+                        stats->direct_hipfile_read_calls +=
+                            completion->hipfile_read_calls;
+                        ++stats->direct_completed_ops;
+                    }
                 }
             }
         }

@@ -5721,7 +5721,9 @@ CreateStorageBackend(const FileStorageConfig& config) {
             if (distributed_config.xds_mode != XdsMode::kPosix) {
 #ifdef USE_XDS
                 auto accelerator = CreateHyFileAcceleratorFileIo(
-                    distributed_config.xds_library_path);
+                    distributed_config.xds_library_path,
+                    static_cast<size_t>(
+                        distributed_config.xds_staging_buffer_bytes));
                 if (accelerator) {
                     backend->SetAcceleratorFileIo(std::move(*accelerator));
                 } else if (distributed_config.xds_mode == XdsMode::kRequired) {

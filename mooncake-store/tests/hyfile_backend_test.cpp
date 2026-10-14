@@ -19,6 +19,7 @@ namespace mooncake {
 namespace {
 
 namespace abi = xds::hyfile_abi;
+constexpr size_t kDefaultStagingBufferBytes = 4 * 1024 * 1024;
 
 struct FakeState {
     abi::Error driver_open_result{abi::kSuccess, 0};
@@ -40,6 +41,7 @@ struct FakeState {
     std::vector<void*> allocations;
     bool return_requested_length = true;
     ssize_t read_result = 0;
+    size_t expected_malloc_size = kDefaultStagingBufferBytes;
 
     int driver_open_calls = 0;
     int driver_close_calls = 0;
@@ -141,7 +143,7 @@ int DeviceSynchronize() {
 
 int MallocDevice(void** base, size_t length) {
     ++fake_state->malloc_calls;
-    EXPECT_EQ(length, 4u * 1024 * 1024);
+    EXPECT_EQ(length, fake_state->expected_malloc_size);
     if (fake_state->malloc_result != 0) return fake_state->malloc_result;
     const int result = ::posix_memalign(base, 4096, length + 4096);
     if (result == 0) {
@@ -240,9 +242,12 @@ class HyFileBackendTest : public ::testing::Test {
         fake_state = nullptr;
     }
 
-    tl::expected<std::shared_ptr<AcceleratorFileIo>, XdsError> Create() {
+    tl::expected<std::shared_ptr<AcceleratorFileIo>, XdsError> Create(
+        size_t staging_buffer_bytes = kDefaultStagingBufferBytes) {
+        state_.expected_malloc_size = staging_buffer_bytes;
         return xds::testing::CreateHyFileAcceleratorFileIoForTesting(
-            RuntimeIdentity(), CompleteApi(), CompleteHipApi());
+            RuntimeIdentity(), CompleteApi(), CompleteHipApi(),
+            staging_buffer_bytes);
     }
 
     FakeState state_;
@@ -250,7 +255,8 @@ class HyFileBackendTest : public ::testing::Test {
 
 TEST(HyFileBackendProductionTest, MissingLibraryFailsClosed) {
     auto backend = CreateHyFileAcceleratorFileIo(
-        "/path/that/does/not/exist/libhyfile.so");
+        "/path/that/does/not/exist/libhyfile.so",
+        kDefaultStagingBufferBytes);
     ASSERT_FALSE(backend);
     EXPECT_EQ(backend.error().error_class, XdsErrorClass::kNotEligible);
     EXPECT_EQ(backend.error().target_state, XdsTargetState::kUntouched);
@@ -261,10 +267,19 @@ TEST_F(HyFileBackendTest, MissingRequiredFunctionFailsBeforeDriverOpen) {
     auto api = CompleteApi();
     api.read = nullptr;
     auto backend = xds::testing::CreateHyFileAcceleratorFileIoForTesting(
-        RuntimeIdentity(), api, CompleteHipApi());
+        RuntimeIdentity(), api, CompleteHipApi(),
+        kDefaultStagingBufferBytes);
     ASSERT_FALSE(backend);
     EXPECT_EQ(backend.error().operation, "hyfile-required-symbol-missing");
     EXPECT_EQ(state_.driver_open_calls, 0);
+}
+
+TEST_F(HyFileBackendTest, CapabilitiesReportActualScratchCapacity) {
+    EXPECT_EQ(DirectIoCapabilities{}.staging_buffer_bytes, 0u);
+    auto backend = Create(8192);
+    ASSERT_TRUE(backend);
+    EXPECT_TRUE((*backend)->Capabilities().supports_gpu_staging);
+    EXPECT_EQ((*backend)->Capabilities().staging_buffer_bytes, 8192u);
 }
 
 TEST_F(HyFileBackendTest, ProcessRuntimeOpensAndClosesDriverOnce) {
@@ -280,6 +295,14 @@ TEST_F(HyFileBackendTest, ProcessRuntimeOpensAndClosesDriverOnce) {
     EXPECT_EQ(state_.driver_close_calls, 0);
     xds::testing::ResetHyFileProcessRuntimeForTesting();
     EXPECT_EQ(state_.driver_close_calls, 1);
+}
+
+TEST_F(HyFileBackendTest, RejectsInvalidStagingBufferSizeBeforeDriverOpen) {
+    auto backend = Create(4097);
+    ASSERT_FALSE(backend);
+    EXPECT_EQ(backend.error().error_class, XdsErrorClass::kContractViolation);
+    EXPECT_EQ(backend.error().operation, "hyfile-staging-buffer-size");
+    EXPECT_EQ(state_.driver_open_calls, 0);
 }
 
 TEST_F(HyFileBackendTest, BufferLifecycleSynchronizesBeforeDeregister) {
@@ -404,11 +427,11 @@ TEST_F(HyFileBackendTest, ReadSyncFailureMarksTargetStateUnknown) {
 TEST_F(HyFileBackendTest, StagingChunksExactLogicalBytesAndReusesScratch) {
     DirectFile file;
     if (!file.valid()) GTEST_SKIP() << "O_DIRECT is unavailable";
-    constexpr size_t capacity = 4 * 1024 * 1024;
+    constexpr size_t capacity = 8192;
     AlignedMemory memory(capacity + 8192);
     ASSERT_NE(memory.data(), nullptr);
     std::memset(memory.data(), 0xff, memory.size());
-    auto backend = Create();
+    auto backend = Create(capacity);
     ASSERT_TRUE(backend);
     auto fr = (*backend)->RegisterFile(file.fd(), file.identity());
     auto br = (*backend)->RegisterBuffer(memory.data(), memory.size(), 0);
@@ -420,6 +443,9 @@ TEST_F(HyFileBackendTest, StagingChunksExactLogicalBytesAndReusesScratch) {
     auto result = (*backend)->ReadStaged(op);
     ASSERT_TRUE(result);
     EXPECT_EQ(result->bytes, op.length);
+    EXPECT_EQ(result->physical_bytes, capacity + 8192);
+    EXPECT_EQ(result->hipfile_read_calls, 2u);
+    EXPECT_EQ(result->staging_chunks, 2u);
     EXPECT_EQ(state_.read_calls, 2);
     EXPECT_EQ(state_.copy_calls, 2);
     EXPECT_EQ(state_.malloc_calls, 1);

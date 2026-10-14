@@ -4193,6 +4193,34 @@ std::vector<tl::expected<void, XdsError>> Client::BatchReadDfsRanges(
     if (dfs_storage_backend_) {
         DistributedStorageBackend::XdsReadStats stats;
         auto results = dfs_storage_backend_->BatchReadRanges(requests, &stats);
+        const auto& planned = stats.staged_aggregate_plan;
+        if (planned.enabled) {
+            LOG(INFO) << "[XDS_STAGED_AGG_DRY_RUN] scope=planned"
+                      << " includes_failed_or_unexecuted_plans=1"
+                      << " evaluated_objects=" << planned.evaluated_objects
+                      << " skipped_objects=" << planned.skipped_objects
+                      << " staged_ops=" << planned.staged_ops
+                      << " candidate_windows=" << planned.candidate_windows
+                      << " baseline_calls=" << planned.baseline_calls
+                      << " candidate_calls=" << planned.candidate_calls
+                      << " saved_calls="
+                      << planned.baseline_calls - planned.candidate_calls
+                      << " baseline_physical_bytes="
+                      << planned.baseline_physical_bytes
+                      << " candidate_physical_bytes="
+                      << planned.candidate_physical_bytes
+                      << " saved_physical_bytes="
+                      << planned.baseline_physical_bytes -
+                             planned.candidate_physical_bytes
+                      << " scratch_bytes=" << planned.scratch_bytes
+                      << " gap_rejections=" << planned.gap_rejections
+                      << " capacity_rejections=" << planned.capacity_rejections
+                      << " oversized_ops=" << planned.oversized_ops
+                      << " estimate_valid=" << planned.estimate_valid
+                      << " scratch_unavailable=" << planned.scratch_unavailable
+                      << " arithmetic_overflow=" << planned.arithmetic_overflow
+                      << " observation_failed=" << planned.observation_failed;
+        }
         size_t failed_requests = 0;
         for (const auto& result : results) {
             if (!result) ++failed_requests;
@@ -4202,6 +4230,9 @@ std::vector<tl::expected<void, XdsError>> Client::BatchReadDfsRanges(
         if (stats.direct_completed_ops) {
             LOG(INFO) << "[XDS_READ_SUCCESS] path=direct logical_bytes="
                       << stats.direct_bytes
+                      << " physical_bytes=" << stats.direct_physical_bytes
+                      << " hipfile_read_calls="
+                      << stats.direct_hipfile_read_calls
                       << " completed_ops=" << stats.direct_completed_ops
                       << " batch_requests=" << requests.size()
                       << " failed_requests=" << failed_requests;
@@ -4209,6 +4240,11 @@ std::vector<tl::expected<void, XdsError>> Client::BatchReadDfsRanges(
         if (stats.staging_completed_ops) {
             LOG(INFO) << "[XDS_READ_SUCCESS] path=gpu_staging logical_bytes="
                       << stats.staging_bytes
+                      << " physical_bytes=" << stats.staging_physical_bytes
+                      << " hipfile_read_calls="
+                      << stats.staging_hipfile_read_calls
+                      << " staging_chunks=" << stats.staging_chunks
+                      << " max_op_bytes=" << stats.max_staged_op_bytes
                       << " completed_ops=" << stats.staging_completed_ops
                       << " batch_requests=" << requests.size()
                       << " failed_requests=" << failed_requests;

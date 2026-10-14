@@ -66,6 +66,8 @@ class EnvGuard {
         Save("MOONCAKE_DFS_SHARD_CAPACITY");
         Save("MOONCAKE_DFS_ALIGNMENT");
         Save("MOONCAKE_DFS_SINGLE_TENANT");
+        Save("MOONCAKE_XDS_STAGING_BUFFER_BYTES");
+        Save("MOONCAKE_XDS_STAGED_AGGREGATE_DRY_RUN");
     }
 
     ~EnvGuard() {
@@ -448,6 +450,9 @@ TEST(DistributedStorageConfigTest, ReadsValidatesAndFormatsEnvironment) {
     env.Set("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.65");
     env.Set("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "12");
     env.Set("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL", "3");
+    env.Set("MOONCAKE_XDS_STAGING_BUFFER_BYTES", "8388608");
+    EXPECT_FALSE(DistributedStorageConfig{}.xds_staged_aggregate_dry_run);
+    env.Set("MOONCAKE_XDS_STAGED_AGGREGATE_DRY_RUN", "1");
 
     const auto config = DistributedStorageConfig::FromEnvironment();
     EXPECT_EQ(config.fsdir, tmp.path());
@@ -460,6 +465,11 @@ TEST(DistributedStorageConfigTest, ReadsValidatesAndFormatsEnvironment) {
     EXPECT_DOUBLE_EQ(config.eviction_low_watermark, 0.65);
     EXPECT_EQ(config.deferred_free_duration, std::chrono::seconds(12));
     EXPECT_EQ(config.eviction_check_interval, std::chrono::seconds(3));
+    EXPECT_EQ(config.xds_staging_buffer_bytes, 8u * 1024 * 1024);
+    EXPECT_TRUE(config.xds_staged_aggregate_dry_run);
+    env.Set("MOONCAKE_XDS_STAGED_AGGREGATE_DRY_RUN", "0");
+    EXPECT_FALSE(DistributedStorageConfig::FromEnvironment()
+                     .xds_staged_aggregate_dry_run);
     EXPECT_TRUE(config.Validate());
     EXPECT_TRUE(config.ValidateForAllocator());
 
@@ -468,6 +478,15 @@ TEST(DistributedStorageConfigTest, ReadsValidatesAndFormatsEnvironment) {
     EXPECT_NE(formatted.find("shard_count=8"), std::string::npos);
     EXPECT_NE(formatted.find("eviction_high_watermark=0.85"),
               std::string::npos);
+    EXPECT_NE(formatted.find("xds_staging_buffer_bytes=8388608"),
+              std::string::npos);
+
+    EXPECT_NE(formatted.find("xds_staged_aggregate_dry_run=1"),
+              std::string::npos);
+
+    auto invalid_staging = config;
+    invalid_staging.xds_staging_buffer_bytes = 4097;
+    EXPECT_FALSE(invalid_staging.Validate());
 
     auto invalid_eviction = config;
     invalid_eviction.eviction_low_watermark = 0.9;

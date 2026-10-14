@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <string>
 
@@ -18,7 +19,8 @@ namespace mooncake {
 // created through this factory so ordinary Store builds do not acquire a
 // link-time dependency on libhyfile.so.
 tl::expected<std::shared_ptr<AcceleratorFileIo>, XdsError>
-CreateHyFileAcceleratorFileIo(const std::string& library_path);
+CreateHyFileAcceleratorFileIo(const std::string& library_path,
+                              size_t staging_buffer_bytes = 4 * 1024 * 1024);
 
 #ifdef MOONCAKE_ENABLE_XDS_TEST_HOOKS
 namespace xds::testing {
@@ -37,7 +39,7 @@ struct HipRuntimeApi {
 tl::expected<std::shared_ptr<AcceleratorFileIo>, XdsError>
 CreateHyFileAcceleratorFileIoForTesting(
     const std::string& runtime_identity, const hyfile_abi::Api& hyfile_api,
-    const HipRuntimeApi& hip_api);
+    const HipRuntimeApi& hip_api, size_t staging_buffer_bytes);
 
 void ResetHyFileProcessRuntimeForTesting();
 

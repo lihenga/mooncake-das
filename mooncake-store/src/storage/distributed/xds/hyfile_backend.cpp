@@ -29,6 +29,11 @@ namespace abi = xds::hyfile_abi;
 
 constexpr uint64_t kDirectIoAlignment = 4096;
 
+bool IsValidStagingBufferSize(size_t size) {
+    return size != 0 && size % kDirectIoAlignment == 0 &&
+           size <= static_cast<size_t>(std::numeric_limits<ssize_t>::max());
+}
+
 XdsError Failure(XdsErrorClass error_class, XdsTargetState target_state,
                  std::string operation, int64_t raw_code = 0) {
     return XdsError{error_class, target_state, raw_code, std::move(operation)};
@@ -318,9 +323,11 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
    public:
     HyFileAcceleratorFileIo(
         std::shared_ptr<HyFileProcessRuntime> runtime,
-        std::vector<DeviceXdsState> device_states)
+        std::vector<DeviceXdsState> device_states,
+        size_t staging_buffer_bytes)
         : runtime_(std::move(runtime)),
-          device_states_(std::move(device_states)) {}
+          device_states_(std::move(device_states)),
+          staging_buffer_bytes_(staging_buffer_bytes) {}
 
     ~HyFileAcceleratorFileIo() override {
         std::lock_guard<std::mutex> state_lock(state_mutex_);
@@ -391,6 +398,7 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
         capabilities.file_offset_alignment = kDirectIoAlignment;
         capabilities.device_address_alignment = kDirectIoAlignment;
         capabilities.length_alignment = kDirectIoAlignment;
+        capabilities.staging_buffer_bytes = staging_buffer_bytes_;
         capabilities.supports_gpu_staging = runtime_->Hip().malloc_device &&
             runtime_->Hip().free_device && runtime_->Hip().copy_device;
         return capabilities;
@@ -591,7 +599,8 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
                 error_class, XdsTargetState::kStoppedSafeToOverwrite,
                 "hipFileRead", raw));
         }
-        return DirectReadCompletion{static_cast<uint64_t>(bytes)};
+        return DirectReadCompletion{static_cast<uint64_t>(bytes),
+                                    static_cast<uint64_t>(bytes), 1, 0};
     }
 
     tl::expected<DirectReadCompletion, XdsError> ReadStaged(
@@ -660,7 +669,7 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
         }
         if (!scratch.base) {
             // Register the actual allocation, never an interior rounded pointer.
-            result = hip.malloc_device(&scratch.base, kScratchCapacity);
+            result = hip.malloc_device(&scratch.base, staging_buffer_bytes_);
             if (result != hip.success || !scratch.base) {
                 scratch.quarantined = scratch.base != nullptr;
                 scratch.registration_uncertain = scratch.base != nullptr;
@@ -676,7 +685,7 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
                     "hipMalloc:staging-alignment"));
             }
             const auto registered = api.buffer_register(
-                scratch.base, kScratchCapacity, abi::kRdmaRegister);
+                scratch.base, staging_buffer_bytes_, abi::kRdmaRegister);
             if (!IsSuccess(registered)) {
                 // A failed vendor registration is not assumed to be atomic.
                 scratch.quarantined = true;
@@ -688,8 +697,11 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
             scratch.registered = true;
         }
         bool copied = false;
+        uint64_t physical_bytes = 0;
+        uint64_t hipfile_read_calls = 0;
+        uint64_t staging_chunks = 0;
         for (uint64_t offset = begin; offset < end;) {
-            const uint64_t length = std::min<uint64_t>(kScratchCapacity,
+            const uint64_t length = std::min<uint64_t>(staging_buffer_bytes_,
                                                        end - offset);
             errno = 0;
             const ssize_t bytes = api.read(file->second.handle, scratch.base,
@@ -716,6 +728,9 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
                     "hipFileRead:staging", bytes == -1 && saved_errno
                         ? -static_cast<int64_t>(saved_errno) : bytes));
             }
+            physical_bytes += static_cast<uint64_t>(bytes);
+            ++hipfile_read_calls;
+            ++staging_chunks;
             const uint64_t copy_begin = std::max(offset, op.file_offset);
             const uint64_t copy_end = std::min(offset + length,
                                                op.file_offset + op.length);
@@ -743,7 +758,8 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
             copied = true;
             offset += length;
         }
-        return DirectReadCompletion{op.length};
+        return DirectReadCompletion{op.length, physical_bytes,
+                                    hipfile_read_calls, staging_chunks};
     }
 
     tl::expected<void, XdsError> DeregisterFile(
@@ -829,7 +845,6 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
     }
 
    private:
-    static constexpr size_t kScratchCapacity = 4 * 1024 * 1024;
     struct Scratch {
         void* base = nullptr;
         bool registered = false;
@@ -847,6 +862,7 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
 
     std::shared_ptr<HyFileProcessRuntime> runtime_;
     std::vector<DeviceXdsState> device_states_;
+    const size_t staging_buffer_bytes_;
     uint64_t next_id_ = 1;
     mutable std::mutex state_mutex_;
     std::unordered_map<uint64_t, FileRegistration> files_;
@@ -854,7 +870,13 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
 };
 
 tl::expected<std::shared_ptr<AcceleratorFileIo>, XdsError> BuildAdapter(
-    const std::shared_ptr<HyFileProcessRuntime>& runtime) {
+    const std::shared_ptr<HyFileProcessRuntime>& runtime,
+    size_t staging_buffer_bytes) {
+    if (!IsValidStagingBufferSize(staging_buffer_bytes)) {
+        return tl::make_unexpected(Failure(
+            XdsErrorClass::kContractViolation, XdsTargetState::kUntouched,
+            "hyfile-staging-buffer-size"));
+    }
     if (!runtime->IsCurrentProcess()) {
         return tl::make_unexpected(
             ForkFailure("hyfile-runtime-inherited-after-fork"));
@@ -876,18 +898,25 @@ tl::expected<std::shared_ptr<AcceleratorFileIo>, XdsError> BuildAdapter(
         static_cast<size_t>(device_count), DeviceXdsState::kAvailable);
     return std::static_pointer_cast<AcceleratorFileIo>(
         std::make_shared<HyFileAcceleratorFileIo>(runtime,
-                                                  std::move(device_states)));
+                                                  std::move(device_states),
+                                                  staging_buffer_bytes));
 }
 
 }  // namespace
 
 tl::expected<std::shared_ptr<AcceleratorFileIo>, XdsError>
-CreateHyFileAcceleratorFileIo(const std::string& library_path) {
+CreateHyFileAcceleratorFileIo(const std::string& library_path,
+                              size_t staging_buffer_bytes) {
+    if (!IsValidStagingBufferSize(staging_buffer_bytes)) {
+        return tl::make_unexpected(Failure(
+            XdsErrorClass::kContractViolation, XdsTargetState::kUntouched,
+            "hyfile-staging-buffer-size"));
+    }
     auto runtime = AcquireProcessRuntime(
         library_path,
         [&] { return LoadProductionRuntime(library_path); });
     if (!runtime) return tl::make_unexpected(runtime.error());
-    return BuildAdapter(*runtime);
+    return BuildAdapter(*runtime, staging_buffer_bytes);
 }
 
 #ifdef MOONCAKE_ENABLE_XDS_TEST_HOOKS
@@ -896,7 +925,12 @@ namespace xds::testing {
 tl::expected<std::shared_ptr<AcceleratorFileIo>, XdsError>
 CreateHyFileAcceleratorFileIoForTesting(
     const std::string& runtime_identity, const hyfile_abi::Api& hyfile_api,
-    const HipRuntimeApi& hip_api) {
+    const HipRuntimeApi& hip_api, size_t staging_buffer_bytes) {
+    if (!IsValidStagingBufferSize(staging_buffer_bytes)) {
+        return tl::make_unexpected(Failure(
+            XdsErrorClass::kContractViolation, XdsTargetState::kUntouched,
+            "hyfile-staging-buffer-size"));
+    }
     const HipApi internal_hip_api{hip_api.get_device_count,
                                   hip_api.set_device,
                                   hip_api.device_synchronize,
@@ -909,7 +943,7 @@ CreateHyFileAcceleratorFileIoForTesting(
             return RuntimeSpec{nullptr, false, hyfile_api, internal_hip_api};
         });
     if (!runtime) return tl::make_unexpected(runtime.error());
-    return BuildAdapter(*runtime);
+    return BuildAdapter(*runtime, staging_buffer_bytes);
 }
 
 void ResetHyFileProcessRuntimeForTesting() {

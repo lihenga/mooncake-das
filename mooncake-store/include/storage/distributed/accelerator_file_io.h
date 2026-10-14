@@ -41,6 +41,8 @@ struct DirectIoCapabilities {
     uint64_t device_address_alignment = 4096;
     uint64_t length_alignment = 4096;
     bool supports_gpu_staging = false;
+    // Actual per-read scratch capacity; zero means unknown, not a config default.
+    uint64_t staging_buffer_bytes = 0;
 };
 
 struct XdsFileIdentity {
@@ -74,7 +76,13 @@ struct DirectReadOp {
 };
 
 struct DirectReadCompletion {
+    // Logical bytes delivered to the caller's final device ranges.
     uint64_t bytes = 0;
+    // Bytes submitted to the vendor read API after any alignment expansion.
+    uint64_t physical_bytes = 0;
+    uint64_t hipfile_read_calls = 0;
+    // Non-zero only for the GPU-staging path.
+    uint64_t staging_chunks = 0;
 };
 
 class AcceleratorFileIo {

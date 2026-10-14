@@ -1228,6 +1228,7 @@ id、对齐值和结果。任一目标组合失败时不得在该组合上启用
 | `MOONCAKE_XDS_LIBRARY_PATH` | `/opt/hyhal/lib/libhyfile.so` | 显式动态库路径 |
 | `MOONCAKE_XDS_ALLOW_REQUEST_FALLBACK` | `true` | safe request failure 是否允许整 key fallback |
 | `MOONCAKE_XDS_MIN_READ_SIZE` | `16384` | 每个 coalesced DirectReadOp 的最小长度 |
+| `MOONCAKE_XDS_STAGING_BUFFER_BYTES` | `4194304` | 每个实际使用 device 懒分配并复用的 GPU staging 大小；必须为正的 4096 字节整数倍 |
 | `MOONCAKE_XDS_FILE_CACHE_SIZE` | `1024` | BUCKET xDS file registration cache 上限；达到上限后不再注册新文件 |
 
 首版不提供：
@@ -1270,6 +1271,46 @@ fallback、contract violation、short read、device synchronize 失败和 backen
 
 端到端评估继续使用现有 SGLang prefetch latency、TTFT、ITL、CPU 使用率、host memory
 bandwidth 和 DCU copy-engine 利用率。新增专用 metrics 不作为首版路径正确性的前置条件。
+
+当前批次日志分别汇总 direct 与 GPU staging 的逻辑字节数、物理读取字节数、
+`hipFileRead` 调用数和完成 op 数；staging 路径还记录 chunk 数与最大逻辑 op 大小。
+这些字段用于评估对齐读取放大，并判断 `MOONCAKE_XDS_STAGING_BUFFER_BYTES` 是否需要调优。
+
+#### Staged 聚合候选只读统计
+
+下一轮观测可在承载 Mooncake backend 的进程启动前设置
+`MOONCAKE_XDS_STAGED_AGGREGATE_DRY_RUN=1`（默认 `0`）。这只是统计开关，
+**不跳过真实 I/O、不重排或合并真实 operations**，也不改变目标状态、pin 生命周期或
+fallback。关闭开关或调用方不请求 stats 时，不进行额外候选分配或排序。
+
+每次 `Client::BatchReadDfsRanges` backend 调用最多输出一条
+`[XDS_STAGED_AGG_DRY_RUN] scope=planned`，不采样、不记录逐 range 或原始 key。
+它与 `[XDS_READ_SUCCESS]` 独立：计划可能随后失败或因 fatal 未执行
+（`includes_failed_or_unexecuted_plans=1`），不可当作成功 I/O 或已实现的性能收益。
+
+- `evaluated_objects` / `skipped_objects`：已评估 / 跳过的请求对象数；无效整批不评估，
+  单对象规划失败则跳过该对象。`staged_ops` 是现有 planner 合并后的 staged op 数，
+  不含 direct ops；`candidate_windows` 是被接受的多目标窗口数。
+- `baseline_calls` / `candidate_calls` 及 `baseline_physical_bytes` /
+  `candidate_physical_bytes`：原计划 / 模拟计划的 vendor calls 与物理字节；
+  `saved_calls` / `saved_physical_bytes` 是二者差值，仅表示已评估子集。
+- `scratch_bytes` 来自 adapter capabilities 的实际容量，而不是配置猜测；容量未知
+  （`0`）或不是 4K 整数倍时，`scratch_unavailable=1`，跳过估计。
+- `gap_rejections` / `capacity_rejections` 计数贪心扫描中因正 gap / 联合覆盖超容量
+  而结束当前窗口的次数，不是所有两两组合数；`oversized_ops` 是单 op 覆盖超容量数。
+- `estimate_valid=0` 表示未能完整估计可评估计划；`arithmetic_overflow` /
+  `observation_failed` 标识统计算术 / 资源异常。失败对象不提交部分计数，也不改变 I/O。
+  汇总候选收益时必须筛选 `estimate_valid=1`；无效行可能保留此前对象的部分统计，
+  不能当作完整 batch 的估计，也不能将缺失估计当作零收益。
+
+基线使用 4K 覆盖 `P = align_up(offset + length, 4096) - align_down(offset, 4096)`，
+以实际 scratch 容量 `S` 计算 `calls = P / S + (P % S != 0)`，不是把 op 数当 calls。
+仅在同一请求/object、文件、device、extent 内对源覆盖窗口副本排序，贪心合并重叠或
+相接且联合覆盖不超过 `S` 的窗口，不跨正 gap、对象 extent 或已验证 EOF。只有 calls
+下降且 bytes 不增加才接受候选；各最终窗口的物理字节分别求和，不能用全局 union
+替代。超容量 op 保留原有分块 calls/bytes，不参与聚合且不枚举 chunks，因此这是保守
+候选估计而非全局最优。不额外打开文件或执行 `fstat`。关闭开关即可停止统计；本变更
+不会自动启动负载或部署远端。
 
 ### 8.2 测试方案
 
