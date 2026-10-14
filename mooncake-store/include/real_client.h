@@ -996,10 +996,9 @@ class RealClient : public PyClient {
     // KV transfer sessions (process-local; not shared with DummyClient).
     // get_sessions_ stores a FilterQueryResult'd QueryResult (single complete
     // supported replica + lease); ranges only compare lease locally (no
-    // Master). MEMORY uses BatchTransferReadRanges; DFS reads through
-    // request-scoped staging; LOCAL_DISK restores on the owner then
-    // BatchTransferReadOffloadRanges; DISK BatchGets into a temp buffer then
-    // scatters by src_offset.
+    // Master). MEMORY uses BatchTransferReadRanges; LOCAL_DISK restores on
+    // the owner then BatchTransferReadOffloadRanges. Other replica types are
+    // rejected at session start.
     // Put sessions track writable + inflight so end/revoke can seal the
     // session and wait for outstanding range writes before finalize/free.
     struct PutSessionEntry {
@@ -1099,17 +1098,7 @@ class RealClient : public PyClient {
 
     struct SessionRangeReadPlan {
         std::vector<SessionRangeReadRequest> memory_requests;
-        std::vector<SessionRangeReadRequest> dfs_requests;
         std::vector<SessionRangeReadRequest> local_disk_requests;
-        std::vector<SessionRangeReadRequest> disk_requests;
-    };
-
-    struct DfsSessionStagingArena {
-        std::shared_ptr<BufferHandle> staging_buffer;
-        std::unordered_map<std::string, size_t> object_offsets;
-        std::vector<std::string> object_keys;
-        std::vector<QueryResult> cached_query_results;
-        std::unordered_map<std::string, std::vector<Slice>> object_slices;
     };
 
     bool validate_session_range_batch_arguments(
@@ -1133,31 +1122,8 @@ class RealClient : public PyClient {
         const std::vector<SessionRangeReadRequest> &requests,
         std::vector<int> &results);
 
-    DfsSessionStagingArena build_dfs_session_staging_arena(
-        const std::vector<SessionRangeReadRequest> &requests,
-        std::vector<int> &results);
-
-    bool session_range_requests_target_device(
-        const std::vector<SessionRangeReadRequest> &requests) const;
-
-    void execute_session_dfs_range_reads(
-        const std::vector<SessionRangeReadRequest> &requests,
-        std::vector<int> &results);
-
     void execute_session_local_disk_range_reads(
         const std::vector<SessionRangeReadRequest> &requests,
-        std::vector<int> &results);
-
-    void execute_session_disk_range_reads(
-        const std::vector<SessionRangeReadRequest> &requests,
-        std::vector<int> &results);
-
-    tl::expected<void, ErrorCode> scatter_session_range_read(
-        const SessionRangeReadRequest &request,
-        const void *staging_buffer) const;
-
-    void complete_staged_session_range_read(
-        const SessionRangeReadRequest &request, const void *staging_buffer,
         std::vector<int> &results);
 
     bool invalidate_expired_get_session(const SessionRangeReadRequest &request,
@@ -1165,11 +1131,6 @@ class RealClient : public PyClient {
 
     void mark_get_session_lease_expired_locked(
         const SessionRangeReadRequest &request, std::vector<int> &results);
-
-    static void fail_file_backed_requests_for_key(
-        const std::vector<SessionRangeReadRequest> &requests,
-        const std::string &object_key, ErrorCode error,
-        std::vector<int> &results);
 
     std::unordered_map<std::string, MountedSegmentRecord>
         mounted_segment_records_;

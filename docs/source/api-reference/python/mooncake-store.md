@@ -3002,17 +3002,12 @@ and each request re-checks it once its transfer completes: if the cached lease
 lapsed while the read was in flight, the call returns `LEASE_EXPIRED`, the
 result is discarded, and the session is dropped. LOCAL_DISK reads additionally
 report `OBJECT_HAS_LEASE` when the restored offload buffer outlives its GC TTL.
-The MEMORY path remains zero-copy via `BatchTransferReadRanges`. DFS replicas
-are read into request-scoped host staging and then scattered to host or device
-destinations; for device destinations, staging first uses the fixed-capacity
-pinned restore arena configured by `MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES`
-and falls back to the regular client buffer allocator if it is unavailable or
-exhausted. LOCAL_DISK replicas are restored on the owner via the offload RPC
-and then scatter object-byte ranges into already `register_buffer`'d
-destinations (the reader does not need a setup local buffer). DISK replicas
-`BatchGet` into a temporary host buffer and scatter by `src_offset`. If a key
-has no complete MEMORY, DFS, LOCAL_DISK, or DISK replica — for example because
-it has only NOF replicas — `batch_get_session_start` returns
+The MEMORY path remains zero-copy via `BatchTransferReadRanges` and is preferred
+when available. LOCAL_DISK replicas are restored on the owner via the offload
+RPC and then scatter object-byte ranges into already `register_buffer`'d
+destinations (the reader does not need a setup local buffer). If a key has no
+complete MEMORY or LOCAL_DISK replica — for example because it has only DFS,
+DISK, or NOF replicas — `batch_get_session_start` returns
 `INVALID_REPLICA` for that key and does not open a session. Put sessions
 reserve object space via Master `BatchPutStart` and finalize with
 `BatchPutEnd`.
@@ -3025,8 +3020,8 @@ seal the session (no further range writes) and wait for in-flight range transfer
 before talking to Master.
 
 ⚠️ **Store-managed Buffer Required**: All destination buffers must resolve to
-Store-managed registered memory. DFS session reads use temporary staging; the
-staging allocation is released after the synchronous read and scatter finish.
+Store-managed registered memory. LOCAL_DISK restore buffers are released after
+the synchronous range transfer finishes.
 
 #### batch_get_session_start()
 
