@@ -340,7 +340,7 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
         std::lock_guard<std::mutex> api_lock(runtime_->ApiMutex());
         const auto& hip = runtime_->Hip();
         const auto& api = runtime_->Api();
-        for (const auto& [device, scratch] : scratch_) {
+        for (auto& [device, scratch] : scratch_) {
             if (!scratch.base) continue;
             if (hip.set_device(device) != hip.success ||
                 hip.device_synchronize() != hip.success ||
@@ -354,10 +354,12 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
                 runtime_->Quarantine();
                 return;
             }
+            scratch.registered = false;
             if (hip.free_device(scratch.base) != hip.success) {
                 runtime_->Quarantine();
                 return;
             }
+            scratch.base = nullptr;
         }
         for (const auto& [_, buffer] : buffers_) {
             const int set_result = hip.set_device(buffer.device_id);
@@ -401,6 +403,7 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
         capabilities.staging_buffer_bytes = staging_buffer_bytes_;
         capabilities.supports_gpu_staging = runtime_->Hip().malloc_device &&
             runtime_->Hip().free_device && runtime_->Hip().copy_device;
+        capabilities.supports_staged_window = capabilities.supports_gpu_staging;
         return capabilities;
     }
 
@@ -605,34 +608,103 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
 
     tl::expected<DirectReadCompletion, XdsError> ReadStaged(
         const DirectReadOp& op) override {
+        return ReadStagedImpl(&op, 1, false);
+    }
+
+    tl::expected<DirectReadCompletion, XdsError> ReadStagedWindow(
+        const std::vector<DirectReadOp>& operations) override {
+        return ReadStagedImpl(operations.data(), operations.size(), true);
+    }
+
+   private:
+    // Pointer/count keeps the legacy single-target path allocation-free.
+    tl::expected<DirectReadCompletion, XdsError> ReadStagedImpl(
+        const DirectReadOp* operations, size_t count, bool window) {
         if (!runtime_->IsCurrentProcess()) {
             return tl::make_unexpected(ForkFailure("gpu-staging:fork"));
         }
-        std::lock_guard<std::mutex> state_lock(state_mutex_);
-        auto file = files_.find(op.file.id);
-        auto buffer = buffers_.find(op.buffer.id);
-        const uint64_t limit = std::numeric_limits<uint64_t>::max();
-        if (file == files_.end() || buffer == buffers_.end() ||
-            op.file.fd != file->second.fd ||
-            op.buffer.base != buffer->second.base ||
-            op.buffer.length != buffer->second.length ||
-            op.buffer.device_id != buffer->second.device_id ||
-            op.device_id != buffer->second.device_id || op.length == 0 ||
-            op.device_offset > buffer->second.length ||
-            op.length > buffer->second.length - op.device_offset ||
-            op.file_offset > limit - op.length ||
-            op.file_offset + op.length > limit - (kDirectIoAlignment - 1)) {
+        if (count == 0) {
             return tl::make_unexpected(Failure(
                 XdsErrorClass::kContractViolation, XdsTargetState::kUntouched,
-                "gpu-staging:arguments"));
+                "gpu-staging:empty-window"));
         }
-        const uint64_t begin = op.file_offset / kDirectIoAlignment *
-                               kDirectIoAlignment;
-        const uint64_t end = (op.file_offset + op.length +
-                              kDirectIoAlignment - 1) /
-                             kDirectIoAlignment * kDirectIoAlignment;
+        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        const auto& first = operations[0];
+        auto file = files_.find(first.file.id);
+        uint64_t begin = std::numeric_limits<uint64_t>::max();
+        uint64_t end = 0;
+        uint64_t logical_bytes = 0;
+        std::vector<std::pair<uint64_t, uint64_t>> sources;
+        std::vector<std::pair<uintptr_t, uintptr_t>> targets;
+        if (window) {
+            try {
+                sources.reserve(count);
+                targets.reserve(count);
+            } catch (...) {
+                return tl::make_unexpected(Failure(
+                    XdsErrorClass::kTransientIo, XdsTargetState::kUntouched,
+                    "gpu-staging:window-allocation"));
+            }
+        }
+        for (size_t i = 0; i < count; ++i) {
+            const auto& op = operations[i];
+            auto buffer = buffers_.find(op.buffer.id);
+            const uint64_t limit = std::numeric_limits<uint64_t>::max();
+            if (file == files_.end() || buffer == buffers_.end() ||
+                op.file.fd != file->second.fd ||
+                op.buffer.base != buffer->second.base ||
+                op.buffer.length != buffer->second.length ||
+                op.buffer.device_id != buffer->second.device_id ||
+                op.device_id != buffer->second.device_id || op.length == 0 ||
+                op.device_offset > buffer->second.length ||
+                op.length > buffer->second.length - op.device_offset ||
+                op.file_offset > limit - op.length ||
+                op.file_offset + op.length > limit - (kDirectIoAlignment - 1) ||
+                op.file.id != first.file.id || op.device_id != first.device_id ||
+                op.extent_begin != first.extent_begin ||
+                op.extent_end != first.extent_end || (window && !op.staged) ||
+                op.length > limit - logical_bytes) {
+                return tl::make_unexpected(Failure(
+                    XdsErrorClass::kContractViolation, XdsTargetState::kUntouched,
+                    "gpu-staging:arguments"));
+            }
+            const uint64_t member_begin = op.file_offset / kDirectIoAlignment *
+                                          kDirectIoAlignment;
+            const uint64_t member_end = (op.file_offset + op.length +
+                                         kDirectIoAlignment - 1) /
+                                        kDirectIoAlignment * kDirectIoAlignment;
+            begin = std::min(begin, member_begin);
+            end = std::max(end, member_end);
+            logical_bytes += op.length;
+            if (window) {
+                sources.emplace_back(member_begin, member_end);
+                const uintptr_t address =
+                    reinterpret_cast<uintptr_t>(buffer->second.base) +
+                    op.device_offset;
+                targets.emplace_back(address, address + op.length);
+            }
+        }
+        if (window) {
+            std::sort(sources.begin(), sources.end());
+            std::sort(targets.begin(), targets.end());
+            uint64_t covered_end = sources.front().second;
+            for (size_t i = 1; i < count; ++i) {
+                if (sources[i].first > covered_end ||
+                    targets[i].first < targets[i - 1].second) {
+                    return tl::make_unexpected(Failure(
+                        XdsErrorClass::kContractViolation,
+                        XdsTargetState::kUntouched, "gpu-staging:window-ranges"));
+                }
+                covered_end = std::max(covered_end, sources[i].second);
+            }
+            if (end - begin > staging_buffer_bytes_) {
+                return tl::make_unexpected(Failure(
+                    XdsErrorClass::kContractViolation,
+                    XdsTargetState::kUntouched, "gpu-staging:window-capacity"));
+            }
+        }
         struct stat info {};
-        if (begin < op.extent_begin || end > op.extent_end ||
+        if (begin < first.extent_begin || end > first.extent_end ||
             ::fstat(file->second.owned_fd, &info) != 0 || info.st_size < 0 ||
             end > static_cast<uint64_t>(info.st_size)) {
             return tl::make_unexpected(Failure(
@@ -653,7 +725,7 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
                 XdsTargetState::kUnknownMayStillBeWritten,
                 "gpu-staging:runtime-quarantined"));
         }
-        auto& scratch = scratch_[op.device_id];
+        auto& scratch = scratch_[first.device_id];
         if (scratch.quarantined) {
             return tl::make_unexpected(Failure(
                 XdsErrorClass::kBackendFatal,
@@ -661,7 +733,7 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
                                        : XdsTargetState::kUntouched,
                 "gpu-staging:quarantined"));
         }
-        int result = hip.set_device(op.device_id);
+        int result = hip.set_device(first.device_id);
         if (result != hip.success) {
             return tl::make_unexpected(Failure(
                 XdsErrorClass::kBackendFatal, XdsTargetState::kUntouched,
@@ -731,37 +803,42 @@ class HyFileAcceleratorFileIo final : public AcceleratorFileIo {
             physical_bytes += static_cast<uint64_t>(bytes);
             ++hipfile_read_calls;
             ++staging_chunks;
-            const uint64_t copy_begin = std::max(offset, op.file_offset);
-            const uint64_t copy_end = std::min(offset + length,
-                                               op.file_offset + op.length);
-            const int copy_result = hip.copy_device(
-                static_cast<char*>(buffer->second.base) + op.device_offset +
-                    (copy_begin - op.file_offset),
-                static_cast<char*>(scratch.base) + (copy_begin - offset),
-                copy_end - copy_begin);
-            // Even a failed memcpy may have submitted work.
-            result = hip.device_synchronize();
-            if (result != hip.success) {
-                scratch.quarantined = true;
-                scratch.target_unknown = true;
-                return tl::make_unexpected(Failure(
-                    XdsErrorClass::kBackendFatal,
-                    XdsTargetState::kUnknownMayStillBeWritten,
-                    "hipDeviceSynchronize:staging-copy", result));
+            for (size_t i = 0; i < count; ++i) {
+                const auto& op = operations[i];
+                const uint64_t copy_begin = std::max(offset, op.file_offset);
+                const uint64_t copy_end = std::min(offset + length,
+                                                   op.file_offset + op.length);
+                if (copy_begin >= copy_end) continue;
+                const int copy_result = hip.copy_device(
+                    static_cast<char*>(op.buffer.base) + op.device_offset +
+                        (copy_begin - op.file_offset),
+                    static_cast<char*>(scratch.base) + (copy_begin - offset),
+                    copy_end - copy_begin);
+                // Even a failed memcpy may have submitted work.
+                result = hip.device_synchronize();
+                if (result != hip.success) {
+                    scratch.quarantined = true;
+                    scratch.target_unknown = true;
+                    return tl::make_unexpected(Failure(
+                        XdsErrorClass::kBackendFatal,
+                        XdsTargetState::kUnknownMayStillBeWritten,
+                        "hipDeviceSynchronize:staging-copy", result));
+                }
+                if (copy_result != hip.success) {
+                    return tl::make_unexpected(Failure(
+                        XdsErrorClass::kBackendFatal,
+                        XdsTargetState::kStoppedSafeToOverwrite,
+                        "hipMemcpy:staging", copy_result));
+                }
+                copied = true;
             }
-            if (copy_result != hip.success) {
-                return tl::make_unexpected(Failure(
-                    XdsErrorClass::kBackendFatal,
-                    XdsTargetState::kStoppedSafeToOverwrite,
-                    "hipMemcpy:staging", copy_result));
-            }
-            copied = true;
             offset += length;
         }
-        return DirectReadCompletion{op.length, physical_bytes,
+        return DirectReadCompletion{logical_bytes, physical_bytes,
                                     hipfile_read_calls, staging_chunks};
     }
 
+   public:
     tl::expected<void, XdsError> DeregisterFile(
         XdsFileRegistration registration) override {
         if (!runtime_->IsCurrentProcess()) {

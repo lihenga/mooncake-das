@@ -48,10 +48,19 @@ bool AddPlanned(uint64_t& total, uint64_t value) {
     return true;
 }
 
-// Only the observation copy is sorted. A failed estimate is discarded by the
-// caller, without changing operations, pins, errors, or successful-I/O stats.
-bool EstimateStagedAggregate(const std::vector<DirectReadOp>& operations,
-                             StagedAggregatePlan& stats) {
+struct StagedWindow {
+    size_t anchor = 0;
+    uint64_t logical_bytes = 0;
+    std::vector<size_t> indices;
+    std::vector<DirectReadOp> operations;
+};
+
+// Source sorting is confined to this pure planner. Members are returned in
+// original order, anchored at their minimum original index. Optional statistics
+// always describe the original operations, never an already aggregated plan.
+bool PlanStagedAggregate(const std::vector<DirectReadOp>& operations,
+                         uint64_t scratch, std::vector<StagedWindow>* output,
+                         StagedAggregatePlan* stats) {
     struct Window {
         uint64_t file;
         int fd;
@@ -60,13 +69,15 @@ bool EstimateStagedAggregate(const std::vector<DirectReadOp>& operations,
         uint64_t extent_end;
         uint64_t begin;
         uint64_t end;
+        size_t index;
         auto Group() const {
             return std::tie(file, fd, device, extent_begin, extent_end);
         }
     };
     std::vector<Window> windows;
-    const uint64_t scratch = stats.scratch_bytes;
-    for (const auto& op : operations) {
+    if (scratch == 0 || scratch % 4096 != 0) return false;
+    for (size_t index = 0; index < operations.size(); ++index) {
+        const auto& op = operations[index];
         if (!op.staged) continue;
         constexpr uint64_t alignment = 4096;
         const uint64_t max = std::numeric_limits<uint64_t>::max();
@@ -78,56 +89,75 @@ bool EstimateStagedAggregate(const std::vector<DirectReadOp>& operations,
         if (begin < op.extent_begin || end > op.extent_end || end <= begin)
             return false;
         const uint64_t bytes = end - begin;
-        const uint64_t calls = bytes / scratch + (bytes % scratch != 0);
-        if (!AddPlanned(stats.staged_ops, 1) ||
-            !AddPlanned(stats.baseline_calls, calls) ||
-            !AddPlanned(stats.baseline_physical_bytes, bytes) ||
-            !AddPlanned(stats.candidate_calls, calls) ||
-            !AddPlanned(stats.candidate_physical_bytes, bytes)) return false;
+        if (stats) {
+            const uint64_t calls = bytes / scratch + (bytes % scratch != 0);
+            if (!AddPlanned(stats->staged_ops, 1) ||
+                !AddPlanned(stats->baseline_calls, calls) ||
+                !AddPlanned(stats->baseline_physical_bytes, bytes) ||
+                !AddPlanned(stats->candidate_calls, calls) ||
+                !AddPlanned(stats->candidate_physical_bytes, bytes)) return false;
+        }
         if (bytes > scratch) {
-            if (!AddPlanned(stats.oversized_ops, 1)) return false;
+            if (stats && !AddPlanned(stats->oversized_ops, 1)) return false;
             continue;  // Preserve the exact chunk baseline; do not aggregate.
         }
         windows.push_back({op.file.id, op.file.fd, op.device_id, op.extent_begin,
-                           op.extent_end, begin, end});
+                           op.extent_end, begin, end, index});
     }
     std::sort(windows.begin(), windows.end(), [](const auto& a, const auto& b) {
-        return std::make_tuple(a.Group(), a.begin, a.end) <
-               std::make_tuple(b.Group(), b.begin, b.end);
+        return std::make_tuple(a.Group(), a.begin, a.end, a.index) <
+               std::make_tuple(b.Group(), b.begin, b.end, b.index);
     });
     for (size_t i = 0; i < windows.size();) {
         const auto& first = windows[i];
         uint64_t end = first.end;
-        uint64_t baseline_bytes = end - first.begin;
+        uint64_t baseline_bytes = stats ? end - first.begin : 0;
+        uint64_t logical_bytes = operations[first.index].length;
         uint64_t count = 1;
         size_t next = i + 1;
         for (; next < windows.size(); ++next) {
             const auto& window = windows[next];
             if (window.Group() != first.Group()) break;
             if (window.begin > end) {
-                if (!AddPlanned(stats.gap_rejections, 1)) return false;
+                if (stats && !AddPlanned(stats->gap_rejections, 1)) return false;
                 break;
             }
             const uint64_t combined_end = std::max(end, window.end);
             if (combined_end - first.begin > scratch) {
-                if (!AddPlanned(stats.capacity_rejections, 1)) return false;
+                if (stats && !AddPlanned(stats->capacity_rejections, 1))
+                    return false;
                 break;
             }
-            if (!AddPlanned(baseline_bytes, window.end - window.begin) ||
+            if ((stats && !AddPlanned(baseline_bytes,
+                                      window.end - window.begin)) ||
+                !AddPlanned(logical_bytes, operations[window.index].length) ||
                 !AddPlanned(count, 1)) return false;
             end = combined_end;
         }
         const uint64_t candidate_bytes = end - first.begin;
         // Single-op windows keep their original baseline. Every accepted
         // multi-target window must save calls without increasing bytes.
-        if (count > 1 && candidate_bytes <= baseline_bytes) {
-            if (!AddPlanned(stats.candidate_windows, 1)) return false;
-            stats.candidate_calls -= count - 1;
-            stats.candidate_physical_bytes -= baseline_bytes - candidate_bytes;
+        if (count > 1) {
+            if (stats) {
+                if (!AddPlanned(stats->candidate_windows, 1)) return false;
+                stats->candidate_calls -= count - 1;
+                stats->candidate_physical_bytes -= baseline_bytes - candidate_bytes;
+            }
+            if (output) {
+                StagedWindow merged;
+                merged.logical_bytes = logical_bytes;
+                for (size_t member = i; member < next; ++member)
+                    merged.indices.push_back(windows[member].index);
+                std::sort(merged.indices.begin(), merged.indices.end());
+                merged.anchor = merged.indices.front();
+                for (const auto index : merged.indices)
+                    merged.operations.push_back(operations[index]);
+                output->push_back(std::move(merged));
+            }
         }
         i = next;
     }
-    return AddPlanned(stats.evaluated_objects, 1);
+    return !stats || AddPlanned(stats->evaluated_objects, 1);
 }
 
 XdsMode ParseXdsMode(const std::string& value, bool* valid) {
@@ -492,6 +522,8 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     config.xds_staged_aggregate_dry_run = Environ::GetBool(
         "MOONCAKE_XDS_STAGED_AGGREGATE_DRY_RUN",
         config.xds_staged_aggregate_dry_run);
+    config.xds_staged_aggregate_read = Environ::GetBool(
+        "MOONCAKE_XDS_STAGED_AGGREGATE_READ", config.xds_staged_aggregate_read);
     LOG(INFO) << config.FormatStr();
     return config;
 }
@@ -523,7 +555,8 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", xds_staging_buffer_bytes=" << xds_staging_buffer_bytes
         << ", xds_file_cache_size=" << xds_file_cache_size
         << ", xds_allow_request_fallback=" << xds_allow_request_fallback
-        << ", xds_staged_aggregate_dry_run=" << xds_staged_aggregate_dry_run;
+        << ", xds_staged_aggregate_dry_run=" << xds_staged_aggregate_dry_run
+        << ", xds_staged_aggregate_read=" << xds_staged_aggregate_read;
     return oss.str();
 }
 
@@ -1910,6 +1943,9 @@ DistributedStorageBackend::BatchReadRanges(
     struct PlannedRequest {
         std::vector<std::shared_ptr<XdsBufferEntry>> pins;
         std::vector<DirectReadOp> operations;
+        std::vector<StagedWindow> windows;
+        // -1 means legacy operation; otherwise the owning window index.
+        std::vector<int64_t> window_for_op;
         std::optional<XdsError> error;
     };
     std::vector<PlannedRequest> plans(requests.size());
@@ -2097,7 +2133,8 @@ DistributedStorageBackend::BatchReadRanges(
                 if (plan.error) continue;
                 try {
                     auto estimate = planned;
-                    if (EstimateStagedAggregate(plan.operations, estimate)) {
+                    if (PlanStagedAggregate(plan.operations, planned.scratch_bytes,
+                                            nullptr, &estimate)) {
                         --estimate.skipped_objects;
                         planned = estimate;
                     } else {
@@ -2110,6 +2147,44 @@ DistributedStorageBackend::BatchReadRanges(
                     planned.estimate_valid = false;
                 }
             }
+        }
+    }
+
+    // Build every execution window before the first I/O, independently of
+    // whether the caller requested statistics. Unsupported adapters and unknown
+    // capacity retain the original operations without invoking the new API.
+    if (distributed_config_.xds_staged_aggregate_read &&
+        capabilities.supports_staged_window &&
+        capabilities.staging_buffer_bytes != 0 &&
+        capabilities.staging_buffer_bytes % 4096 == 0) {
+        for (auto& plan : plans) {
+            if (plan.error) continue;
+            try {
+                if (!PlanStagedAggregate(plan.operations,
+                                         capabilities.staging_buffer_bytes,
+                                         &plan.windows, nullptr)) {
+                    plan.error = XdsFailure(XdsErrorClass::kContractViolation,
+                                           XdsTargetState::kUntouched,
+                                           "staged-window-overflow");
+                    batch_contract_invalid = true;
+                    continue;
+                }
+                plan.window_for_op.assign(plan.operations.size(), -1);
+                for (size_t w = 0; w < plan.windows.size(); ++w) {
+                    for (const auto index : plan.windows[w].indices)
+                        plan.window_for_op[index] = static_cast<int64_t>(w);
+                }
+            } catch (...) {
+                // Planning has not touched any destination. Do not leak pins.
+                for (auto& pending : plans)
+                    for (const auto& pin : pending.pins) UnpinXdsBuffer(pin);
+                throw;
+            }
+        }
+        if (batch_contract_invalid) {
+            for (auto& plan : plans)
+                for (const auto& pin : plan.pins) UnpinXdsBuffer(pin);
+            return results;
         }
     }
 
@@ -2128,10 +2203,19 @@ DistributedStorageBackend::BatchReadRanges(
         }
         if (!plan.error) {
             bool wrote_target = false;
-            for (const auto& operation : plan.operations) {
-                auto completion = operation.staged
-                    ? accelerator->ReadStaged(operation)
-                    : accelerator->Read(operation);
+            for (size_t index = 0; index < plan.operations.size(); ++index) {
+                const auto& operation = plan.operations[index];
+                const StagedWindow* window = nullptr;
+                if (!plan.window_for_op.empty() && plan.window_for_op[index] >= 0) {
+                    window = &plan.windows[plan.window_for_op[index]];
+                    if (window->anchor != index) continue;
+                }
+                const uint64_t expected_bytes =
+                    window ? window->logical_bytes : operation.length;
+                auto completion = window
+                    ? accelerator->ReadStagedWindow(window->operations)
+                    : operation.staged ? accelerator->ReadStaged(operation)
+                                       : accelerator->Read(operation);
                 if (!completion) {
                     plan.error = completion.error();
                     if (wrote_target && plan.error->target_state ==
@@ -2155,7 +2239,7 @@ DistributedStorageBackend::BatchReadRanges(
                     }
                     break;
                 }
-                if (completion->bytes != operation.length) {
+                if (completion->bytes != expected_bytes) {
                     plan.error = XdsFailure(
                         XdsErrorClass::kTransientIo,
                         XdsTargetState::kStoppedSafeToOverwrite, "short-read");
@@ -2173,6 +2257,10 @@ DistributedStorageBackend::BatchReadRanges(
                         stats->max_staged_op_bytes = std::max(
                             stats->max_staged_op_bytes, completion->bytes);
                         ++stats->staging_completed_ops;
+                        if (window) {
+                            ++stats->aggregate_windows;
+                            stats->aggregate_targets += window->operations.size();
+                        }
                     } else {
                         stats->direct_bytes += completion->bytes;
                         stats->direct_physical_bytes +=

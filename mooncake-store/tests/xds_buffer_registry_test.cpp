@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
@@ -24,6 +25,7 @@ class FakeAcceleratorFileIo final : public AcceleratorFileIo {
         capabilities.supports_distributed_fs = true;
         capabilities.supports_gpu_staging = true;
         capabilities.staging_buffer_bytes = scratch_bytes;
+        capabilities.supports_staged_window = supports_window;
         return capabilities;
     }
     DeviceXdsState DeviceState(int32_t) const override {
@@ -72,6 +74,26 @@ class FakeAcceleratorFileIo final : public AcceleratorFileIo {
         return {};
     }
 
+    tl::expected<DirectReadCompletion, XdsError> ReadStagedWindow(
+        const std::vector<DirectReadOp>& ops) override {
+        ++window_calls;
+        operations.insert(operations.end(), ops.begin(), ops.end());
+        if (on_read) on_read();
+        if (fail_window) return tl::make_unexpected(window_error);
+        uint64_t begin = std::numeric_limits<uint64_t>::max(), end = 0, sum = 0;
+        for (const auto& op : ops) {
+            begin = std::min(begin, op.file_offset / 4096 * 4096);
+            end = std::max(end, (op.file_offset + op.length + 4095) / 4096 * 4096);
+            sum += op.length;
+        }
+        return DirectReadCompletion{sum, end - begin, 1, 1};
+    }
+    bool supports_window = true;
+    bool fail_window = false;
+    int window_calls = 0;
+    XdsError window_error{XdsErrorClass::kBackendFatal,
+                          XdsTargetState::kUnknownMayStillBeWritten, -1,
+                          "fake-window-failure"};
     uint64_t scratch_bytes = 8192;
     bool fail_staged = false;
     std::function<void()> on_read;
@@ -329,6 +351,92 @@ class XdsAggregatePlanTest : public ::testing::Test {
     std::shared_ptr<DistributedStorageBackend> backend_;
     std::shared_ptr<FakeAcceleratorFileIo> fake_;
 };
+
+TEST_F(XdsAggregatePlanTest, RealAndDryRunAreIndependentIncludingNoStats) {
+    for (bool real : {false, true}) {
+        for (bool dry : {false, true}) {
+            config_.xds_staged_aggregate_read = real;
+            Start(dry);
+            const auto request = Request({{4097, 10}, {1, 10}});
+            const auto stats = Run({request});
+            EXPECT_EQ(fake_->window_calls, real ? 1 : 0);
+            EXPECT_EQ(fake_->staged_calls, real ? 0 : 2);
+            EXPECT_EQ(stats.staging_completed_ops, real ? 1u : 2u);
+            EXPECT_EQ(stats.aggregate_windows, real ? 1u : 0u);
+            EXPECT_EQ(stats.aggregate_targets, real ? 2u : 0u);
+            EXPECT_EQ(stats.max_staged_op_bytes, real ? 20u : 10u);
+            EXPECT_EQ(stats.staged_aggregate_plan.enabled, dry);
+            if (dry) {
+                EXPECT_EQ(stats.staged_aggregate_plan.baseline_calls, 2u);
+                EXPECT_EQ(stats.staged_aggregate_plan.candidate_calls, 1u);
+            }
+            const auto results = backend_->BatchReadRanges({request});
+            ASSERT_TRUE(results[0]);
+            EXPECT_EQ(fake_->window_calls, real ? 2 : 0);
+            EXPECT_EQ(fake_->staged_calls, real ? 0 : 4);
+        }
+    }
+}
+
+TEST_F(XdsAggregatePlanTest, RealWindowUsesMinimumIndexAcrossNonmembers) {
+    config_.xds_staged_aggregate_read = true;
+    Start(true);
+    const auto stats = Run({Request({{4097, 10}, {16385, 10}, {1, 10}})});
+    ASSERT_EQ(fake_->operations.size(), 3u);
+    EXPECT_EQ(fake_->operations[0].file_offset, 4097u);
+    EXPECT_EQ(fake_->operations[1].file_offset, 1u);
+    EXPECT_EQ(fake_->operations[2].file_offset, 16385u);
+    EXPECT_EQ(fake_->window_calls, 1);
+    EXPECT_EQ(fake_->staged_calls, 1);
+    EXPECT_EQ(stats.staging_completed_ops, 2u);
+}
+
+TEST_F(XdsAggregatePlanTest, UnsupportedSingleAndOversizeUseLegacy) {
+    config_.xds_staged_aggregate_read = true;
+    Start(false);
+    fake_->supports_window = false;
+    Run({Request({{1, 10}, {4097, 10}})});
+    EXPECT_EQ(fake_->window_calls, 0);
+    EXPECT_EQ(fake_->staged_calls, 2);
+    fake_->supports_window = true;
+    Run({Request({{1, 8192}, {1, 10}})});
+    EXPECT_EQ(fake_->window_calls, 0);
+    EXPECT_EQ(fake_->staged_calls, 4);
+    Run({Request({{1, 10}})});
+    EXPECT_EQ(fake_->window_calls, 0);
+    EXPECT_EQ(fake_->staged_calls, 5);
+}
+
+TEST_F(XdsAggregatePlanTest, FailedWindowNeverRetriesAndRetainsUnknownPins) {
+    config_.xds_staged_aggregate_read = true;
+    Start(true);
+    fake_->fail_window = true;
+    DistributedStorageBackend::XdsReadStats stats;
+    auto results = backend_->BatchReadRanges(
+        {Request({{1, 10}, {4097, 10}, {16385, 10}})}, &stats);
+    ASSERT_FALSE(results[0]);
+    EXPECT_EQ(fake_->window_calls, 1);
+    EXPECT_EQ(fake_->staged_calls, 0);
+    EXPECT_EQ(stats.staging_completed_ops, 0u);
+    EXPECT_EQ(stats.aggregate_windows, 0u);
+    EXPECT_EQ(stats.aggregate_targets, 0u);
+    EXPECT_FALSE(backend_->UnregisterXdsBuffer(memory_));
+    EXPECT_EQ(fake_->buffer_deregister_calls, 0);
+    results = backend_->BatchReadRanges({Request({{1, 10}})});
+    EXPECT_FALSE(results[0]);
+    EXPECT_EQ(fake_->staged_calls, 0);
+}
+
+TEST_F(XdsAggregatePlanTest, LaterInvalidTargetPreventsAllIoWithRealEnabled) {
+    config_.xds_staged_aggregate_read = true;
+    Start(false);
+    auto request = Request({{1, 10}, {4097, 10}});
+    request.ranges.back().length = 65536;
+    auto results = backend_->BatchReadRanges({request});
+    EXPECT_FALSE(results[0]);
+    EXPECT_EQ(fake_->window_calls, 0);
+    EXPECT_EQ(fake_->staged_calls, 0);
+}
 
 TEST_F(XdsAggregatePlanTest, CoversOverlapTouchGapCapacityAndLargeOps) {
     struct Case {

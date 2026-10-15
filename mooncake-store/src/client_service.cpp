@@ -4246,6 +4246,8 @@ std::vector<tl::expected<void, XdsError>> Client::BatchReadDfsRanges(
                       << " staging_chunks=" << stats.staging_chunks
                       << " max_op_bytes=" << stats.max_staged_op_bytes
                       << " completed_ops=" << stats.staging_completed_ops
+                      << " aggregate_windows=" << stats.aggregate_windows
+                      << " aggregate_targets=" << stats.aggregate_targets
                       << " batch_requests=" << requests.size()
                       << " failed_requests=" << failed_requests;
         }

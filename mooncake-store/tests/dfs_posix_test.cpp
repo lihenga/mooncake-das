@@ -453,6 +453,8 @@ TEST(DistributedStorageConfigTest, ReadsValidatesAndFormatsEnvironment) {
     env.Set("MOONCAKE_XDS_STAGING_BUFFER_BYTES", "8388608");
     EXPECT_FALSE(DistributedStorageConfig{}.xds_staged_aggregate_dry_run);
     env.Set("MOONCAKE_XDS_STAGED_AGGREGATE_DRY_RUN", "1");
+    EXPECT_FALSE(DistributedStorageConfig{}.xds_staged_aggregate_read);
+    env.Set("MOONCAKE_XDS_STAGED_AGGREGATE_READ", "1");
 
     const auto config = DistributedStorageConfig::FromEnvironment();
     EXPECT_EQ(config.fsdir, tmp.path());
@@ -467,6 +469,12 @@ TEST(DistributedStorageConfigTest, ReadsValidatesAndFormatsEnvironment) {
     EXPECT_EQ(config.eviction_check_interval, std::chrono::seconds(3));
     EXPECT_EQ(config.xds_staging_buffer_bytes, 8u * 1024 * 1024);
     EXPECT_TRUE(config.xds_staged_aggregate_dry_run);
+    EXPECT_TRUE(config.xds_staged_aggregate_read);
+    env.Set("MOONCAKE_XDS_STAGED_AGGREGATE_READ", "0");
+    EXPECT_FALSE(DistributedStorageConfig::FromEnvironment()
+                     .xds_staged_aggregate_read);
+    EXPECT_NE(config.FormatStr().find("xds_staged_aggregate_read=1"),
+              std::string::npos);
     env.Set("MOONCAKE_XDS_STAGED_AGGREGATE_DRY_RUN", "0");
     EXPECT_FALSE(DistributedStorageConfig::FromEnvironment()
                      .xds_staged_aggregate_dry_run);

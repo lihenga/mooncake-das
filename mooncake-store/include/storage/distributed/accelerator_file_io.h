@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include <ylt/util/tl/expected.hpp>
 
@@ -43,6 +44,8 @@ struct DirectIoCapabilities {
     bool supports_gpu_staging = false;
     // Actual per-read scratch capacity; zero means unknown, not a config default.
     uint64_t staging_buffer_bytes = 0;
+    // Independent of vendor scatter/gather: one staged read, multiple targets.
+    bool supports_staged_window = false;
 };
 
 struct XdsFileIdentity {
@@ -103,6 +106,17 @@ class AcceleratorFileIo {
         return tl::make_unexpected(XdsError{
             XdsErrorClass::kNotEligible, XdsTargetState::kUntouched, 0,
             "gpu-staging-not-supported"});
+    }
+    // All members must be staged, share file/device/extent, have connected
+    // 4K covering ranges fitting scratch, and have disjoint destinations.
+    // Validate every member before I/O. Completion bytes is the logical sum
+    // (including overlapping sources); physical_bytes counts the union once.
+    // Failure must not be retried through the single-target interface.
+    virtual tl::expected<DirectReadCompletion, XdsError> ReadStagedWindow(
+        const std::vector<DirectReadOp>&) {
+        return tl::make_unexpected(XdsError{
+            XdsErrorClass::kNotEligible, XdsTargetState::kUntouched, 0,
+            "staged-window-not-supported"});
     }
     virtual tl::expected<void, XdsError> DeregisterFile(
         XdsFileRegistration registration) = 0;

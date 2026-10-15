@@ -36,6 +36,7 @@ struct FakeState {
     int free_calls = 0;
     int copy_calls = 0;
     int copy_result = 0;
+    int fail_copy_call = 0;
     int fail_sync_call = 0;
     bool fill_reads = false;
     std::vector<void*> allocations;
@@ -163,6 +164,7 @@ int FreeDevice(void*) {
 
 int CopyDevice(void* dst, const void* src, size_t length) {
     ++fake_state->copy_calls;
+    if (fake_state->fail_copy_call == fake_state->copy_calls) return 9;
     if (fake_state->copy_result == 0) std::memcpy(dst, src, length);
     return fake_state->copy_result;
 }
@@ -422,6 +424,126 @@ TEST_F(HyFileBackendTest, ReadSyncFailureMarksTargetStateUnknown) {
     state_.synchronize_result = 0;
     ASSERT_TRUE((*backend)->DeregisterFile(*file_registration));
     ASSERT_TRUE((*backend)->DeregisterBuffer(*buffer_registration));
+}
+
+TEST_F(HyFileBackendTest, StagedWindowScattersOverlappingSourcesWithGuards) {
+    DirectFile file;
+    if (!file.valid()) GTEST_SKIP() << "O_DIRECT is unavailable";
+    AlignedMemory memory(16384);
+    ASSERT_NE(memory.data(), nullptr);
+    std::memset(memory.data(), 0xff, memory.size());
+    auto backend = Create(8192);
+    ASSERT_TRUE(backend);
+    EXPECT_TRUE((*backend)->Capabilities().supports_staged_window);
+    auto fr = (*backend)->RegisterFile(file.fd(), file.identity());
+    auto br = (*backend)->RegisterBuffer(memory.data(), memory.size(), 0);
+    ASSERT_TRUE(fr);
+    ASSERT_TRUE(br);
+    state_.fill_reads = true;
+    std::vector<DirectReadOp> ops{
+        {*fr, *br, 100, 13, 6000, 0, true, 0, 16384},
+        {*fr, *br, 1, 8201, 6000, 0, true, 0, 16384}};
+    auto result = (*backend)->ReadStagedWindow(ops);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->bytes, 12000u);  // Logical sum exceeds physical scratch.
+    EXPECT_EQ(result->physical_bytes, 8192u);
+    EXPECT_EQ(result->hipfile_read_calls, 1u);
+    EXPECT_EQ(result->staging_chunks, 1u);
+    EXPECT_EQ(state_.read_calls, 1);
+    EXPECT_EQ(state_.copy_calls, 2);
+    EXPECT_EQ(state_.synchronize_calls, 3);
+    const auto* bytes = static_cast<unsigned char*>(memory.data());
+    for (size_t i = 0; i < memory.size(); ++i) {
+        unsigned char expected = 0xff;
+        for (const auto& op : ops) {
+            if (i >= op.device_offset && i < op.device_offset + op.length)
+                expected = (op.file_offset + i - op.device_offset) % 251;
+        }
+        ASSERT_EQ(bytes[i], expected) << i;
+    }
+    ASSERT_TRUE((*backend)->ReadStagedWindow(ops));
+    EXPECT_EQ(state_.malloc_calls, 1);
+}
+
+TEST_F(HyFileBackendTest, StagedWindowValidatesEveryMemberBeforeIo) {
+    DirectFile file;
+    if (!file.valid()) GTEST_SKIP() << "O_DIRECT is unavailable";
+    AlignedMemory memory(32768);
+    auto backend = Create(8192);
+    ASSERT_TRUE(backend);
+    auto fr = (*backend)->RegisterFile(file.fd(), file.identity());
+    auto br = (*backend)->RegisterBuffer(memory.data(), memory.size(), 0);
+    ASSERT_TRUE(fr);
+    ASSERT_TRUE(br);
+    const DirectReadOp first{*fr, *br, 1, 1, 10, 0, true, 0, 32768};
+    const DirectReadOp second{*fr, *br, 4097, 8193, 10, 0, true, 0, 32768};
+    for (int invalid = 0; invalid < 9; ++invalid) {
+        auto bad = second;
+        switch (invalid) {
+            case 0: ++bad.buffer.id; break;
+            case 1: bad.device_offset = br->length; break;
+            case 2: bad.file_offset = 12289; break;  // Gap.
+            case 3: bad.device_offset = first.device_offset; break;
+            case 4: ++bad.file.id; break;
+            case 5: ++bad.device_id; break;
+            case 6: bad.extent_end = 8192; break;
+            case 7: bad.staged = false; break;
+            case 8: bad.length = std::numeric_limits<uint64_t>::max(); break;
+        }
+        const auto result = (*backend)->ReadStagedWindow({first, bad});
+        ASSERT_FALSE(result) << invalid;
+        EXPECT_EQ(result.error().target_state, XdsTargetState::kUntouched);
+    }
+    EXPECT_FALSE((*backend)->ReadStagedWindow({}));
+    EXPECT_EQ(state_.read_calls, 0);
+    EXPECT_EQ(state_.copy_calls, 0);
+    EXPECT_EQ(state_.malloc_calls, 0);
+}
+
+TEST_F(HyFileBackendTest, StagedWindowSecondCopyFailureStopsSafely) {
+    DirectFile file;
+    if (!file.valid()) GTEST_SKIP() << "O_DIRECT is unavailable";
+    AlignedMemory memory(16384);
+    auto backend = Create(8192);
+    ASSERT_TRUE(backend);
+    auto fr = (*backend)->RegisterFile(file.fd(), file.identity());
+    auto br = (*backend)->RegisterBuffer(memory.data(), memory.size(), 0);
+    ASSERT_TRUE(fr);
+    ASSERT_TRUE(br);
+    state_.fail_copy_call = 2;
+    auto result = (*backend)->ReadStagedWindow({
+        {*fr, *br, 1, 1, 10, 0, true, 0, 16384},
+        {*fr, *br, 4097, 8193, 10, 0, true, 0, 16384}});
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().target_state,
+              XdsTargetState::kStoppedSafeToOverwrite);
+    EXPECT_EQ(state_.read_calls, 1);
+    EXPECT_EQ(state_.copy_calls, 2);
+    EXPECT_EQ(state_.synchronize_calls, 3);
+}
+
+TEST_F(HyFileBackendTest, StagedWindowSecondCopySyncQuarantines) {
+    DirectFile file;
+    if (!file.valid()) GTEST_SKIP() << "O_DIRECT is unavailable";
+    AlignedMemory memory(16384);
+    auto backend = Create(8192);
+    ASSERT_TRUE(backend);
+    auto fr = (*backend)->RegisterFile(file.fd(), file.identity());
+    auto br = (*backend)->RegisterBuffer(memory.data(), memory.size(), 0);
+    ASSERT_TRUE(fr);
+    ASSERT_TRUE(br);
+    state_.fail_sync_call = 3;
+    std::vector<DirectReadOp> ops{
+        {*fr, *br, 1, 1, 10, 0, true, 0, 16384},
+        {*fr, *br, 4097, 8193, 10, 0, true, 0, 16384}};
+    auto result = (*backend)->ReadStagedWindow(ops);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().target_state,
+              XdsTargetState::kUnknownMayStillBeWritten);
+    EXPECT_FALSE((*backend)->ReadStagedWindow(ops));
+    EXPECT_FALSE((*backend)->DeregisterFile(*fr));
+    EXPECT_EQ(state_.read_calls, 1);
+    EXPECT_EQ(state_.copy_calls, 2);
 }
 
 TEST_F(HyFileBackendTest, StagingChunksExactLogicalBytesAndReusesScratch) {

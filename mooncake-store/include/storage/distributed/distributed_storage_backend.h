@@ -75,6 +75,7 @@ struct DistributedStorageConfig {
     size_t xds_file_cache_size = 1024;
     bool xds_allow_request_fallback = true;
     bool xds_staged_aggregate_dry_run = false;
+    bool xds_staged_aggregate_read = false;
     // Cleared by FromEnvironment() when the direct-I/O backend name is
     // unknown. Keep this separate from allocator validation so diagnostics
     // identify the actual invalid setting.
@@ -196,10 +197,14 @@ class DistributedStorageBackend : public StorageBackendInterface {
         uint64_t direct_hipfile_read_calls = 0;
         uint64_t staging_hipfile_read_calls = 0;
         uint64_t staging_chunks = 0;
+        // Execution-unit logical sum; overlapping sources can exceed scratch.
         uint64_t max_staged_op_bytes = 0;
-        // Completed backend operations, not vendor read calls or requests.
+        // Completed backend execution units, not vendor calls or requests.
+        // A staged window counts once, regardless of its target count.
         uint64_t direct_completed_ops = 0;
         uint64_t staging_completed_ops = 0;
+        uint64_t aggregate_windows = 0;
+        uint64_t aggregate_targets = 0;
     };
     std::vector<tl::expected<void, XdsError>> BatchReadRanges(
         const std::vector<DfsRangeReadRequest>& requests,

@@ -1280,8 +1280,9 @@ bandwidth 和 DCU copy-engine 利用率。新增专用 metrics 不作为首版�
 
 下一轮观测可在承载 Mooncake backend 的进程启动前设置
 `MOONCAKE_XDS_STAGED_AGGREGATE_DRY_RUN=1`（默认 `0`）。这只是统计开关，
-**不跳过真实 I/O、不重排或合并真实 operations**，也不改变目标状态、pin 生命周期或
-fallback。关闭开关或调用方不请求 stats 时，不进行额外候选分配或排序。
+**自身不跳过真实 I/O、不重排或合并真实 operations**，也不改变目标状态、pin 生命周期或
+fallback。关闭此开关或调用方不请求 stats 时，不计算额外候选统计；独立真实聚合开关
+开启时仍会构造执行窗口，不依赖 stats 指针。
 
 每次 `Client::BatchReadDfsRanges` backend 调用最多输出一条
 `[XDS_STAGED_AGG_DRY_RUN] scope=planned`，不采样、不记录逐 range 或原始 key。
@@ -1311,6 +1312,45 @@ fallback。关闭开关或调用方不请求 stats 时，不进行额外候选�
 替代。超容量 op 保留原有分块 calls/bytes，不参与聚合且不枚举 chunks，因此这是保守
 候选估计而非全局最优。不额外打开文件或执行 `fstat`。关闭开关即可停止统计；本变更
 不会自动启动负载或部署远端。
+
+#### 真实 staged 源窗口聚合与 scatter（路线 A）
+
+`MOONCAKE_XDS_STAGED_AGGREGATE_READ=1` 独立开启真实聚合，默认 `0`；DRY_RUN
+只控制观测，两开关可任意组合。均关闭保持原有执行行为。真实聚合与 dry-run 使用同一
+源排序贪心规划函数，dry-run 始终以聚合前的原 operations 为基线。
+
+仅同 request/object、file、device、extent 的 staged 成员可组成窗口，4K 覆盖必须
+重叠或相接、联合长度不超过 adapter 实际 scratch。独立 `supports_staged_window`
+capability 才授权调用 `ReadStagedWindow(vector<DirectReadOp>)`，不能用已有 vendor
+scatter/gather 字段替代。未支持、容量未知、单目标或超容量 op 在调用前保留旧路径
+（超容量仍按旧分块执行）；一旦调用窗口接口，失败不能重试单目标 staged 读取。
+
+所有 batch 参数校验及目标 pin、所有窗口构造均在首次 I/O 前完成。窗口放在其成员
+最小原 op index 处执行，成员按原顺序 scatter，其他 operations 保持彼此相对顺序。
+成员无需连续：这可能提前执行后续成员，安全性依赖既有全 batch 目标内存不重叠验证
+和请求完成后发布契约，并不保证开启后完全维持逐 op 时序。
+
+HyFile 单/多目标共用内部 pointer/count 执行器与原 scratch、锁、quarantine。
+全部成员的注册、bounds、file/device/extent、一致性、覆盖连通、目标不重叠和 logical
+sum 溢出检查先于 I/O，并再次检查实际 EOF。一次窗口 read/sync 后逐目标 D2D，每次
+copy 后同步；不增加 stream、scratch 或并发。失败不计该窗口部分成功；未知目标状态
+保留相关请求全部 pins，fatal 阻止后续执行，不提前发布请求成功。
+
+`[XDS_READ_SUCCESS] path=gpu_staging` 中：
+
+- `completed_ops` / `staging_completed_ops` 计完成的 backend **执行单元**：窗口计 1，
+  不是目标成员数，也不是 vendor call 数。
+- `aggregate_windows` 计完整成功的聚合窗口，`aggregate_targets` 计这些窗口的原 op
+  成员数；单目标旧路径不计入两者。
+- `logical_bytes` 是所有目标有效长度之和，源重叠也分别计；`physical_bytes` 对每个
+  窗口只计一次物理读取。`max_op_bytes` / `max_staged_op_bytes` 为执行单元的 logical
+  sum，源重叠时可以大于 scratch 容量，不能再据此推断物理窗口大小。
+- 失败窗口不增加成功 counters，即便较早目标已经写入；错误目标状态独立传播。
+
+验证应先在 Linux/HIP 环境编译并运行 `hyfile_backend_test`、
+`xds_buffer_registry_test`、`dfs_posix_test`，再由用户控制同配置、同缓存条件的 48 并发
+A/B；比较 vendor calls/physical bytes、D2D/同步开销、恢复耗时、端到端延迟及失败率。
+候选统计不是实测加速。本变更不自动部署、重启或运行负载。
 
 ### 8.2 测试方案
 
