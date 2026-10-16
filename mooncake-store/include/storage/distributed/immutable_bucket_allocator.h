@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -12,7 +13,9 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <ylt/util/tl/expected.hpp>
@@ -198,16 +201,31 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
                        const DistributedFSDescriptor& descriptor);
 
     /**
-     * @brief All committed entries recovered from disk at Init() time.
+     * @brief One bucket's worth of winners, handed to the master as recovery
+     * advances.
      *
-     * The master re-registers these as COMPLETE DFS replicas so recovered
-     * objects are queryable and readable, then clears the list.
+     * Recovery streams these batches instead of collecting the whole set, which
+     * is what keeps the restart peak independent of the total key count.
      */
     struct RecoveredReplica {
         std::string key;
         DistributedFSDescriptor descriptor;
     };
-    std::vector<RecoveredReplica> TakeRecoveredReplicas();
+    using RecoveredBatchConsumer =
+        std::function<void(std::vector<RecoveredReplica>&&)>;
+
+    /**
+     * @brief Rebuild allocator state from the buckets previous runs left on
+     * disk, streaming each bucket's winners to `consumer` as it is committed.
+     *
+     * Runs exactly once after Init() and before the allocator serves traffic.
+     * `consumer` is invoked with `mutex_` released, so the allocator mutex and
+     * the master's metadata shard mutex are never nested. A null consumer still
+     * rebuilds the allocator but reports no replicas, which is how the
+     * snapshot-restore path keeps its own metadata source.
+     */
+    tl::expected<void, ErrorCode> RecoverBucketsProgressively(
+        const RecoveredBatchConsumer& consumer);
 
     /**
      * @brief Bucket-granular eviction transaction.
@@ -490,6 +508,11 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     void RollbackBucketPublicationLocked(int64_t bucket_id,
                                          const BucketPtr& bucket);
     size_t EffectiveReadyTargetLocked() const;
+    // Same computation, but counts `recovered_count` buckets as already
+    // committed to the pool. Recovery runs after Init() has started the worker
+    // pool, so at that point `buckets_` is still empty and the plain overload
+    // would let the pool over-create.
+    size_t EffectiveReadyTargetLocked(size_t recovered_count) const;
     BucketPtr PromoteReadyBucketLocked();
     bool ActiveBucketHasSpaceLocked(uint64_t required,
                                     BucketPtr* bucket = nullptr) const;
@@ -539,7 +562,51 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
                                            bool verify_placement_offset,
                                            BucketPtr* out_bucket);
 
-    tl::expected<void, ErrorCode> RecoverFromDisk(bool recover_metadata);
+    // One live entry a worker found in a bucket's `.meta`. The descriptor is
+    // built on the worker so that committing stays a bookkeeping step;
+    // `generation` and `entry_offset` are what the duplicate-key comparison
+    // needs.
+    struct RecoveryCandidate {
+        RecoveredReplica replica;
+        uint64_t generation = 0;
+        uint64_t entry_offset = 0;
+    };
+
+    // A bucket as parsed from disk by one recovery worker: the state to publish
+    // plus the COMMITTED entries that may win a key. Nothing here reads or
+    // writes allocator state, which is what keeps workers free of `mutex_`.
+    struct ParsedBucket {
+        BucketPtr bucket;
+        std::vector<RecoveryCandidate> candidates;
+        uint64_t max_generation = 0;
+        bool discarded = false;
+    };
+
+    // A key that turned up in more than one bucket. The winner is deliberately
+    // not decided while committing: that needs the running winner's generation,
+    // and this model keeps no per-bucket entry table to read it from. Recording
+    // it instead keeps the bookkeeping proportional to the number of duplicated
+    // keys - which is rare - rather than to the number of keys.
+    struct RecoveryConflict {
+        std::string key;
+        int64_t bucket_id = -1;
+    };
+
+    // Parses one bucket's `.meta` without touching allocator state, so it is
+    // safe to run on a worker thread.
+    ParsedBucket ParseBucketMeta(int64_t bucket_id);
+
+    // Publishes one parsed bucket under `mutex_`. A candidate whose key is not
+    // in `key_index_` is the final winner and is appended to `winners`; a
+    // duplicate is recorded in `recovery_conflicts_` for the final pass.
+    void CommitParsedBucketLocked(int64_t bucket_id, ParsedBucket& parsed,
+                                  std::vector<RecoveredReplica>& winners);
+
+    // Decides every recorded duplicate by the persisted
+    // (generation, bucket_id, entry_offset) tuple and streams the corrected
+    // winner. Single-threaded and called with no lock held, so the bucket reads
+    // it performs are ordinary DFS I/O.
+    void ResolveRecoveryConflicts(const RecoveredBatchConsumer& consumer);
 
     void DeleteBucketFiles(int64_t bucket_id);
 
@@ -594,7 +661,16 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     std::list<int64_t> lru_list_;
     std::unordered_map<int64_t, std::list<int64_t>::iterator> lru_index_;
 
-    std::vector<RecoveredReplica> recovered_replicas_;
+    // Bucket ids Init() discovered but has not parsed yet. Recovery consumes
+    // them one batch at a time, so no two buckets' `.meta` contents coexist
+    // beyond the in-flight batch.
+    std::vector<int64_t> pending_recovery_meta_ids_;
+    std::vector<int64_t> pending_recovery_data_ids_;
+    // Resolved at Init(): the configured worker count, or the auto value when
+    // the configured one is 0.
+    size_t recovery_worker_count_ = 0;
+    // Duplicate keys seen while committing, resolved in one final pass.
+    std::vector<RecoveryConflict> recovery_conflicts_;
 
     std::shared_ptr<const BucketIdSnapshot> bucket_id_snapshot_;
     std::atomic<uint64_t> bucket_snapshot_version_{0};
