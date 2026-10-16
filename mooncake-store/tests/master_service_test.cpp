@@ -1865,6 +1865,7 @@ TEST_F(MasterServiceTest, DfsBucketAllocationFailureEvictsBeforeRetryingPut) {
             context.client_id, "forced_eviction_new", TenantId::Default(),
             4096, config);
         ASSERT_TRUE(replacement.has_value()) << toString(replacement.error());
+        ASSERT_NE(FindDfsDescriptor(*replacement), nullptr);
         ASSERT_TRUE(service
                         .PutRevoke(context.client_id, "forced_eviction_new",
                                    TenantId::Default(), ReplicaType::ALL)
