@@ -1843,23 +1843,29 @@ TEST_F(MasterServiceTest, DfsBucketAllocationFailureEvictsBeforeRetryingPut) {
     // use the allocation-failure recovery path.
     ScopedEnvVar eviction_interval("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL",
                                    "3600");
-    ScopedBucketDfsEnv env(root, "4096", "1", "1", "0.99", "0.8");
+    ScopedBucketDfsEnv env(root, "4096", "2", "1", "0.99", "0.8");
 
     {
-        MasterService service;
+        auto service_config =
+            MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+        MasterService service(service_config);
         const auto context = PrepareSimpleSegment(service);
         ReplicateConfig config;
         config.replica_num = 1;
         config.dfs_replica_num = 1;
 
-        ASSERT_TRUE(service
-                        .PutStart(context.client_id, "forced_eviction_old",
-                                  TenantId::Default(), 4096, config)
-                        .has_value());
-        ASSERT_TRUE(service
-                        .PutEnd(context.client_id, "forced_eviction_old",
-                                TenantId::Default(), ReplicaType::ALL)
-                        .has_value());
+        // Fill two buckets so the first is sealed and evictable, while the
+        // second remains active. Active buckets cannot be eviction candidates.
+        for (const auto* key : {"forced_eviction_old", "forced_eviction_active"}) {
+            ASSERT_TRUE(service
+                            .PutStart(context.client_id, key,
+                                      TenantId::Default(), 4096, config)
+                            .has_value());
+            ASSERT_TRUE(service
+                            .PutEnd(context.client_id, key, TenantId::Default(),
+                                    ReplicaType::ALL)
+                            .has_value());
+        }
 
         auto replacement = service.PutStart(
             context.client_id, "forced_eviction_new", TenantId::Default(),
