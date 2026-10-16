@@ -4587,7 +4587,14 @@ auto MasterService::PutStartInternal(
             if (*dfs_allocation_error == ErrorCode::NO_AVAILABLE_HANDLE &&
                 bucket_allocator_ != nullptr && !retried_dfs_allocation) {
                 retried_dfs_allocation = true;
-                if (TryRecoverDfsSpaceAfterAllocationFailure()) {
+                // Eviction validates metadata and then acquires object-operation
+                // locks for all candidates. Do not hold the request lock here:
+                // the write key may be one of those candidates, and the opposite
+                // metadata/object lock order would otherwise deadlock.
+                object_operation_lock.lock.unlock();
+                const bool recovered = TryRecoverDfsSpaceAfterAllocationFailure();
+                object_operation_lock.lock.lock();
+                if (recovered) {
                     --attempt;
                     continue;
                 }
