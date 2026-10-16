@@ -2093,9 +2093,13 @@ class MasterService {
     bool TryRecoverDfsSpaceAfterAllocationFailure();
     // Shard-mode per-key eviction (unchanged behaviour).
     void RunShardDfsEviction();
-    // Re-registers DFS replicas recovered from bucket metadata as COMPLETE so
-    // a restarted master can serve them. Called once, before serving traffic.
-    void RestoreRecoveredDfsReplicas();
+    // Rebuilds allocator state from bucket metadata and, when
+    // `rebuild_metadata` is true, re-registers the recovered DFS replicas as
+    // COMPLETE so a restarted master can serve them. Called once, before
+    // serving traffic. Recovery itself always runs, even in snapshot mode,
+    // because the allocator cannot allocate, free or evict without it; only the
+    // master metadata rebuild is conditioned on snapshot mode.
+    void RestoreRecoveredDfsReplicas(bool rebuild_metadata);
     void InitDfsAllocatorFromEnvironment(const MasterServiceConfig& config);
     /**
      * @brief Helper to release space of expired discarded replicas.

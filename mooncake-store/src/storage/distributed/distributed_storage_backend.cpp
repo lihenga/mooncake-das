@@ -26,6 +26,10 @@ namespace {
 // count would blow up both the thread and the memory budget.
 constexpr int kMaxBatchReadThreads = 256;
 constexpr int kMaxBucketCreateConcurrency = 8;
+// Upper bound on MOONCAKE_DFS_RECOVERY_WORKERS. Recovery holds one parsed
+// bucket per worker in flight, so an unbounded count would defeat the bounded
+// temporary-memory goal of progressive recovery.
+constexpr int kMaxRecoveryWorkers = 64;
 
 // Bound temporary memory and I/O latency while still collapsing the common
 // BatchAllocate output to one read. Larger batches become a few contiguous
@@ -246,6 +250,14 @@ bool DistributedStorageConfig::ValidateForBucketAllocator() const {
                    << "], batch_read_threads=" << batch_read_threads;
         return false;
     }
+    if (recovery_worker_count < 0 ||
+        recovery_worker_count > kMaxRecoveryWorkers) {
+        LOG(ERROR)
+            << "DistributedStorageConfig: recovery_worker_count must be in [0, "
+            << kMaxRecoveryWorkers
+            << "], recovery_worker_count=" << recovery_worker_count;
+        return false;
+    }
     return true;
 }
 
@@ -316,6 +328,8 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     config.bucket_create_concurrency =
         Environ::GetInt("MOONCAKE_DFS_BUCKET_CREATE_CONCURRENCY",
                         config.bucket_create_concurrency);
+    config.recovery_worker_count = Environ::GetInt(
+        "MOONCAKE_DFS_RECOVERY_WORKERS", config.recovery_worker_count);
     config.batch_read_threads = Environ::GetInt(
         "MOONCAKE_DFS_BATCH_READ_THREADS", config.batch_read_threads);
     config.batch_read_merge_enabled =
@@ -345,6 +359,7 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", max_bucket_count=" << max_bucket_count
         << ", ready_bucket_target=" << ready_bucket_target
         << ", bucket_create_concurrency=" << bucket_create_concurrency
+        << ", recovery_worker_count=" << recovery_worker_count
         << ", batch_read_threads=" << batch_read_threads
         << ", batch_read_merge_enabled=" << batch_read_merge_enabled
         << ", direct_read_enabled=" << direct_read_enabled;

@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -20,6 +21,7 @@
 #include "storage/distributed/bucket_entry_layout.h"
 #include "storage/distributed/fs_adapter.h"
 #include "storage/distributed/dfs_allocator_interface.h"
+#include "thread_pool.h"
 #include "types.h"
 
 namespace mooncake {
@@ -132,6 +134,15 @@ enum class BucketEntryState : int32_t {
  * BucketState object identity before publishing the result. No RPC, callback
  * or
  * filesystem call ever happens while `mutex_` is held.
+ *
+ * Recovery
+ * --------
+ * `Init()` only enumerates bucket file names; `RecoverBucketsProgressively()`
+ * parses the `.meta` contents later, concurrently, and commits them serially
+ * in ascending bucket_id order. Temporary memory is therefore bounded by the
+ * worker count rather than the total key count. The recovery consumer (the
+ * master's metadata writer) is invoked outside `mutex_`, so the allocator mutex
+ * and the master's metadata shard mutex are never nested.
  */
 class ImmutableBucketAllocator final : public DfsAllocatorInterface {
    public:
@@ -198,16 +209,42 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
                        const DistributedFSDescriptor& descriptor);
 
     /**
-     * @brief All committed entries recovered from disk at Init() time.
+     * @brief One committed entry that survived restart recovery.
      *
-     * The master re-registers these as COMPLETE DFS replicas so recovered
-     * objects are queryable and readable, then clears the list.
+     * The allocator hands these to the master as it commits each recovered
+     * bucket, so the master can re-register them as COMPLETE DFS replicas
+     * without the allocator ever holding a full-result vector.
      */
     struct RecoveredReplica {
         std::string key;
         DistributedFSDescriptor descriptor;
     };
-    std::vector<RecoveredReplica> TakeRecoveredReplicas();
+
+    /**
+     * @brief Callback receiving one bucket's worth of recovered winners.
+     *
+     * Invoked once per committed bucket, in ascending bucket_id order, after
+     * the allocator's mutex has been released. The master uses it to rebuild
+     * its metadata; the allocator never calls back while holding `mutex_`.
+     */
+    using RecoveredBatchConsumer =
+        std::function<void(std::vector<RecoveredReplica>&&)>;
+
+    /**
+     * @brief Rebuild allocator state from disk, one bucket at a time.
+     *
+     * Buckets are parsed concurrently by `recovery_worker_count_` workers but
+     * committed serially in ascending bucket_id order. Each committed bucket's
+     * winners are delivered to `consumer` immediately, so no full-result vector
+     * is ever materialized; live temporary memory is bounded by the number of
+     * workers times one parsed bucket. `consumer` may be empty, in which case
+     * only allocator state is rebuilt (snapshot mode). Recovery runs
+     * unconditionally: `buckets_`/`key_index_`/`next_bucket_id_` are needed
+     * regardless of whether the master rebuilds metadata from `.meta` or from a
+     * snapshot.
+     */
+    tl::expected<void, ErrorCode> RecoverBucketsProgressively(
+        const RecoveredBatchConsumer& consumer);
 
     /**
      * @brief Bucket-granular eviction transaction.
@@ -402,7 +439,16 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     void FinishBucketCreationLocked(bool synchronous);
     void RollbackBucketPublicationLocked(int64_t bucket_id,
                                          const BucketPtr& bucket);
-    size_t EffectiveReadyTargetLocked() const;
+    size_t EffectiveReadyTargetLocked() const {
+        return EffectiveReadyTargetLocked(0);
+    }
+    // Same as above, but also counts `recovered_count` buckets that recovery
+    // has discovered on disk but not yet published into `buckets_`. Init needs
+    // this: the ready pool starts before RecoverBucketsProgressively() commits
+    // anything, so without folding the recovered count in the target would be
+    // computed against an empty `buckets_` and could precreate buckets past
+    // max_bucket_count_.
+    size_t EffectiveReadyTargetLocked(size_t recovered_count) const;
     BucketPtr PromoteReadyBucketLocked();
     bool ActiveBucketHasSpaceLocked(uint64_t required,
                                     BucketPtr* bucket = nullptr) const;
@@ -436,7 +482,32 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
                                          const DistributedFSDescriptor& desc,
                                          BucketPtr* out_bucket);
 
-    tl::expected<void, ErrorCode> RecoverFromDisk();
+    // Result of parsing one bucket's `.meta` during recovery.
+    struct ParsedBucket {
+        // Freshly rebuilt bucket, null when the bucket was rejected.
+        BucketPtr bucket;
+        // COMMITTED entries this bucket contributes as recovery winners, in
+        // the order they appear in `bucket->entries`.
+        std::vector<RecoveredReplica> candidates;
+        // Largest (generation + 1) seen in this bucket; the caller takes the
+        // running max to seed `next_generation_`.
+        uint64_t max_generation = 0;
+        // True when the bucket was rejected and its files already deleted.
+        bool discarded = false;
+    };
+
+    // Reads and validates one bucket's `.meta`, producing a fresh BucketState
+    // plus its winner candidates. Pure with respect to allocator state: it only
+    // reads files and returns a value, never touching `mutex_`, so several
+    // workers may run it concurrently.
+    ParsedBucket ParseBucketMeta(int64_t bucket_id);
+
+    // Publishes one parsed bucket: resolves duplicate-key winners against the
+    // current `key_index_` using keep-max on (generation, bucket_id,
+    // entry_offset), records the winners in `winners`, and moves the bucket
+    // into `buckets_`. Requires `mutex_`; `winners` must be empty on entry.
+    void CommitParsedBucketLocked(int64_t bucket_id, ParsedBucket& parsed,
+                                  std::vector<RecoveredReplica>& winners);
 
     void DeleteBucketFiles(int64_t bucket_id);
 
@@ -488,7 +559,13 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     std::list<int64_t> lru_list_;
     std::unordered_map<int64_t, std::list<int64_t>::iterator> lru_index_;
 
-    std::vector<RecoveredReplica> recovered_replicas_;
+    // Bucket ids discovered in `Init()` by file name only, held until
+    // `RecoverBucketsProgressively()` parses them. Parsing is deferred so the
+    // content never exists all at once.
+    std::vector<int64_t> pending_recovery_meta_ids_;
+    std::vector<int64_t> pending_recovery_data_ids_;
+    // Worker threads used to parse buckets concurrently during recovery.
+    size_t recovery_worker_count_ = 1;
 
     std::atomic<bool> initialized_{false};
 };

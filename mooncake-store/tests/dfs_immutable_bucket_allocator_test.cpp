@@ -139,6 +139,23 @@ std::optional<DistributedFSDescriptor> RollOverActiveBucket(
     return *desc;
 }
 
+// Convenience over the streaming recovery API: drains every recovered batch
+// into a single vector so tests can assert on the recovered set. Recovery of a
+// restarted allocator must run exactly once, before any recovered-state
+// assertion.
+std::vector<ImmutableBucketAllocator::RecoveredReplica> RecoverAll(
+    ImmutableBucketAllocator& allocator) {
+    std::vector<ImmutableBucketAllocator::RecoveredReplica> all;
+    auto consumer =
+        [&all](std::vector<ImmutableBucketAllocator::RecoveredReplica>&&
+                   batch) {
+            for (auto& replica : batch) all.push_back(std::move(replica));
+        };
+    auto result = allocator.RecoverBucketsProgressively(consumer);
+    EXPECT_TRUE(result.has_value());
+    return all;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -694,7 +711,7 @@ TEST(ImmutableBucketAllocatorTest, RecoveryRejectsOldMetadataVersion) {
     ImmutableBucketAllocator recovered;
     ASSERT_TRUE(
         recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-    EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
+    EXPECT_TRUE(RecoverAll(recovered).empty());
     EXPECT_FALSE(std::filesystem::exists(BucketDataFile(tmp, 0)));
     EXPECT_FALSE(std::filesystem::exists(BucketMetaFile(tmp, 0)));
 }
@@ -711,7 +728,7 @@ TEST(ImmutableBucketAllocatorTest, RecoveryChoosesLargestEntryGeneration) {
     ImmutableBucketAllocator recovered;
     ASSERT_TRUE(
         recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-    auto replicas = recovered.TakeRecoveredReplicas();
+    auto replicas = RecoverAll(recovered);
     ASSERT_EQ(replicas.size(), 1u);
     EXPECT_EQ(replicas[0].key, "duplicate");
     EXPECT_EQ(replicas[0].descriptor.shard_idx, 1);
@@ -729,7 +746,7 @@ TEST(ImmutableBucketAllocatorTest, RecoveryBreaksGenerationTiesByLocation) {
     ImmutableBucketAllocator recovered;
     ASSERT_TRUE(
         recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-    auto replicas = recovered.TakeRecoveredReplicas();
+    auto replicas = RecoverAll(recovered);
     ASSERT_EQ(replicas.size(), 1u);
     EXPECT_EQ(replicas[0].descriptor.shard_idx, 1);
     EXPECT_EQ(replicas[0].descriptor.offset, 0u);
@@ -762,7 +779,7 @@ TEST(ImmutableBucketAllocatorTest, RecoveryRestoresOnlyCommittedEntries) {
     ASSERT_TRUE(
         recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
 
-    auto replicas = recovered.TakeRecoveredReplicas();
+    auto replicas = RecoverAll(recovered);
     ASSERT_EQ(replicas.size(), 1u);
     EXPECT_EQ(replicas[0].key, "committed");
     EXPECT_EQ(replicas[0].descriptor.offset, committed_desc.offset);
@@ -809,7 +826,7 @@ TEST(ImmutableBucketAllocatorTest, RecoveryDoesNotRevivedFreedKeys) {
     ImmutableBucketAllocator recovered;
     ASSERT_TRUE(
         recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-    EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
+    EXPECT_TRUE(RecoverAll(recovered).empty());
     EXPECT_FALSE(recovered.GetBucketIdForKey("gone").has_value());
 }
 
@@ -831,7 +848,7 @@ TEST(ImmutableBucketAllocatorTest, DestructorFlushesDeferredTombstones) {
     ImmutableBucketAllocator recovered;
     ASSERT_TRUE(
         recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-    EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
+    EXPECT_TRUE(RecoverAll(recovered).empty());
     EXPECT_FALSE(recovered.GetBucketIdForKey("gone").has_value());
 }
 
@@ -899,7 +916,7 @@ TEST(ImmutableBucketAllocatorTest, RecoveryRejectsCorruptAndTruncatedMetadata) {
         ImmutableBucketAllocator recovered;
         ASSERT_TRUE(
             recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-        EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
+        EXPECT_TRUE(RecoverAll(recovered).empty());
         EXPECT_FALSE(recovered.GetBucketIdForKey("k").has_value());
         // Metadata that cannot be verified makes the data unusable: a cache
         // miss is always cheaper than serving bytes nobody can validate, so
@@ -931,7 +948,7 @@ TEST(ImmutableBucketAllocatorTest, RecoveryRejectsCorruptAndTruncatedMetadata) {
         ImmutableBucketAllocator recovered;
         ASSERT_TRUE(
             recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-        EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
+        EXPECT_TRUE(RecoverAll(recovered).empty());
         EXPECT_FALSE(std::filesystem::exists(data_path));
         EXPECT_FALSE(std::filesystem::exists(meta_path));
     }
@@ -957,7 +974,7 @@ TEST(ImmutableBucketAllocatorTest, RecoveryRejectsCorruptAndTruncatedMetadata) {
         ImmutableBucketAllocator recovered;
         ASSERT_TRUE(
             recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-        EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
+        EXPECT_TRUE(RecoverAll(recovered).empty());
         EXPECT_FALSE(recovered.GetBucketIdForKey("k").has_value());
         EXPECT_FALSE(std::filesystem::exists(BucketMetaFile(tmp, 0)));
     }
@@ -986,7 +1003,7 @@ TEST(ImmutableBucketAllocatorTest, NarrowedCapacityDiscardsIncompatibleBuckets) 
     ImmutableBucketAllocator recovered;
     ASSERT_TRUE(
         recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity / 2, 8)));
-    EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
+    EXPECT_TRUE(RecoverAll(recovered).empty());
     EXPECT_FALSE(recovered.GetBucketIdForKey("k").has_value());
     EXPECT_FALSE(std::filesystem::exists(data_path));
     EXPECT_FALSE(std::filesystem::exists(BucketMetaFile(tmp, 0)));
@@ -1013,6 +1030,7 @@ TEST(ImmutableBucketAllocatorTest, RecoveryRemovesOrphanDataFiles) {
     ASSERT_TRUE(
         recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
     // A data file with no valid metadata is unreachable, so it is reclaimed.
+    EXPECT_TRUE(RecoverAll(recovered).empty());
     EXPECT_FALSE(std::filesystem::exists(orphan));
     // Bucket ids must not be reused after an orphan at a higher id.
     auto desc = recovered.Allocate("k", 100);
@@ -1069,7 +1087,7 @@ TEST(ImmutableBucketAllocatorTest, RecoveryContinuesInterruptedEviction) {
     ASSERT_TRUE(
         recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
     // The eviction is finished rather than the entries being resurrected.
-    EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
+    EXPECT_TRUE(RecoverAll(recovered).empty());
     EXPECT_FALSE(std::filesystem::exists(data_path));
     EXPECT_FALSE(std::filesystem::exists(meta_path));
 }
@@ -1091,8 +1109,9 @@ TEST(ImmutableBucketAllocatorTest, RecoveryPreservesBucketIdSequence) {
     ASSERT_TRUE(recovered.Init(MakeBucketConfig(tmp.path(), capacity, 8)));
     // Buckets 0 and 1 were sealed by the rollovers; bucket 2 was still active
     // at shutdown, so it has no metadata and its data file is reclaimed.
+    auto replicas = RecoverAll(recovered);
     EXPECT_EQ(recovered.GetBucketCount(), 2u);
-    EXPECT_EQ(recovered.TakeRecoveredReplicas().size(), 2u);
+    EXPECT_EQ(replicas.size(), 2u);
     EXPECT_FALSE(std::filesystem::exists(BucketMetaFile(tmp, 2)));
     EXPECT_FALSE(std::filesystem::exists(tmp.file(
         "bucket_" + ImmutableBucketAllocator::FormatBucketId(2) + ".data")));
@@ -1101,6 +1120,93 @@ TEST(ImmutableBucketAllocatorTest, RecoveryPreservesBucketIdSequence) {
     auto desc = recovered.Allocate("after", 100);
     ASSERT_TRUE(desc.has_value());
     EXPECT_EQ(desc->shard_idx, 3);
+}
+
+TEST(ImmutableBucketAllocatorTest, RecoveryStreamsOneBatchPerBucketInIdOrder) {
+    TempDir tmp("bucket_recover_batches");
+    constexpr int64_t kBuckets = 5;
+    for (int64_t id = 0; id < kBuckets; ++id) {
+        ASSERT_TRUE(CreateBucketDataFile(tmp, id, kBucketCapacity));
+        ASSERT_TRUE(WriteBucketMetadata(
+            tmp,
+            MakeMetadataSnapshot(id, "key_" + std::to_string(id), 0, id + 1)));
+    }
+
+    auto config = MakeBucketConfig(tmp.path(), kBucketCapacity, 16);
+    // Force more than one parse batch so the streaming path is exercised.
+    config.recovery_worker_count = 2;
+    ImmutableBucketAllocator recovered;
+    ASSERT_TRUE(recovered.Init(config).has_value());
+
+    std::vector<int64_t> batch_bucket_ids;
+    size_t total = 0;
+    auto consumer =
+        [&](std::vector<ImmutableBucketAllocator::RecoveredReplica>&& batch) {
+            ASSERT_FALSE(batch.empty());
+            batch_bucket_ids.push_back(batch.front().descriptor.shard_idx);
+            total += batch.size();
+        };
+    ASSERT_TRUE(recovered.RecoverBucketsProgressively(consumer).has_value());
+
+    // Every recovered bucket produced exactly one batch of its own winner.
+    ASSERT_EQ(batch_bucket_ids.size(), static_cast<size_t>(kBuckets));
+    EXPECT_EQ(total, static_cast<size_t>(kBuckets));
+    // Commit order is ascending bucket_id, independent of parse order.
+    EXPECT_TRUE(
+        std::is_sorted(batch_bucket_ids.begin(), batch_bucket_ids.end()));
+}
+
+TEST(ImmutableBucketAllocatorTest, RecoveryDemotesDuplicateLosersAndPersists) {
+    TempDir tmp("bucket_recover_loser");
+    ASSERT_TRUE(CreateBucketDataFile(tmp, 0, kBucketCapacity));
+    ASSERT_TRUE(CreateBucketDataFile(tmp, 1, kBucketCapacity));
+    ASSERT_TRUE(WriteBucketMetadata(tmp, MakeMetadataSnapshot(0, "dup", 0, 10)));
+    ASSERT_TRUE(WriteBucketMetadata(tmp, MakeMetadataSnapshot(1, "dup", 0, 11)));
+
+    ImmutableBucketAllocator first;
+    ASSERT_TRUE(first.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 16)));
+    // Streaming emits candidates in ascending bucket_id order, so the key is
+    // reported twice; the greater generation (bucket 1) is emitted last and is
+    // what the master's last-wins consumer keeps.
+    auto replicas = RecoverAll(first);
+    ASSERT_EQ(replicas.size(), 2u);
+    EXPECT_EQ(replicas.back().descriptor.shard_idx, 1);
+    // The allocator itself resolves the winner and demotes the loser.
+    ASSERT_TRUE(first.GetBucketIdForKey("dup").has_value());
+    EXPECT_EQ(first.GetBucketIdForKey("dup").value(), 1);
+
+    // A second start must reach the same conclusion from the persisted state:
+    // the losing entry was demoted to a tombstone, not merely skipped in memory,
+    // so it is no longer even a candidate.
+    ImmutableBucketAllocator second;
+    ASSERT_TRUE(second.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 16)));
+    auto second_replicas = RecoverAll(second);
+    ASSERT_EQ(second_replicas.size(), 1u);
+    EXPECT_EQ(second_replicas[0].descriptor.shard_idx, 1);
+    ASSERT_TRUE(second.GetBucketIdForKey("dup").has_value());
+    EXPECT_EQ(second.GetBucketIdForKey("dup").value(), 1);
+}
+
+TEST(ImmutableBucketAllocatorTest, RecoveryWithEmptyConsumerRebuildsAllocator) {
+    TempDir tmp("bucket_recover_null_consumer");
+    {
+        ImmutableBucketAllocator alloc;
+        ASSERT_TRUE(
+            alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
+        auto desc = alloc.Allocate("k", 100);
+        ASSERT_TRUE(desc.has_value());
+        ASSERT_TRUE(alloc.MarkCommitted("k", *desc));
+        ASSERT_TRUE(
+            RollOverActiveBucket(alloc, "filler", kBucketCapacity).has_value());
+    }
+
+    ImmutableBucketAllocator recovered;
+    ASSERT_TRUE(
+        recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
+    // An empty consumer mirrors the snapshot-restore path: the allocator is
+    // rebuilt from disk, but no replica is re-registered.
+    ASSERT_TRUE(recovered.RecoverBucketsProgressively(nullptr).has_value());
+    EXPECT_TRUE(recovered.GetBucketIdForKey("k").has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -1793,7 +1899,7 @@ TEST(BucketMetadataDurabilityTest, AbruptRestartDropsTheActiveBucket) {
         recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
     // Losing the single active bucket is the accepted trade-off for keeping the
     // put path free of metadata I/O. Its data file must not be left behind.
-    EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
+    EXPECT_TRUE(RecoverAll(recovered).empty());
     EXPECT_FALSE(recovered.GetBucketIdForKey("crash_a").has_value());
     EXPECT_FALSE(recovered.GetBucketIdForKey("crash_b").has_value());
     EXPECT_FALSE(std::filesystem::exists(data_path));
@@ -1827,7 +1933,7 @@ TEST(BucketMetadataDurabilityTest, AbruptRestartKeepsSealedBuckets) {
     ImmutableBucketAllocator recovered;
     ASSERT_TRUE(
         recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-    auto replicas = recovered.TakeRecoveredReplicas();
+    auto replicas = RecoverAll(recovered);
     ASSERT_EQ(replicas.size(), 1u);
     EXPECT_EQ(replicas[0].key, "sealed_key");
     EXPECT_TRUE(recovered.GetBucketIdForKey("sealed_key").has_value());
@@ -1917,7 +2023,7 @@ TEST(BucketMetadataDurabilityTest, FlushRacesWithConcurrentAllocateAndCommit) {
     constexpr size_t kTotal = kThreads * kPerThread;
     ImmutableBucketAllocator recovered;
     ASSERT_TRUE(recovered.Init(config));
-    const size_t restored = recovered.TakeRecoveredReplicas().size();
+    const size_t restored = RecoverAll(recovered).size();
     EXPECT_GE(restored, kTotal - kEntriesPerBucket);
     EXPECT_LE(restored, kTotal);
 }
