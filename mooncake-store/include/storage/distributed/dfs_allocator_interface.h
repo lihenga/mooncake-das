@@ -24,8 +24,8 @@ struct DistributedStorageConfig;
  * and reclaimed per key.
  *
  * BUCKET uses ImmutableBucketAllocator: a dynamic set of append-only bucket
- * files with persisted `.meta` sidecars, whole-bucket LRU eviction and
- * restart recovery.
+ * files with whole-bucket LRU eviction and no persisted metadata, so a master
+ * restart starts from empty buckets.
  */
 enum class DfsAllocatorType {
     SHARD,
@@ -132,8 +132,8 @@ class DfsAllocatorInterface {
      * @brief Release the space described by `descriptor` for `key`.
      *
      * Must be a no-op when the descriptor no longer matches the allocator's
-     * current state for that key (i.e. a stale free from a superseded
-     * generation), so late completions cannot drop a newer allocation.
+     * current state for that key (i.e. a stale free for a region that has since
+     * been reallocated), so late completions cannot drop a newer allocation.
      */
     virtual void Free(const std::string& key,
                       const DistributedFSDescriptor& descriptor) = 0;

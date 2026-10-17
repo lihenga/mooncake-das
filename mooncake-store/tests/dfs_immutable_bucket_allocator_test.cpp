@@ -21,9 +21,6 @@
 #include <unordered_set>
 #include <vector>
 
-#include <ylt/struct_pb.hpp>
-
-#include "crc32c.h"
 #include "replica.h"
 #include "storage/distributed/bucket_entry_layout.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
@@ -68,16 +65,6 @@ class TempDir {
 
 constexpr uint64_t kAlignment = 4096;
 constexpr uint64_t kBucketCapacity = 64 * 1024;
-
-template <typename T, typename = void>
-struct HasBucketGeneration : std::false_type {};
-
-template <typename T>
-struct HasBucketGeneration<
-    T, std::void_t<decltype(std::declval<T&>().bucket_generation)>>
-    : std::true_type {};
-
-static_assert(!HasBucketGeneration<PersistedBucketMetadata>::value);
 
 DistributedStorageConfig MakeBucketConfig(const std::string& fsdir,
                                           uint64_t bucket_capacity,
@@ -128,9 +115,9 @@ std::string BucketMetaFile(const TempDir& tmp, int64_t bucket_id) {
                     ImmutableBucketAllocator::FormatBucketId(bucket_id) + ".meta");
 }
 
-// Seals the current active bucket, which is the only moment its `.meta` file is
-// written. The filler object is sized so that it only fits into an empty
-// bucket, forcing the allocator to roll over instead of appending.
+// Seals the current active bucket. The filler object is sized so that it only
+// fits into an empty bucket, forcing the allocator to roll over instead of
+// appending.
 std::optional<DistributedFSDescriptor> RollOverActiveBucket(
     ImmutableBucketAllocator& alloc, const std::string& filler_key,
     uint64_t bucket_capacity) {
@@ -201,55 +188,6 @@ TEST(ImmutableBucketAllocatorTest, AllocateRejectsInvalidRequests) {
 std::string BucketDataFile(const TempDir& tmp, int64_t bucket_id) {
     return tmp.file("bucket_" +
                     ImmutableBucketAllocator::FormatBucketId(bucket_id) + ".data");
-}
-
-bool WriteBucketMetadata(const TempDir& tmp, PersistedBucketMetadata snapshot) {
-    snapshot.checksum = 0;
-    std::string checksum_payload;
-    struct_pb::to_pb(snapshot, checksum_payload);
-    snapshot.checksum =
-        Crc32cValue(checksum_payload.data(), checksum_payload.size());
-    std::string payload;
-    struct_pb::to_pb(snapshot, payload);
-
-    const std::string path = BucketMetaFile(tmp, snapshot.bucket_id);
-    const int fd = ::open(path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
-    if (fd < 0) return false;
-    const ssize_t written = ::pwrite(fd, payload.data(), payload.size(), 0);
-    const int close_result = ::close(fd);
-    return written == static_cast<ssize_t>(payload.size()) && close_result == 0;
-}
-
-bool CreateBucketDataFile(const TempDir& tmp, int64_t bucket_id,
-                          uint64_t capacity) {
-    const std::string path = BucketDataFile(tmp, bucket_id);
-    const int fd = ::open(path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
-    if (fd < 0) return false;
-    const int truncate_result = ::ftruncate(fd, static_cast<off_t>(capacity));
-    const int close_result = ::close(fd);
-    return truncate_result == 0 && close_result == 0;
-}
-
-PersistedBucketMetadata MakeMetadataSnapshot(
-    int64_t bucket_id, std::string key, uint64_t entry_offset,
-    uint64_t generation, uint32_t version = kBucketMetadataVersion) {
-    PersistedBucketEntry entry;
-    entry.key = std::move(key);
-    entry.entry_offset = entry_offset;
-    entry.key_size = entry.key.size();
-    entry.value_size = 100;
-    entry.reserved_size = kAlignment;
-    entry.generation = generation;
-    entry.state = static_cast<int32_t>(BucketEntryState::COMMITTED);
-
-    PersistedBucketMetadata snapshot;
-    snapshot.version = version;
-    snapshot.bucket_id = bucket_id;
-    snapshot.capacity = kBucketCapacity;
-    snapshot.alignment = kAlignment;
-    snapshot.append_offset = entry_offset + entry.reserved_size;
-    snapshot.entries.push_back(std::move(entry));
-    return snapshot;
 }
 
 TEST(ImmutableBucketAllocatorTest, KeyLengthDoesNotAffectReservedSize) {
@@ -553,7 +491,7 @@ TEST(ImmutableBucketAllocatorTest, BatchAllocateRejectsBadRequestsAtomically) {
 }
 
 // ---------------------------------------------------------------------------
-// ImmutableBucketAllocator: Free / MarkCommitted
+// ImmutableBucketAllocator: Free
 // ---------------------------------------------------------------------------
 
 TEST(ImmutableBucketAllocatorTest, FreeTombstonesEntryAndAllowsReuseOfKey) {
@@ -603,479 +541,56 @@ TEST(ImmutableBucketAllocatorTest, StaleFreeDoesNotDropNewAllocation) {
     EXPECT_FALSE(alloc.GetBucketIdForKey("k").has_value());
 }
 
-TEST(ImmutableBucketAllocatorTest, MarkCommittedValidatesDescriptorIdentity) {
-    TempDir tmp("bucket_commit");
-    ImmutableBucketAllocator alloc;
-    ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-
-    auto desc = alloc.Allocate("k", 100);
-    ASSERT_TRUE(desc.has_value());
-
-    auto wrong = *desc;
-    wrong.offset += kAlignment;
-    EXPECT_FALSE(alloc.MarkCommitted("k", wrong));
-    EXPECT_FALSE(alloc.MarkCommitted("other_key", *desc));
-
-    EXPECT_TRUE(alloc.MarkCommitted("k", *desc));
-    // Idempotent: a duplicate PutEnd for the same generation still succeeds.
-    EXPECT_TRUE(alloc.MarkCommitted("k", *desc));
-}
-
 // ---------------------------------------------------------------------------
-// ImmutableBucketAllocator: metadata persistence and recovery
+// ImmutableBucketAllocator: restart behaviour (nothing is recovered)
 // ---------------------------------------------------------------------------
 
-TEST(ImmutableBucketAllocatorTest, MetadataIsPersistedWhenBucketIsSealed) {
-    TempDir tmp("bucket_persist");
-    ImmutableBucketAllocator alloc;
-    ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-
-    auto desc = alloc.Allocate("persisted", 100);
-    ASSERT_TRUE(desc.has_value());
-
-    // The active bucket keeps its metadata in memory only: no file at all, and
-    // in particular none of the legacy slot/log/temp companions.
-    const std::string meta_path = BucketMetaFile(tmp, 0);
-    EXPECT_FALSE(std::filesystem::exists(meta_path));
-    EXPECT_FALSE(std::filesystem::exists(meta_path + ".0"));
-    EXPECT_FALSE(std::filesystem::exists(meta_path + ".1"));
-    EXPECT_FALSE(std::filesystem::exists(meta_path + ".log"));
-    EXPECT_FALSE(std::filesystem::exists(meta_path + ".tmp"));
-
-    // Rolling over to the next bucket seals bucket 0 and writes its one and
-    // only metadata file.
-    ASSERT_TRUE(
-        RollOverActiveBucket(alloc, "filler", kBucketCapacity).has_value());
-    ASSERT_TRUE(std::filesystem::exists(meta_path));
-    EXPECT_GT(std::filesystem::file_size(meta_path), 0u);
-    EXPECT_FALSE(std::filesystem::exists(meta_path + ".0"));
-    EXPECT_FALSE(std::filesystem::exists(meta_path + ".1"));
-    EXPECT_FALSE(std::filesystem::exists(meta_path + ".log"));
-}
-
-TEST(ImmutableBucketAllocatorTest, MetadataRoundTripKeepsEntryGenerationAndKey) {
-    TempDir tmp("bucket_metadata_schema");
+TEST(ImmutableBucketAllocatorTest, InitPurgesLeftoverBucketFiles) {
+    TempDir tmp("bucket_purge");
+    // What a previous process left behind: a data file nobody can address any
+    // more, plus a `.meta` file from a build that still wrote one.
+    const std::string data_path = BucketDataFile(tmp, 7);
+    const std::string meta_path = BucketMetaFile(tmp, 7);
     {
-        ImmutableBucketAllocator alloc;
-        ASSERT_TRUE(
-            alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-        auto desc = alloc.Allocate("metadata_key", 100);
-        ASSERT_TRUE(desc.has_value());
-        ASSERT_TRUE(alloc.MarkCommitted("metadata_key", *desc));
-        ASSERT_TRUE(
-            RollOverActiveBucket(alloc, "filler", kBucketCapacity).has_value());
-    }
-
-    const std::string meta_path = BucketMetaFile(tmp, 0);
-    const size_t size = std::filesystem::file_size(meta_path);
-    std::string payload(size, '\0');
-    const int fd = ::open(meta_path.c_str(), O_RDONLY);
-    ASSERT_GE(fd, 0);
-    ASSERT_EQ(::pread(fd, payload.data(), payload.size(), 0),
-              static_cast<ssize_t>(payload.size()));
-    ASSERT_EQ(::close(fd), 0);
-
-    PersistedBucketMetadata snapshot;
-    struct_pb::from_pb(snapshot, payload);
-    EXPECT_EQ(snapshot.version, kBucketMetadataVersion);
-    EXPECT_EQ(snapshot.version, 5u);
-    ASSERT_FALSE(snapshot.entries.empty());
-    EXPECT_EQ(snapshot.entries[0].key, "metadata_key");
-    EXPECT_GT(snapshot.entries[0].generation, 0u);
-}
-
-TEST(ImmutableBucketAllocatorTest, RecoveryRejectsOldMetadataVersion) {
-    TempDir tmp("bucket_old_metadata");
-    auto old_snapshot =
-        MakeMetadataSnapshot(0, "old_key", 0, 7, kBucketMetadataVersion - 1);
-    ASSERT_TRUE(CreateBucketDataFile(tmp, 0, kBucketCapacity));
-    ASSERT_TRUE(WriteBucketMetadata(tmp, std::move(old_snapshot)));
-
-    ImmutableBucketAllocator recovered;
-    ASSERT_TRUE(
-        recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-    EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
-    EXPECT_FALSE(std::filesystem::exists(BucketDataFile(tmp, 0)));
-    EXPECT_FALSE(std::filesystem::exists(BucketMetaFile(tmp, 0)));
-}
-
-TEST(ImmutableBucketAllocatorTest, RecoveryChoosesLargestEntryGeneration) {
-    TempDir tmp("bucket_duplicate_generation");
-    ASSERT_TRUE(CreateBucketDataFile(tmp, 0, kBucketCapacity));
-    ASSERT_TRUE(CreateBucketDataFile(tmp, 1, kBucketCapacity));
-    ASSERT_TRUE(
-        WriteBucketMetadata(tmp, MakeMetadataSnapshot(0, "duplicate", 0, 10)));
-    ASSERT_TRUE(
-        WriteBucketMetadata(tmp, MakeMetadataSnapshot(1, "duplicate", 0, 11)));
-
-    ImmutableBucketAllocator recovered;
-    ASSERT_TRUE(
-        recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-    auto replicas = recovered.TakeRecoveredReplicas();
-    ASSERT_EQ(replicas.size(), 1u);
-    EXPECT_EQ(replicas[0].key, "duplicate");
-    EXPECT_EQ(replicas[0].descriptor.shard_idx, 1);
-}
-
-TEST(ImmutableBucketAllocatorTest, RecoveryBreaksGenerationTiesByLocation) {
-    TempDir tmp("bucket_duplicate_tie");
-    ASSERT_TRUE(CreateBucketDataFile(tmp, 0, kBucketCapacity));
-    ASSERT_TRUE(CreateBucketDataFile(tmp, 1, kBucketCapacity));
-    ASSERT_TRUE(WriteBucketMetadata(
-        tmp, MakeMetadataSnapshot(0, "duplicate", kAlignment, 10)));
-    ASSERT_TRUE(
-        WriteBucketMetadata(tmp, MakeMetadataSnapshot(1, "duplicate", 0, 10)));
-
-    ImmutableBucketAllocator recovered;
-    ASSERT_TRUE(
-        recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-    auto replicas = recovered.TakeRecoveredReplicas();
-    ASSERT_EQ(replicas.size(), 1u);
-    EXPECT_EQ(replicas[0].descriptor.shard_idx, 1);
-    EXPECT_EQ(replicas[0].descriptor.offset, 0u);
-}
-
-TEST(ImmutableBucketAllocatorTest, RecoveryRestoresOnlyCommittedEntries) {
-    TempDir tmp("bucket_recover");
-    DistributedFSDescriptor committed_desc;
-    {
-        ImmutableBucketAllocator alloc;
-        ASSERT_TRUE(
-            alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-        auto committed = alloc.Allocate("committed", 100);
-        ASSERT_TRUE(committed.has_value());
-        committed_desc = *committed;
-        ASSERT_TRUE(alloc.MarkCommitted("committed", committed_desc));
-
-        auto pending = alloc.Allocate("pending", 100);
-        ASSERT_TRUE(pending.has_value());
-        // Deliberately not committed: it simulates a crash after PutStart but
-        // before the DFS data write was confirmed.
-
-        // Seal bucket 0 so that its metadata reaches disk at all. The filler
-        // lands in bucket 1, which stays active and is therefore discarded.
-        ASSERT_TRUE(
-            RollOverActiveBucket(alloc, "filler", kBucketCapacity).has_value());
-    }
-
-    ImmutableBucketAllocator recovered;
-    ASSERT_TRUE(
-        recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-
-    auto replicas = recovered.TakeRecoveredReplicas();
-    ASSERT_EQ(replicas.size(), 1u);
-    EXPECT_EQ(replicas[0].key, "committed");
-    EXPECT_EQ(replicas[0].descriptor.offset, committed_desc.offset);
-    EXPECT_EQ(replicas[0].descriptor.object_size, committed_desc.object_size);
-    EXPECT_EQ(replicas[0].descriptor.aligned_size, committed_desc.aligned_size);
-    EXPECT_EQ(replicas[0].descriptor.shard_idx, committed_desc.shard_idx);
-    EXPECT_EQ(replicas[0].descriptor.file_path, committed_desc.file_path);
-
-    EXPECT_TRUE(recovered.GetBucketIdForKey("committed").has_value());
-    // The uncommitted entry must not come back as readable.
-    EXPECT_FALSE(recovered.GetBucketIdForKey("pending").has_value());
-    // The bucket that was still active at shutdown had no metadata, so its data
-    // file was reclaimed and its uncommitted filler is gone as well.
-    EXPECT_FALSE(recovered.GetBucketIdForKey("filler").has_value());
-    EXPECT_EQ(recovered.GetBucketCount(), 1u);
-
-    // A recovered bucket is sealed, so new allocations never append to it.
-    auto fresh = recovered.Allocate("fresh", 100);
-    ASSERT_TRUE(fresh.has_value());
-    EXPECT_NE(fresh->shard_idx, committed_desc.shard_idx);
-}
-
-TEST(ImmutableBucketAllocatorTest, RecoveryDoesNotRevivedFreedKeys) {
-    TempDir tmp("bucket_recover_tombstone");
-    {
-        ImmutableBucketAllocator alloc;
-        ASSERT_TRUE(
-            alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-        auto desc = alloc.Allocate("gone", 100);
-        ASSERT_TRUE(desc.has_value());
-        ASSERT_TRUE(alloc.MarkCommitted("gone", *desc));
-        // Seal the bucket first, so that "gone" is actually on disk and the
-        // tombstone has something to invalidate.
-        ASSERT_TRUE(
-            RollOverActiveBucket(alloc, "filler", kBucketCapacity).has_value());
-        ASSERT_TRUE(std::filesystem::exists(BucketMetaFile(tmp, 0)));
-
-        alloc.Free("gone", *desc);
-        // Free() defers its metadata write so it never fsyncs under a caller's
-        // lock; make the tombstone durable before simulating the restart.
-        EXPECT_GE(alloc.FlushDirtyMetadata(), 1u);
-    }
-
-    ImmutableBucketAllocator recovered;
-    ASSERT_TRUE(
-        recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-    EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
-    EXPECT_FALSE(recovered.GetBucketIdForKey("gone").has_value());
-}
-
-TEST(ImmutableBucketAllocatorTest, DestructorFlushesDeferredTombstones) {
-    TempDir tmp("bucket_dtor_flush");
-    {
-        ImmutableBucketAllocator alloc;
-        ASSERT_TRUE(
-            alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-        auto desc = alloc.Allocate("gone", 100);
-        ASSERT_TRUE(desc.has_value());
-        ASSERT_TRUE(alloc.MarkCommitted("gone", *desc));
-        ASSERT_TRUE(
-            RollOverActiveBucket(alloc, "filler", kBucketCapacity).has_value());
-        alloc.Free("gone", *desc);
-        // No explicit flush: a clean shutdown must persist it anyway.
-    }
-
-    ImmutableBucketAllocator recovered;
-    ASSERT_TRUE(
-        recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-    EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
-    EXPECT_FALSE(recovered.GetBucketIdForKey("gone").has_value());
-}
-
-TEST(ImmutableBucketAllocatorTest, FlushDirtyMetadataIsIdempotent) {
-    TempDir tmp("bucket_flush_idempotent");
-    ImmutableBucketAllocator alloc;
-    ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-
-    // Nothing dirty yet.
-    EXPECT_EQ(alloc.FlushDirtyMetadata(), 0u);
-
-    auto desc = alloc.Allocate("k", 100);
-    ASSERT_TRUE(desc.has_value());
-    // The active bucket is never written, so allocating leaves nothing to
-    // flush.
-    EXPECT_EQ(alloc.FlushDirtyMetadata(), 0u);
-
-    // Sealing writes the metadata inline, which also leaves nothing pending.
-    ASSERT_TRUE(
-        RollOverActiveBucket(alloc, "filler", kBucketCapacity).has_value());
-    EXPECT_EQ(alloc.FlushDirtyMetadata(), 0u);
-
-    // Freeing from the sealed bucket dirties it again.
-    alloc.Free("k", *desc);
-    EXPECT_GE(alloc.FlushDirtyMetadata(), 1u);
-    // A second flush has nothing left to write.
-    EXPECT_EQ(alloc.FlushDirtyMetadata(), 0u);
-}
-
-TEST(ImmutableBucketAllocatorTest, RecoveryRejectsCorruptAndTruncatedMetadata) {
-    // Corrupt checksum: the whole bucket is discarded, never partially trusted.
-    {
-        TempDir tmp("bucket_recover_corrupt");
-        std::string meta_path;
-        std::string data_path;
-        {
-            ImmutableBucketAllocator alloc;
-            ASSERT_TRUE(
-                alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-            auto desc = alloc.Allocate("k", 100);
-            ASSERT_TRUE(desc.has_value());
-            ASSERT_TRUE(alloc.MarkCommitted("k", *desc));
-            ASSERT_TRUE(RollOverActiveBucket(alloc, "filler", kBucketCapacity)
-                            .has_value());
-            meta_path = BucketMetaFile(tmp, 0);
-            data_path = desc->file_path;
-            ASSERT_TRUE(std::filesystem::exists(meta_path));
-        }
-        // Flip bytes in the middle of the payload.
-        {
-            const int fd = ::open(meta_path.c_str(), O_RDWR);
-            ASSERT_GE(fd, 0);
-            const auto size = std::filesystem::file_size(meta_path);
-            std::vector<char> buffer(size);
-            ASSERT_EQ(::pread(fd, buffer.data(), size, 0),
-                      static_cast<ssize_t>(size));
-            for (size_t i = size / 2; i < size; ++i) {
-                buffer[i] = static_cast<char>(~buffer[i]);
-            }
-            ASSERT_EQ(::pwrite(fd, buffer.data(), size, 0),
-                      static_cast<ssize_t>(size));
-            ::close(fd);
-        }
-
-        ImmutableBucketAllocator recovered;
-        ASSERT_TRUE(
-            recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-        EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
-        EXPECT_FALSE(recovered.GetBucketIdForKey("k").has_value());
-        // Metadata that cannot be verified makes the data unusable: a cache
-        // miss is always cheaper than serving bytes nobody can validate, so
-        // both files go away.
-        EXPECT_FALSE(std::filesystem::exists(data_path));
-        EXPECT_FALSE(std::filesystem::exists(meta_path));
-    }
-
-    // Truncated metadata file.
-    {
-        TempDir tmp("bucket_recover_truncated");
-        std::string meta_path;
-        std::string data_path;
-        {
-            ImmutableBucketAllocator alloc;
-            ASSERT_TRUE(
-                alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-            auto desc = alloc.Allocate("k", 100);
-            ASSERT_TRUE(desc.has_value());
-            ASSERT_TRUE(alloc.MarkCommitted("k", *desc));
-            ASSERT_TRUE(RollOverActiveBucket(alloc, "filler", kBucketCapacity)
-                            .has_value());
-            meta_path = BucketMetaFile(tmp, 0);
-            data_path = desc->file_path;
-            ASSERT_TRUE(std::filesystem::exists(meta_path));
-        }
-        ASSERT_EQ(::truncate(meta_path.c_str(), 3), 0);
-
-        ImmutableBucketAllocator recovered;
-        ASSERT_TRUE(
-            recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-        EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
-        EXPECT_FALSE(std::filesystem::exists(data_path));
-        EXPECT_FALSE(std::filesystem::exists(meta_path));
-    }
-
-    // Missing data file: the metadata can never describe anything readable
-    // again, so the leftover `.meta` is reclaimed instead of reported forever.
-    {
-        TempDir tmp("bucket_recover_no_data");
-        std::string data_path;
-        {
-            ImmutableBucketAllocator alloc;
-            ASSERT_TRUE(
-                alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-            auto desc = alloc.Allocate("k", 100);
-            ASSERT_TRUE(desc.has_value());
-            ASSERT_TRUE(alloc.MarkCommitted("k", *desc));
-            ASSERT_TRUE(RollOverActiveBucket(alloc, "filler", kBucketCapacity)
-                            .has_value());
-            data_path = desc->file_path;
-        }
-        std::filesystem::remove(data_path);
-
-        ImmutableBucketAllocator recovered;
-        ASSERT_TRUE(
-            recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-        EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
-        EXPECT_FALSE(recovered.GetBucketIdForKey("k").has_value());
-        EXPECT_FALSE(std::filesystem::exists(BucketMetaFile(tmp, 0)));
-    }
-}
-
-TEST(ImmutableBucketAllocatorTest, NarrowedCapacityDiscardsIncompatibleBuckets) {
-    TempDir tmp("bucket_recover_narrowed");
-    std::string data_path;
-    {
-        ImmutableBucketAllocator alloc;
-        ASSERT_TRUE(
-            alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-        auto desc = alloc.Allocate("k", 100);
-        ASSERT_TRUE(desc.has_value());
-        ASSERT_TRUE(alloc.MarkCommitted("k", *desc));
-        ASSERT_TRUE(
-            RollOverActiveBucket(alloc, "filler", kBucketCapacity).has_value());
-        data_path = desc->file_path;
+        const int fd = ::open(data_path.c_str(), O_CREAT | O_WRONLY, 0644);
+        ASSERT_GE(fd, 0);
+        ::close(fd);
+        const int meta_fd = ::open(meta_path.c_str(), O_CREAT | O_WRONLY, 0644);
+        ASSERT_GE(meta_fd, 0);
+        ::close(meta_fd);
     }
     ASSERT_TRUE(std::filesystem::exists(data_path));
-    ASSERT_TRUE(std::filesystem::exists(BucketMetaFile(tmp, 0)));
+    ASSERT_TRUE(std::filesystem::exists(meta_path));
 
-    // Restarting with a smaller bucket_capacity makes the persisted metadata
-    // incompatible, so the entries inside can no longer be located reliably.
-    // Reclaim the bucket rather than keeping unusable bytes around forever.
-    ImmutableBucketAllocator recovered;
-    ASSERT_TRUE(
-        recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity / 2, 8)));
-    EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
-    EXPECT_FALSE(recovered.GetBucketIdForKey("k").has_value());
-    EXPECT_FALSE(std::filesystem::exists(data_path));
-    EXPECT_FALSE(std::filesystem::exists(BucketMetaFile(tmp, 0)));
-
-    // Discarded ids are still retired so stale descriptors from the previous
-    // run can never alias a freshly created bucket.
-    auto desc = recovered.Allocate("fresh", 100);
-    ASSERT_TRUE(desc.has_value());
-    EXPECT_GT(desc->shard_idx, 1);
-}
-
-TEST(ImmutableBucketAllocatorTest, RecoveryRemovesOrphanDataFiles) {
-    TempDir tmp("bucket_recover_orphan");
-    const std::string orphan = tmp.file(
-        "bucket_" + ImmutableBucketAllocator::FormatBucketId(7) + ".data");
-    {
-        const int fd = ::open(orphan.c_str(), O_CREAT | O_WRONLY, 0644);
-        ASSERT_GE(fd, 0);
-        ::close(fd);
-    }
-    ASSERT_TRUE(std::filesystem::exists(orphan));
-
-    ImmutableBucketAllocator recovered;
-    ASSERT_TRUE(
-        recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-    // A data file with no valid metadata is unreachable, so it is reclaimed.
-    EXPECT_FALSE(std::filesystem::exists(orphan));
-    // Bucket ids must not be reused after an orphan at a higher id.
-    auto desc = recovered.Allocate("k", 100);
-    ASSERT_TRUE(desc.has_value());
-    EXPECT_GT(desc->shard_idx, 7);
-}
-
-TEST(ImmutableBucketAllocatorTest, RecoveryContinuesInterruptedEviction) {
-    TempDir tmp("bucket_recover_evicting");
-    // Build a bucket, then rewrite its metadata with the evicting marker set,
-    // simulating a crash between the marker and the file deletes.
-    std::string meta_path;
-    std::string data_path;
-    {
-        ImmutableBucketAllocator alloc;
-        ASSERT_TRUE(
-            alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-        auto desc = alloc.Allocate("k", 100);
-        ASSERT_TRUE(desc.has_value());
-        ASSERT_TRUE(alloc.MarkCommitted("k", *desc));
-        ASSERT_TRUE(
-            RollOverActiveBucket(alloc, "filler", kBucketCapacity).has_value());
-        data_path = desc->file_path;
-        meta_path = BucketMetaFile(tmp, 0);
-        ASSERT_TRUE(std::filesystem::exists(meta_path));
-    }
-
-    {
-        // Load, set evicting, recompute the checksum, and overwrite the single
-        // metadata file. This models a durable marker publication that was not
-        // followed by the data delete.
-        const auto size = std::filesystem::file_size(meta_path);
-        std::string payload(size, '\0');
-        const int fd = ::open(meta_path.c_str(), O_RDWR);
-        ASSERT_GE(fd, 0);
-        ASSERT_EQ(::pread(fd, payload.data(), size, 0),
-                  static_cast<ssize_t>(size));
-        PersistedBucketMetadata snapshot;
-        struct_pb::from_pb(snapshot, payload);
-        snapshot.evicting = true;
-        snapshot.checksum = 0;
-        std::string rechecked;
-        struct_pb::to_pb(snapshot, rechecked);
-        snapshot.checksum = Crc32cValue(rechecked.data(), rechecked.size());
-        std::string final_payload;
-        struct_pb::to_pb(snapshot, final_payload);
-        ASSERT_EQ(::ftruncate(fd, 0), 0);
-        ASSERT_EQ(::pwrite(fd, final_payload.data(), final_payload.size(), 0),
-                  static_cast<ssize_t>(final_payload.size()));
-        ::close(fd);
-    }
-
-    ImmutableBucketAllocator recovered;
-    ASSERT_TRUE(
-        recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-    // The eviction is finished rather than the entries being resurrected.
-    EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
+    ImmutableBucketAllocator alloc;
+    ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
+    // Both are unreachable garbage, so they are reclaimed at startup. Bucket id
+    // 7 is outside the ready pool, so it is not recreated afterwards.
     EXPECT_FALSE(std::filesystem::exists(data_path));
     EXPECT_FALSE(std::filesystem::exists(meta_path));
 }
 
-TEST(ImmutableBucketAllocatorTest, RecoveryPreservesBucketIdSequence) {
-    TempDir tmp("bucket_recover_ids");
+TEST(ImmutableBucketAllocatorTest, InitLeavesOtherFilesAlone) {
+    TempDir tmp("bucket_purge_scope");
+    // Only the two canonical `bucket_<id>.<suffix>` names are recognized;
+    // anything else in the directory belongs to someone else.
+    const std::string legacy = tmp.file(
+        "bucket_" + ImmutableBucketAllocator::FormatBucketId(7) + ".meta.tmp");
+    const std::string unrelated = tmp.file("not_a_bucket.txt");
+    for (const auto& path : {legacy, unrelated}) {
+        const int fd = ::open(path.c_str(), O_CREAT | O_WRONLY, 0644);
+        ASSERT_GE(fd, 0);
+        ::close(fd);
+    }
+
+    ImmutableBucketAllocator alloc;
+    ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
+    EXPECT_TRUE(std::filesystem::exists(legacy));
+    EXPECT_TRUE(std::filesystem::exists(unrelated));
+}
+
+TEST(ImmutableBucketAllocatorTest, RestartRecoversNothingAndRestartsBucketIds) {
+    TempDir tmp("bucket_restart");
     const uint64_t capacity = kAlignment;  // one entry per bucket
     {
         ImmutableBucketAllocator alloc;
@@ -1083,24 +598,27 @@ TEST(ImmutableBucketAllocatorTest, RecoveryPreservesBucketIdSequence) {
         for (int i = 0; i < 3; ++i) {
             auto desc = alloc.Allocate("k" + std::to_string(i), 100);
             ASSERT_TRUE(desc.has_value());
-            ASSERT_TRUE(alloc.MarkCommitted("k" + std::to_string(i), *desc));
         }
+        ASSERT_TRUE(std::filesystem::exists(BucketDataFile(tmp, 0)));
     }
 
-    ImmutableBucketAllocator recovered;
-    ASSERT_TRUE(recovered.Init(MakeBucketConfig(tmp.path(), capacity, 8)));
-    // Buckets 0 and 1 were sealed by the rollovers; bucket 2 was still active
-    // at shutdown, so it has no metadata and its data file is reclaimed.
-    EXPECT_EQ(recovered.GetBucketCount(), 2u);
-    EXPECT_EQ(recovered.TakeRecoveredReplicas().size(), 2u);
-    EXPECT_FALSE(std::filesystem::exists(BucketMetaFile(tmp, 2)));
-    EXPECT_FALSE(std::filesystem::exists(tmp.file(
-        "bucket_" + ImmutableBucketAllocator::FormatBucketId(2) + ".data")));
+    auto config = MakeBucketConfig(tmp.path(), capacity, 8);
+    // No ready pool, so no fresh bucket file hides the ones being reclaimed.
+    config.ready_bucket_target = 0;
+    ImmutableBucketAllocator restarted;
+    ASSERT_TRUE(restarted.Init(config));
+    // No key survives, and neither does the data it was written to.
+    EXPECT_FALSE(restarted.GetBucketIdForKey("k0").has_value());
+    EXPECT_FALSE(restarted.GetBucketIdForKey("k1").has_value());
+    EXPECT_FALSE(restarted.GetBucketIdForKey("k2").has_value());
+    EXPECT_FALSE(std::filesystem::exists(BucketDataFile(tmp, 0)));
+    EXPECT_FALSE(std::filesystem::exists(BucketDataFile(tmp, 1)));
+    EXPECT_FALSE(std::filesystem::exists(BucketDataFile(tmp, 2)));
 
-    // Ids of discarded buckets must not be reused either.
-    auto desc = recovered.Allocate("after", 100);
+    // Ids start over instead of continuing where the previous run stopped.
+    auto desc = restarted.Allocate("after", 100);
     ASSERT_TRUE(desc.has_value());
-    EXPECT_EQ(desc->shard_idx, 3);
+    EXPECT_EQ(desc->shard_idx, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1146,7 +664,6 @@ TEST(ImmutableBucketAllocatorTest, CommitEvictionDeletesBucketAndFrees) {
     for (int i = 0; i < 3; ++i) {
         auto desc = alloc.Allocate("k" + std::to_string(i), 100);
         ASSERT_TRUE(desc.has_value()) << "allocation " << i;
-        ASSERT_TRUE(alloc.MarkCommitted("k" + std::to_string(i), *desc));
         descs.push_back(*desc);
     }
     EXPECT_EQ(alloc.GetBucketCount(), 3u);
@@ -1187,7 +704,6 @@ TEST(ImmutableBucketAllocatorTest, AbortEvictionRestoresBucketUnchanged) {
     for (int i = 0; i < 3; ++i) {
         auto desc = alloc.Allocate("k" + std::to_string(i), 100);
         ASSERT_TRUE(desc.has_value());
-        ASSERT_TRUE(alloc.MarkCommitted("k" + std::to_string(i), *desc));
     }
 
     auto pending = alloc.PrepareEviction();
@@ -1216,7 +732,6 @@ TEST(ImmutableBucketAllocatorTest, UnresolvedPendingEvictionSelfAborts) {
     for (int i = 0; i < 3; ++i) {
         auto desc = alloc.Allocate("k" + std::to_string(i), 100);
         ASSERT_TRUE(desc.has_value());
-        ASSERT_TRUE(alloc.MarkCommitted("k" + std::to_string(i), *desc));
     }
 
     int64_t bucket_id = -1;
@@ -1242,7 +757,6 @@ TEST(ImmutableBucketAllocatorTest, CommitAndAbortEvictionAreIdempotent) {
     for (int i = 0; i < 3; ++i) {
         auto desc = alloc.Allocate("k" + std::to_string(i), 100);
         ASSERT_TRUE(desc.has_value());
-        ASSERT_TRUE(alloc.MarkCommitted("k" + std::to_string(i), *desc));
     }
 
     auto pending = alloc.PrepareEviction();
@@ -1336,7 +850,6 @@ TEST(ImmutableBucketAllocatorTest, EvictionUsesFixedCapacityDenominator) {
     for (int i = 0; i < 5; ++i) {
         auto desc = alloc.Allocate("k" + std::to_string(i), 100);
         ASSERT_TRUE(desc.has_value());
-        ASSERT_TRUE(alloc.MarkCommitted("k" + std::to_string(i), *desc));
     }
     EXPECT_EQ(alloc.GetTotalCapacity(), 8u * capacity);
     const uint64_t used_before = alloc.GetUsedBytes();
@@ -1385,7 +898,6 @@ TEST(ImmutableBucketAllocatorTest, ReadableDescriptorSurvivesConcurrentEviction)
     for (int i = 0; i < 3; ++i) {
         auto desc = alloc.Allocate("k" + std::to_string(i), 100);
         ASSERT_TRUE(desc.has_value());
-        ASSERT_TRUE(alloc.MarkCommitted("k" + std::to_string(i), *desc));
         descs.push_back(*desc);
     }
 
@@ -1399,15 +911,14 @@ TEST(ImmutableBucketAllocatorTest, ReadableDescriptorSurvivesConcurrentEviction)
     EXPECT_TRUE(std::filesystem::exists(descs[0].file_path));
 }
 
-TEST(ImmutableBucketAllocatorTest, MetadataFlushCannotOutliveEvictedBucket) {
-    TempDir tmp("bucket_flush_evict_race");
+TEST(ImmutableBucketAllocatorTest, FreeRacesWithEvictionCommit) {
+    TempDir tmp("bucket_free_evict_race");
     const uint64_t capacity = kAlignment;
     ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeEvictionConfig(tmp.path(), capacity, 4)));
 
     auto victim_desc = alloc.Allocate("victim", 100);
     ASSERT_TRUE(victim_desc.has_value());
-    ASSERT_TRUE(alloc.MarkCommitted("victim", *victim_desc));
     auto active_desc = alloc.Allocate("active", 100);
     ASSERT_TRUE(active_desc.has_value());
 
@@ -1415,18 +926,16 @@ TEST(ImmutableBucketAllocatorTest, MetadataFlushCannotOutliveEvictedBucket) {
     ASSERT_FALSE(pending.Empty());
     ASSERT_EQ(pending.bucket_id(), 0);
     const std::string data_path = victim_desc->file_path;
-    const std::string meta_path = BucketMetaFile(tmp, 0);
 
-    // Dirty the frozen bucket after Prepare's sealing flush, then race a new
-    // flush against marker publication and deletion. A captured flush must not
-    // recreate normal metadata after this exact BucketState is removed.
-    alloc.Free("victim", *victim_desc);
+    // Race a Free() of the victim against the commit that deletes its bucket.
+    // Both only touch memory, so nothing can resurrect the bucket afterwards -
+    // and no metadata file may appear as a side effect of either path.
     std::atomic<bool> start{false};
-    std::thread flusher([&]() {
+    std::thread freer([&]() {
         while (!start.load(std::memory_order_acquire)) {
             std::this_thread::yield();
         }
-        (void)alloc.FlushDirtyMetadata();
+        alloc.Free("victim", *victim_desc);
     });
     std::thread evictor(
         [&alloc, &start, pending = std::move(pending)]() mutable {
@@ -1436,11 +945,11 @@ TEST(ImmutableBucketAllocatorTest, MetadataFlushCannotOutliveEvictedBucket) {
             alloc.CommitEviction(std::move(pending));
         });
     start.store(true, std::memory_order_release);
-    flusher.join();
+    freer.join();
     evictor.join();
 
     EXPECT_FALSE(std::filesystem::exists(data_path));
-    EXPECT_FALSE(std::filesystem::exists(meta_path));
+    EXPECT_FALSE(std::filesystem::exists(BucketMetaFile(tmp, 0)));
     EXPECT_FALSE(alloc.GetBucketIdForKey("victim").has_value());
 }
 
@@ -1515,7 +1024,6 @@ TEST(ImmutableBucketAllocatorTest, ConcurrentFreeAndUpdateAccessAreSafe) {
         const std::string key = "k" + std::to_string(i);
         auto desc = alloc.Allocate(key, 512);
         ASSERT_TRUE(desc.has_value());
-        ASSERT_TRUE(alloc.MarkCommitted(key, *desc));
         allocations.emplace_back(key, *desc);
     }
 
@@ -1756,11 +1264,11 @@ TEST(BucketEntryLayoutTest, DescriptorConstructionIsCentralized) {
 }
 
 // ---------------------------------------------------------------------------
-// Metadata durability boundary: what an abrupt restart keeps and what it drops
+// Restart boundary: an abrupt restart keeps nothing, and reclaims everything
 // ---------------------------------------------------------------------------
 
-TEST(BucketMetadataDurabilityTest, AbruptRestartDropsTheActiveBucket) {
-    TempDir tmp("bucket_crash_active");
+TEST(BucketRestartTest, AbruptRestartDropsEveryBucket) {
+    TempDir tmp("bucket_crash");
     const pid_t child = ::fork();
     ASSERT_GE(child, 0);
     if (child == 0) {
@@ -1768,14 +1276,11 @@ TEST(BucketMetadataDurabilityTest, AbruptRestartDropsTheActiveBucket) {
         if (!alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8))) {
             ::_exit(10);
         }
-        auto first = alloc.Allocate("crash_a", 100);
-        auto second = alloc.Allocate("crash_b", 100);
-        if (!first || !second || !alloc.MarkCommitted("crash_a", *first) ||
-            !alloc.MarkCommitted("crash_b", *second)) {
+        if (!alloc.Allocate("crash_a", 100) || !alloc.Allocate("crash_b", 100)) {
             ::_exit(11);
         }
-        // Simulate a process crash: the bucket is still active, so its metadata
-        // only ever existed in memory and the destructor never runs.
+        // Simulate a process crash: the destructor never runs. Nothing is lost
+        // by that any more, because there was never anything to flush.
         ::_exit(0);
     }
     int status = 0;
@@ -1783,143 +1288,39 @@ TEST(BucketMetadataDurabilityTest, AbruptRestartDropsTheActiveBucket) {
     ASSERT_TRUE(WIFEXITED(status));
     ASSERT_EQ(WEXITSTATUS(status), 0);
 
-    const std::string data_path = tmp.file(
-        "bucket_" + ImmutableBucketAllocator::FormatBucketId(0) + ".data");
+    const std::string data_path = BucketDataFile(tmp, 0);
     ASSERT_TRUE(std::filesystem::exists(data_path));
-    ASSERT_FALSE(std::filesystem::exists(BucketMetaFile(tmp, 0)));
 
-    ImmutableBucketAllocator recovered;
-    ASSERT_TRUE(
-        recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-    // Losing the single active bucket is the accepted trade-off for keeping the
-    // put path free of metadata I/O. Its data file must not be left behind.
-    EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
-    EXPECT_FALSE(recovered.GetBucketIdForKey("crash_a").has_value());
-    EXPECT_FALSE(recovered.GetBucketIdForKey("crash_b").has_value());
-    EXPECT_FALSE(std::filesystem::exists(data_path));
+    ImmutableBucketAllocator restarted;
+    ASSERT_TRUE(restarted.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
+    // No metadata survives the restart, so the bytes are unreachable and every
+    // key that pointed at them is gone.
+    EXPECT_FALSE(restarted.GetBucketIdForKey("crash_a").has_value());
+    EXPECT_FALSE(restarted.GetBucketIdForKey("crash_b").has_value());
 }
 
-TEST(BucketMetadataDurabilityTest, AbruptRestartKeepsSealedBuckets) {
-    TempDir tmp("bucket_crash_sealed");
-    const pid_t child = ::fork();
-    ASSERT_GE(child, 0);
-    if (child == 0) {
-        ImmutableBucketAllocator alloc;
-        if (!alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8))) {
-            ::_exit(20);
-        }
-        auto desc = alloc.Allocate("sealed_key", 100);
-        if (!desc || !alloc.MarkCommitted("sealed_key", *desc)) ::_exit(21);
-        // Rolling over seals bucket 0 and writes its `.meta` inline, before any
-        // destructor could run.
-        if (!RollOverActiveBucket(alloc, "filler", kBucketCapacity)) {
-            ::_exit(22);
-        }
-        ::_exit(0);
-    }
-    int status = 0;
-    ASSERT_EQ(::waitpid(child, &status, 0), child);
-    ASSERT_TRUE(WIFEXITED(status));
-    ASSERT_EQ(WEXITSTATUS(status), 0);
-
-    ASSERT_TRUE(std::filesystem::exists(BucketMetaFile(tmp, 0)));
-
-    ImmutableBucketAllocator recovered;
-    ASSERT_TRUE(
-        recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
-    auto replicas = recovered.TakeRecoveredReplicas();
-    ASSERT_EQ(replicas.size(), 1u);
-    EXPECT_EQ(replicas[0].key, "sealed_key");
-    EXPECT_TRUE(recovered.GetBucketIdForKey("sealed_key").has_value());
-}
-
-TEST(BucketMetadataDurabilityTest, EachBucketOwnsExactlyOneMetadataFile) {
-    TempDir tmp("bucket_one_meta_per_bucket");
+TEST(BucketRestartTest, BucketDirectoryHoldsOnlyDataFiles) {
+    TempDir tmp("bucket_only_data_files");
     const uint64_t capacity = 4 * kAlignment;  // four entries per bucket
     ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), capacity, 16)));
 
     for (int i = 0; i < 20; ++i) {
-        const std::string key = "obj_" + std::to_string(i);
-        auto desc = alloc.Allocate(key, 100);
+        auto desc = alloc.Allocate("obj_" + std::to_string(i), 100);
         ASSERT_TRUE(desc.has_value());
-        ASSERT_TRUE(alloc.MarkCommitted(key, *desc));
     }
 
-    // Every file in the directory is either a `.data` or its single `.meta`
-    // companion: no log, no snapshot slots, no rename temporaries.
-    std::set<std::string> data_ids;
-    std::set<std::string> meta_ids;
+    // No `.meta` companion, no log, no snapshot slots, no rename temporaries:
+    // a bucket is exactly one preallocated data file.
+    size_t data_files = 0;
     for (const auto& entry : std::filesystem::directory_iterator(tmp.path())) {
         const std::string name = entry.path().filename().string();
-        ASSERT_EQ(name.rfind("bucket_", 0), 0u);
-        const std::string id = name.substr(7, 6);
-        const std::string suffix = name.substr(13);
-        if (suffix == ".data") {
-            data_ids.insert(id);
-        } else if (suffix == ".meta") {
-            meta_ids.insert(id);
-        } else {
-            FAIL() << "Unexpected file in the bucket directory: " << name;
-        }
+        ASSERT_EQ(name.substr(0, 7), "bucket_") << "Unexpected file: " << name;
+        ASSERT_EQ(name.substr(name.size() - 5), ".data")
+            << "Unexpected file: " << name;
+        ++data_files;
     }
-    ASSERT_FALSE(meta_ids.empty());
-    // Only the still-active bucket has data without metadata.
-    EXPECT_EQ(data_ids.size(), meta_ids.size() + 1);
-    for (const auto& id : meta_ids) {
-        EXPECT_EQ(data_ids.count(id), 1u);
-    }
-}
-
-TEST(BucketMetadataDurabilityTest, FlushRacesWithConcurrentAllocateAndCommit) {
-    TempDir tmp("bucket_flush_race");
-    // A small capacity makes buckets roll over constantly, so sealing (which
-    // writes metadata inline) runs while other threads keep allocating.
-    constexpr uint64_t kEntriesPerBucket = 8;
-    auto config =
-        MakeBucketConfig(tmp.path(), kEntriesPerBucket * kAlignment, 64);
-    ImmutableBucketAllocator alloc;
-    ASSERT_TRUE(alloc.Init(config));
-
-    constexpr int kThreads = 6;
-    constexpr int kPerThread = 20;
-    std::atomic<bool> start{false};
-    std::vector<std::thread> writers;
-    for (int t = 0; t < kThreads; ++t) {
-        writers.emplace_back([&alloc, &start, t]() {
-            while (!start.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
-            }
-            for (int i = 0; i < kPerThread; ++i) {
-                const std::string key =
-                    "race_" + std::to_string(t) + "_" + std::to_string(i);
-                auto desc = alloc.Allocate(key, 100);
-                if (desc) {
-                    EXPECT_TRUE(alloc.MarkCommitted(key, *desc));
-                }
-            }
-        });
-    }
-    std::thread flusher([&alloc, &start]() {
-        start.store(true, std::memory_order_release);
-        for (int i = 0; i < 80; ++i) {
-            (void)alloc.FlushDirtyMetadata();
-            std::this_thread::yield();
-        }
-    });
-    for (auto& writer : writers) writer.join();
-    flusher.join();
-    (void)alloc.FlushDirtyMetadata();
-
-    // Every sealed bucket must be recoverable in full. Only the one bucket that
-    // is still active at this point has no metadata, so at most its entries are
-    // missing.
-    constexpr size_t kTotal = kThreads * kPerThread;
-    ImmutableBucketAllocator recovered;
-    ASSERT_TRUE(recovered.Init(config));
-    const size_t restored = recovered.TakeRecoveredReplicas().size();
-    EXPECT_GE(restored, kTotal - kEntriesPerBucket);
-    EXPECT_LE(restored, kTotal);
+    EXPECT_GT(data_files, 0u);
 }
 
 }  // namespace mooncake::test

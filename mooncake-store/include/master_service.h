@@ -2093,9 +2093,10 @@ class MasterService {
     bool TryRecoverDfsSpaceAfterAllocationFailure();
     // Shard-mode per-key eviction (unchanged behaviour).
     void RunShardDfsEviction();
-    // Re-registers DFS replicas recovered from bucket metadata as COMPLETE so
-    // a restarted master can serve them. Called once, before serving traffic.
-    void RestoreRecoveredDfsReplicas();
+    // Drops every DFS replica still visible at startup. Bucket data files are
+    // deleted when the allocator initializes, so these replicas can only point
+    // at bytes that no longer exist. Called once, before serving traffic.
+    void DropDfsReplicasAfterRestart();
     void InitDfsAllocatorFromEnvironment(const MasterServiceConfig& config);
     /**
      * @brief Helper to release space of expired discarded replicas.
@@ -2774,9 +2775,8 @@ class MasterService {
     // to it through DfsAllocatorInterface.
     std::unique_ptr<DfsAllocatorInterface> dfs_allocator_;
     // Non-owning downcast of dfs_allocator_, set only in BUCKET mode. Used for
-    // the bucket-specific lifecycle calls (MarkCommitted, two-phase eviction,
-    // recovery, deferred metadata flush) that are not part of the common
-    // interface.
+    // the bucket-specific lifecycle calls (two-phase eviction, post-restart
+    // replica cleanup) that are not part of the common interface.
     ImmutableBucketAllocator* bucket_allocator_{nullptr};
 
     // Segment management

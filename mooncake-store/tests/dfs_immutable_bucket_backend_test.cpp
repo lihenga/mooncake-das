@@ -234,7 +234,6 @@ class DfsBucketBackendTest : public ::testing::Test {
         auto results = backend_->BatchWrite({{key, *desc, slices}});
         EXPECT_EQ(results.size(), 1u);
         EXPECT_TRUE(results[0].has_value());
-        EXPECT_TRUE(allocator_->MarkCommitted(key, *desc));
         return *desc;
     }
 
@@ -756,12 +755,13 @@ TEST_F(DfsBucketBackendTest, ConcurrentReadsAndWritesOnSharedBucket) {
     }
 }
 
-TEST_F(DfsBucketBackendTest, ReadAfterAllocatorRecoveryReturnsSameBytes) {
-    // Write data, drop the allocator, recover it, and read via the recovered
-    // descriptors: recovery must restore usable descriptors, not just
-    // bookkeeping.
-    BucketTempDir dir("dfs_bucket_recover_io");
+TEST_F(DfsBucketBackendTest, RestartReclaimsBucketDataFiles) {
+    // A restart keeps nothing: the allocator purges every bucket file it finds,
+    // so the bytes a previous process wrote are gone the next time it starts.
+    BucketTempDir dir("dfs_bucket_restart_io");
     auto config = MakeBucketConfig(dir.path());
+    // No ready pool, so a fresh bucket file cannot hide the ones being reclaimed.
+    config.ready_bucket_target = 0;
 
     std::vector<std::string> keys{"rec_a", "rec_b"};
     std::vector<std::string> values{std::string(300, 'p'),
@@ -774,6 +774,7 @@ TEST_F(DfsBucketBackendTest, ReadAfterAllocatorRecoveryReturnsSameBytes) {
         file_config, config, std::make_unique<PosixFsAdapter>());
     ASSERT_TRUE(backend->Init().has_value());
 
+    std::vector<std::string> written_paths;
     {
         ImmutableBucketAllocator allocator;
         ASSERT_TRUE(allocator.Init(config).has_value());
@@ -784,31 +785,18 @@ TEST_F(DfsBucketBackendTest, ReadAfterAllocatorRecoveryReturnsSameBytes) {
             auto results = backend->BatchWrite({{keys[i], *desc, slices}});
             ASSERT_EQ(results.size(), 1u);
             ASSERT_TRUE(results[0].has_value());
-            ASSERT_TRUE(allocator.MarkCommitted(keys[i], *desc));
+            written_paths.push_back(desc->file_path);
         }
-        // Active buckets intentionally have no durable metadata. Force a
-        // rollover so the bucket containing the test objects is sealed and
-        // persisted before simulating a restart.
-        ASSERT_TRUE(allocator.Allocate("seal_filler", config.bucket_capacity)
-                        .has_value());
     }
 
-    ImmutableBucketAllocator recovered;
-    ASSERT_TRUE(recovered.Init(config).has_value());
-    auto replicas = recovered.TakeRecoveredReplicas();
-    ASSERT_EQ(replicas.size(), keys.size());
-
-    for (const auto& replica : replicas) {
-        const auto it = std::find(keys.begin(), keys.end(), replica.key);
-        ASSERT_NE(it, keys.end());
-        const size_t index = std::distance(keys.begin(), it);
-        std::string out(replica.descriptor.object_size, '\0');
-        std::vector<Slice> slices{{out.data(), out.size()}};
-        auto results =
-            backend->BatchRead({{replica.key, replica.descriptor, slices}});
-        ASSERT_EQ(results.size(), 1u);
-        ASSERT_TRUE(results[0].has_value()) << "key=" << replica.key;
-        EXPECT_EQ(out, values[index]) << "key=" << replica.key;
+    ImmutableBucketAllocator restarted;
+    ASSERT_TRUE(restarted.Init(config).has_value());
+    // Nothing is recovered, and the files holding the old bytes are reclaimed.
+    for (const auto& key : keys) {
+        EXPECT_FALSE(restarted.GetBucketIdForKey(key).has_value());
+    }
+    for (const auto& path : written_paths) {
+        EXPECT_FALSE(std::filesystem::exists(path));
     }
 }
 
@@ -836,7 +824,6 @@ TEST_F(DfsBucketBackendTest, ParallelBatchReadAcrossBuckets) {
             auto results = backend_->BatchWrite({{key, *desc, slices}});
             ASSERT_EQ(results.size(), 1u);
             ASSERT_TRUE(results[0].has_value()) << "Write failed for " << key;
-            ASSERT_TRUE(allocator_->MarkCommitted(key, *desc));
 
             keys.push_back(key);
             values.push_back(value);
@@ -884,7 +871,6 @@ TEST_F(DfsBucketBackendTest, NonContiguousEntriesInSameBucket) {
             {const_cast<char*>(values[i].data()), values[i].size()}};
         auto results = backend_->BatchWrite({{keys[i], *desc, slices}});
         ASSERT_TRUE(results[0].has_value());
-        ASSERT_TRUE(allocator_->MarkCommitted(keys[i], *desc));
         descriptors.push_back(*desc);
     }
 
@@ -933,8 +919,6 @@ TEST_F(DfsBucketBackendTest, SingleBucketPathFallsBackToSequential) {
             {const_cast<char*>(value.data()), value.size()}};
         auto results = backend_->BatchWrite({{key, *desc, slices}});
         ASSERT_TRUE(results[0].has_value());
-        ASSERT_TRUE(allocator_->MarkCommitted(key, *desc));
-
         keys.push_back(key);
         values.push_back(value);
         descriptors.push_back(*desc);
@@ -982,8 +966,6 @@ TEST_F(DfsBucketBackendTest, ContiguousEntriesAreMerged) {
             {const_cast<char*>(value.data()), value.size()}};
         auto results = backend_->BatchWrite({{key, *desc, slices}});
         ASSERT_TRUE(results[0].has_value());
-        ASSERT_TRUE(allocator_->MarkCommitted(key, *desc));
-
         keys.push_back(key);
         values.push_back(value);
         descriptors.push_back(*desc);
@@ -1044,8 +1026,6 @@ TEST_F(DfsBucketBackendTest, BatchReadWithDifferentThreadCounts) {
             {const_cast<char*>(value.data()), value.size()}};
         auto results = backend_->BatchWrite({{key, *desc, slices}});
         ASSERT_TRUE(results[0].has_value());
-        ASSERT_TRUE(allocator_->MarkCommitted(key, *desc));
-
         keys.push_back(key);
         values.push_back(value);
         descriptors.push_back(*desc);
@@ -1136,7 +1116,6 @@ TEST_F(DfsBucketBackendTest, BatchReadMixedContiguousAndNonContiguous) {
             {const_cast<char*>(values[i].data()), values[i].size()}};
         auto results = backend_->BatchWrite({{keys[i], *desc, slices}});
         ASSERT_TRUE(results[0].has_value()) << "Write failed for " << keys[i];
-        ASSERT_TRUE(allocator_->MarkCommitted(keys[i], *desc));
         descriptors.push_back(*desc);
     }
 

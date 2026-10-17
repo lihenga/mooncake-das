@@ -602,11 +602,10 @@ void MasterService::InitDfsAllocatorFromEnvironment(
         return;
     }
 
-    // Snapshot is the metadata recovery source when enabled. Do not rebuild
-    // DFS replicas from bucket state in that mode.
-    if (bucket_allocator_ != nullptr && !config.enable_snapshot &&
-        !config.enable_snapshot_restore) {
-        RestoreRecoveredDfsReplicas();
+    // Bucket data files are gone, so any DFS replica still visible here - from
+    // a previous run or from an HA snapshot - points at nothing.
+    if (bucket_allocator_ != nullptr) {
+        DropDfsReplicasAfterRestart();
     }
 
     LOG(INFO) << "DFS allocator initialized, type="
@@ -4723,37 +4722,6 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     -> tl::expected<void, ErrorCode> {
     const auto& key = object_meta.key;
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
-    // In bucket mode a DFS entry must be durably marked COMMITTED *before* the
-    // replica becomes COMPLETE; otherwise a restart could recover metadata
-    // pointing at data the master never confirmed. The persist is DFS I/O, so
-    // it runs before any metadata shard lock is taken.
-    if (bucket_allocator_ != nullptr &&
-        (replica_type == ReplicaType::ALL ||
-         replica_type == ReplicaType::DFS)) {
-        std::vector<DistributedFSDescriptor> pending_dfs;
-        {
-            std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-            MetadataAccessorRO probe(this, object_id);
-            if (probe.Exists()) {
-                probe.Get().VisitReplicas(
-                    [](const Replica& replica) {
-                        return replica.is_dfs_replica() &&
-                               replica.is_processing();
-                    },
-                    [&pending_dfs](const Replica& replica) {
-                        pending_dfs.push_back(replica.get_dfs_descriptor());
-                    });
-            }
-        }
-        for (const auto& descriptor : pending_dfs) {
-            if (!bucket_allocator_->MarkCommitted(key, descriptor)) {
-                LOG(ERROR) << "key=" << key
-                           << ", error=dfs_commit_failed, bucket_id="
-                           << descriptor.shard_idx;
-                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-            }
-        }
-    }
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this, object_id);
@@ -7307,49 +7275,49 @@ void MasterService::FreeDfsReplicas(const std::string& key,
     }
 }
 
-void MasterService::RestoreRecoveredDfsReplicas() {
+void MasterService::DropDfsReplicasAfterRestart() {
     if (bucket_allocator_ == nullptr) return;
 
-    auto recovered = bucket_allocator_->TakeRecoveredReplicas();
-    if (recovered.empty()) return;
-
-    const TenantId tenant_id = TenantId::Default();
-    size_t restored = 0;
-    for (auto& entry : recovered) {
-        const size_t shard_idx = getMetadataShardIndex(tenant_id, entry.key);
+    // Bucket data files are deleted when the allocator initializes, so every
+    // DFS replica this process can still see is a dangling reference: either a
+    // leftover from a previous run, or one deserialized from an HA snapshot
+    // whose bucket file no longer exists. Drop them all rather than let a read
+    // resolve to bytes that were already reclaimed; objects that held nothing
+    // else disappear with them.
+    //
+    // Deliberately not ClearStaleHandles(): that path is HA-aware and would try
+    // to append an oplog entry per object while the store is still starting up,
+    // which neither works nor scales. This runs before traffic is served, so
+    // the in-memory sweep is enough.
+    const std::function<bool(const Replica&)> is_dangling_dfs =
+        [](const Replica& replica) { return replica.is_dfs_replica(); };
+    size_t dropped_keys = 0;
+    for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
         MetadataShardAccessorRW shard(this, shard_idx);
-        auto& tenant_state = shard->tenants[tenant_id];
-
-        if (tenant_state.metadata.find(entry.key) !=
-            tenant_state.metadata.end()) {
-            // Something else already owns this key. Leave it alone: the
-            // recovered DFS extent stays allocated but unreferenced rather than
-            // overwriting live metadata.
-            LOG(WARNING) << "Skipping DFS recovery for key=" << entry.key
-                         << ": metadata already present";
-            continue;
+        for (auto tenant_it = shard->tenants.begin();
+             tenant_it != shard->tenants.end();) {
+            auto& tenant_state = tenant_it->second;
+            auto it = tenant_state.metadata.begin();
+            while (it != tenant_state.metadata.end()) {
+                if (CleanupStaleHandles(tenant_state, it->second,
+                                        is_dangling_dfs, &shard)) {
+                    it = EraseMetadata(tenant_state, it, tenant_it->first,
+                                       QuotaEraseMode::kFull, &shard);
+                    ++dropped_keys;
+                } else {
+                    ++it;
+                }
+            }
+            if (tenant_state.Empty()) {
+                tenant_it = shard->tenants.erase(tenant_it);
+            } else {
+                ++tenant_it;
+            }
         }
-
-        const uint64_t object_size = entry.descriptor.object_size;
-        std::vector<Replica> replicas;
-        replicas.emplace_back(entry.descriptor, ReplicaStatus::COMPLETE);
-        tenant_state.metadata.emplace(
-            std::piecewise_construct, std::forward_as_tuple(entry.key),
-            std::forward_as_tuple(UUID{0, 0}, std::chrono::system_clock::now(),
-                                  object_size, std::move(replicas),
-                                  std::nullopt,
-                                  /*enable_hard_pin=*/false,
-                                  ObjectDataType::UNKNOWN, std::string(),
-                                  tenant_id, entry.key));
-        // No quota ledger adoption: a recovered object holds only a DFS
-        // replica, which carries no memory quota charge, so there is no
-        // pending charge to adopt.
-        ++restored;
     }
 
-    LOG(INFO) << "Restored " << restored
-              << " DFS replicas from bucket metadata (" << recovered.size()
-              << " candidates)";
+    LOG(INFO) << "Dropped DFS replicas left behind by the previous run ("
+              << dropped_keys << " object(s) removed)";
 }
 
 void MasterService::RunDfsEviction() {
@@ -7385,11 +7353,6 @@ bool MasterService::RunBucketDfsEvictionInternal(
     bool force_one, std::optional<int64_t> invalidated_bucket_id) {
     if (bucket_allocator_ == nullptr) return false;
     const bool invalidating_missing_bucket = invalidated_bucket_id.has_value();
-
-    // Free() defers its metadata write so it never fsyncs under a metadata
-    // shard lock. This tick holds no master lock, so it is the right place to
-    // make those tombstones durable.
-    bucket_allocator_->FlushDirtyMetadata();
 
     const TenantId tenant_id = TenantId::Default();
     // Buckets already inspected in this cycle. Bounds the scan when every
@@ -9718,25 +9681,18 @@ void MasterService::EvictionThreadFunc() {
         }
 #endif
 
-        if (dfs_allocator_ && dfs_allocator_->IsEvictionEnabled()) {
+        if (dfs_allocator_) {
+            // Client-reported missing buckets must be reclaimed even when
+            // eviction is disabled, so this runs unconditionally.
             ProcessInvalidatedDfsBuckets();
-            const auto steady_now = std::chrono::steady_clock::now();
-            if (steady_now >= next_dfs_eviction_time) {
-                RunDfsEviction();
-                next_dfs_eviction_time =
-                    std::chrono::steady_clock::now() +
-                    dfs_allocator_->GetEvictionCheckInterval();
-            }
-        } else if (bucket_allocator_ != nullptr && dfs_allocator_) {
-            ProcessInvalidatedDfsBuckets();
-            // Even with eviction disabled, deferred bucket tombstones still
-            // need a lock-free context in which to become durable.
-            const auto steady_now = std::chrono::steady_clock::now();
-            if (steady_now >= next_dfs_eviction_time) {
-                bucket_allocator_->FlushDirtyMetadata();
-                next_dfs_eviction_time =
-                    std::chrono::steady_clock::now() +
-                    dfs_allocator_->GetEvictionCheckInterval();
+            if (dfs_allocator_->IsEvictionEnabled()) {
+                const auto steady_now = std::chrono::steady_clock::now();
+                if (steady_now >= next_dfs_eviction_time) {
+                    RunDfsEviction();
+                    next_dfs_eviction_time =
+                        std::chrono::steady_clock::now() +
+                        dfs_allocator_->GetEvictionCheckInterval();
+                }
             }
         }
 

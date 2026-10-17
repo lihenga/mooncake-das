@@ -27,62 +27,15 @@ namespace mooncake {
 struct DistributedStorageConfig;
 
 /**
- * @brief Persisted state of one entry inside a bucket.
+ * @brief In-memory state of one reservation inside a bucket.
  *
- * `entry_offset` is both the aligned start of the entry and the value offset;
-
- * * the data file stores no key header.
+ * A reservation is created PENDING by `Allocate`/`BatchAllocate` and stays
+ * PENDING: bucket metadata is never persisted, so there is no commit step to
+ * record. `Free` turns it into a TOMBSTONE, which keeps the reserved bytes
+ * accounted for until the whole bucket is evicted.
  */
-struct PersistedBucketEntry {
-    std::string key;
-    uint64_t entry_offset = 0;
-    uint64_t key_size = 0;
-    uint64_t value_size = 0;
-    uint64_t reserved_size = 0;
-    uint64_t generation = 0;
-    // 0 = PENDING (space reserved, data not known to be durable)
-    // 1 = COMMITTED (data fully written; safe to recover)
-    // 2 = TOMBSTONE (freed/removed; must not be revived on restart)
-    int32_t state = 0;
-    YLT_REFL(PersistedBucketEntry, key, entry_offset, key_size, value_size,
-             reserved_size, generation, state);
-};
-
-/**
- * @brief On-disk `.meta` snapshot of one bucket.
- *
- * A CRC-32C over the serialized payload (with `checksum` zeroed) detects torn
- * or corrupt metadata; `version` rejects formats this build cannot parse.
- *
- * There is exactly one `.meta` file per bucket, holding the bucket's full state
- * at the moment it was written. It is written when the bucket stops being the
- * active one (it is sealed) and rewritten only when the sealed bucket's state
- * changed afterwards, never once per key.
- */
-struct PersistedBucketMetadata {
-    uint32_t version = 0;
-    uint32_t checksum = 0;
-    int64_t bucket_id = 0;
-    uint64_t capacity = 0;
-    uint64_t alignment = 0;
-    uint64_t append_offset = 0;
-    // Set when the bucket has been chosen for eviction and its data file is
-    // being deleted. Recovery treats such a bucket as gone rather than live.
-    bool evicting = false;
-    std::vector<PersistedBucketEntry> entries;
-    YLT_REFL(PersistedBucketMetadata, version, checksum, bucket_id, capacity,
-             alignment, append_offset, evicting, entries);
-};
-
-// Bump when the layout of PersistedBucketMetadata changes incompatibly.
-// Version 5 removes the bucket-level identity counter and describes data files
-// whose entries contain only object bytes followed by padding. Older versions
-// are rejected.
-inline constexpr uint32_t kBucketMetadataVersion = 5;
-
 enum class BucketEntryState : int32_t {
     PENDING = 0,
-    COMMITTED = 1,
     TOMBSTONE = 2,
 };
 
@@ -91,32 +44,25 @@ enum class BucketEntryState : int32_t {
  *
  * Space is handed out by appending into the currently active bucket file. Each
  * bucket has a fixed capacity; when a request no longer fits, a new bucket is
- * created. Buckets carry persisted metadata so committed entries can be
- * recovered after a master restart, and eviction works at whole-bucket
- * granularity through a two-phase protocol driven by the master.
+ * created. Eviction works at whole-bucket granularity through a two-phase
+ * protocol driven by the master.
  *
- * Metadata durability
- * -------------------
- * Each bucket owns exactly two files:
+ * No metadata durability
+ * ----------------------
+ * Bucket state lives in memory only. A bucket owns exactly one file:
  *
  *   bucket_NNNNNN.data     preallocated data file
- *   bucket_NNNNNN.meta     the bucket's single full metadata snapshot
  *
- * The active bucket keeps its metadata in memory only. The `.meta` file is
- * written when the bucket is sealed, i.e. when allocation moves on to a new
- * bucket, and rewritten afterwards only if the sealed bucket's state changed
- * (a tail reservation committing, or an entry being freed). Rewrites happen in
- * place: the hot path never writes metadata, never renames and never appends to
- * a log, so storing a key costs no metadata I/O at all.
+ * Nothing describes what is inside that file, so a master restart loses every
+ * bucket: `Init()` deletes every `bucket_*.data` it finds (together with any
+ * `bucket_*.meta` left behind by an older build) and allocation starts from an
+ * empty table with bucket ids counting up from 0 again. The DFS tier behaves
+ * as a pure cache that is cold after a restart.
  *
- * `FlushDirtyMetadata()` performs the deferred writes for every bucket marked
- * dirty. It runs on the master's DFS maintenance tick and at shutdown.
- *
- * The accepted failure mode: if the master dies before a bucket is sealed, that
- * bucket has no `.meta` file and recovery deletes its `.data` file, so at most
- * the newest bucket's contents are lost. Because an in-place rewrite that is
- * torn destroys both the old and the new content, a crash during a rewrite has
- * the same effect for that one bucket.
+ * This is the deliberate trade-off: without a per-key metadata snapshot the
+ * put path performs no metadata I/O at all and the allocator never keeps a
+ * second copy of every key for durability, which is what made large key counts
+ * expensive in both time and memory.
  *
  * Lock ownership
  * --------------
@@ -125,13 +71,11 @@ enum class BucketEntryState : int32_t {
  * eviction bookkeeping. Bucket state lives behind shared_ptr and is only
  * mutated while `mutex_` is held, so no per-bucket mutex is needed.
  *
- * Slow DFS I/O (preallocation, metadata writes, deletes) is always performed
- * with `mutex_` released: the caller snapshots the state it needs under the
- * lock, does the I/O, then reacquires the lock and re-validates the captured
- *
- * BucketState object identity before publishing the result. No RPC, callback
- * or
- * filesystem call ever happens while `mutex_` is held.
+ * Slow DFS I/O (preallocation, deletes) is always performed with `mutex_`
+ * released: the caller snapshots the state it needs under the lock, does the
+ * I/O, then reacquires the lock and re-validates the captured BucketState
+ * object identity before publishing the result. No RPC, callback or filesystem
+ * call ever happens while `mutex_` is held.
  */
 class ImmutableBucketAllocator final : public DfsAllocatorInterface {
    public:
@@ -183,31 +127,6 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
      * @return the previous value of max_bucket_count_.
      */
     int64_t SetMaxBucketCount(int64_t new_max_bucket_count);
-
-    /**
-     * @brief Mark a reservation as durable so restart recovery may revive it.
-     *
-     * Called by the master once the client reports the DFS data write finished
-     * (PutEnd). A mismatching descriptor or generation is ignored, so a late
-     * completion from a superseded operation cannot commit the allocation that
-     * replaced it.
-     *
-     * @return true when the entry is COMMITTED and that fact is durable.
-     */
-    bool MarkCommitted(const std::string& key,
-                       const DistributedFSDescriptor& descriptor);
-
-    /**
-     * @brief All committed entries recovered from disk at Init() time.
-     *
-     * The master re-registers these as COMPLETE DFS replicas so recovered
-     * objects are queryable and readable, then clears the list.
-     */
-    struct RecoveredReplica {
-        std::string key;
-        DistributedFSDescriptor descriptor;
-    };
-    std::vector<RecoveredReplica> TakeRecoveredReplicas();
 
     /**
      * @brief Bucket-granular eviction transaction.
@@ -287,21 +206,6 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     void AbortEviction(PendingEviction&& pending);
 
     /**
-     * @brief Write the `.meta` file of every bucket whose state is dirty.
-     *
-     * The hot paths - BatchAllocate, MarkCommitted, Free - only update memory
-     * and mark the bucket dirty, because the master calls `Free()` while
-     * holding a metadata shard lock and DFS I/O must never happen under that
-     * lock. This method performs the deferred writes, so it must be called with
-     * no master lock held: the master's DFS maintenance tick drives it, and the
-     * destructor runs it once more so a clean shutdown leaves no unwritten
-     * metadata.
-     *
-     * @return the number of buckets whose metadata was made durable.
-     */
-    size_t FlushDirtyMetadata();
-
-    /**
      * @brief Number of buckets currently tracked (test/metrics helper).
      */
     size_t GetBucketCount() const;
@@ -333,7 +237,6 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
         uint64_t key_size = 0;
         uint64_t value_size = 0;
         uint64_t reserved_size = 0;
-        uint64_t generation = 0;
         BucketEntryState state = BucketEntryState::PENDING;
     };
 
@@ -341,8 +244,8 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
         int64_t bucket_id = 0;
         uint64_t capacity = 0;
         uint64_t append_offset = 0;
-        // Bytes reserved by entries that are still live (PENDING or
-        // COMMITTED). Drives the "is this bucket worth evicting" decision.
+        // Bytes reserved by entries that are still live (not TOMBSTONE).
+        // Drives the "is this bucket worth evicting" decision.
         uint64_t live_bytes = 0;
         int64_t last_access_ns = 0;
         // Set between PrepareEviction and Commit/Abort. A frozen bucket
@@ -351,14 +254,10 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
         // A ready bucket owns a fully preallocated data file but has never
         // accepted an allocation. Ready buckets are absent from the LRU.
         bool ready = false;
-        // True once the bucket has been sealed (it is no longer the active
-        // bucket), which is when its `.meta` file starts to exist.
+        // True once the bucket has been sealed: it is no longer the active
+        // bucket and accepts no further allocations. Remains meaningful for
+        // space accounting and eviction even though nothing is persisted.
         bool sealed = false;
-        // Set when the in-memory state differs from what the `.meta` file
-        // holds, cleared once the file has been rewritten. Only meaningful for
-        // a sealed bucket: an unsealed one is deliberately not persisted at
-        // all.
-        bool meta_dirty = false;
         // Tombstoned entries, kept for eviction bookkeeping.
         uint64_t tombstones = 0;
         std::unordered_map<std::string, BucketEntry> entries;
@@ -375,20 +274,8 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     std::string BucketDataPath(int64_t bucket_id) const;
     std::string BucketMetaPath(int64_t bucket_id) const;
 
-    // Serializes `bucket` into a PersistedBucketMetadata snapshot. Taken under
-    // `mutex_`; the file write happens outside it.
-    PersistedBucketMetadata SnapshotLocked(BucketState& bucket, bool evicting);
-
-    // Overwrites `bucket_id`'s single `.meta` file in place and syncs it.
-    tl::expected<void, ErrorCode> PersistMetadata(
-        const PersistedBucketMetadata& snapshot);
-
-    // Marks `bucket` as needing its `.meta` file (re)written. A bucket that is
-    // still active is never persisted, so the flag is only set once sealed.
-    static void MarkMetaDirtyLocked(BucketState& bucket);
-
-    // Seals the currently active bucket - it stops accepting allocations - and
-    // marks it for persistence. Requires `mutex_`.
+    // Seals the currently active bucket - it stops accepting allocations.
+    // Requires `mutex_`.
     void SealActiveBucketLocked();
 
     // Synchronous compatibility path used only when ready_bucket_target_ is 0.
@@ -436,7 +323,17 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
                                          const DistributedFSDescriptor& desc,
                                          BucketPtr* out_bucket);
 
-    tl::expected<void, ErrorCode> RecoverFromDisk();
+    /**
+     * @brief Delete every leftover bucket file from a previous process.
+     *
+     * Called once by `Init()` before any bucket is preallocated. Bucket data is
+     * only addressable through in-memory state, so anything a previous master
+     * left behind is unreachable garbage; a `bucket_*.meta` written by an older
+     * build goes the same way. Only names matching `bucket_<id>.data` or
+     * `bucket_<id>.meta` are touched - other files in the directory belong to
+     * someone else.
+     */
+    tl::expected<void, ErrorCode> PurgeExistingBucketFiles();
 
     void DeleteBucketFiles(int64_t bucket_id);
 
@@ -458,11 +355,6 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     std::chrono::seconds eviction_check_interval_{5};
 
     mutable std::mutex mutex_;
-    // Serializes `.meta` writes and eviction deletion. Flush and eviction both
-    // revalidate BucketState pointer identity after taking this mutex so a
-    // captured operation cannot recreate or overwrite metadata for a bucket
-    // that has since been removed.
-    std::mutex metadata_io_mutex_;
     std::deque<int64_t> ready_bucket_ids_;
     size_t bucket_creations_in_flight_ = 0;
     size_t waiting_allocators_ = 0;
@@ -477,9 +369,10 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     std::vector<std::thread> bucket_create_workers_;
     std::unordered_map<int64_t, BucketPtr> buckets_;
     std::unordered_map<std::string, int64_t> key_index_;
+    // Always starts at 0: a restart begins with an empty table, so there is no
+    // previous id to continue from and no leftover file to collide with.
     int64_t next_bucket_id_ = 0;
     int64_t active_bucket_id_ = -1;
-    uint64_t next_generation_ = 1;
     // Once the high watermark is crossed, keep evicting until usage falls
     // below the low watermark; protected buckets may make that span several
     // prepare/resolve rounds.
@@ -487,8 +380,6 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
 
     std::list<int64_t> lru_list_;
     std::unordered_map<int64_t, std::list<int64_t>::iterator> lru_index_;
-
-    std::vector<RecoveredReplica> recovered_replicas_;
 
     std::atomic<bool> initialized_{false};
 };

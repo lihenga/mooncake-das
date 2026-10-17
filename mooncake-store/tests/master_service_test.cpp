@@ -1539,12 +1539,11 @@ TEST_F(MasterServiceTest, DfsBucketBatchPutStartRollsBackRejectedKeys) {
     std::filesystem::remove_all(root, ec);
 }
 
-TEST_F(MasterServiceTest, DfsBucketRestartRestoresQueryableReplicas) {
+TEST_F(MasterServiceTest, DfsBucketRestartDropsEveryReplica) {
     const auto root = MakeDfsTestRoot("restart");
     ScopedBucketDfsEnv env(root, "1048576", "16");
 
     std::vector<std::string> keys{"restart_a", "restart_b"};
-    std::vector<DistributedFSDescriptor> before;
 
     {
         MasterService service;
@@ -1561,29 +1560,18 @@ TEST_F(MasterServiceTest, DfsBucketRestartRestoresQueryableReplicas) {
                             .PutEnd(context.client_id, key, TenantId::Default(),
                                     ReplicaType::ALL)
                             .has_value());
-            const auto* dfs = FindDfsDescriptor(*start);
-            ASSERT_NE(dfs, nullptr);
-            before.push_back(dfs->get_dfs_descriptor());
+            ASSERT_NE(FindDfsDescriptor(*start), nullptr);
         }
     }
 
     {
-        // A fresh master over the same directory must recover the committed
-        // entries as COMPLETE, queryable replicas, not just allocator state.
+        // A fresh master over the same directory keeps nothing: bucket data
+        // files are reclaimed at startup, so there is nothing left to serve.
         MasterService service;
-        for (size_t i = 0; i < keys.size(); ++i) {
-            auto query = service.GetReplicaList(keys[i], TenantId::Default());
-            ASSERT_TRUE(query.has_value())
-                << "key " << keys[i] << " was not recovered";
-            const auto* dfs = FindDfsDescriptor(query->replicas);
-            ASSERT_NE(dfs, nullptr) << "key " << keys[i];
-            const auto& desc = dfs->get_dfs_descriptor();
-            // The recovered descriptor must match the original field by field.
-            EXPECT_EQ(desc.file_path, before[i].file_path);
-            EXPECT_EQ(desc.offset, before[i].offset);
-            EXPECT_EQ(desc.object_size, before[i].object_size);
-            EXPECT_EQ(desc.aligned_size, before[i].aligned_size);
-            EXPECT_EQ(desc.shard_idx, before[i].shard_idx);
+        for (const auto& key : keys) {
+            auto query = service.GetReplicaList(key, TenantId::Default());
+            EXPECT_FALSE(query.has_value())
+                << "key " << key << " should not survive a restart";
         }
     }
 
@@ -1591,7 +1579,7 @@ TEST_F(MasterServiceTest, DfsBucketRestartRestoresQueryableReplicas) {
     std::filesystem::remove_all(root, ec);
 }
 
-TEST_F(MasterServiceTest, DfsBucketRestartDoesNotRestoreRemovedKeys) {
+TEST_F(MasterServiceTest, DfsBucketRestartDropsRemovedAndUncommittedKeys) {
     const auto root = MakeDfsTestRoot("restart_revoked");
     ScopedBucketDfsEnv env(root, "1048576", "16");
 
@@ -1613,20 +1601,23 @@ TEST_F(MasterServiceTest, DfsBucketRestartDoesNotRestoreRemovedKeys) {
                         .has_value());
         ASSERT_TRUE(service.Remove("gone", TenantId::Default()).has_value());
 
-        // Never committed (no PutEnd): must not come back either.
+        // Committed, then left behind by the restart: must not come back either.
         ASSERT_TRUE(service
-                        .PutStart(context.client_id, "never_committed",
+                        .PutStart(context.client_id, "committed",
                                   TenantId::Default(), 4096, config)
+                        .has_value());
+        ASSERT_TRUE(service
+                        .PutEnd(context.client_id, "committed",
+                                TenantId::Default(), ReplicaType::ALL)
                         .has_value());
     }
 
     {
         MasterService service;
-        auto removed = service.GetReplicaList("gone", TenantId::Default());
-        EXPECT_FALSE(removed.has_value());
-        auto uncommitted =
-            service.GetReplicaList("never_committed", TenantId::Default());
-        EXPECT_FALSE(uncommitted.has_value());
+        EXPECT_FALSE(
+            service.GetReplicaList("gone", TenantId::Default()).has_value());
+        EXPECT_FALSE(service.GetReplicaList("committed", TenantId::Default())
+                         .has_value());
     }
 
     std::error_code ec;
