@@ -958,6 +958,16 @@ DistributedStorageBackend::ResolveTarget(
                    << " for key " << key;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    const std::string expected_path =
+        canonical_root_dir_ + "/" + kBucketFilePrefix +
+        ImmutableBucketAllocator::FormatBucketId(descriptor.shard_idx) +
+        kBucketDataSuffix;
+    if (CanonicalizePath(descriptor.file_path) != expected_path) {
+        LOG(ERROR) << "DFS bucket path mismatch for key " << key
+                   << ", descriptor=" << descriptor.file_path
+                   << ", expected=" << expected_path;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     if (!IsBucketDescriptorRangeValid(descriptor, key, distributed_config_)) {
         LOG(ERROR) << "Invalid DFS bucket descriptor for key " << key
                    << ", offset=" << descriptor.offset
