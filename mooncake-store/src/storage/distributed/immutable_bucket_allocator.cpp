@@ -1805,8 +1805,11 @@ bool ImmutableBucketAllocator::CommitEviction(PendingEviction&& pending) {
     if (!persisted) {
         LOG(ERROR) << "Failed to persist DFS eviction marker for bucket "
                    << bucket_id << ", error=" << persisted.error()
-                   << "; the bucket is already invisible to readers and "
-                      "will be reclaimed on a later attempt";
+                   << "; aborting eviction and retaining the bucket for retry";
+        pending.owner_ = this;
+        pending.bucket_identity_ = std::move(bucket_identity);
+        AbortEviction(std::move(pending), /*demote=*/false);
+        return false;
     }
 
     {
