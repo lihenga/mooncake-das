@@ -728,6 +728,8 @@ DistributedStorageBackend::GetOrOpenBucket(int64_t bucket_id) {
     const std::string path = canonical_root_dir_ + "/" + kBucketFilePrefix +
                              ImmutableBucketAllocator::FormatBucketId(bucket_id) +
                              kBucketDataSuffix;
+    // Only the allocator may create bucket files. Keep the existing adapter
+    // entry point, which already opens read/write without O_CREAT.
     auto fd_result = fs_adapter_->OpenFileReadWriteExisting(path);
     if (!fd_result) {
         static DfsLogLimiter log_limiter;
@@ -942,6 +944,16 @@ DistributedStorageBackend::ResolveTarget(
     if (descriptor.shard_idx < 0) {
         LOG(ERROR) << "Invalid DFS bucket id " << descriptor.shard_idx
                    << " for key " << key;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const std::string expected_path =
+        canonical_root_dir_ + "/" + kBucketFilePrefix +
+        ImmutableBucketAllocator::FormatBucketId(descriptor.shard_idx) +
+        kBucketDataSuffix;
+    if (CanonicalizePath(descriptor.file_path) != expected_path) {
+        LOG(ERROR) << "DFS bucket path mismatch for key " << key
+                   << ", descriptor=" << descriptor.file_path
+                   << ", expected=" << expected_path;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (!IsBucketDescriptorRangeValid(descriptor, key, distributed_config_)) {

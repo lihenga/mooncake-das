@@ -227,9 +227,15 @@ tl::expected<std::vector<std::string>, ErrorCode> PosixFsAdapter::ListFiles(
     return result;
 }
 
-tl::expected<int, ErrorCode> PosixFsAdapter::OpenFile(const std::string& path) {
-    int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-    if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+tl::expected<int, ErrorCode> PosixFsAdapter::OpenFile(const std::string& path,
+                                                  bool create) {
+    int fd =
+        ::open(path.c_str(), O_RDWR | O_CLOEXEC | (create ? O_CREAT : 0), 0644);
+    if (fd < 0) {
+        return tl::make_unexpected(!create && errno == ENOENT
+                                       ? ErrorCode::FILE_NOT_FOUND
+                                       : ErrorCode::FILE_OPEN_FAIL);
+    }
     return fd;
 }
 

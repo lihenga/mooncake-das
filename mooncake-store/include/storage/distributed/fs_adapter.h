@@ -111,7 +111,9 @@ class FileSystemAdapter {
 
     // === fd-based I/O for shard-offset DFS mode ===
 
-    virtual tl::expected<int, ErrorCode> OpenFile(const std::string& /*path*/) {
+    // With create=false, missing files must return FILE_NOT_FOUND.
+    virtual tl::expected<int, ErrorCode> OpenFile(
+        const std::string& /*path*/, bool /*create*/ = true) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
 

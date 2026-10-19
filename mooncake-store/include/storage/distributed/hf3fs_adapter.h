@@ -40,7 +40,8 @@ class Hf3fsAdapter : public FileSystemAdapter {
     tl::expected<std::vector<std::string>, ErrorCode> ListFiles(
         const std::string& dir) override;
 
-    tl::expected<int, ErrorCode> OpenFile(const std::string& path) override;
+    tl::expected<int, ErrorCode> OpenFile(const std::string& path,
+                                         bool create = true) override;
     tl::expected<int, ErrorCode> OpenFileReadOnly(
         const std::string& path) override;
     tl::expected<int, ErrorCode> OpenFileReadWriteExisting(
