@@ -1808,7 +1808,8 @@ bool ImmutableBucketAllocator::CommitEviction(PendingEviction&& pending) {
                    << "; aborting eviction and retaining the bucket for retry";
         pending.owner_ = this;
         pending.bucket_identity_ = std::move(bucket_identity);
-        AbortEviction(std::move(pending), /*demote=*/false);
+        // Let this pass reach other buckets before retrying the failed one.
+        AbortEviction(std::move(pending), /*demote=*/true);
         return false;
     }
 
