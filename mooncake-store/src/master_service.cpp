@@ -7512,6 +7512,7 @@ bool MasterService::RunBucketDfsEvictionInternal(
             // master to validate, so it can be reclaimed immediately.
             const bool committed =
                 bucket_allocator_->CommitEviction(std::move(pending));
+            if (!committed) return evicted;
             if (committed && !invalidating_missing_bucket) {
                 MasterMetricManager::instance().inc_dfs_bucket_evictions();
             }
@@ -7717,6 +7718,7 @@ bool MasterService::RunBucketDfsEvictionInternal(
         // into this bucket, so it is now safe to drop the files.
         const bool committed =
             bucket_allocator_->CommitEviction(std::move(pending));
+        if (!committed) return evicted;
         if (committed && !invalidating_missing_bucket) {
             MasterMetricManager::instance().inc_dfs_bucket_evictions();
         }
