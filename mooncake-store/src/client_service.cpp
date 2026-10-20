@@ -73,29 +73,21 @@ std::optional<size_t> GetTransportRegistrationLimit(
 namespace {
 
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
-constexpr size_t kDefaultDfsWriteArenaSize = 256ULL * 1024 * 1024;
+constexpr size_t kDefaultDfsWriteChunkSize = 256ULL * 1024 * 1024;
 constexpr size_t kDefaultDfsWriteArenaCount = 2;
 
-size_t ReadDfsWriteArenaSize() {
+size_t ReadDfsWriteChunkSize() {
     const size_t size = Environ::GetSizeT(
-        FileStorageEnvironmentVariables::MC_STORE_DFS_WRITE_ARENA_SIZE_BYTES.name,
-        kDefaultDfsWriteArenaSize);
-    return size == 0 ? kDefaultDfsWriteArenaSize : size;
+        FileStorageEnvironmentVariables::MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES.name,
+        kDefaultDfsWriteChunkSize);
+    return size == 0 ? kDefaultDfsWriteChunkSize : size;
 }
 
-size_t ReadPositiveDfsWriteArenaCount() {
+size_t ReadDfsWriteArenaCount() {
     const size_t count = Environ::GetSizeT(
         FileStorageEnvironmentVariables::MC_STORE_DFS_WRITE_ARENA_COUNT.name,
         kDefaultDfsWriteArenaCount);
     return count == 0 ? kDefaultDfsWriteArenaCount : count;
-}
-
-size_t ReadDfsWriteChunkSize(size_t arena_size) {
-    if (arena_size == 0) return 0;
-    const size_t configured = Environ::GetSizeT(
-        FileStorageEnvironmentVariables::MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES.name,
-        arena_size);
-    return configured == 0 ? arena_size : std::min(arena_size, configured);
 }
 
 bool IsValidServiceEndpoint(const std::string& endpoint) {
@@ -529,9 +521,8 @@ Client::Client(const std::string& local_hostname,
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
       object_checksum_enabled_(Environ::Get().GetStoreChecksumEnabled()),
-      dfs_write_arena_size_(ReadDfsWriteArenaSize()),
-      dfs_write_arena_count_(ReadPositiveDfsWriteArenaCount()),
-      dfs_write_chunk_size_(ReadDfsWriteChunkSize(dfs_write_arena_size_)),
+      dfs_write_arena_count_(ReadDfsWriteArenaCount()),
+      dfs_write_chunk_size_(ReadDfsWriteChunkSize()),
       pinned_buffer_pool_(
           std::make_shared<PinnedBufferPool>(Environ::GetSizeT(
               "MC_STORE_DFS_PINNED_POOL_BYTES",
@@ -546,19 +537,17 @@ Client::Client(const std::string& local_hostname,
         LOG(INFO) << "Object checksum validation is enabled";
     }
 
-    if (dfs_write_arena_size_ > 0) {
-        try {
-            dfs_write_staging_pool_ = std::make_shared<DfsWriteStagingPool>(
-                dfs_write_arena_size_, dfs_write_arena_count_);
-            LOG(INFO) << "Initialized DFS write staging arenas: count="
-                      << dfs_write_arena_count_ << ", size="
-                      << dfs_write_arena_size_ << ", chunk_limit="
-                      << dfs_write_chunk_size_;
-        } catch (const std::exception& e) {
-            LOG(ERROR) << "Failed to initialize DFS write staging arenas: "
-                       << e.what();
-            throw;
-        }
+    try {
+        dfs_write_staging_pool_ = std::make_shared<DfsWriteStagingPool>(
+            dfs_write_chunk_size_, dfs_write_arena_count_);
+        LOG(INFO) << "Initialized DFS write staging arenas: count="
+                  << dfs_write_arena_count_ << ", size="
+                  << dfs_write_chunk_size_ << ", chunk_limit="
+                  << dfs_write_chunk_size_;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to initialize DFS write staging arenas: "
+                   << e.what();
+        throw;
     }
 
     if (metrics_) {
@@ -3262,11 +3251,14 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
     return results;
 }
 
+void Client::AsyncDfsWriteContext::ReleaseStagingSlot() {
+    if (!staging_pool || !staging_slot) return;
+    staging_pool->Release(std::move(staging_slot));
+}
+
 Client::AsyncDfsWriteContext::~AsyncDfsWriteContext() {
     slices.clear();
-    if (staging_pool && staging_slot) {
-        staging_pool->Release(std::move(staging_slot));
-    }
+    ReleaseStagingSlot();
 }
 
 bool Client::StageDfsWriteData(
@@ -3378,6 +3370,13 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
     ObserveDirectIo("write", DirectStorageMetricSource(ReplicaType::DFS),
                     all_succeeded, successful_bytes,
                     write_duration_seconds);
+
+    // BatchWrite is synchronous: once it returns, neither the backend nor the
+    // local request views use the staging bytes. Release the slot before the
+    // completion RPCs so another chunk can stage while PutEnd/PutRevoke runs.
+    requests.clear();
+    context->slices.clear();
+    context->ReleaseStagingSlot();
 
     // Report each key individually so one failure cannot revoke its neighbours.
     // The RPCs are idempotent on the master side, so a bounded retry is safe.
@@ -3673,10 +3672,9 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
         return;
     }
 
-    const size_t arena_size = dfs_write_arena_size_;
     const size_t chunk_limit = dfs_write_chunk_size_;
 
-    if (arena_size == 0 || !dfs_write_staging_pool_) {
+    if (!dfs_write_staging_pool_) {
         LOG(ERROR) << "DFS write staging arena is unavailable";
         for (auto& op : ops) {
             if (!op.IsResolved() &&
@@ -3693,6 +3691,7 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
     std::vector<std::vector<size_t>> chunks;
     std::vector<size_t> chunk;
     size_t chunk_bytes = 0;
+    uint64_t total_payload_bytes = 0;
     const auto flush_chunk = [&]() {
         if (!chunk.empty()) {
             chunks.push_back(std::move(chunk));
@@ -3722,6 +3721,12 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
             op.AppendFailureContext("DFS object exceeds staging chunk limit");
             continue;
         }
+        if (total_payload_bytes <=
+            std::numeric_limits<uint64_t>::max() - object_bytes) {
+            total_payload_bytes += object_bytes;
+        } else {
+            total_payload_bytes = std::numeric_limits<uint64_t>::max();
+        }
         if (!chunk.empty() && object_bytes > chunk_limit - chunk_bytes) {
             flush_chunk();
         }
@@ -3729,6 +3734,13 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
         chunk_bytes += object_bytes;
     }
     flush_chunk();
+
+    if (dfs_read_trace_enabled()) {
+        LOG(INFO) << "Async DFS write batch: total_payload_bytes="
+                  << total_payload_bytes << ", chunks=" << chunks.size()
+                  << ", chunk_limit_bytes=" << chunk_limit
+                  << ", arena_count=" << dfs_write_arena_count_;
+    }
 
     for (size_t chunk_index = 0; chunk_index < chunks.size(); ++chunk_index) {
         bool slot_timed_out = false;

@@ -1019,6 +1019,7 @@ class Client {
         std::shared_ptr<DistributedStorageBackend> backend;
         bool is_upsert = false;
 
+        void ReleaseStagingSlot();
         ~AsyncDfsWriteContext();
     };
 
@@ -1103,7 +1104,6 @@ class Client {
     const std::string metadata_connstring_;
     const std::string protocol_;
     const bool object_checksum_enabled_;
-    const size_t dfs_write_arena_size_;
     const size_t dfs_write_arena_count_;
     const size_t dfs_write_chunk_size_;
 
