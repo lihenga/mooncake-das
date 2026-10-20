@@ -480,7 +480,7 @@ tl::expected<int, ErrorCode> Hf3fsAdapter::OpenFileReadWriteExisting(
     return fd;
 }
 
-
+tl::expected<void, ErrorCode> Hf3fsAdapter::CloseFile(int fd) {
     if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);
     hf3fs_dereg_fd(fd);
     if (close(fd) != 0) {
