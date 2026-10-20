@@ -2145,7 +2145,7 @@ bool ImmutableBucketAllocator::HasLowUtilizationBucket(double threshold) const {
 
     std::lock_guard<std::mutex> lock(mutex_);
     for (const auto& [bucket_id, bucket] : buckets_) {
-        if (bucket_id == active_bucket_id_ || bucket->frozen ||
+        if (bucket_id == active_bucket_id_ || bucket->ready || bucket->frozen ||
             bucket->capacity == 0) {
             continue;
         }

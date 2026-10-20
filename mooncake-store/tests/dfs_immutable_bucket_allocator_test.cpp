@@ -1884,6 +1884,25 @@ TEST(ImmutableBucketAllocatorTest, LowUtilizationEvictionIgnoresGlobalWatermark)
     EXPECT_TRUE(alloc.GetBucketIdForKey("second").has_value());
 }
 
+TEST(ImmutableBucketAllocatorTest, ReadyBucketsDoNotBlockWatermarkEviction) {
+    TempDir tmp("bucket_ready_watermark");
+    auto config = MakeEvictionConfig(tmp.path(), kAlignment, 4);
+    config.ready_bucket_target = 4;
+    ImmutableBucketAllocator alloc;
+    ASSERT_TRUE(alloc.Init(config));
+    EXPECT_FALSE(alloc.HasLowUtilizationBucket(0.05));
+    for (int i = 0; i < 3; ++i) {
+        const auto key = "healthy_" + std::to_string(i);
+        auto descriptor = alloc.Allocate(key, 100);
+        ASSERT_TRUE(descriptor.has_value());
+        ASSERT_TRUE(alloc.MarkCommitted(key, *descriptor));
+    }
+    EXPECT_FALSE(alloc.HasLowUtilizationBucket(0.05));
+    auto pending = alloc.PrepareEviction();
+    EXPECT_GE(pending.bucket_id(), 0);
+    EXPECT_FALSE(pending.Empty());
+}
+
 TEST(ImmutableBucketAllocatorTest, LowUtilizationEvictionSkipsHealthyBucket) {
     TempDir tmp("bucket_skip_low_utilization");
     const uint64_t capacity = kAlignment;
