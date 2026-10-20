@@ -5228,6 +5228,10 @@ void Client::ExecuteTask(const ClientTask& client_task) {
     try {
         switch (assignment.type) {
             case TaskType::DFS_BACKFILL: {
+                if (!dfs_storage_backend_) {
+                    result = ErrorCode::DFS_SERVICE_UNAVAILABLE;
+                    break;
+                }
                 DfsBackfillPayload payload;
                 struct_json::from_json(payload, assignment.payload);
                 auto start = master_client_.DfsBackfillStart(
@@ -5310,6 +5314,7 @@ void Client::ExecuteTask(const ClientTask& client_task) {
         // Other errors (e.g., OBJECT_NOT_FOUND, REPLICA_NOT_FOUND) should
         // not be retried
         bool should_retry =
+            assignment.type != TaskType::DFS_BACKFILL &&
             (result == ErrorCode::NO_AVAILABLE_HANDLE) &&
             (current_retry_count < assignment.max_retry_attempts);
 
@@ -5332,11 +5337,18 @@ void Client::ExecuteTask(const ClientTask& client_task) {
             task_thread_pool_.enqueue(
                 [this, retry_task]() { ExecuteTask(retry_task); });
         } else {
-            LOG(ERROR) << "action=task_execution_failed"
+            // DFS recovery is retried by the master after a cooldown. A
+            // persistent outage must not produce one error per degraded key.
+            static DfsLogLimiter dfs_backfill_limiter;
+            auto suppressed = assignment.type == TaskType::DFS_BACKFILL
+                ? dfs_backfill_limiter.ShouldLog()
+                : std::optional<uint64_t>(0);
+            if (suppressed) LOG(ERROR) << "action=task_execution_failed"
                        << ", task_id=" << assignment.id
                        << ", error_code=" << result
                        << ", retry_count=" << current_retry_count
-                       << ", max_retry_count=" << assignment.max_retry_attempts;
+                       << ", max_retry_count=" << assignment.max_retry_attempts
+                       << ", suppressed=" << *suppressed;
             TaskCompleteRequest complete_request;
             complete_request.id = assignment.id;
             complete_request.status = TaskStatus::FAILED;
