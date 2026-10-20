@@ -2026,6 +2026,19 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
                         .PutEnd(initial_context.client_id, "retry_existing",
                                  TenantId::Default(), ReplicaType::ALL)
                         .has_value());
+        // Recovery deliberately ignores an active bucket without metadata.
+        // Roll over to persist the committed source bucket before restart.
+        auto rollover = initial_service.PutStart(
+            initial_context.client_id, "retry_rollover", TenantId::Default(),
+            1048576 - 4096, config);
+        ASSERT_TRUE(rollover.has_value());
+        ASSERT_TRUE(initial_service.PutRevoke(
+            initial_context.client_id, "retry_rollover", TenantId::Default(),
+            ReplicaType::ALL));
+        auto meta_path = std::filesystem::path(
+            dfs->get_dfs_descriptor().file_path);
+        meta_path.replace_extension(".meta");
+        ASSERT_TRUE(std::filesystem::exists(meta_path));
     }
 
     std::filesystem::rename(root, saved_root);
