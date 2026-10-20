@@ -120,7 +120,7 @@ bool HttpMetadataServer::start() {
     if (ec.hasResult()) {
         const auto result = ec.result().value();
         LOG(ERROR) << "Failed to start HTTP metadata server on " << host_ << ":"
-                   << port_ << ": code=" << result.val()
+                   << port_ << ": code=" << result.value()
                    << ", message=" << result.message();
         return false;
     }
