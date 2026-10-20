@@ -8,9 +8,11 @@
 #include <atomic>  // For std::atomic
 #include <chrono>  // For std::chrono
 #include <csignal>
+#include <cstdio>   // For popen and pclose
 #include <cstdlib>  // For std::getenv
 #include <fstream>  // For std::ifstream
 #include <memory>   // For std::unique_ptr
+#include <sstream>
 #include <string>
 #include <thread>  // For std::thread
 #include <json/json.h>
@@ -49,6 +51,50 @@ constexpr char kDefaultKvSoftPinTtlFlagValue[] = "1800000";
 constexpr char kDefaultMaxKvSoftPinTtlFlagValue[] = "86400000";
 
 namespace {
+
+void LogPortOccupier(uint16_t port, const std::string& service_name) {
+    const std::string command =
+        "lsof -nP -a -iTCP:" + std::to_string(port) +
+        " -sTCP:LISTEN -F pc 2>/dev/null";
+    FILE* pipe = popen(command.c_str(), "r");
+    if (pipe == nullptr) {
+        LOG(WARNING) << "Unable to inspect process occupying " << service_name
+                     << " port " << port << ": failed to execute lsof";
+        return;
+    }
+
+    std::string output;
+    char buffer[256];
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        output.append(buffer);
+    }
+    const int status = pclose(pipe);
+    if (output.empty()) {
+        LOG(WARNING) << "No listening process information found for "
+                     << service_name << " port " << port
+                     << "; lsof exit status=" << status;
+        return;
+    }
+
+    std::istringstream stream(output);
+    std::string line;
+    std::string pid;
+    std::string command_name;
+    while (std::getline(stream, line)) {
+        if (line.size() > 1 && line[0] == 'p') {
+            pid = line.substr(1);
+        } else if (line.size() > 1 && line[0] == 'c') {
+            command_name = line.substr(1);
+            LOG(ERROR) << "Process occupying " << service_name << " port "
+                       << port << ": pid=" << pid
+                       << ", command=" << command_name;
+        }
+    }
+    if (pid.empty() || command_name.empty()) {
+        LOG(WARNING) << "Incomplete process information for " << service_name
+                     << " port " << port << ": " << output;
+    }
+}
 
 bool ValidateDurationFlag(const char* flagname, const std::string& value) {
     uint64_t parsed_value = 0;
@@ -1630,16 +1676,10 @@ int main(int argc, char* argv[]) {
     } else {
         // version is not used in non-HA mode, just pass a dummy value
         mooncake::ViewVersionId version = 0;
-        coro_rpc::coro_rpc_server server(
-            master_config.rpc_thread_num, master_config.rpc_port,
-            master_config.rpc_address,
-            std::chrono::seconds(master_config.rpc_conn_timeout_seconds),
-            master_config.rpc_enable_tcp_no_delay);
         const char* value = std::getenv("MC_RPC_PROTOCOL");
 #ifdef YLT_ENABLE_IBV
         if (value && std::string_view(value) == "rdma") {
             LOG(INFO) << "Initializing RDMA for non-HA RPC server";
-            server.init_ibv();
         }
 #else
         if (value && std::string_view(value) == "rdma") {
@@ -1661,8 +1701,21 @@ int main(int argc, char* argv[]) {
         admin_server.SetServiceDelegate(wrapped_master_service);
         admin_server.SetServiceAvailable(true);
 
-        LOG(INFO) << "Registering non-HA RPC handlers";
-        mooncake::RegisterRpcService(server, *wrapped_master_service);
+        auto create_rpc_server = [&]() {
+            auto rpc_server = std::make_unique<coro_rpc::coro_rpc_server>(
+                master_config.rpc_thread_num, master_config.rpc_port,
+                master_config.rpc_address,
+                std::chrono::seconds(master_config.rpc_conn_timeout_seconds),
+                master_config.rpc_enable_tcp_no_delay);
+#ifdef YLT_ENABLE_IBV
+            if (value && std::string_view(value) == "rdma") {
+                rpc_server->init_ibv();
+            }
+#endif
+            LOG(INFO) << "Registering non-HA RPC handlers";
+            mooncake::RegisterRpcService(*rpc_server, *wrapped_master_service);
+            return rpc_server;
+        };
 
         static std::atomic<bool> shutdown_requested{false};
         static std::atomic<int> shutdown_signal{0};
@@ -1673,27 +1726,75 @@ int main(int argc, char* argv[]) {
         std::signal(SIGINT, signal_handler);
         std::signal(SIGTERM, signal_handler);
 
+        constexpr int kRpcStartMaxAttempts = 3;
         coro_rpc::err_code server_result{};
         std::atomic<bool> server_done{false};
-        std::thread server_thread(
-            [&server, &server_result, &server_done]() {
-                LOG(INFO) << "Starting non-HA RPC server";
-                server_result = server.start();
-                server_done.store(true);
-            });
+        std::unique_ptr<coro_rpc::coro_rpc_server> server;
+        std::thread server_thread;
+        int rpc_start_attempt = 0;
+        for (; rpc_start_attempt < kRpcStartMaxAttempts; ++rpc_start_attempt) {
+            server = create_rpc_server();
+            server_result = {};
+            server_done.store(false);
+            const int attempt = rpc_start_attempt + 1;
+            LOG(INFO) << "Starting non-HA RPC server, attempt=" << attempt
+                      << "/" << kRpcStartMaxAttempts;
+            server_thread = std::thread(
+                [server_ptr = server.get(), &server_result, &server_done]() {
+                    server_result = server_ptr->start();
+                    if (server_result) {
+                        LOG(ERROR) << "RPC server start returned an error: code="
+                                   << server_result.val()
+                                   << ", message=" << server_result.message();
+                    } else {
+                        LOG(INFO) << "RPC server start returned successfully: code="
+                                  << server_result.val()
+                                  << ", message=" << server_result.message();
+                    }
+                    server_done.store(true);
+                });
 
-        while (!shutdown_requested.load() && !server_done.load()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            while (!shutdown_requested.load() && !server_done.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+
+            if (shutdown_requested.load() || !server_done.load() ||
+                !server_result) {
+                break;
+            }
+
+            server_thread.join();
+            LOG(ERROR) << "RPC server attempt failed: attempt=" << attempt
+                       << "/" << kRpcStartMaxAttempts
+                       << ", code=" << server_result.val()
+                       << ", message=" << server_result.message();
+            if (server_result.ec == coro_rpc::errc::address_in_used) {
+                LogPortOccupier(static_cast<uint16_t>(master_config.rpc_port),
+                                "RPC server");
+            }
+            server.reset();
+            if (attempt < kRpcStartMaxAttempts) {
+                LOG(INFO) << "Retrying RPC server start in 1 second";
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
         }
 
         const bool stopped_by_signal = shutdown_requested.load();
         LOG(INFO) << "Master main loop exited: shutdown_requested="
                   << stopped_by_signal
                   << ", shutdown_signal=" << shutdown_signal.load()
-                  << ", server_done=" << server_done.load();
+                  << ", server_done=" << server_done.load()
+                  << ", rpc_start_attempt="
+                  << (rpc_start_attempt < kRpcStartMaxAttempts
+                          ? rpc_start_attempt + 1
+                          : kRpcStartMaxAttempts);
 
-        server.stop();
-        server_thread.join();
+        if (server) {
+            server->stop();
+        }
+        if (server_thread.joinable()) {
+            server_thread.join();
+        }
 
         if (stopped_by_signal) {
             LOG(INFO) << "Shutdown signal received; RPC server result: code="
