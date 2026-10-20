@@ -656,9 +656,12 @@ TEST_F(DfsBucketClientTest, FailedAsyncWriteIsBackfilledFromSurvivingMemory) {
     provider_->SetDfsStorageBackend(backend_);
     const std::string key = "backfill_after_io_failure";
     std::string value(4096, 'B');
-    std::vector<Slice> slices{{value.data(), value.size()}};
+    std::vector<std::string> values{value};
+    auto slices = MakeSlices(values);
     adapter_->FailAllWrites(true);
-    ASSERT_TRUE(writer_->Put(key, slices, DfsConfig()));
+    auto put = writer_->BatchPut({key}, slices, DfsConfig());
+    ASSERT_EQ(put.size(), 1u);
+    ASSERT_TRUE(put.front().has_value());
     ASSERT_TRUE(WaitForKeyGone(key));
     const auto writes = adapter_->WriteCalls();
     // Also fail a background attempt. Recovery must retry that task without
