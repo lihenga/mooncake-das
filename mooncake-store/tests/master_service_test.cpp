@@ -27,6 +27,8 @@
 #include <unistd.h>
 
 #include "tenant_quota_policy_store.h"
+#include "storage/distributed/distributed_storage_backend.h"
+#include "storage/distributed/posix_fs_adapter.h"
 #include "types.h"
 #include "utils.h"
 
@@ -2000,10 +2002,23 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
         ReplicateConfig config;
         config.replica_num = 1;
         config.dfs_replica_num = 1;
-        ASSERT_TRUE(initial_service
-                        .PutStart(initial_context.client_id, "retry_existing",
-                                  TenantId::Default(), 4096, config)
-                        .has_value());
+        auto start = initial_service.PutStart(
+            initial_context.client_id, "retry_existing", TenantId::Default(),
+            4096, config);
+        ASSERT_TRUE(start.has_value());
+        const auto* dfs = FindDfsDescriptor(*start);
+        ASSERT_NE(dfs, nullptr);
+        auto storage = initial_service.GetStorageConfig();
+        ASSERT_TRUE(storage.has_value());
+        DistributedStorageBackend backend(
+            *storage, DistributedStorageConfig::FromEnvironment(),
+            std::make_unique<PosixFsAdapter>(), storage->dfs_root_identity);
+        ASSERT_TRUE(backend.Init());
+        std::string value(4096, 'R');
+        auto written = backend.BatchWrite({{"retry_existing",
+            dfs->get_dfs_descriptor(), {{value.data(), value.size()}}}});
+        ASSERT_EQ(written.size(), 1u);
+        ASSERT_TRUE(written.front());
         ASSERT_TRUE(initial_service
                         .PutEnd(initial_context.client_id, "retry_existing",
                                  TenantId::Default(), ReplicaType::ALL)
