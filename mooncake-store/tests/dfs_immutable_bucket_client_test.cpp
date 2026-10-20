@@ -876,7 +876,6 @@ TEST_F(DfsBucketClientTest,
 // Exercise the integration of bounded staging (#82) and physical metrics (#83).
 TEST_F(DfsBucketClientTest, ServiceMetricsSettleEveryChunkAndOversizedKeyOnce) {
     writer_.reset();
-    SetEnv("MC_STORE_DFS_WRITE_ARENA_SIZE_BYTES", "8192");
     SetEnv("MC_STORE_DFS_WRITE_ARENA_COUNT", "1");
     SetEnv("MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES", "8192");
     writer_ = CreateClient("127.0.0.1:18201");

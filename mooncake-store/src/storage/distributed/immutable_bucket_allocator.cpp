@@ -1816,8 +1816,7 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
             write.bucket_id = bucket_id;
             write.bucket_identity = bucket;
             if (!bucket->placed_durable) {
-                write.in_memory_snapshot =
-                    SnapshotLocked(*bucket);
+                write.in_memory_snapshot = SnapshotLocked(*bucket);
             }
             pending.push_back(std::move(write));
             // Clear the flag together with taking the snapshot. A change that
@@ -2159,8 +2158,7 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
         const double usage = static_cast<double>(UsedBytesLocked()) /
                              static_cast<double>(capacity);
         const bool prioritize_low_utilization =
-            low_utilization_threshold > 0.0 &&
-            low_utilization_threshold <= 1.0;
+            low_utilization_threshold > 0.0 && low_utilization_threshold <= 1.0;
         if (!force_one && !low_utilization_only) {
             if (usage >= eviction_high_watermark_) {
                 eviction_active_ = true;
@@ -2184,7 +2182,8 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
                 if (bucket_id == active_bucket_id_) continue;
                 auto bucket_it = buckets_.find(bucket_id);
                 if (bucket_it == buckets_.end()) continue;
-                if (bucket_it->second->ready || bucket_it->second->frozen) continue;
+                if (bucket_it->second->ready || bucket_it->second->frozen)
+                    continue;
                 const auto& candidate = bucket_it->second;
                 const bool is_low_utilization =
                     candidate->capacity > 0 &&

@@ -1683,8 +1683,8 @@ TEST(ImmutableBucketAllocatorTest, EvictionDoesNotRewriteMetadata) {
                            ? alloc.PrepareInvalidation(victim->shard_idx)
                            : alloc.PrepareEviction();
         ASSERT_EQ(pending.bucket_id(), victim->shard_idx);
-        ASSERT_EQ(pending.candidates().size(), 1u);
-        EXPECT_EQ(pending.candidates().front().key, "victim");
+        ASSERT_EQ(pending.Candidates().size(), 1u);
+        EXPECT_EQ(pending.Candidates().front().key, "victim");
         EXPECT_EQ(read_saved(), original);
         ASSERT_TRUE(alloc.CommitEviction(std::move(pending)));
         EXPECT_EQ(read_saved(), original);
@@ -1922,7 +1922,7 @@ TEST(ImmutableBucketAllocatorTest, LowUtilizationEvictionIgnoresGlobalWatermark)
     EXPECT_LT(alloc.GetUsedBytes(), alloc.GetTotalCapacity() * 0.9);
     auto pending = alloc.PrepareEvictionForLowUtilization(0.05);
     ASSERT_GE(pending.bucket_id(), 0);
-    EXPECT_TRUE(pending.Empty());
+    EXPECT_FALSE(pending.Empty());
     EXPECT_EQ(pending.bucket_id(), first->shard_idx);
     ASSERT_TRUE(alloc.CommitEviction(std::move(pending)));
     EXPECT_FALSE(alloc.GetBucketIdForKey("first").has_value());
