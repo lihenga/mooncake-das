@@ -904,6 +904,7 @@ MasterService::CreateSnapshotCatalogStore(const MasterServiceConfig& config) {
 }
 
 MasterService::~MasterService() {
+    LOG(INFO) << "MasterService destructor started";
     dfs_retry_running_.store(false, std::memory_order_release);
     dfs_retry_cv_.notify_all();
     if (dfs_retry_thread_.joinable()) {

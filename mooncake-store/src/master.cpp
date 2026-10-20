@@ -1682,13 +1682,20 @@ int main(int argc, char* argv[]) {
         int server_result = 0;
         std::atomic<bool> server_done{false};
         std::thread server_thread([&server, &server_result, &server_done]() {
+            LOG(INFO) << "RPC server thread starting";
             server_result = server.start();
+            LOG(ERROR) << "RPC server thread exited, result=" << server_result;
             server_done.store(true);
         });
 
         while (!shutdown_requested.load() && !server_done.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
+
+        LOG(INFO) << "Master main loop exited, shutdown_requested="
+                  << shutdown_requested.load()
+                  << ", server_done=" << server_done.load()
+                  << ", server_result=" << server_result;
 
         server.stop();
         server_thread.join();
@@ -1697,6 +1704,7 @@ int main(int argc, char* argv[]) {
             LOG(INFO) << "Shutdown signal received, exiting gracefully";
             return 0;
         }
+        LOG(ERROR) << "RPC server stopped unexpectedly, result=" << server_result;
         return server_result;
     }
 }
