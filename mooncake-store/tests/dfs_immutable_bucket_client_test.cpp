@@ -873,6 +873,48 @@ TEST_F(DfsBucketClientTest,
     EXPECT_DOUBLE_EQ(*dfs_failures, 1.0);
 }
 
+// Exercise the integration of bounded staging (#82) and physical metrics (#83).
+TEST_F(DfsBucketClientTest, ServiceMetricsSettleEveryChunkAndOversizedKeyOnce) {
+    writer_.reset();
+    SetEnv("MC_STORE_DFS_WRITE_ARENA_SIZE_BYTES", "8192");
+    SetEnv("MC_STORE_DFS_WRITE_ARENA_COUNT", "1");
+    SetEnv("MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES", "8192");
+    writer_ = CreateClient("127.0.0.1:18201");
+    ASSERT_NE(writer_, nullptr);
+    writer_->SetDfsStorageBackend(backend_);
+    const auto endpoint = NextServiceEndpoint();
+    ASSERT_EQ(writer_->SetServiceEndpoint(endpoint), 0);
+
+    std::vector<std::string> keys{"chunk_0", "chunk_1", "oversized",
+                                   "chunk_2", "chunk_3", "chunk_4"};
+    std::vector<std::string> values(keys.size(), std::string(4096, 'C'));
+    values[2].resize(12288, 'X');
+    auto slices = MakeSlices(values);
+    auto results = writer_->BatchPut(keys, slices, DfsConfig());
+    ASSERT_EQ(results.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (i == 2) continue;
+        ASSERT_TRUE(results[i].has_value());
+        ASSERT_TRUE(WaitForDfsReplica(keys[i]));
+        ExpectDfsValue(keys[i], values[i]);
+    }
+    writer_.reset();  // Drain all three chunks and report their final outcomes.
+    auto pending = FindServiceMetricValue(
+        "mooncake_master_service_dual_write_pending", endpoint);
+    auto both = FindServiceMetricValue(
+        "mooncake_master_service_dual_write_total", endpoint,
+        "outcome=\"both_success\"");
+    auto memory_only = FindServiceMetricValue(
+        "mooncake_master_service_dual_write_total", endpoint,
+        "outcome=\"memory_only\"");
+    ASSERT_TRUE(pending.has_value());
+    ASSERT_TRUE(both.has_value());
+    ASSERT_TRUE(memory_only.has_value());
+    EXPECT_DOUBLE_EQ(*pending, 0.0);
+    EXPECT_DOUBLE_EQ(*both, 5.0);
+    EXPECT_DOUBLE_EQ(*memory_only, 1.0);
+}
+
 TEST_F(DfsBucketClientTest, OpenFailuresAreRateLimitedAndRevokeEveryDfsReplica) {
     struct Capture : google::LogSink {
         Capture() { google::AddLogSink(this); }

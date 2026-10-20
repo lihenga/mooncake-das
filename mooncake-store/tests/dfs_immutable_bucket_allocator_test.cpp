@@ -921,6 +921,30 @@ TEST(ImmutableBucketAllocatorTest, RecoveryChoosesLargestEntryGeneration) {
     EXPECT_EQ(replicas[0].descriptor.shard_idx, 1);
 }
 
+TEST(ImmutableBucketAllocatorTest, RecoveryLiveBytesDriveLowUtilizationProbe) {
+    TempDir tmp("bucket_recovery_low_utilization");
+    ASSERT_TRUE(CreateBucketDataFile(tmp, 0, kBucketCapacity));
+    ASSERT_TRUE(CreateBucketDataFile(tmp, 1, kBucketCapacity));
+    // Recovery traverses bucket 1 first, then must transfer the live bytes to
+    // bucket 0 when its greater generation wins the duplicate conflict.
+    ASSERT_TRUE(WriteBucketMetadata(tmp, MakeMetadataSnapshot(0, "dup", 0, 11)));
+    ASSERT_TRUE(WriteBucketMetadata(tmp, MakeMetadataSnapshot(1, "dup", 0, 10)));
+    ImmutableBucketAllocator recovered;
+    ASSERT_TRUE(recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
+    auto replicas = RecoverAll(recovered);
+    ASSERT_EQ(replicas.size(), 1u);
+    ASSERT_EQ(replicas[0].descriptor.shard_idx, 0);
+    const double threshold = 0.5 * static_cast<double>(kAlignment) /
+                             static_cast<double>(kBucketCapacity);
+    ASSERT_TRUE(recovered.HasLowUtilizationBucket(threshold));
+    auto loser = recovered.PrepareEvictionForLowUtilization(threshold);
+    ASSERT_EQ(loser.bucket_id(), 1);
+    ASSERT_TRUE(recovered.CommitEviction(std::move(loser)));
+    EXPECT_FALSE(recovered.HasLowUtilizationBucket(threshold));
+    recovered.Free("dup", replicas[0].descriptor);
+    EXPECT_TRUE(recovered.HasLowUtilizationBucket(threshold));
+}
+
 TEST(ImmutableBucketAllocatorTest, RecoveryBreaksGenerationTiesByLocation) {
     TempDir tmp("bucket_duplicate_tie");
     ASSERT_TRUE(CreateBucketDataFile(tmp, 0, kBucketCapacity));

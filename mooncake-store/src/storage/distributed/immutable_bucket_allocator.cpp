@@ -2134,14 +2134,14 @@ ImmutableBucketAllocator::PrepareEvictionForAllocationFailure() {
 
 ImmutableBucketAllocator::PendingEviction
 ImmutableBucketAllocator::PrepareEvictionForLowUtilization(double threshold) {
-    if (threshold <= 0.0 || threshold >= 1.0) {
+    if (threshold <= 0.0 || threshold > 1.0) {
         return {};
     }
     return PrepareEvictionInternal(/*force_one=*/false, threshold);
 }
 
 bool ImmutableBucketAllocator::HasLowUtilizationBucket(double threshold) const {
-    if (threshold <= 0.0 || threshold >= 1.0) return false;
+    if (threshold <= 0.0 || threshold > 1.0) return false;
 
     std::lock_guard<std::mutex> lock(mutex_);
     for (const auto& [bucket_id, bucket] : buckets_) {
