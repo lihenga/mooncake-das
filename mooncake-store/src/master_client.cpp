@@ -503,7 +503,7 @@ ErrorCode MasterClient::Connect(const std::string& master_addr,
         ha_connection_policy_enabled_.load(std::memory_order_acquire);
     if (use_ha_control_pool) {
         ha_probe_client_accessor_.GetOrCreateClientPool(master_addr);
-    } else if (force_recreate) {
+    } else if (force_recreate || client_addr_param_ != master_addr) {
         client_accessor_.RecreateClientPool(master_addr);
     } else {
         client_accessor_.GetOrCreateClientPool(master_addr);
