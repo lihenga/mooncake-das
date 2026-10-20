@@ -364,14 +364,13 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
 }
 
 PersistedBucketMetadata ImmutableBucketAllocator::SnapshotLocked(
-    BucketState& bucket, bool evicting) {
+    BucketState& bucket) {
     PersistedBucketMetadata snapshot;
     snapshot.version = kBucketMetadataVersion;
     snapshot.bucket_id = bucket.bucket_id;
     snapshot.capacity = bucket.capacity;
     snapshot.alignment = alignment_;
     snapshot.append_offset = bucket.append_offset;
-    snapshot.evicting = evicting;
     snapshot.entries.reserve(bucket.entries.size());
     for (const auto& [key, entry] : bucket.entries) {
         PersistedBucketEntry persisted;
@@ -1512,8 +1511,7 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
             // An unsealed bucket is deliberately never written: it is still
             // being appended to, and its data is discarded on the next start.
             if (!bucket->sealed || !bucket->meta_dirty) continue;
-            pending.push_back({bucket_id, bucket,
-                               SnapshotLocked(*bucket, /*evicting=*/false)});
+            pending.push_back({bucket_id, bucket, SnapshotLocked(*bucket)});
             // Clear the flag together with taking the snapshot. A change that
             // lands while we are unlocked sets it again and is picked up by the
             // next flush, instead of being swallowed by a late clear. It also
@@ -1769,7 +1767,6 @@ ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
         pending.candidates_ = std::move(candidates);
     }
 
-    FlushDirtyMetadata();
     return pending;
 }
 
@@ -1872,10 +1869,8 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
         victim->frozen = true;
         RemoveFromLruLocked(victim->bucket_id);
 
-        // A frozen bucket takes no further appends, so this is the point where
-        // its in-memory state becomes final. Sealing it here means the `.meta`
-        // file exists before the master starts validating candidates, which is
-        // what lets the commit path publish an eviction marker over it.
+        // If the master rejects eviction, normal maintenance can persist this
+        // sealed state; preparing eviction itself does no metadata I/O.
         if (!victim->sealed) {
             victim->sealed = true;
             victim->meta_dirty = true;
@@ -1887,8 +1882,6 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
         pending.candidates_ = std::move(candidates);
     }
 
-    // Write the sealed metadata out before returning, without the lock held.
-    FlushDirtyMetadata();
     return pending;
 }
 
@@ -1903,7 +1896,6 @@ bool ImmutableBucketAllocator::CommitEviction(PendingEviction&& pending) {
     if (bucket_id < 0 || !bucket_identity) return false;
 
     std::lock_guard<std::mutex> metadata_lock(metadata_io_mutex_);
-    PersistedBucketMetadata marker;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = buckets_.find(bucket_id);
@@ -1927,27 +1919,6 @@ bool ImmutableBucketAllocator::CommitEviction(PendingEviction&& pending) {
                         << bucket_id << " has a PENDING entry";
             return false;
         }
-        marker = SnapshotLocked(*it->second, /*evicting=*/true);
-    }
-
-    // Publish a durable "this bucket is being evicted" marker before deleting
-    // anything. If we crash between the marker and the deletes, recovery sees
-    // the marker and treats the bucket as gone instead of resurrecting entries
-    // whose data file may already be missing.
-    auto persisted = PersistMetadata(marker);
-    if (!persisted) {
-        LOG(ERROR) << "Failed to persist DFS eviction marker for bucket "
-                   << bucket_id << ", error=" << persisted.error()
-                   << "; the bucket is already invisible to readers and "
-                      "will be reclaimed on a later attempt";
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = buckets_.find(bucket_id);
-        if (it == buckets_.end() || it->second.get() != bucket_identity.get()) {
-            return false;
-        }
         for (const auto& [key, entry] : it->second->entries) {
             if (!IsLive(entry.state)) continue;
             auto index_it = key_index_.find(key);
@@ -1961,9 +1932,9 @@ bool ImmutableBucketAllocator::CommitEviction(PendingEviction&& pending) {
         if (active_bucket_id_ == bucket_id) active_bucket_id_ = -1;
     }
 
-    // File deletion happens last and outside the lock. A failure here leaks
-    // space but can no longer produce a dangling read, because the master has
-    // already dropped every replica in this bucket.
+    // shortcut: interrupted deletion may restore cached entries, add a durable
+    // eviction intent if recovery must remember logical evictions.
+    // The master has already dropped all replicas before file deletion.
     DeleteBucketFiles(bucket_id);
     // The deleted bucket's quota slot is reusable only after its files are no
     // longer present. Wake both refill workers and allocation waiters now.
