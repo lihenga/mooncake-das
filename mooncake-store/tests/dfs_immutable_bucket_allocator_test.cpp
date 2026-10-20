@@ -1676,6 +1676,59 @@ TEST(ImmutableBucketAllocatorTest, LowUtilizationEvictionSkipsHealthyBucket) {
     EXPECT_TRUE(pending.Empty());
 }
 
+TEST(ImmutableBucketAllocatorTest,
+     LowUtilizationUsesReservedPrefixInsteadOfBucketCapacity) {
+    TempDir tmp("bucket_low_utilization_reserved_prefix");
+    const uint64_t capacity = 4 * kAlignment;
+    ImmutableBucketAllocator alloc;
+    auto config = MakeEvictionConfig(tmp.path(), capacity, 4);
+    config.ready_bucket_target = 0;
+    ASSERT_TRUE(alloc.Init(config));
+
+    // The first entry occupies two pages.  The larger second entry does not fit
+    // in the remaining two pages, so it seals the half-filled first bucket.
+    // That bucket is 100% live in its reserved prefix, not 50% utilized.
+    auto first = alloc.Allocate("first", kAlignment + 1);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(alloc.MarkCommitted("first", *first));
+    auto second = alloc.Allocate("second", 2 * kAlignment + 1);
+    ASSERT_TRUE(second.has_value());
+    ASSERT_NE(first->shard_idx, second->shard_idx);
+
+    auto pending = alloc.PrepareEvictionForLowUtilization(0.75);
+    EXPECT_TRUE(pending.Empty());
+}
+
+TEST(ImmutableBucketAllocatorTest, ReclaimsBucketWithNinetyFourPercentHoles) {
+    TempDir tmp("bucket_reclaim_ninety_four_percent_holes");
+    const uint64_t capacity = 16 * kAlignment;
+    ImmutableBucketAllocator alloc;
+    auto config = MakeEvictionConfig(tmp.path(), capacity, 4);
+    config.ready_bucket_target = 0;
+    ASSERT_TRUE(alloc.Init(config));
+
+    std::vector<DistributedFSDescriptor> descriptors;
+    for (int i = 0; i < 16; ++i) {
+        auto descriptor = alloc.Allocate("failed-" + std::to_string(i), 100);
+        ASSERT_TRUE(descriptor.has_value());
+        descriptors.push_back(*descriptor);
+    }
+    ASSERT_TRUE(alloc.MarkCommitted("failed-15", descriptors.back()));
+    for (int i = 0; i < 15; ++i) {
+        alloc.Free("failed-" + std::to_string(i), descriptors[i]);
+    }
+
+    // Rollover seals the affected bucket. Its live share is 1 / 16 = 6.25%,
+    // which the old 5% default missed but the 10% default must reclaim.
+    auto next = alloc.Allocate("next", 100);
+    ASSERT_TRUE(next.has_value());
+    ASSERT_NE(next->shard_idx, descriptors.front().shard_idx);
+
+    auto pending = alloc.PrepareEvictionForLowUtilization(0.10);
+    ASSERT_FALSE(pending.Empty());
+    EXPECT_EQ(pending.bucket_id(), descriptors.front().shard_idx);
+}
+
 TEST(ImmutableBucketAllocatorTest, EvictionStopsAtLowWatermark) {
     TempDir tmp("bucket_evict_low");
     const uint64_t capacity = kAlignment;

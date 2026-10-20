@@ -1815,10 +1815,14 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
             }
         }
 
-        // Walk the LRU from the cold end and take the first bucket that is
-        // neither active, frozen, nor still waiting for an async write to
-        // finish. A PENDING entry means the client has not called PutEnd yet,
-        // so the bucket's data file must not be deleted underneath it.
+        // Walk the LRU from the cold end and take the first safe candidate. The
+        // low-utilization pass runs before ordinary watermark eviction, so
+        // hole-heavy buckets are reclaimed before healthy LRU buckets. Using
+        // append_offset as the utilization denominator is important: it is the
+        // logical DFS space charged by UsedBytesLocked(), whereas capacity also
+        // includes an unallocated suffix. A PENDING entry means the client has
+        // not called PutEnd/PutRevoke yet, so the bucket's data file must not be
+        // deleted underneath it.
         BucketPtr victim;
         for (auto it = lru_list_.rbegin(); it != lru_list_.rend(); ++it) {
             const int64_t bucket_id = *it;
@@ -1827,18 +1831,21 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
             if (bucket_it == buckets_.end()) continue;
             if (bucket_it->second->frozen) continue;
             const auto& candidate = bucket_it->second;
-            if (low_utilization_scan &&
-                static_cast<double>(candidate->live_bytes) /
-                        static_cast<double>(candidate->capacity) >=
-                    low_utilization_threshold) {
-                continue;
-            }
             const bool has_pending = std::any_of(
                 candidate->entries.begin(), candidate->entries.end(),
                 [](const auto& item) {
                     return item.second.state == BucketEntryState::PENDING;
                 });
             if (has_pending) continue;
+            if (candidate->append_offset == 0) continue;
+
+            const double live_share =
+                static_cast<double>(candidate->live_bytes) /
+                static_cast<double>(candidate->append_offset);
+            if (low_utilization_scan &&
+                live_share >= low_utilization_threshold) {
+                continue;
+            }
             victim = candidate;
             break;
         }

@@ -37,9 +37,12 @@ struct DistributedStorageConfig {
     bool eviction_enabled = true;
     double eviction_high_watermark = 0.9;
     double eviction_low_watermark = 0.7;
-    // BUCKET mode only: reclaim sealed buckets whose live utilization is below
-    // this threshold. A value of 0 disables low-utilization cleanup.
-    double low_utilization_threshold = 0.05;
+    // BUCKET mode only: reclaim sealed buckets whose live share of the actually
+    // reserved prefix is below this threshold. A 10% default catches buckets
+    // left almost empty by sustained asynchronous DFS write failures without
+    // treating ordinary fragmentation as a reclamation candidate. A value of
+    // 0 disables low-utilization cleanup.
+    double low_utilization_threshold = 0.10;
     // Maximum number of low-utilization buckets reclaimed per maintenance tick.
     int low_utilization_evictions_per_tick = 1;
     std::chrono::seconds deferred_free_duration{30};

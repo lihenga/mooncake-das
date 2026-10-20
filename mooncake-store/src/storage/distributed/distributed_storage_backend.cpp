@@ -311,8 +311,8 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
         config.low_utilization_threshold > 1.0) {
         LOG(WARNING) << "Invalid MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_THRESHOLD="
                      << config.low_utilization_threshold
-                     << "; using default 0.05";
-        config.low_utilization_threshold = 0.05;
+                     << "; using default 0.10";
+        config.low_utilization_threshold = 0.10;
     }
     config.low_utilization_evictions_per_tick = Environ::GetInt(
         "MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_EVICTIONS_PER_TICK",
