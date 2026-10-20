@@ -20,7 +20,43 @@
 #include "default_config.h"
 
 namespace mooncake {
+
+class MasterClientTestPeer {
+   public:
+    static auto Pool(const MasterClient& client) {
+        return client.client_accessor_.GetClientPool();
+    }
+};
+
 namespace testing {
+
+TEST(NonHAReconnectTest, FailedConnectAttemptsReusePoolAndRecover) {
+    InProcMaster master;
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder().build()));
+    const auto address = master.master_address();
+    const auto port = master.rpc_port();
+    master.Stop();
+
+    MasterClient client(generate_uuid());
+    EXPECT_NE(client.Connect(address), ErrorCode::OK);
+    const auto pool = MasterClientTestPeer::Pool(client);
+    ASSERT_NE(pool, nullptr);
+    for (int attempt = 0; attempt < 32; ++attempt) {
+        EXPECT_NE(client.Connect(address), ErrorCode::OK);
+        EXPECT_EQ(MasterClientTestPeer::Pool(client), pool);
+    }
+    for (int cycle = 0; cycle < 2; ++cycle) {
+        ASSERT_TRUE(master.Start(
+            InProcMasterConfigBuilder().set_rpc_port(port).build()));
+        ASSERT_EQ(client.Connect(address), ErrorCode::OK);
+        EXPECT_EQ(MasterClientTestPeer::Pool(client), pool);
+        master.Stop();
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            EXPECT_NE(client.Connect(address), ErrorCode::OK);
+            EXPECT_EQ(MasterClientTestPeer::Pool(client), pool);
+        }
+    }
+}
 
 TEST(NonHAReconnectTest, ZeroSegmentClientStartsHeartbeatOnlyAfterMount) {
     InProcMaster master;
