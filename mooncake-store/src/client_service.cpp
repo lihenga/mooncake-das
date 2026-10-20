@@ -4547,7 +4547,7 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
             : TransferWrite(target, slices);
         if (result != ErrorCode::OK) {
             revoke_lambda();
-            return tl::unexpected(result);
+            return tl::unexpected(ErrorCode::TRANSFER_FAIL);
         }
     }
 
