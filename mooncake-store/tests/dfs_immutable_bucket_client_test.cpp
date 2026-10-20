@@ -687,6 +687,24 @@ TEST_F(DfsBucketClientTest, FailedAsyncWriteIsBackfilledFromSurvivingMemory) {
     EXPECT_EQ(out, value);
 }
 
+TEST_F(DfsBucketClientTest, FailedWriteIsBackfilledByMemoryOnlyHolder) {
+    // Only writer_ has a DFS backend. The memory holder must create its own
+    // backfill backend without requiring SetDfsStorageBackend from the caller.
+    const std::vector<std::string> keys{"backfill_memory_only_holder_0",
+                                      "backfill_memory_only_holder_1"};
+    std::vector<std::string> values{std::string(4096, 'M'),
+                                   std::string(4096, 'N')};
+    auto slices = MakeSlices(values);
+    adapter_->FailAllWrites(true);
+    auto put = writer_->BatchPut(keys, slices, DfsConfig());
+    ASSERT_EQ(put.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_TRUE(put[i].has_value());
+        ASSERT_TRUE(WaitForDfsReplica(keys[i], std::chrono::seconds(12)));
+        ExpectDfsValue(keys[i], values[i]);
+    }
+}
+
 TEST_F(DfsBucketClientTest, OpenFailuresAreRateLimitedAndRevokeEveryDfsReplica) {
     struct Capture : google::LogSink {
         Capture() { google::AddLogSink(this); }
