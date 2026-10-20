@@ -6536,8 +6536,9 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
     const UUID& dynamic_replication_lease_id,
     uint64_t dynamic_replication_version_epoch) {
-    // Like PutEnd, persist bucket COMMITTED before publishing COMPLETE, and
-    // keep DFS I/O outside the metadata lock. Only this copy's targets qualify.
+    // Like PutEnd, mark bucket entries COMMITTED before publishing COMPLETE.
+    // Keep allocator calls outside the shard lock; only this copy's targets
+    // qualify. Sealed-bucket metadata follows the existing flush policy.
     if (bucket_allocator_ != nullptr) {
         std::vector<DistributedFSDescriptor> pending;
         {

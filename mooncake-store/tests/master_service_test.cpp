@@ -1995,6 +1995,7 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
     const auto root = MakeDfsTestRoot("retry_after_recovery");
     const auto saved_root = root + "_saved";
     ScopedBucketDfsEnv env(root, "1048576", "16");
+    std::filesystem::path persisted_meta;
 
     {
         MasterService initial_service;
@@ -2032,14 +2033,21 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
             initial_context.client_id, "retry_rollover", TenantId::Default(),
             1048576 - 4096, config);
         ASSERT_TRUE(rollover.has_value());
+        const auto* rollover_dfs = FindDfsDescriptor(*rollover);
+        ASSERT_NE(rollover_dfs, nullptr);
+        ASSERT_NE(rollover_dfs->get_dfs_descriptor().shard_idx,
+                  dfs->get_dfs_descriptor().shard_idx);
         ASSERT_TRUE(initial_service.PutRevoke(
             initial_context.client_id, "retry_rollover", TenantId::Default(),
             ReplicaType::ALL));
-        auto meta_path = std::filesystem::path(
+        persisted_meta = std::filesystem::path(
             dfs->get_dfs_descriptor().file_path);
-        meta_path.replace_extension(".meta");
-        ASSERT_TRUE(std::filesystem::exists(meta_path));
+        persisted_meta.replace_extension(".meta");
     }
+
+    // The clean shutdown flushes sealed metadata; consuming a preallocated
+    // bucket can defer that I/O until maintenance or shutdown.
+    ASSERT_TRUE(std::filesystem::exists(persisted_meta));
 
     std::filesystem::rename(root, saved_root);
     {
