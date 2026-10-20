@@ -249,7 +249,11 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
         PendingEviction(PendingEviction&& other) noexcept;
         PendingEviction& operator=(PendingEviction&& other) noexcept;
 
-        bool Empty() const { return candidates_.empty(); }
+        // A transaction is empty only when no bucket was selected. A selected
+        // bucket may legitimately have no live entries left (every key in it
+        // was freed), and such a bucket must still be evicted, so this cannot
+        // be derived from candidates_.empty().
+        bool Empty() const { return bucket_id_ < 0; }
         int64_t bucket_id() const { return bucket_id_; }
         const std::vector<EvictionCandidate>& Candidates() const {
             return candidates_;
@@ -602,6 +606,11 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     // it performs are ordinary DFS I/O.
     void ResolveRecoveryConflicts(const RecoveredBatchConsumer& consumer);
 
+    // Deletes the files of buckets recovery gave up on, one bucket at a time,
+    // on the dedicated `recovery_cleanup_thread_`. Runs after recovery has
+    // finished so the startup path never blocks on deleting a large backlog.
+    void CleanupSkippedBuckets(std::vector<int64_t> skipped_ids);
+
     void DeleteBucketFiles(int64_t bucket_id);
 
     uint64_t UsedBytesLocked() const;
@@ -663,8 +672,17 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     // Resolved at Init(): the configured worker count, or the auto value when
     // the configured one is 0.
     size_t recovery_worker_count_ = 0;
+    // Resolved at Init(): the number of buckets recovery may restore before it
+    // gives up and skips the rest, or 0 for no bucket-count limit.
+    size_t recovery_max_buckets_ = 0;
+    // Resolved at Init(): the wall-clock budget in seconds for recovery,
+    // or 0 for no time limit.
+    int recovery_max_duration_seconds_ = 0;
     // Duplicate keys seen while committing, resolved in one final pass.
     std::vector<RecoveryConflict> recovery_conflicts_;
+    // Joins in the destructor before `fs_adapter_` is torn down: the cleanup
+    // thread deletes files through the adapter.
+    std::thread recovery_cleanup_thread_;
 
     std::shared_ptr<const BucketIdSnapshot> bucket_id_snapshot_;
     std::atomic<uint64_t> bucket_snapshot_version_{0};

@@ -241,6 +241,8 @@ std::optional<int64_t> ReadDfsBucketCreateFailureTotal() {
         line_begin = line_end + 1;
     }
     return std::nullopt;
+}
+
 // Convenience over the streaming recovery API: drains every recovered batch
 // into a single vector so tests can assert on the recovered set. Recovery of a
 // restarted allocator must run exactly once, before any recovered-state
@@ -1324,6 +1326,11 @@ TEST(ImmutableBucketAllocatorTest, RecoveryDisabledReclaimsFilesAndUsesFreshBudg
     std::ofstream(tmp.file("bucket_000042.data")) << "orphan data";
     std::vector<std::string> old_files;
     for (const auto& entry : std::filesystem::directory_iterator(tmp.path())) {
+        // The DFS root marker belongs to the layer above this allocator and
+        // outlives the startup sweep: only the bucket files are reclaimed.
+        if (entry.path().filename().string() == kDfsRootMarkerFileName) {
+            continue;
+        }
         old_files.push_back(entry.path().string());
     }
 
@@ -1373,7 +1380,7 @@ TEST(ImmutableBucketAllocatorTest, RecoveryDisabledReclaimsFilesAndUsesFreshBudg
     EXPECT_EQ(descriptor->shard_idx, 51);
 }
 
-TEST(ImmutableBucketAllocatorTest, RecoveryStreamsOneBatchPerBucketInIdOrder) {
+TEST(ImmutableBucketAllocatorTest, RecoveryStreamsOneBatchPerBucketNewestFirst) {
     TempDir tmp("bucket_recover_batches");
     constexpr int64_t kBuckets = 5;
     for (int64_t id = 0; id < kBuckets; ++id) {
@@ -1402,9 +1409,91 @@ TEST(ImmutableBucketAllocatorTest, RecoveryStreamsOneBatchPerBucketInIdOrder) {
     // Every recovered bucket produced exactly one batch of its own winner.
     ASSERT_EQ(batch_bucket_ids.size(), static_cast<size_t>(kBuckets));
     EXPECT_EQ(total, static_cast<size_t>(kBuckets));
-    // Commit order is ascending bucket_id, independent of parse order.
-    EXPECT_TRUE(
-        std::is_sorted(batch_bucket_ids.begin(), batch_bucket_ids.end()));
+    // Commit order is descending bucket_id (newest bucket first), independent
+    // of parse order.
+    EXPECT_TRUE(std::is_sorted(
+        batch_bucket_ids.begin(), batch_bucket_ids.end(),
+        [](int64_t lhs, int64_t rhs) { return lhs > rhs; }));
+}
+
+TEST(ImmutableBucketAllocatorTest, RecoveryStopsAtBucketLimitAndDeletesRest) {
+    TempDir tmp("bucket_recover_limit");
+    constexpr int64_t kBuckets = 5;
+    for (int64_t id = 0; id < kBuckets; ++id) {
+        ASSERT_TRUE(CreateBucketDataFile(tmp, id, kBucketCapacity));
+        ASSERT_TRUE(WriteBucketMetadata(
+            tmp, MakeMetadataSnapshot(id, "key_" + std::to_string(id), 0,
+                                      id + 1)));
+    }
+
+    auto config = MakeBucketConfig(tmp.path(), kBucketCapacity, 16);
+    // One worker per batch makes the cut deterministic: recovery commits the
+    // newest bucket, then stops once the bucket budget is spent.
+    config.recovery_worker_count = 1;
+    config.recovery_max_buckets = 2;
+    std::vector<std::string> keys;
+    {
+        ImmutableBucketAllocator recovered;
+        ASSERT_TRUE(recovered.Init(config).has_value());
+        auto consumer = [&keys](
+            std::vector<ImmutableBucketAllocator::RecoveredReplica>&& batch) {
+            for (auto& replica : batch) keys.push_back(replica.key);
+        };
+        ASSERT_TRUE(
+            recovered.RecoverBucketsProgressively(consumer).has_value());
+        // Only the two newest buckets (ids 4 and 3) were restored.
+        EXPECT_TRUE(recovered.GetBucketIdForKey("key_4").has_value());
+        EXPECT_TRUE(recovered.GetBucketIdForKey("key_3").has_value());
+        EXPECT_FALSE(recovered.GetBucketIdForKey("key_2").has_value());
+        EXPECT_FALSE(recovered.GetBucketIdForKey("key_0").has_value());
+    }
+    EXPECT_EQ(keys, (std::vector<std::string>{"key_4", "key_3"}));
+
+    // The destructor joins the cleanup thread, so the skipped buckets are gone
+    // once the allocator is destroyed.
+    EXPECT_FALSE(std::filesystem::exists(BucketMetaFile(tmp, 2)));
+    EXPECT_FALSE(std::filesystem::exists(BucketDataFile(tmp, 2)));
+    EXPECT_FALSE(std::filesystem::exists(BucketMetaFile(tmp, 0)));
+    EXPECT_FALSE(std::filesystem::exists(BucketDataFile(tmp, 0)));
+    EXPECT_TRUE(std::filesystem::exists(BucketMetaFile(tmp, 3)));
+    EXPECT_TRUE(std::filesystem::exists(BucketMetaFile(tmp, 4)));
+
+    // A second start only sees the surviving buckets and cannot resurrect the
+    // keys that were skipped.
+    ImmutableBucketAllocator second;
+    ASSERT_TRUE(
+        second.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 16))
+            .has_value());
+    EXPECT_EQ(RecoverAll(second).size(), 2u);
+    EXPECT_FALSE(second.GetBucketIdForKey("key_2").has_value());
+}
+
+TEST(ImmutableBucketAllocatorTest, RecoveryUsesSecondTimeBudget) {
+    TempDir tmp("bucket_recover_deadline");
+    constexpr int64_t kBuckets = 128;
+    for (int64_t id = 0; id < kBuckets; ++id) {
+        ASSERT_TRUE(CreateBucketDataFile(tmp, id, kBucketCapacity));
+        ASSERT_TRUE(WriteBucketMetadata(
+            tmp, MakeMetadataSnapshot(id, "key_" + std::to_string(id), 0,
+                                      id + 1)));
+    }
+
+    auto config = MakeBucketConfig(tmp.path(), kBucketCapacity, 1024);
+    config.recovery_worker_count = 1;
+    // A one-second budget is intentionally longer than this small recovery
+    // workload. Zero would disable the limit instead.
+    config.recovery_max_duration_seconds = 1;
+    ImmutableBucketAllocator recovered;
+    ASSERT_TRUE(recovered.Init(config).has_value());
+    auto replicas = RecoverAll(recovered);
+
+    // The one-second budget is expressed in seconds and must not truncate a
+    // small recovery workload.
+    ASSERT_EQ(replicas.size(), static_cast<size_t>(kBuckets));
+    for (size_t i = 0; i < replicas.size(); ++i) {
+        const int64_t expected_id = kBuckets - 1 - static_cast<int64_t>(i);
+        EXPECT_EQ(replicas[i].key, "key_" + std::to_string(expected_id));
+    }
 }
 
 TEST(ImmutableBucketAllocatorTest, RecoveryDemotesDuplicateLosersAndPersists) {
@@ -1416,12 +1505,12 @@ TEST(ImmutableBucketAllocatorTest, RecoveryDemotesDuplicateLosersAndPersists) {
 
     ImmutableBucketAllocator first;
     ASSERT_TRUE(first.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 16)));
-    // Streaming emits candidates in ascending bucket_id order, so the key is
-    // reported twice; the greater generation (bucket 1) is emitted last and is
-    // what the master's last-wins consumer keeps.
+    // Newest bucket first: bucket 1 claims the key and streams its replica at
+    // once. Bucket 0 is the duplicate, and resolving it confirms the same
+    // winner, so no corrected batch is emitted.
     auto replicas = RecoverAll(first);
-    ASSERT_EQ(replicas.size(), 2u);
-    EXPECT_EQ(replicas.back().descriptor.shard_idx, 1);
+    ASSERT_EQ(replicas.size(), 1u);
+    EXPECT_EQ(replicas[0].descriptor.shard_idx, 1);
     // The allocator itself resolves the winner and demotes the loser.
     ASSERT_TRUE(first.GetBucketIdForKey("dup").has_value());
     EXPECT_EQ(first.GetBucketIdForKey("dup").value(), 1);

@@ -166,6 +166,11 @@ ImmutableBucketAllocator::~ImmutableBucketAllocator() {
     for (const int64_t bucket_id : ready_bucket_ids) {
         DeleteBucketFiles(bucket_id);
     }
+    // The cleanup thread deletes files through `fs_adapter_`, so it must finish
+    // before the adapter is shut down.
+    if (recovery_cleanup_thread_.joinable()) {
+        recovery_cleanup_thread_.join();
+    }
     if (fs_adapter_) fs_adapter_->Shutdown();
 }
 
@@ -206,6 +211,8 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
         static_cast<size_t>(config.bucket_create_concurrency);
     recovery_worker_count_ = ResolveRecoveryWorkerCount(
         config.recovery_worker_count);
+    recovery_max_buckets_ = static_cast<size_t>(config.recovery_max_buckets);
+    recovery_max_duration_seconds_ = config.recovery_max_duration_seconds;
     eviction_enabled_ = config.eviction_enabled;
     eviction_high_watermark_ = config.eviction_high_watermark;
     eviction_low_watermark_ = config.eviction_low_watermark;
@@ -253,12 +260,6 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
         return marker_result;
     }
 
-    auto recovered = RecoverFromDisk(config.bucket_recovery_enabled);
-    if (!recovered) {
-        fs_adapter_->Shutdown();
-        fs_adapter_.reset();
-        return recovered;
-    }
     // Enumerate bucket files by name only and defer their `.meta` contents to
     // RecoverBucketsProgressively(). Parsing later, one bucket at a time, is
     // what keeps recovery temporary memory bounded by the worker count instead
@@ -288,8 +289,13 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
                 // `.meta.log` and `.meta.tmp.*` leftovers from older layouts -
                 // is deliberately ignored.
             }
+            // Recover newest buckets first: a higher id means the bucket was
+            // sealed later, so its entries are newer. If the recovery budget
+            // cuts this short, the buckets most likely to hold current data
+            // have already been restored.
             std::sort(pending_recovery_meta_ids_.begin(),
-                      pending_recovery_meta_ids_.end());
+                      pending_recovery_meta_ids_.end(),
+                      std::greater<int64_t>());
             std::sort(pending_recovery_data_ids_.begin(),
                       pending_recovery_data_ids_.end());
         }
@@ -307,12 +313,44 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
         next_bucket_id_ = max_seen_id + 1;
 
         if (!config.bucket_recovery_enabled) {
-            // Old files stay outside this process's allocation and eviction
-            // state; the allocator starts from a fresh id range.
-            LOG(INFO) << "DFS bucket recovery disabled; retaining existing "
-                      << "files, next_bucket_id=" << next_bucket_id_;
+            // Recovery is disabled: the files found above are invisible to
+            // this process's allocation and eviction state, so nothing would
+            // ever reclaim them and they would keep occupying the DFS
+            // directory. Delete exactly the scanned ids off the startup path
+            // so a large legacy directory does not stall initialization.
+            std::unordered_set<int64_t> legacy_ids(
+                pending_recovery_meta_ids_.begin(),
+                pending_recovery_meta_ids_.end());
+            legacy_ids.insert(pending_recovery_data_ids_.begin(),
+                              pending_recovery_data_ids_.end());
+            std::vector<int64_t> sweep(legacy_ids.begin(), legacy_ids.end());
             pending_recovery_meta_ids_.clear();
             pending_recovery_data_ids_.clear();
+            if (sweep.empty()) {
+                LOG(INFO) << "DFS bucket recovery disabled; no legacy bucket "
+                             "files to delete, next_bucket_id="
+                          << next_bucket_id_;
+            } else {
+                LOG(INFO) << "DFS bucket recovery disabled; deleting "
+                          << sweep.size()
+                          << " legacy bucket(s) in the background, next_bucket_id="
+                          << next_bucket_id_;
+                try {
+                    // `sweep` is passed as an lvalue so the catch block below
+                    // can still reclaim the files if the worker thread cannot
+                    // be started.
+                    legacy_cleanup_worker_ = std::thread(
+                        &ImmutableBucketAllocator::LegacyCleanupWorker, this,
+                        sweep);
+                } catch (const std::system_error& e) {
+                    LOG(WARNING)
+                        << "Failed to start DFS legacy bucket cleanup worker: "
+                        << e.what() << ", deleting synchronously";
+                    for (const int64_t bucket_id : sweep) {
+                        DeleteBucketFiles(bucket_id);
+                    }
+                }
+            }
         }
     }
     size_t initial_ready_target = 0;
@@ -1323,6 +1361,7 @@ ImmutableBucketAllocator::ReserveInBucketLocked(BucketState& bucket,
     bucket.placed.push_back(std::move(placed));
     bucket.append_offset = layout->end();
     ++bucket.pending_count;
+    bucket.live_bytes += layout->aligned_size;
     key_index_[key] =
         LiveKeyRecord{bucket.bucket_id, BucketEntryState::PENDING};
 
@@ -1361,8 +1400,8 @@ void ImmutableBucketAllocator::UnreserveInBucketLocked(
     }
     if (placed_it == bucket.placed.end()) return;
 
-    const uint64_t entry_end =
-        placed_it->entry_offset + placed_it->reserved_size;
+    const uint64_t reserved_size = placed_it->reserved_size;
+    const uint64_t entry_end = placed_it->entry_offset + reserved_size;
     if (std::next(placed_it) == bucket.placed.end() &&
         bucket.append_offset == entry_end) {
         // Only the most recent reservation can give its space back; an entry
@@ -1377,6 +1416,13 @@ void ImmutableBucketAllocator::UnreserveInBucketLocked(
 
     bucket.placed.erase(placed_it);
     if (bucket.pending_count > 0) --bucket.pending_count;
+    // The reservation no longer holds live bytes. The space itself stays
+    // reserved in the append-only bucket until the whole bucket is evicted.
+    if (bucket.live_bytes >= reserved_size) {
+        bucket.live_bytes -= reserved_size;
+    } else {
+        bucket.live_bytes = 0;
+    }
 
     auto index_it = key_index_.find(key);
     if (index_it != key_index_.end() &&
@@ -1435,9 +1481,20 @@ ImmutableBucketAllocator::FindMatchingEntryLocked(
         for (const auto& placed : bucket_it->second->placed) {
             if (placed.key == key) live_placement = &placed;
         }
-        if (live_placement == nullptr ||
-            live_placement->entry_offset != desc.offset) {
+        if (live_placement == nullptr) {
+            return fail("stale_descriptor_no_placement");
+        }
+        if (live_placement->entry_offset != desc.offset) {
             return fail("stale_descriptor_offset");
+        }
+        // The offset alone does not identify a placement: a descriptor whose
+        // size fields were tampered with (or carried over from a superseded
+        // operation) must not address the live entry either.
+        if (live_placement->object_size != desc.object_size) {
+            return fail("object_size_mismatch");
+        }
+        if (live_placement->reserved_size != desc.aligned_size) {
+            return fail("aligned_size_mismatch");
         }
     }
 
@@ -1713,6 +1770,13 @@ void ImmutableBucketAllocator::Free(const std::string& key,
     if (record->state == BucketEntryState::PENDING &&
         bucket->pending_count > 0) {
         --bucket->pending_count;
+    }
+    // The entry stops counting as live; the descriptor's aligned slot size is
+    // exactly the `reserved_size` recorded when it was placed.
+    if (bucket->live_bytes >= descriptor.aligned_size) {
+        bucket->live_bytes -= descriptor.aligned_size;
+    } else {
+        bucket->live_bytes = 0;
     }
     key_index_.erase(key);
     // The tombstone must survive a restart so the key cannot come back, but the
@@ -2108,8 +2172,7 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
 
         // Walk the LRU from the cold end and take the first bucket that is
         // neither active, frozen, nor still waiting for an async write to
-        // finish. A PENDING entry means the client has not called PutEnd yet,
-        // so the bucket's data file must not be deleted underneath it.
+        // finish.
         BucketPtr victim;
         for (auto it = lru_list_.rbegin(); it != lru_list_.rend(); ++it) {
             const int64_t bucket_id = *it;
@@ -2124,15 +2187,10 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
                     low_utilization_threshold) {
                 continue;
             }
-            const bool has_pending = std::any_of(
-                candidate->entries.begin(), candidate->entries.end(),
-                [](const auto& item) {
-                    return item.second.state == BucketEntryState::PENDING;
-                });
-            if (has_pending) continue;
+            // A PENDING entry means the client has not called PutEnd yet, so
+            // the bucket's data file must not be deleted underneath it.
+            if (candidate->pending_count != 0) continue;
             victim = candidate;
-            if (bucket_it->second->pending_count != 0) continue;
-            victim = bucket_it->second;
             break;
         }
         if (!victim) return pending;
@@ -2411,45 +2469,11 @@ ImmutableBucketAllocator::ParsedBucket ImmutableBucketAllocator::ParseBucketMeta
         parsed.discarded = true;
         return parsed;
     }
-    if (!recover_metadata) {
-        // Recovery is disabled: the files found above are invisible to this
-        // process's allocation and eviction state, so nothing would ever
-        // reclaim them and they would keep occupying the DFS directory. Record
-        // the id sequence, then delete exactly the scanned ids off the startup
-        // path so a large legacy directory does not stall initialization.
-        next_bucket_id_ = max_seen_id + 1;
-        std::unordered_set<int64_t> legacy_ids(meta_ids.begin(), meta_ids.end());
-        legacy_ids.insert(data_ids.begin(), data_ids.end());
-        std::vector<int64_t> sweep(legacy_ids.begin(), legacy_ids.end());
-        if (sweep.empty()) {
-            LOG(INFO) << "DFS bucket recovery disabled; no legacy bucket files "
-                         "to delete, next_bucket_id="
-                      << next_bucket_id_;
-            return {};
-        }
-        LOG(INFO) << "DFS bucket recovery disabled; deleting " << sweep.size()
-                  << " legacy bucket(s) in the background, next_bucket_id="
-                  << next_bucket_id_;
-        try {
-            // `sweep` is passed by value so the catch block below can still
-            // reclaim the files if the worker thread cannot be started.
-            legacy_cleanup_worker_ = std::thread(
-                &ImmutableBucketAllocator::LegacyCleanupWorker, this, sweep);
-        } catch (const std::system_error& e) {
-            LOG(WARNING) << "Failed to start DFS legacy bucket cleanup worker: "
-                         << e.what() << ", deleting synchronously";
-            for (const int64_t bucket_id : sweep) {
-                DeleteBucketFiles(bucket_id);
-            }
-        }
-        return {};
-    }
-    std::sort(meta_ids.begin(), meta_ids.end());
-
     auto bucket = std::make_shared<BucketState>();
     bucket->bucket_id = bucket_id;
     bucket->capacity = snapshot.capacity;
     bucket->append_offset = 0;
+    bucket->live_bytes = 0;
     bucket->last_access_ns = CurrentTimeNs();
     // Everything on disk was written at seal time, so a recovered bucket is
     // sealed by definition, its `.meta` already matches this state and its
@@ -2524,6 +2548,9 @@ ImmutableBucketAllocator::ParsedBucket ImmutableBucketAllocator::ParseBucketMeta
         // stays free of allocator state. Building the descriptor here spreads
         // that work across the worker pool instead of doing it at commit.
         if (seen_keys.insert(persisted.key).second) {
+            // Count the slot as live; a duplicate that loses the cross-bucket
+            // race is subtracted again in ResolveRecoveryConflicts().
+            bucket->live_bytes += persisted.reserved_size;
             parsed.candidates.push_back(RecoveryCandidate{
                 RecoveredReplica{persisted.key,
                                  MakeBucketDescriptor(
@@ -2622,6 +2649,9 @@ void ImmutableBucketAllocator::ResolveRecoveryConflicts(
         uint64_t best_value_size = 0;
         int64_t best_bucket_id = -1;
         bool have_best = false;
+        // Slot size each member bucket counted as live for this key; every
+        // member but the winner has to give it back.
+        std::unordered_map<int64_t, uint64_t> member_live_bytes;
         for (const int64_t member : group.bucket_ids) {
             auto snapshot = ReadBucketMetadata(member);
             if (!snapshot) continue;
@@ -2634,6 +2664,7 @@ void ImmutableBucketAllocator::ResolveRecoveryConflicts(
                 auto layout = RebuildBucketEntryLayout(
                     entry.entry_offset, entry.value_size, alignment_);
                 if (!layout) continue;
+                member_live_bytes[member] = entry.reserved_size;
                 if (!have_best ||
                     std::tie(entry.generation, member, entry.entry_offset) >
                         std::tie(best_generation, best_bucket_id,
@@ -2654,6 +2685,17 @@ void ImmutableBucketAllocator::ResolveRecoveryConflicts(
                 LiveKeyRecord{best_bucket_id, BucketEntryState::COMMITTED};
             auto it = buckets_.find(best_bucket_id);
             if (it != buckets_.end()) it->second->meta_dirty = true;
+            // Only the winner's bucket keeps these bytes counted as live.
+            for (const auto& [member, bytes] : member_live_bytes) {
+                if (member == best_bucket_id) continue;
+                auto loser_it = buckets_.find(member);
+                if (loser_it == buckets_.end()) continue;
+                if (loser_it->second->live_bytes >= bytes) {
+                    loser_it->second->live_bytes -= bytes;
+                } else {
+                    loser_it->second->live_bytes = 0;
+                }
+            }
         }
 
         // Only a change of winner needs a corrected batch. The master applies
@@ -2690,6 +2732,19 @@ ImmutableBucketAllocator::RecoverBucketsProgressively(
 
     const size_t workers = std::max<size_t>(1, recovery_worker_count_);
 
+    // Recovery stops at the first batch boundary where either budget is spent,
+    // so a huge backlog cannot stall startup; a zero value disables that
+    // dimension.
+    const bool has_deadline = recovery_max_duration_seconds_ > 0;
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::seconds(recovery_max_duration_seconds_);
+    // Ids the budget left unparsed, and where the cut happened. The cut index
+    // is kept so a failed cleanup-thread start can still delete them here.
+    std::unordered_set<int64_t> skipped_ids;
+    size_t skip_start = meta_ids.size();
+    const char* limit_reason = nullptr;
+
     std::unordered_set<int64_t> discarded_ids;
     uint64_t max_generation = 0;
     size_t recovered_bucket_count = 0;
@@ -2698,7 +2753,20 @@ ImmutableBucketAllocator::RecoverBucketsProgressively(
 
     const size_t total = meta_ids.size();
     ThreadPool pool(workers);
+    const size_t max_buckets = recovery_max_buckets_;
     for (size_t batch_start = 0; batch_start < total; batch_start += workers) {
+        // Cut over only at a batch boundary and only once at least one batch
+        // has committed, so even a tiny budget still restores the newest
+        // buckets and an in-flight batch is never left half-published.
+        const bool bucket_limit_reached =
+            max_buckets > 0 && recovered_bucket_count >= max_buckets;
+        const bool time_limit_reached =
+            has_deadline && std::chrono::steady_clock::now() >= deadline;
+        if (batch_start > 0 && (bucket_limit_reached || time_limit_reached)) {
+            limit_reason = bucket_limit_reached ? "bucket_limit" : "time_limit";
+            skip_start = batch_start;
+            break;
+        }
         const size_t batch_end = std::min(total, batch_start + workers);
         const size_t batch_size = batch_end - batch_start;
 
@@ -2766,6 +2834,20 @@ ImmutableBucketAllocator::RecoverBucketsProgressively(
         // `parsed` is destroyed here, releasing this batch before the next.
     }
 
+    // Buckets the budget cut off keep their files for now; an asynchronous
+    // cleanup thread removes them so a large backlog never delays startup.
+    if (limit_reason != nullptr) {
+        for (size_t i = skip_start; i < meta_ids.size(); ++i) {
+            skipped_ids.insert(meta_ids[i]);
+        }
+        LOG(WARNING) << "DFS bucket recovery stopped early (" << limit_reason
+                     << "), recovered=" << recovered_bucket_count
+                     << ", skipped=" << skipped_ids.size()
+                     << ", max_buckets=" << recovery_max_buckets_
+                     << ", max_duration_seconds="
+                     << recovery_max_duration_seconds_;
+    }
+
     // Settle every duplicated key. The running winner's replica was already
     // streamed; a corrected one is streamed only when the true winner differs.
     ResolveRecoveryConflicts(consumer);
@@ -2782,6 +2864,9 @@ ImmutableBucketAllocator::RecoverBucketsProgressively(
         for (const int64_t data_id : data_ids) {
             if (buckets_.count(data_id) > 0) continue;
             if (discarded_ids.count(data_id) > 0) continue;
+            // Skipped buckets belong to the cleanup thread; deleting them here
+            // as well would race with it.
+            if (skipped_ids.count(data_id) > 0) continue;
             orphan_data_ids.push_back(data_id);
         }
     }
@@ -2814,22 +2899,66 @@ ImmutableBucketAllocator::RecoverBucketsProgressively(
             lru_list_.push_front(bucket_id);
             lru_index_[bucket_id] = lru_list_.begin();
         }
+
+        // The ready pool reads the published id set, so publish it while the
+        // lock guarding `buckets_` is still held.
+        PublishBucketIdSnapshotLocked();
     }
 
-    PublishBucketIdSnapshotLocked();
     // Recovery may have rewritten in-memory state (PENDING entries demoted to
     // tombstones, duplicate losers demoted). Persist that now so the next start
     // reads exactly what this process believes.
     const size_t rewritten = FlushDirtyMetadata();
 
+    // Delete the skipped buckets off the startup path. `skipped_ids` is moved
+    // into the thread; `meta_ids`/`skip_start` still let the catch fall back to
+    // deleting here if the thread cannot start.
+    const size_t skipped_count = skipped_ids.size();
+    if (skipped_count > 0) {
+        // The cleanup worker takes a plain vector; `skipped_ids` stays a set
+        // for the orphan dedup above, so hand it a converted copy.
+        std::vector<int64_t> skipped(skipped_ids.begin(), skipped_ids.end());
+        bool cleanup_started = false;
+        try {
+            std::thread cleanup(
+                &ImmutableBucketAllocator::CleanupSkippedBuckets, this,
+                std::move(skipped));
+            recovery_cleanup_thread_ = std::move(cleanup);
+            cleanup_started = true;
+        } catch (const std::system_error& e) {
+            LOG(WARNING) << "Failed to start skipped-bucket cleanup thread: "
+                         << e.what() << "; deleting skipped buckets synchronously";
+            for (size_t i = skip_start; i < meta_ids.size(); ++i) {
+                DeleteBucketFiles(meta_ids[i]);
+            }
+        }
+        if (cleanup_started) {
+            LOG(INFO) << "DFS bucket recovery started asynchronous cleanup for "
+                      << skipped_count << " skipped buckets";
+        }
+    }
+
     LOG(INFO) << "DFS bucket recovery complete, buckets="
               << recovered_bucket_count << ", replicas="
               << recovered_replica_count << ", discarded=" << discarded_count
+              << ", skipped=" << skipped_count
               << ", workers=" << workers
               << ", next_bucket_id=" << next_bucket_id_
               << ", next_generation=" << next_generation_
               << ", rewritten_buckets=" << rewritten;
     return {};
+}
+
+void ImmutableBucketAllocator::CleanupSkippedBuckets(
+    std::vector<int64_t> skipped_ids) {
+    size_t deleted = 0;
+    for (const int64_t bucket_id : skipped_ids) {
+        LOG(WARNING) << "Deleting DFS bucket skipped by the recovery budget, "
+                     << "bucket_id=" << bucket_id;
+        DeleteBucketFiles(bucket_id);
+        ++deleted;
+    }
+    LOG(INFO) << "DFS skipped-bucket cleanup complete, deleted=" << deleted;
 }
 
 }  // namespace mooncake

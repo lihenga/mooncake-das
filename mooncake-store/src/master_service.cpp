@@ -807,19 +807,22 @@ void MasterService::InitDfsAllocatorFromEnvironment(
         return;
     }
 
+    // Publish the allocator pointers before recovery runs: the recovery helper
+    // reads the bucket allocator through the member, so it must be set first.
+    dfs_allocator_owner_ = std::move(allocator);
+    bucket_allocator_.store(bucket_allocator);
+    dfs_allocator_.store(dfs_allocator_owner_.get());
+
     // Recovery runs unconditionally: the bucket allocator needs buckets_,
     // key_index_ and next_bucket_id_ before it can allocate, free or evict, so
     // skipping it would leave the allocator blind to everything already on
     // disk. Snapshot only replaces the metadata recovery source, so in snapshot
     // mode recovery still rebuilds allocator state and the consumer stays empty.
-    if (bucket_allocator_ != nullptr) {
+    if (bucket_allocator != nullptr) {
         RestoreRecoveredDfsReplicas(/*rebuild_metadata=*/!config.enable_snapshot &&
                                     !config.enable_snapshot_restore);
     }
 
-    dfs_allocator_owner_ = std::move(allocator);
-    bucket_allocator_.store(bucket_allocator);
-    dfs_allocator_.store(dfs_allocator_owner_.get());
     enable_dfs_.store(true, std::memory_order_release);
     dfs_retry_needed_.store(false, std::memory_order_release);
 
