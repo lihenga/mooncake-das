@@ -2010,8 +2010,11 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
         ASSERT_NE(dfs, nullptr);
         auto storage = initial_service.GetStorageConfig();
         ASSERT_TRUE(storage.has_value());
+        FileStorageConfig file_config;
+        file_config.storage_filepath = root;
+        file_config.storage_backend_type = StorageBackendType::kDistributed;
         DistributedStorageBackend backend(
-            *storage, DistributedStorageConfig::FromEnvironment(),
+            file_config, DistributedStorageConfig::FromEnvironment(),
             std::make_unique<PosixFsAdapter>(), storage->dfs_root_identity);
         ASSERT_TRUE(backend.Init());
         std::string value(4096, 'R');
