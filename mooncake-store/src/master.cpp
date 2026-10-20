@@ -1375,23 +1375,16 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
 // Function to start HTTP metadata server
 std::unique_ptr<mooncake::HttpMetadataServer> StartHttpMetadataServer(
     int port, const std::string& host) {
-    LOG(INFO) << "Starting C++ HTTP metadata server on " << host << ":" << port;
-
     try {
         auto server =
             std::make_unique<mooncake::HttpMetadataServer>(port, host);
-        server->start();
-
-        // Check if server started successfully
-        if (server->is_running()) {
-            LOG(INFO) << "C++ HTTP metadata server started successfully";
+        if (server->start() && server->is_running()) {
             return server;
-        } else {
-            LOG(ERROR) << "Failed to start C++ HTTP metadata server";
-            return nullptr;
         }
+        return nullptr;
     } catch (const std::exception& e) {
-        LOG(ERROR) << "Failed to start C++ HTTP metadata server: " << e.what();
+        LOG(ERROR) << "HTTP metadata server startup threw an exception on "
+                   << host << ":" << port << ": " << e.what();
         return nullptr;
     }
 }
@@ -1527,8 +1520,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    LOG(INFO)
-        << "Master service started on port " << master_config.rpc_port
+    LOG(INFO) << "Master service configuration loaded"
         << ", max_threads=" << master_config.rpc_thread_num
         << ", enable_metric_reporting=" << master_config.enable_metric_reporting
         << ", metrics_port=" << master_config.metrics_port
@@ -1613,7 +1605,6 @@ int main(int argc, char* argv[]) {
                                     master_config.http_metadata_server_host);
 
         if (!http_metadata_server) {
-            LOG(FATAL) << "Failed to start HTTP metadata server";
             return 1;
         }
 
@@ -1647,6 +1638,7 @@ int main(int argc, char* argv[]) {
         const char* value = std::getenv("MC_RPC_PROTOCOL");
 #ifdef YLT_ENABLE_IBV
         if (value && std::string_view(value) == "rdma") {
+            LOG(INFO) << "Initializing RDMA for non-HA RPC server";
             server.init_ibv();
         }
 #else
@@ -1662,7 +1654,6 @@ int main(int argc, char* argv[]) {
             static_cast<uint16_t>(master_config.metrics_port),
             master_config.enable_metric_reporting, master_config.metrics_host);
         if (!admin_server.Start()) {
-            LOG(ERROR) << "Failed to start master admin server";
             return 1;
         }
         admin_server.SetRuntimeState(
@@ -1670,41 +1661,49 @@ int main(int argc, char* argv[]) {
         admin_server.SetServiceDelegate(wrapped_master_service);
         admin_server.SetServiceAvailable(true);
 
+        LOG(INFO) << "Registering non-HA RPC handlers";
         mooncake::RegisterRpcService(server, *wrapped_master_service);
 
         static std::atomic<bool> shutdown_requested{false};
-        auto signal_handler = [](int /* signum */) {
+        static std::atomic<int> shutdown_signal{0};
+        auto signal_handler = [](int signum) {
+            shutdown_signal.store(signum);
             shutdown_requested.store(true);
         };
         std::signal(SIGINT, signal_handler);
         std::signal(SIGTERM, signal_handler);
 
-        int server_result = 0;
+        coro_rpc::err_code server_result{};
         std::atomic<bool> server_done{false};
-        std::thread server_thread([&server, &server_result, &server_done]() {
-            LOG(INFO) << "RPC server thread starting";
-            server_result = server.start();
-            LOG(ERROR) << "RPC server thread exited, result=" << server_result;
-            server_done.store(true);
-        });
+        std::thread server_thread(
+            [&server, &server_result, &server_done]() {
+                LOG(INFO) << "Starting non-HA RPC server";
+                server_result = server.start();
+                server_done.store(true);
+            });
 
         while (!shutdown_requested.load() && !server_done.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
-        LOG(INFO) << "Master main loop exited, shutdown_requested="
-                  << shutdown_requested.load()
-                  << ", server_done=" << server_done.load()
-                  << ", server_result=" << server_result;
+        const bool stopped_by_signal = shutdown_requested.load();
+        LOG(INFO) << "Master main loop exited: shutdown_requested="
+                  << stopped_by_signal
+                  << ", shutdown_signal=" << shutdown_signal.load()
+                  << ", server_done=" << server_done.load();
 
         server.stop();
         server_thread.join();
 
-        if (shutdown_requested.load()) {
-            LOG(INFO) << "Shutdown signal received, exiting gracefully";
+        if (stopped_by_signal) {
+            LOG(INFO) << "Shutdown signal received; RPC server result: code="
+                      << server_result.val()
+                      << ", message=" << server_result.message();
             return 0;
         }
-        LOG(ERROR) << "RPC server stopped unexpectedly, result=" << server_result;
-        return server_result;
+        LOG(ERROR) << "RPC server stopped unexpectedly: code="
+                   << server_result.val()
+                   << ", message=" << server_result.message();
+        return server_result.val();
     }
 }

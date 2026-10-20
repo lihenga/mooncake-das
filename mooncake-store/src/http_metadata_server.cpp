@@ -118,8 +118,10 @@ bool HttpMetadataServer::start() {
     // instead of reporting a healthy server that never came up.
     auto ec = server_->async_start();
     if (ec.hasResult()) {
+        const auto result = ec.result().value();
         LOG(ERROR) << "Failed to start HTTP metadata server on " << host_ << ":"
-                   << port_;
+                   << port_ << ": code=" << result.val()
+                   << ", message=" << result.message();
         return false;
     }
     running_ = true;

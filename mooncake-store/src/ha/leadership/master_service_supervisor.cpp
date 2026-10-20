@@ -472,8 +472,9 @@ int RunSupervisorLoop(const HABackendSpec& spec,
 
         async_simple::Future<coro_rpc::err_code> ec = server.async_start();
         if (ec.hasResult()) {
-            LOG(ERROR) << "Failed to start master service: "
-                       << ec.result().value();
+            const auto result = ec.result().value();
+            LOG(ERROR) << "Failed to start master service: code=" << result.val()
+                       << ", message=" << result.message();
             StopLeadershipMonitor(leadership_monitor_handle);
             DeactivateServingState(admin_server, label_reconciler);
             EnterStandbyMode(admin_server, *standby_controller,
@@ -507,7 +508,8 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         }
 
         auto server_err = std::move(ec).get();
-        LOG(ERROR) << "Master service stopped: " << server_err;
+        LOG(ERROR) << "Master service stopped: code=" << server_err.val()
+                   << ", message=" << server_err.message();
 
         StopLeadershipMonitor(leadership_monitor_handle);
         DeactivateServingState(admin_server, label_reconciler);

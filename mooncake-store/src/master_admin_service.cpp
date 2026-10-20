@@ -334,8 +334,10 @@ bool MasterAdminServer::Start() {
 
     auto ec = http_server_.async_start();
     if (ec.hasResult()) {
+        const auto result = ec.result().value();
         LOG(ERROR) << "Failed to start master admin server on " << http_host_
-                   << ":" << http_port_ << ": " << ec.value().message();
+                   << ":" << http_port_ << ": code=" << result.val()
+                   << ", message=" << result.message();
         return false;
     }
 
