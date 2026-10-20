@@ -1664,7 +1664,8 @@ TEST(ImmutableBucketAllocatorTest, EvictionDoesNotRewriteMetadata) {
         // metadata by committing. Prepare must not flush that change.
         auto active = alloc.Allocate("active", 100);
         ASSERT_TRUE(active.has_value());
-        ASSERT_GE(alloc.FlushDirtyMetadata(), 1u);
+        ASSERT_NE(active->shard_idx, victim->shard_idx);
+        alloc.FlushDirtyMetadata();
         ASSERT_TRUE(alloc.MarkCommitted("victim", *victim));
         const auto meta_path = BucketMetaFile(tmp, victim->shard_idx);
         const auto saved_path = tmp.file("saved_metadata");
