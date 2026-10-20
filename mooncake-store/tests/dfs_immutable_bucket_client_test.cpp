@@ -652,6 +652,36 @@ TEST_F(DfsBucketClientTest, FailedAsyncWriteRevokesOnlyTheDfsReplica) {
     }
 }
 
+TEST_F(DfsBucketClientTest, FailedAsyncWriteIsBackfilledFromSurvivingMemory) {
+    provider_->SetDfsStorageBackend(backend_);
+    const std::string key = "backfill_after_io_failure";
+    std::string value(4096, 'B');
+    std::vector<Slice> slices{{value.data(), value.size()}};
+    adapter_->FailAllWrites(true);
+    ASSERT_TRUE(writer_->Put(key, slices, DfsConfig()));
+    ASSERT_TRUE(WaitForKeyGone(key));
+    const auto writes = adapter_->WriteCalls();
+    // Also fail a background attempt. Recovery must retry that task without
+    // losing the sole good memory copy or retaining its failed allocation.
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(8);
+    while (adapter_->WriteCalls() == writes &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_GT(adapter_->WriteCalls(), writes);
+    ASSERT_TRUE(WaitForKeyGone(key));
+    adapter_->FailAllWrites(false);
+    ASSERT_TRUE(WaitForDfsReplica(key, std::chrono::seconds(12)));
+    ExpectDfsValue(key, value);
+    auto query = QueryDfsOnly(key);
+    ASSERT_TRUE(query.has_value());
+    std::string out(value.size(), '\0');
+    std::vector<Slice> output{{out.data(), out.size()}};
+    ASSERT_TRUE(writer_->Get(key, *query, output));
+    EXPECT_EQ(out, value);
+}
+
 TEST_F(DfsBucketClientTest, OpenFailuresAreRateLimitedAndRevokeEveryDfsReplica) {
     struct Capture : google::LogSink {
         Capture() { google::AddLogSink(this); }

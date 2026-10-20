@@ -4541,9 +4541,13 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
 
     // Transfer to each target
     for (const auto& target : targets) {
-        if (TransferWrite(target, slices) != ErrorCode::OK) {
+        const auto result = target.is_dfs_replica()
+            ? WriteDfsReplicas({key}, {&slices},
+                               {target.get_dfs_descriptor()}).front()
+            : TransferWrite(target, slices);
+        if (result != ErrorCode::OK) {
             revoke_lambda();
-            return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            return tl::unexpected(result);
         }
     }
 
@@ -5223,6 +5227,27 @@ void Client::ExecuteTask(const ClientTask& client_task) {
 
     try {
         switch (assignment.type) {
+            case TaskType::DFS_BACKFILL: {
+                DfsBackfillPayload payload;
+                struct_json::from_json(payload, assignment.payload);
+                auto start = master_client_.DfsBackfillStart(
+                    payload.key, payload.tenant_id, payload.source,
+                    assignment.id);
+                if (!start) {
+                    result = start.error();
+                    break;
+                }
+                auto finish = [&](bool success) {
+                    return master_client_.DfsBackfillFinish(
+                        payload.key, payload.tenant_id, assignment.id, success);
+                };
+                auto copied = ExecuteReplicaTransfer(
+                    payload.key, "dfs_backfill", [&] { return finish(true); },
+                    [&] { return finish(false); }, start->source,
+                    start->targets);
+                result = copied ? ErrorCode::OK : copied.error();
+                break;
+            }
             case TaskType::REPLICA_COPY: {
                 ReplicaCopyPayload payload;
                 struct_json::from_json(payload, assignment.payload);
