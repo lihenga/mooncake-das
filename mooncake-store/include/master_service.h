@@ -2159,6 +2159,7 @@ class MasterService {
 
     // Eviction thread function
     void EvictionThreadFunc();
+    void DfsEvictionThreadFunc();
     void NofHeartbeatThreadFunc();
     bool TryUnmountNoFSegmentByHeartbeat(
         const MountedNoFSegmentSnapshot& snapshot,
@@ -2269,6 +2270,7 @@ class MasterService {
 
     // Eviction thread related members
     std::thread eviction_thread_;
+    std::thread dfs_eviction_thread_;
     std::atomic<bool> eviction_running_{false};
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
