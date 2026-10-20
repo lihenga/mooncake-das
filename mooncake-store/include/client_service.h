@@ -27,6 +27,7 @@
 #include "count_min_sketch.h"
 #include "local_hot_cache.h"
 #include "pinned_buffer_pool.h"
+#include "dfs_write_staging_pool.h"
 
 namespace mooncake {
 
@@ -966,6 +967,10 @@ class Client {
      */
     void SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert = false,
                          bool allow_async = true);
+    void SubmitDfsWriteChunk(std::vector<PutOperation>& ops,
+                             const std::vector<size_t>& op_indices,
+                             bool is_upsert, bool allow_async,
+                             bool* slot_timed_out = nullptr);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
     void StartBatchUpsert(std::vector<PutOperation>& ops,
                           const ReplicateConfig& config);
@@ -983,23 +988,21 @@ class Client {
      *
      * The background task must not reference the caller's CPU or GPU buffers,
      * which may be freed or overwritten as soon as BatchPut returns. All slice
-     * bytes are therefore copied into owned storage (pinned host memory when a
-     * GPU is involved, plain host memory otherwise) before the task is queued,
-     * and `slices` points into that storage.
+     * bytes are copied into one fixed-capacity arena slot before the task is
+     * queued, and `slices` points into that slot.
      *
-     * `backend` and `pinned_pool` are held by shared_ptr so the task keeps them
-     * alive even if the Client is torn down while the write is in flight.
+     * `backend` and `staging_pool` are held by shared_ptr so the task keeps
+     * them alive while the write is in flight.
      */
     struct AsyncDfsWriteContext {
         std::vector<std::string> keys;
         std::vector<DistributedFSDescriptor> descriptors;
+        std::shared_ptr<DfsWriteStagingPool> staging_pool;
+        std::shared_ptr<DfsWriteStagingPool::Slot> staging_slot;
         std::vector<std::vector<Slice>> slices;
         // Ready before enqueue; every End retry uses the foreground checksum.
         std::vector<std::optional<uint64_t>> object_checksums;
-        std::vector<PinnedBufferPool::Buffer> staging;
-        std::vector<std::vector<char>> host_staging;
         std::shared_ptr<DistributedStorageBackend> backend;
-        std::shared_ptr<PinnedBufferPool> pinned_pool;
         bool is_upsert = false;
 
         ~AsyncDfsWriteContext();
@@ -1079,12 +1082,14 @@ class Client {
     const std::string metadata_connstring_;
     const std::string protocol_;
     const bool object_checksum_enabled_;
+    const size_t dfs_write_arena_size_;
+    const size_t dfs_write_arena_count_;
+    const size_t dfs_write_chunk_size_;
 
-    // Client persistent thread pool for async operations
-    // Pinned host memory pool for GPU D2H staging. Held by shared_ptr so an
-    // in-flight async DFS write keeps it alive even while the Client is being
-    // destroyed.
+    // Pinned host memory pool for synchronous and fallback staging. The fixed
+    // asynchronous DFS arenas are owned by `dfs_write_staging_pool_`.
     std::shared_ptr<PinnedBufferPool> pinned_buffer_pool_;
+    std::shared_ptr<DfsWriteStagingPool> dfs_write_staging_pool_;
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;
