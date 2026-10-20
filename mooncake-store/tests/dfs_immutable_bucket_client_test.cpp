@@ -89,6 +89,7 @@ device::AcceleratorDeviceRegistrar staging_device_registration(staging_device);
 class FailingBucketFsAdapter : public PosixFsAdapter {
    public:
     int WriteCalls() const { return write_calls_.load(); }
+    int FailedWrites() const { return failed_writes_.load(); }
     void FailWriteCall(int call) { fail_write_call_.store(call); }
     void FailAllWrites(bool fail) { fail_all_writes_.store(fail); }
     void FailAllOpens(bool fail) { fail_all_opens_.store(fail); }
@@ -118,6 +119,7 @@ class FailingBucketFsAdapter : public PosixFsAdapter {
             cv_.wait(lock, [this] { return !blocked_; });
         }
         if (fail_all_writes_.load() || call == fail_write_call_.load()) {
+            ++failed_writes_;
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
         return PosixFsAdapter::WriteAt(fd, iov, iovcnt, offset);
@@ -125,6 +127,7 @@ class FailingBucketFsAdapter : public PosixFsAdapter {
 
    private:
     std::atomic<int> write_calls_{0};
+    std::atomic<int> failed_writes_{0};
     std::atomic<int> fail_write_call_{-1};
     std::atomic<bool> fail_all_writes_{false};
     std::atomic<bool> fail_all_opens_{false};
@@ -650,6 +653,38 @@ TEST_F(DfsBucketClientTest, FailedAsyncWriteRevokesOnlyTheDfsReplica) {
         EXPECT_FALSE(replica.is_dfs_replica())
             << "a failed DFS write must not leave a DFS replica behind";
     }
+}
+
+TEST_F(DfsBucketClientTest, FailedAsyncWriteIsBackfilledFromSurvivingMemory) {
+    provider_->SetDfsStorageBackend(backend_);
+    const std::string key = "backfill_after_io_failure";
+    std::string value(4096, 'B');
+    std::vector<std::string> values{value};
+    auto slices = MakeSlices(values);
+    adapter_->FailAllWrites(true);
+    auto put = writer_->BatchPut({key}, slices, DfsConfig());
+    ASSERT_EQ(put.size(), 1u);
+    ASSERT_TRUE(put.front().has_value());
+    ASSERT_TRUE(WaitForKeyGone(key));
+    // Also fail a background attempt. Recovery must retry that task without
+    // losing the sole good memory copy or retaining its failed allocation.
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(8);
+    while (adapter_->FailedWrites() < 2 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_GE(adapter_->FailedWrites(), 2);
+    ASSERT_TRUE(WaitForKeyGone(key));
+    adapter_->FailAllWrites(false);
+    ASSERT_TRUE(WaitForDfsReplica(key, std::chrono::seconds(12)));
+    ExpectDfsValue(key, value);
+    auto query = QueryDfsOnly(key);
+    ASSERT_TRUE(query.has_value());
+    std::string out(value.size(), '\0');
+    std::vector<Slice> output{{out.data(), out.size()}};
+    ASSERT_TRUE(writer_->Get(key, *query, output));
+    EXPECT_EQ(out, value);
 }
 
 TEST_F(DfsBucketClientTest, OpenFailuresAreRateLimitedAndRevokeEveryDfsReplica) {
