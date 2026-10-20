@@ -2031,7 +2031,7 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
         // Roll over to persist the committed source bucket before restart.
         auto rollover = initial_service.PutStart(
             initial_context.client_id, "retry_rollover", TenantId::Default(),
-            1048576 - 4096, config);
+            1048576, config);
         ASSERT_TRUE(rollover.has_value());
         const auto* rollover_dfs = FindDfsDescriptor(*rollover);
         ASSERT_NE(rollover_dfs, nullptr);
