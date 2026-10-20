@@ -936,13 +936,12 @@ TEST(ImmutableBucketAllocatorTest, RecoveryLiveBytesDriveLowUtilizationProbe) {
     ASSERT_EQ(replicas.back().descriptor.shard_idx, 0);
     const double threshold = 0.5 * static_cast<double>(kAlignment) /
                              static_cast<double>(kBucketCapacity);
-    ASSERT_TRUE(recovered.HasLowUtilizationBucket(threshold));
     auto loser = recovered.PrepareEvictionForLowUtilization(threshold);
     ASSERT_EQ(loser.bucket_id(), 1);
     ASSERT_TRUE(recovered.CommitEviction(std::move(loser)));
-    EXPECT_FALSE(recovered.HasLowUtilizationBucket(threshold));
+    EXPECT_TRUE(recovered.PrepareEvictionForLowUtilization(threshold).Empty());
     recovered.Free("dup", replicas.back().descriptor);
-    EXPECT_TRUE(recovered.HasLowUtilizationBucket(threshold));
+    EXPECT_FALSE(recovered.PrepareEvictionForLowUtilization(threshold).Empty());
 }
 
 TEST(ImmutableBucketAllocatorTest, RecoveryBreaksGenerationTiesByLocation) {
@@ -1935,14 +1934,14 @@ TEST(ImmutableBucketAllocatorTest, ReadyBucketsDoNotBlockWatermarkEviction) {
     config.ready_bucket_target = 4;
     ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(config));
-    EXPECT_FALSE(alloc.HasLowUtilizationBucket(0.05));
+    EXPECT_TRUE(alloc.PrepareEvictionForLowUtilization(0.05).Empty());
     for (int i = 0; i < 3; ++i) {
         const auto key = "healthy_" + std::to_string(i);
         auto descriptor = alloc.Allocate(key, 100);
         ASSERT_TRUE(descriptor.has_value());
         ASSERT_TRUE(alloc.MarkCommitted(key, *descriptor));
     }
-    EXPECT_FALSE(alloc.HasLowUtilizationBucket(0.05));
+    EXPECT_TRUE(alloc.PrepareEvictionForLowUtilization(0.05).Empty());
     auto pending = alloc.PrepareEviction();
     EXPECT_GE(pending.bucket_id(), 0);
     EXPECT_FALSE(pending.Empty());
