@@ -2641,7 +2641,7 @@ TEST_F(MasterServiceTest, DfsBucketBatchPutStartRollsBackRejectedKeys) {
 
 TEST_F(MasterServiceTest, DfsBucketRestartRestoresQueryableReplicas) {
     const auto root = MakeDfsTestRoot("restart");
-    ScopedBucketDfsEnv env(root, "1048576", "16");
+    ScopedBucketDfsEnv env(root, "8192", "16");
 
     std::vector<std::string> keys{"restart_a", "restart_b"};
     std::vector<DistributedFSDescriptor> before;
@@ -2665,6 +2665,11 @@ TEST_F(MasterServiceTest, DfsBucketRestartRestoresQueryableReplicas) {
             ASSERT_NE(dfs, nullptr);
             before.push_back(dfs->get_dfs_descriptor());
         }
+        // Only sealed buckets survive a restart. Force the two committed
+        // entries into a sealed bucket; leave the new active entry pending.
+        ASSERT_TRUE(service.PutStart(context.client_id, "restart_active",
+                                     TenantId::Default(), 4096, config)
+                        .has_value());
     }
 
     {

@@ -932,8 +932,8 @@ TEST(ImmutableBucketAllocatorTest, RecoveryLiveBytesDriveLowUtilizationProbe) {
     ImmutableBucketAllocator recovered;
     ASSERT_TRUE(recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
     auto replicas = RecoverAll(recovered);
-    ASSERT_EQ(replicas.size(), 1u);
-    ASSERT_EQ(replicas[0].descriptor.shard_idx, 0);
+    ASSERT_EQ(replicas.size(), 2u);  // Initial winner, then corrected winner.
+    ASSERT_EQ(replicas.back().descriptor.shard_idx, 0);
     const double threshold = 0.5 * static_cast<double>(kAlignment) /
                              static_cast<double>(kBucketCapacity);
     ASSERT_TRUE(recovered.HasLowUtilizationBucket(threshold));
@@ -941,7 +941,7 @@ TEST(ImmutableBucketAllocatorTest, RecoveryLiveBytesDriveLowUtilizationProbe) {
     ASSERT_EQ(loser.bucket_id(), 1);
     ASSERT_TRUE(recovered.CommitEviction(std::move(loser)));
     EXPECT_FALSE(recovered.HasLowUtilizationBucket(threshold));
-    recovered.Free("dup", replicas[0].descriptor);
+    recovered.Free("dup", replicas.back().descriptor);
     EXPECT_TRUE(recovered.HasLowUtilizationBucket(threshold));
 }
 
@@ -1853,7 +1853,7 @@ TEST(ImmutableBucketAllocatorTest, FreePendingReservationMakesBucketEvictable) {
     alloc.Free("pending", *descriptor);
     auto pending = alloc.PrepareEvictionForLowUtilization(0.6);
     ASSERT_GE(pending.bucket_id(), 0);
-    EXPECT_TRUE(pending.Empty());
+    EXPECT_TRUE(pending.Candidates().empty());
     EXPECT_EQ(pending.bucket_id(), descriptor->shard_idx);
     EXPECT_TRUE(alloc.CommitEviction(std::move(pending)));
 }
