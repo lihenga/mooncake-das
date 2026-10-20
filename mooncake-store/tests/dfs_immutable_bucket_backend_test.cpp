@@ -215,6 +215,8 @@ std::shared_ptr<DistributedStorageBackend> MakeTestBackend(
     return std::make_shared<DistributedStorageBackend>(
         file_config, distributed_config, std::move(adapter),
         kTestDfsRootIdentity);
+}
+
 // Drains the streaming recovery API into a single vector. Recovery of a
 // restarted allocator must run exactly once, before any recovered-state
 // assertion.

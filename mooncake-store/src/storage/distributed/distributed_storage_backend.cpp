@@ -273,6 +273,19 @@ bool DistributedStorageConfig::ValidateForBucketAllocator() const {
             << "], recovery_worker_count=" << recovery_worker_count;
         return false;
     }
+    if (recovery_max_buckets < 0) {
+        LOG(ERROR) << "DistributedStorageConfig: recovery_max_buckets must be "
+                      "non-negative (0 = unlimited), recovery_max_buckets="
+                   << recovery_max_buckets;
+        return false;
+    }
+    if (recovery_max_duration_seconds < 0) {
+        LOG(ERROR)
+            << "DistributedStorageConfig: recovery_max_duration_seconds must be "
+               "non-negative (0 = unlimited), recovery_max_duration_seconds="
+            << recovery_max_duration_seconds;
+        return false;
+    }
     return true;
 }
 
@@ -380,6 +393,11 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
                         config.bucket_create_concurrency);
     config.recovery_worker_count = Environ::GetInt(
         "MOONCAKE_DFS_RECOVERY_WORKERS", config.recovery_worker_count);
+    config.recovery_max_buckets = Environ::GetInt(
+        "MOONCAKE_DFS_RECOVERY_MAX_BUCKETS", config.recovery_max_buckets);
+    config.recovery_max_duration_seconds = Environ::GetInt(
+        "MOONCAKE_DFS_RECOVERY_MAX_DURATION_SECONDS",
+        config.recovery_max_duration_seconds);
     config.batch_read_threads = Environ::GetInt(
         "MOONCAKE_DFS_BATCH_READ_THREADS", config.batch_read_threads);
     config.batch_read_merge_enabled =
@@ -416,6 +434,9 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", ready_bucket_target=" << ready_bucket_target
         << ", bucket_create_concurrency=" << bucket_create_concurrency
         << ", recovery_worker_count=" << recovery_worker_count
+        << ", recovery_max_buckets=" << recovery_max_buckets
+        << ", recovery_max_duration_seconds="
+        << recovery_max_duration_seconds
         << ", batch_read_threads=" << batch_read_threads
         << ", batch_read_merge_enabled=" << batch_read_merge_enabled
         << ", direct_read_enabled=" << direct_read_enabled;
@@ -992,6 +1013,17 @@ DistributedStorageBackend::ResolveTarget(
                    << ", aligned_size=" << descriptor.aligned_size
                    << ", bucket_capacity="
                    << distributed_config_.bucket_capacity;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    const std::string expected_path =
+        canonical_root_dir_ + "/" + kBucketFilePrefix +
+        ImmutableBucketAllocator::FormatBucketId(descriptor.shard_idx) +
+        kBucketDataSuffix;
+    if (CanonicalizePath(descriptor.file_path) != expected_path) {
+        LOG(ERROR) << "DFS bucket path mismatch for key " << key
+                   << ", descriptor=" << descriptor.file_path
+                   << ", expected=" << expected_path;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
