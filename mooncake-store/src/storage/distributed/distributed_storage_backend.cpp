@@ -267,6 +267,19 @@ bool DistributedStorageConfig::ValidateForBucketAllocator() const {
                    << "], batch_read_threads=" << batch_read_threads;
         return false;
     }
+    if (recovery_max_buckets < 0 &&
+        recovery_max_buckets != kRecoveryMaxBucketsUnlimited) {
+        LOG(ERROR) << "DistributedStorageConfig: recovery_max_buckets must be "
+                      "non-negative or -1 for no cap, recovery_max_buckets="
+                   << recovery_max_buckets;
+        return false;
+    }
+    if (recovery_max_duration_seconds < 0) {
+        LOG(ERROR) << "DistributedStorageConfig: recovery_max_duration_seconds "
+                      "must be non-negative, recovery_max_duration_seconds="
+                   << recovery_max_duration_seconds;
+        return false;
+    }
     return true;
 }
 
@@ -372,6 +385,12 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     config.bucket_create_concurrency =
         Environ::GetInt("MOONCAKE_DFS_BUCKET_CREATE_CONCURRENCY",
                         config.bucket_create_concurrency);
+    config.recovery_max_buckets = static_cast<int64_t>(Environ::GetInt(
+        "MOONCAKE_DFS_RECOVERY_MAX_BUCKETS",
+        static_cast<int>(config.recovery_max_buckets)));
+    config.recovery_max_duration_seconds = static_cast<int64_t>(Environ::GetInt(
+        "MOONCAKE_DFS_RECOVERY_MAX_DURATION_SECONDS",
+        static_cast<int>(config.recovery_max_duration_seconds)));
     config.batch_read_threads = Environ::GetInt(
         "MOONCAKE_DFS_BATCH_READ_THREADS", config.batch_read_threads);
     config.batch_read_merge_enabled =
@@ -415,6 +434,8 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", max_bucket_count=" << max_bucket_count
         << ", ready_bucket_target=" << ready_bucket_target
         << ", bucket_create_concurrency=" << bucket_create_concurrency
+        << ", recovery_max_buckets=" << recovery_max_buckets
+        << ", recovery_max_duration_seconds=" << recovery_max_duration_seconds
         << ", batch_read_threads=" << batch_read_threads
         << ", batch_read_merge_enabled=" << batch_read_merge_enabled
         << ", direct_read_enabled=" << direct_read_enabled

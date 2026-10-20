@@ -69,6 +69,42 @@ struct DistributedStorageConfig {
     int ready_bucket_target = 4;
     // BUCKET mode only: maximum number of concurrent bucket preallocations.
     int bucket_create_concurrency = 2;
+    // Both budgets below truncate by *deleting* what does not fit. That is only
+    // sound while the metadata being rebuilt is the buckets' own: no entry can
+    // then name a bucket recovery skipped. When a snapshot owns the metadata
+    // instead it keeps DFS replicas pointing straight at bucket files, so
+    // deleting a bucket the snapshot still names leaves a replica that
+    // IsReplicaReadable() accepts and whose data is gone. MasterService
+    // therefore disables both in snapshot mode - bucket cap -1, time cap 0 -
+    // and restores every bucket.
+    // BUCKET mode only, and only when bucket_recovery_enabled: cap on how many
+    // buckets recovery restores. Recovery runs newest bucket id first, because
+    // the newest writes are assumed to be the hottest, so the cap keeps the
+    // most recently written buckets and drops the oldest. Whatever does not fit
+    // is deleted in the background, off the startup path.
+    //
+    // 0 derives the cap from max_bucket_count, i.e. "recover at most the number
+    // of buckets this process may hold anyway". Raise it above max_bucket_count
+    // to restore a larger history than the configured capacity.
+    int64_t recovery_max_buckets = 0;
+    // No cap at all: restore every bucket on disk, including any beyond
+    // max_bucket_count. Chosen by MasterService in snapshot mode, where a
+    // bucket left behind would dangle in the snapshot's metadata. The extra
+    // buckets are not wasted - eviction reclaims them later, and it drops the
+    // replicas first, which startup truncation cannot do.
+    static constexpr int64_t kRecoveryMaxBucketsUnlimited = -1;
+    // BUCKET mode only: wall-clock budget shared by the whole DFS startup -
+    // the directory scan, the per-bucket loop that parses a bucket, arbitrates
+    // its duplicate keys against the newer buckets already restored and
+    // publishes the survivors, and the master's re-registration of the replicas
+    // that produced. Startup must fit inside the master's leader-election
+    // window, so exceeding the budget skips (and deletes) the remaining, oldest
+    // buckets, and leaves the replicas that do not fit unregistered, reclaiming
+    // their buckets too. One bucket may overshoot: a bucket already being
+    // parsed is always finished so it is never half-published.
+    //
+    // 0 disables the budget.
+    int64_t recovery_max_duration_seconds = 20;
     // BUCKET mode only: number of threads for parallel batch reads across
     // buckets. Set to 1 to disable parallelism. Must be in
     // [1, kMaxBatchReadThreads].
