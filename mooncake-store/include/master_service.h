@@ -2128,7 +2128,14 @@ class MasterService {
     // Re-registers DFS replicas recovered from bucket metadata as COMPLETE so
     // the master can serve them after startup or allocator recovery.
     void RestoreRecoveredDfsReplicas(ImmutableBucketAllocator* allocator);
-    void InitDfsAllocatorFromEnvironment(const MasterServiceConfig& config);
+    enum class DfsInitResult {
+        kInitialized,
+        kDisabled,
+        kRetryableFailure,
+        kPermanentFailure,
+    };
+    DfsInitResult InitDfsAllocatorFromEnvironment(
+        const MasterServiceConfig& config);
     void DfsAllocatorRetryThreadFunc();
     bool InitializeDfsRootGuard(const std::string& root,
                                 const std::string& identity);

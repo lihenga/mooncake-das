@@ -192,8 +192,12 @@ bool PublishExpectedDfsRootFile(const std::string& root,
                                    O_NOFOLLOW,
                                0644);
     if (temp_fd < 0) {
-        LOG(ERROR) << "Failed to create DFS root temp file " << temp_path
-                   << ": " << std::strerror(errno);
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(ERROR) << "Failed to create DFS root temp file " << temp_path
+                       << ": " << std::strerror(errno)
+                       << ", suppressed=" << *suppressed;
+        }
         return false;
     }
 
@@ -202,8 +206,12 @@ bool PublishExpectedDfsRootFile(const std::string& root,
     if (!temp_written || close_result != 0) {
         const int saved_errno = errno;
         ::unlink(temp_path.c_str());
-        LOG(ERROR) << "Failed to write DFS root temp file " << temp_path
-                   << ": " << std::strerror(saved_errno);
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(ERROR) << "Failed to write DFS root temp file " << temp_path
+                       << ": " << std::strerror(saved_errno)
+                       << ", suppressed=" << *suppressed;
+        }
         return false;
     }
 
@@ -211,8 +219,12 @@ bool PublishExpectedDfsRootFile(const std::string& root,
     const int link_errno = errno;
     if (link_result != 0 && link_errno != EEXIST) {
         ::unlink(temp_path.c_str());
-        LOG(ERROR) << "Failed to publish DFS root file " << path << ": "
-                   << std::strerror(link_errno);
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(ERROR) << "Failed to publish DFS root file " << path << ": "
+                       << std::strerror(link_errno)
+                       << ", suppressed=" << *suppressed;
+        }
         return false;
     }
     ::unlink(temp_path.c_str());
@@ -224,7 +236,11 @@ bool PublishExpectedDfsRootFile(const std::string& root,
         return false;
     }
     if (!SyncDfsRootDirectory(root)) {
-        LOG(ERROR) << "Failed to sync DFS root after publishing " << path;
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(ERROR) << "Failed to sync DFS root after publishing " << path
+                       << ", suppressed=" << *suppressed;
+        }
         return false;
     }
     return true;
@@ -235,9 +251,12 @@ bool EnsureDfsRootIdentity(const std::string& root,
                            std::string& identity) {
     std::error_code ec;
     if (!std::filesystem::is_directory(root, ec) || ec) {
-        LOG(ERROR) << "DFS root must already exist as a directory; refusing "
-                      "to create it: "
-                   << root;
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(ERROR) << "DFS root must already exist as a directory; "
+                          "refusing to create it: "
+                       << root << ", suppressed=" << *suppressed;
+        }
         return false;
     }
     if (!IsValidClusterIdComponent(cluster_id)) {
@@ -252,9 +271,12 @@ bool EnsureDfsRootIdentity(const std::string& root,
         return true;
     }
     if (!missing) {
-        LOG(ERROR) << "DFS root identity marker is invalid or belongs to a "
-                      "different cluster: "
-                   << marker_path;
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(ERROR) << "DFS root identity marker is invalid or belongs to "
+                          "a different cluster: "
+                       << marker_path << ", suppressed=" << *suppressed;
+        }
         return false;
     }
 
@@ -286,11 +308,61 @@ bool EnsureDfsRootIdentity(const std::string& root,
             ReadDfsRootIdentity(marker_path, cluster_id, identity, missing)) {
             return true;
         }
-        LOG(ERROR) << "Failed to publish or validate DFS root identity "
-                   << marker_path;
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(ERROR) << "Failed to publish or validate DFS root identity "
+                       << marker_path << ", suppressed=" << *suppressed;
+        }
         return false;
     }
     identity = std::move(candidate);
+    return true;
+}
+
+bool ProbeDfsRootWritable(const std::string& root, std::string& error) {
+    constexpr size_t kProbeSize = 4096;
+    const std::string path =
+        root + "/.mooncake_dfs_init_probe." + std::to_string(::getpid()) +
+        "." + UuidToString(generate_uuid());
+    const int fd = ::open(
+        path.c_str(),
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) {
+        error = "create " + path + ": " + std::strerror(errno);
+        return false;
+    }
+
+    // Exercise allocation and persistence rather than treating a successful
+    // zero-byte create as proof that the DFS can accept ready-bucket writes.
+    std::array<char, kProbeSize> contents{};
+    size_t offset = 0;
+    int failure_errno = 0;
+    while (offset < contents.size()) {
+        const ssize_t written =
+            ::write(fd, contents.data() + offset, contents.size() - offset);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) {
+            failure_errno = written < 0 ? errno : EIO;
+            break;
+        }
+        offset += static_cast<size_t>(written);
+    }
+    if (failure_errno == 0 && ::fdatasync(fd) != 0) failure_errno = errno;
+    if (::close(fd) != 0 && failure_errno == 0) failure_errno = errno;
+
+    if (::unlink(path.c_str()) != 0 && failure_errno == 0) {
+        failure_errno = errno;
+    }
+    if (failure_errno == 0 && !SyncDfsRootDirectory(root)) {
+        failure_errno = EIO;
+    }
+    if (failure_errno != 0) {
+        // Best-effort cleanup also covers write/fsync failures.
+        ::unlink(path.c_str());
+        error = "write/sync/remove " + path + ": " +
+                std::strerror(failure_errno);
+        return false;
+    }
     return true;
 }
 
@@ -832,7 +904,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
     }
 }
 
-void MasterService::InitDfsAllocatorFromEnvironment(
+MasterService::DfsInitResult MasterService::InitDfsAllocatorFromEnvironment(
     const MasterServiceConfig& config) {
     dfs_restore_from_bucket_metadata_ =
         !config.enable_snapshot && !config.enable_snapshot_restore;
@@ -840,7 +912,8 @@ void MasterService::InitDfsAllocatorFromEnvironment(
         "MOONCAKE_ENABLE_DFS", Environ::GetBool("MOONCAKE_DFS_ENABLED", false));
     if (!dfs_enabled) {
         enable_dfs_.store(false, std::memory_order_release);
-        return;
+        dfs_retry_needed_.store(false, std::memory_order_release);
+        return DfsInitResult::kDisabled;
     }
 
     if (enable_oplog_) {
@@ -865,18 +938,34 @@ void MasterService::InitDfsAllocatorFromEnvironment(
         LOG(ERROR) << "Currently, DFS backend is not supported in "
                       "multi-tenant mode";
         enable_dfs_ = false;
-        return;
+        dfs_retry_needed_.store(false, std::memory_order_release);
+        return DfsInitResult::kPermanentFailure;
     }
 
     if (!dfs_config.ValidateForAllocator()) {
         enable_dfs_ = false;
-        return;
+        dfs_retry_needed_.store(false, std::memory_order_release);
+        return DfsInitResult::kPermanentFailure;
     }
     if (!EnsureDfsRootIdentity(dfs_config.fsdir, cluster_id_,
                                dfs_root_identity_)) {
         enable_dfs_ = false;
         dfs_retry_needed_.store(true, std::memory_order_release);
-        return;
+        return DfsInitResult::kRetryableFailure;
+    }
+
+    std::string probe_error;
+    if (!ProbeDfsRootWritable(dfs_config.fsdir, probe_error)) {
+        static DfsLogLimiter probe_log_limiter;
+        if (auto suppressed = probe_log_limiter.ShouldLog()) {
+            LOG(ERROR) << "DFS root write preflight failed; skipping allocator "
+                          "recovery, root="
+                       << dfs_config.fsdir << ", error=" << probe_error
+                       << ", suppressed=" << *suppressed;
+        }
+        enable_dfs_ = false;
+        dfs_retry_needed_.store(true, std::memory_order_release);
+        return DfsInitResult::kRetryableFailure;
     }
 
     std::unique_ptr<DfsAllocatorInterface> allocator;
@@ -891,20 +980,32 @@ void MasterService::InitDfsAllocatorFromEnvironment(
 
     auto init_result = allocator->Init(dfs_config);
     if (!init_result) {
-        LOG(ERROR) << "Failed to initialize DFS allocator, error="
-                   << init_result.error() << ", config={"
-                   << dfs_config.FormatStr() << "}";
+        static DfsLogLimiter init_log_limiter;
+        if (auto suppressed = init_log_limiter.ShouldLog()) {
+            LOG(ERROR) << "Failed to initialize DFS allocator, error="
+                       << init_result.error() << ", config={"
+                       << dfs_config.FormatStr()
+                       << "}, suppressed=" << *suppressed;
+        }
         enable_dfs_ = false;
-        dfs_retry_needed_.store(true, std::memory_order_release);
-        return;
+        const bool permanent =
+            init_result.error() == ErrorCode::INVALID_PARAMS ||
+            init_result.error() == ErrorCode::NOT_SUPPORTED;
+        dfs_retry_needed_.store(!permanent, std::memory_order_release);
+        return permanent ? DfsInitResult::kPermanentFailure
+                         : DfsInitResult::kRetryableFailure;
     }
 
     if (!InitializeDfsRootGuard(dfs_config.fsdir, dfs_root_identity_)) {
-        LOG(ERROR) << "Failed to initialize DFS root file guard for "
-                   << dfs_config.fsdir;
+        static DfsLogLimiter guard_log_limiter;
+        if (auto suppressed = guard_log_limiter.ShouldLog()) {
+            LOG(ERROR) << "Failed to initialize DFS root file guard for "
+                       << dfs_config.fsdir
+                       << ", suppressed=" << *suppressed;
+        }
         enable_dfs_ = false;
         dfs_retry_needed_.store(true, std::memory_order_release);
-        return;
+        return DfsInitResult::kRetryableFailure;
     }
 
     // Snapshot is the metadata recovery source when enabled. Do not rebuild
@@ -923,13 +1024,22 @@ void MasterService::InitDfsAllocatorFromEnvironment(
               << ToString(dfs_config.allocator_type) << ", config={"
               << dfs_config.FormatStr() << "}";
     RefreshDfsMetrics();
+    return DfsInitResult::kInitialized;
 }
 
 void MasterService::DfsAllocatorRetryThreadFunc() {
-    constexpr auto kRetryInterval = std::chrono::seconds(5);
+    constexpr auto kInitialRetryInterval = std::chrono::seconds(5);
+    constexpr auto kMaxRetryInterval = std::chrono::seconds(60);
+    auto retry_interval = kInitialRetryInterval;
     while (dfs_retry_running_.load(std::memory_order_acquire)) {
+        const int jitter_percent = randomUniform<int>(-10, 10);
+        const auto wait_interval = std::chrono::milliseconds(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                retry_interval)
+                .count() *
+            (100 + jitter_percent) / 100);
         std::unique_lock lock(dfs_retry_mutex_);
-        if (dfs_retry_cv_.wait_for(lock, kRetryInterval, [this] {
+        if (dfs_retry_cv_.wait_for(lock, wait_interval, [this] {
                 return !dfs_retry_running_.load(std::memory_order_acquire);
             })) {
             break;
@@ -943,11 +1053,18 @@ void MasterService::DfsAllocatorRetryThreadFunc() {
             // same configured allocator against the current DFS environment.
             retry_config.enable_snapshot = !dfs_restore_from_bucket_metadata_;
             retry_config.enable_snapshot_restore = false;
-            InitDfsAllocatorFromEnvironment(retry_config);
+            const DfsInitResult result =
+                InitDfsAllocatorFromEnvironment(retry_config);
+            if (result != DfsInitResult::kRetryableFailure) break;
         } catch (const std::exception& e) {
-            LOG(WARNING) << "DFS allocator retry failed, error=" << e.what();
+            static DfsLogLimiter retry_log_limiter;
+            if (auto suppressed = retry_log_limiter.ShouldLog()) {
+                LOG(WARNING) << "DFS allocator retry threw an exception, error="
+                             << e.what() << ", suppressed=" << *suppressed;
+            }
         }
         if (!dfs_retry_needed_.load(std::memory_order_acquire)) break;
+        retry_interval = std::min(retry_interval * 2, kMaxRetryInterval);
     }
 }
 
