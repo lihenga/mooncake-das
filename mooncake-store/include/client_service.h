@@ -841,6 +841,8 @@ class Client {
                                     uint64_t quota_bytes = 0);
 
    private:
+    tl::expected<QueryResult, ErrorCode> PrepareDfsReadRetry(
+        const QueryResult& original, const QueryResult& refreshed);
     tl::expected<void, ErrorCode> GetImpl(const std::string& object_key,
                                           const QueryResult& query_result,
                                           std::vector<Slice>& slices);

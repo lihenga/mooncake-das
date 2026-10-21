@@ -538,6 +538,50 @@ TEST_F(DfsBucketBackendTest, FailedEpochConfirmationPreservesCachedHandles) {
     EXPECT_EQ(confirmations, confirmations_after_failure);
 }
 
+TEST_F(DfsBucketBackendTest, FailedEpochConfirmationsShareFailureAndRecover) {
+    std::atomic<size_t> confirmations{0};
+    std::atomic<bool> unavailable{true};
+    std::promise<void> entered;
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    const UUID epoch{3, 2};
+    backend_->SetMasterEpochProvider([&]() -> tl::expected<UUID, ErrorCode> {
+        if (++confirmations == 1) {
+            entered.set_value();
+            released.wait();
+        }
+        if (unavailable) return tl::unexpected(ErrorCode::RPC_TIMEOUT);
+        return epoch;
+    });
+    const auto confirm = [&]() {
+        auto guard = backend_->AcquireBucketEpoch(epoch);
+        return guard ? ErrorCode::OK : guard.error();
+    };
+    auto first = std::async(std::launch::async, confirm);
+    const auto entered_status =
+        entered.get_future().wait_for(std::chrono::seconds(2));
+    std::vector<std::future<ErrorCode>> waiting;
+    for (size_t i = 0; i < 4; ++i) {
+        waiting.push_back(std::async(std::launch::async, confirm));
+    }
+    release.set_value();
+    EXPECT_EQ(entered_status, std::future_status::ready);
+    EXPECT_EQ(first.get(), ErrorCode::RPC_TIMEOUT);
+    for (auto& result : waiting)
+        EXPECT_EQ(result.get(), ErrorCode::RPC_TIMEOUT);
+    EXPECT_EQ(confirmations.load(), 1u);
+
+    // Recovery is retried after the bounded failure cache expires.
+    unavailable = false;
+    EXPECT_EQ(confirm(), ErrorCode::RPC_TIMEOUT);
+    EXPECT_EQ(confirmations.load(), 1u);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_EQ(confirm(), ErrorCode::OK);
+    EXPECT_EQ(confirmations.load(), 2u);
+    EXPECT_EQ(confirm(), ErrorCode::OK);
+    EXPECT_EQ(confirmations.load(), 2u);
+}
+
 TEST_F(DfsBucketBackendTest, EpochConfirmationDoesNotBlockCurrentCachedReads) {
     const std::string key = "epoch_confirm_concurrency";
     const std::string value(4096, 'C');

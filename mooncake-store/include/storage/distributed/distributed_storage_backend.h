@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <set>
 #include <string>
@@ -368,6 +369,10 @@ class DistributedStorageBackend : public StorageBackendInterface {
 
     std::shared_mutex bucket_epoch_mutex_;
     std::mutex bucket_epoch_confirmation_mutex_;
+    // Protected by the confirmation mutex; current-epoch cache hits bypass it.
+    std::optional<ErrorCode> bucket_epoch_confirmation_error_;
+    std::chrono::steady_clock::time_point
+        bucket_epoch_confirmation_retry_after_{};
     UUID bucket_epoch_{};
     std::set<UUID> retired_bucket_epochs_;
     std::function<tl::expected<UUID, ErrorCode>()> master_epoch_provider_;

@@ -1551,6 +1551,34 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     return client;
 }
 
+tl::expected<QueryResult, ErrorCode> Client::PrepareDfsReadRetry(
+    const QueryResult& original, const QueryResult& refreshed) {
+    Replica::Descriptor selected;
+    if (FindFirstCompleteReplica(original.replicas, selected) !=
+            ErrorCode::OK ||
+        !selected.is_dfs_replica()) {
+        return tl::unexpected(ErrorCode::DFS_STALE_HANDLE);
+    }
+    // The caller still owns buffers and session state based on the old query.
+    // Only retry the same replica type, size and checksum view. If the caller
+    // omitted a checksum, do not silently introduce one from a new query.
+    if (original.object_checksum != refreshed.object_checksum) {
+        return tl::unexpected(ErrorCode::DFS_STALE_HANDLE);
+    }
+    for (const auto& replica : refreshed.replicas) {
+        if (!replica.is_dfs_replica() ||
+            replica.status != ReplicaStatus::COMPLETE) {
+            continue;
+        }
+        if (calculate_total_size(replica) != calculate_total_size(selected)) {
+            return tl::unexpected(ErrorCode::DFS_STALE_HANDLE);
+        }
+        return QueryResult({replica}, refreshed.lease_timeout,
+                           original.object_checksum);
+    }
+    return tl::unexpected(ErrorCode::DFS_STALE_HANDLE);
+}
+
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           std::vector<Slice>& slices) {
     auto query_result = Query(object_key);
@@ -1772,8 +1800,10 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     if (result || result.error() != ErrorCode::DFS_STALE_HANDLE) return result;
     auto refreshed = Query(object_key);
     if (!refreshed) return tl::make_unexpected(refreshed.error());
-    // Exactly one retry, including fresh lease and checksum validation.
-    return GetImpl(object_key, *refreshed, slices);
+    auto retry = PrepareDfsReadRetry(query_result, *refreshed);
+    if (!retry) return tl::unexpected(retry.error());
+    // Exactly one retry with a fresh lease, preserving the caller's read view.
+    return GetImpl(object_key, *retry, slices);
 }
 
 tl::expected<void, ErrorCode> Client::GetImpl(const std::string& object_key,
@@ -2086,8 +2116,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             results[retry_indices[i]] = tl::unexpected(refreshed[i].error());
             continue;
         }
+        auto retry =
+            PrepareDfsReadRetry(query_results[retry_indices[i]], *refreshed[i]);
+        if (!retry) {
+            results[retry_indices[i]] = tl::unexpected(retry.error());
+            continue;
+        }
         valid_keys.push_back(retry_keys[i]);
-        valid_queries.push_back(std::move(*refreshed[i]));
+        valid_queries.push_back(std::move(*retry));
         valid_indices.push_back(retry_indices[i]);
     }
     if (!valid_keys.empty()) {

@@ -357,6 +357,11 @@ class DfsBucketClientTest : public ::testing::Test {
         return config;
     }
 
+    tl::expected<QueryResult, ErrorCode> PrepareDfsReadRetry(
+        const QueryResult& original, const QueryResult& refreshed) {
+        return writer_->PrepareDfsReadRetry(original, refreshed);
+    }
+
     tl::expected<QueryResult, ErrorCode> QueryDfsOnly(const std::string& key) {
         auto query = writer_->Query(key);
         if (!query) return tl::make_unexpected(query.error());
@@ -367,7 +372,8 @@ class DfsBucketClientTest : public ::testing::Test {
         if (replicas.empty()) {
             return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
         }
-        return QueryResult(std::move(replicas), query->lease_timeout);
+        return QueryResult(std::move(replicas), query->lease_timeout,
+                           query->object_checksum);
     }
 
     // The DFS write is asynchronous in bucket mode, so wait for the replica to
@@ -591,7 +597,7 @@ TEST_F(DfsBucketEpochClientTest,
 }
 
 TEST_F(DfsBucketEpochClientTest,
-       HealthyRestartRefreshesOldReadDescriptorsOnce) {
+       HealthyRestartRefreshesOnlyUnchangedReadViews) {
     const std::string key = "healthy_restart_read";
     std::string value(4096, 'R');
     std::vector<Slice> slices{{value.data(), value.size()}};
@@ -609,24 +615,139 @@ TEST_F(DfsBucketEpochClientTest,
     ASSERT_TRUE(fresh);
     ASSERT_NE(fresh->replicas[0].get_dfs_descriptor().MasterEpoch(),
               old->replicas[0].get_dfs_descriptor().MasterEpoch());
+    // Bucket metadata does not persist object checksums. Do not silently drop
+    // the old read view's checksum when refreshing after recovery.
+    ASSERT_FALSE(fresh->object_checksum);
+    const bool checksum_changed = old->object_checksum.has_value();
     // Observe the new epoch before consuming a descriptor queried pre-restart.
     ExpectDfsValue(key, value);
     std::string output(value.size(), '\0');
     std::vector<Slice> output_slices{{output.data(), output.size()}};
-    ASSERT_TRUE(writer_->Get(key, *old, output_slices));
-    EXPECT_EQ(output, value);
+    const auto expect_read = [&](const tl::expected<void, ErrorCode>& result) {
+        if (checksum_changed) {
+            ASSERT_FALSE(result);
+            EXPECT_EQ(result.error(), ErrorCode::DFS_STALE_HANDLE);
+            EXPECT_EQ(output, std::string(value.size(), '\0'));
+        } else {
+            ASSERT_TRUE(result);
+            EXPECT_EQ(output, value);
+        }
+    };
+    expect_read(writer_->Get(key, *old, output_slices));
     std::vector<QueryResult> queries;
     queries.push_back(std::move(*old));
     std::unordered_map<std::string, std::vector<Slice>> batch{
         {key, output_slices}};
     std::fill(output.begin(), output.end(), '\0');
     auto read = writer_->BatchGet({key}, queries, batch);
-    ASSERT_TRUE(read.at(0));
+    expect_read(read.at(0));
+    // Rebuilding the caller's view explicitly permits the recovered object.
+    ASSERT_TRUE(writer_->Get(key, *fresh, output_slices));
     EXPECT_EQ(output, value);
     ASSERT_TRUE(writer_->Remove(key, true));
     auto missing = writer_->Get(key, queries[0], output_slices);
     ASSERT_FALSE(missing);
     EXPECT_EQ(missing.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST_F(DfsBucketClientTest, DfsReadRetryPreservesReplicaFilter) {
+    const auto lease =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    Replica::Descriptor dfs{};
+    dfs.status = ReplicaStatus::COMPLETE;
+    dfs.descriptor_variant =
+        DistributedFSDescriptor{"bucket.data", 0, 4096, 4096, 0};
+    dfs.get_dfs_descriptor().master_epoch = UUID{1, 1};
+    const QueryResult original({dfs}, lease, 123);
+    dfs.get_dfs_descriptor().master_epoch = UUID{1, 2};
+    Replica::Descriptor local_disk{};
+    local_disk.status = ReplicaStatus::COMPLETE;
+    local_disk.descriptor_variant =
+        LocalDiskDescriptor{UUID{2, 1}, 4096, "ssd"};
+    const auto new_lease = lease + std::chrono::seconds(1);
+    const QueryResult refreshed({local_disk, dfs}, new_lease, 123);
+
+    auto retry = PrepareDfsReadRetry(original, refreshed);
+    ASSERT_TRUE(retry);
+    ASSERT_EQ(retry->replicas.size(), 1u);
+    ASSERT_TRUE(retry->replicas[0].is_dfs_replica());
+    EXPECT_EQ(retry->replicas[0].get_dfs_descriptor().MasterEpoch(),
+              (UUID{1, 2}));
+    EXPECT_EQ(retry->lease_timeout, new_lease);
+    EXPECT_EQ(retry->object_checksum, original.object_checksum);
+
+    const QueryResult local_only({local_disk}, new_lease, 123);
+    auto rejected = PrepareDfsReadRetry(original, local_only);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error(), ErrorCode::DFS_STALE_HANDLE);
+}
+
+TEST_F(DfsBucketClientTest, DfsReadRetryRejectsChangedObjectView) {
+    const auto lease =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    Replica::Descriptor dfs{};
+    dfs.status = ReplicaStatus::COMPLETE;
+    dfs.descriptor_variant =
+        DistributedFSDescriptor{"bucket.data", 0, 4096, 4096, 0};
+    const QueryResult original({dfs}, lease, 123);
+    for (const uint64_t size : {2048, 8192}) {
+        auto changed = dfs;
+        changed.get_dfs_descriptor().object_size = size;
+        const QueryResult refreshed({changed}, lease, 123);
+        auto retry = PrepareDfsReadRetry(original, refreshed);
+        ASSERT_FALSE(retry);
+        EXPECT_EQ(retry.error(), ErrorCode::DFS_STALE_HANDLE);
+    }
+    for (const auto checksum :
+         {std::optional<uint64_t>{456}, std::optional<uint64_t>{}}) {
+        const QueryResult refreshed({dfs}, lease, checksum);
+        auto retry = PrepareDfsReadRetry(original, refreshed);
+        ASSERT_FALSE(retry);
+        EXPECT_EQ(retry.error(), ErrorCode::DFS_STALE_HANDLE);
+    }
+    const QueryResult without_checksum({dfs}, lease);
+    auto retry = PrepareDfsReadRetry(without_checksum, original);
+    ASSERT_FALSE(retry);
+    EXPECT_EQ(retry.error(), ErrorCode::DFS_STALE_HANDLE);
+}
+
+TEST_F(DfsBucketClientTest, StaleReadsRejectChangedObjectViewBeforeRetry) {
+    const std::string key = "stale_changed_view";
+    std::string value(4096, 'V');
+    std::vector<Slice> slices{{value.data(), value.size()}};
+    ASSERT_TRUE(writer_->Put(key, slices, DfsConfig()));
+    ASSERT_TRUE(WaitForDfsReplica(key));
+    const auto query = QueryDfsOnly(key);
+    ASSERT_TRUE(query);
+    for (const bool change_size : {true, false}) {
+        SCOPED_TRACE(change_size);
+        auto replicas = query->replicas;
+        auto& old = replicas[0].get_dfs_descriptor();
+        old.master_epoch = UUID{};
+        auto checksum = query->object_checksum;
+        if (change_size) {
+            old.object_size *= 2;
+        } else {
+            checksum = checksum.value_or(0) + 1;
+        }
+        std::vector<QueryResult> queries;
+        queries.emplace_back(std::move(replicas), query->lease_timeout,
+                             checksum);
+        std::string output(value.size() * 2, '?');
+        const auto untouched = output;
+        std::vector<Slice> output_slices{{output.data(), output.size()}};
+        auto single = writer_->Get(key, queries[0], output_slices);
+        ASSERT_FALSE(single);
+        EXPECT_EQ(single.error(), ErrorCode::DFS_STALE_HANDLE);
+        EXPECT_EQ(output, untouched);
+        std::unordered_map<std::string, std::vector<Slice>> batch{
+            {key, output_slices}};
+        auto results = writer_->BatchGet({key}, queries, batch);
+        ASSERT_EQ(results.size(), 1u);
+        ASSERT_FALSE(results[0]);
+        EXPECT_EQ(results[0].error(), ErrorCode::DFS_STALE_HANDLE);
+        EXPECT_EQ(output, untouched);
+    }
 }
 
 TEST_F(DfsBucketEpochClientTest,

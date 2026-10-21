@@ -872,10 +872,23 @@ DistributedStorageBackend::AcquireBucketEpoch(const UUID& epoch) {
         return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
     }
     read_lock.unlock();
+    if (bucket_epoch_confirmation_error_ &&
+        std::chrono::steady_clock::now() <
+            bucket_epoch_confirmation_retry_after_) {
+        return tl::make_unexpected(*bucket_epoch_confirmation_error_);
+    }
     // A delayed response is not evidence of a newer master: UUIDs have no
     // order. Network confirmation must not hold the exclusive I/O lock.
     auto current_epoch = master_epoch_provider_();
-    if (!current_epoch) return tl::make_unexpected(current_epoch.error());
+    if (!current_epoch) {
+        // Waiting confirmations share this failure instead of each consuming
+        // another RPC timeout while the master is unavailable.
+        bucket_epoch_confirmation_error_ = current_epoch.error();
+        bucket_epoch_confirmation_retry_after_ =
+            std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        return tl::make_unexpected(current_epoch.error());
+    }
+    bucket_epoch_confirmation_error_.reset();
     if (*current_epoch != epoch) {
         return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
     }
