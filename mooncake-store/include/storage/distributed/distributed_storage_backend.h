@@ -101,6 +101,13 @@ struct DistributedStorageConfig {
     // timeout keeps both charges until the background read really returns.
     uint64_t batch_get_max_inflight_batches = 2;
     uint64_t batch_get_max_inflight_bytes = 2ULL * 1024 * 1024 * 1024;
+    // A successful lightweight read probe may not mean that timed-out business
+    // reads have drained. Keep DFS reads unavailable until this many probes
+    // succeed while all recovery gates remain satisfied.
+    uint64_t dfs_read_recovery_success_threshold = 2;
+    // Do not recover immediately after local admission pressure. This quiet
+    // period is independent from the BatchGet I/O deadline.
+    uint64_t dfs_read_recovery_quiet_ms = 30000;
     // Cleared by FromEnvironment() when MOONCAKE_DFS_ALLOCATOR_TYPE names an
     // unknown allocator, so the master can reject the configuration instead of
     // silently defaulting to SHARD.
@@ -359,7 +366,9 @@ class DistributedStorageBackend
 
     bool AcquireInflightReadUntil(
         uint64_t bytes, std::chrono::steady_clock::time_point deadline);
-    void ReleaseInflightRead(uint64_t bytes);
+    void ReleaseInflightRead(uint64_t bytes, bool timed_out_worker = false);
+    void ResetReadRecoveryProbeStreak();
+    tl::expected<void, ErrorCode> FinishSuccessfulReadProbe();
 
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
     std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
@@ -377,6 +386,9 @@ class DistributedStorageBackend
     std::condition_variable inflight_read_cv_;
     uint64_t inflight_read_batches_{0};
     uint64_t inflight_read_bytes_{0};
+    uint64_t detached_timed_out_read_workers_{0};
+    uint64_t read_recovery_probe_successes_{0};
+    std::chrono::steady_clock::time_point last_read_admission_timeout_{};
     std::mutex health_probe_write_mutex_;
     std::string canonical_root_dir_;
     std::vector<std::unique_ptr<ShardFile>> shard_files_;

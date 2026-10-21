@@ -473,6 +473,8 @@ TEST(DistributedStorageConfigTest, ReadsValidatesAndFormatsEnvironment) {
     env.Set("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL", "3");
     env.Set("MOONCAKE_DFS_BATCH_GET_MAX_INFLIGHT_BATCHES", "7");
     env.Set("MOONCAKE_DFS_BATCH_GET_MAX_INFLIGHT_BYTES", "12345678");
+    env.Set("MOONCAKE_DFS_READ_RECOVERY_SUCCESS_THRESHOLD", "3");
+    env.Set("MOONCAKE_DFS_READ_RECOVERY_QUIET_MS", "456");
 
     const auto config = DistributedStorageConfig::FromEnvironment();
     EXPECT_EQ(config.fsdir, tmp.path());
@@ -487,6 +489,8 @@ TEST(DistributedStorageConfigTest, ReadsValidatesAndFormatsEnvironment) {
     EXPECT_EQ(config.eviction_check_interval, std::chrono::seconds(3));
     EXPECT_EQ(config.batch_get_max_inflight_batches, 7u);
     EXPECT_EQ(config.batch_get_max_inflight_bytes, 12345678u);
+    EXPECT_EQ(config.dfs_read_recovery_success_threshold, 3u);
+    EXPECT_EQ(config.dfs_read_recovery_quiet_ms, 456u);
     EXPECT_TRUE(config.Validate());
     EXPECT_TRUE(config.ValidateForAllocator());
 
@@ -495,11 +499,19 @@ TEST(DistributedStorageConfigTest, ReadsValidatesAndFormatsEnvironment) {
     EXPECT_NE(formatted.find("shard_count=8"), std::string::npos);
     EXPECT_NE(formatted.find("eviction_high_watermark=0.85"),
               std::string::npos);
+    EXPECT_NE(formatted.find("dfs_read_recovery_success_threshold=3"),
+              std::string::npos);
+    EXPECT_NE(formatted.find("dfs_read_recovery_quiet_ms=456"),
+              std::string::npos);
 
     auto invalid_eviction = config;
     invalid_eviction.eviction_low_watermark = 0.9;
     EXPECT_TRUE(invalid_eviction.Validate());
     EXPECT_FALSE(invalid_eviction.ValidateForAllocator());
+
+    auto invalid_recovery = config;
+    invalid_recovery.dfs_read_recovery_success_threshold = 0;
+    EXPECT_FALSE(invalid_recovery.Validate());
 }
 
 TEST(DfsGlobalAllocatorTest, InitReturnsSpecificErrors) {
@@ -1013,9 +1025,11 @@ TEST(DfsBackendTimeoutTest, LimitsTimedReadsUntilRealCompletion) {
     config.shard_capacity = 64 * 1024;
     config.alignment = 4096;
     config.direct_read_enabled = false;
-    config.batch_get_timeout_ms = 20;
+    config.batch_get_timeout_ms = 100;
     config.batch_get_max_inflight_batches = 2;
     config.batch_get_max_inflight_bytes = 12288;
+    config.dfs_read_recovery_success_threshold = 2;
+    config.dfs_read_recovery_quiet_ms = 0;
 
     auto adapter = std::make_unique<BlockingReadPosixFsAdapter>();
     auto* adapter_ptr = adapter.get();
@@ -1040,19 +1054,21 @@ TEST(DfsBackendTimeoutTest, LimitsTimedReadsUntilRealCompletion) {
         released_owners.fetch_add(1);
     });
     adapter_ptr->BlockReads();
-    auto read = [&](std::string& destination,
-                    std::shared_ptr<void> owner = nullptr) {
-        return backend->BatchRead(
+    std::vector<tl::expected<void, ErrorCode>> first_result;
+    std::vector<tl::expected<void, ErrorCode>> second_result;
+    std::thread first_reader([&] {
+        first_result = backend->BatchRead(
             {{"limited_read", descriptor,
-              {{destination.data(), destination.size()}}, std::move(owner)}})[0];
-    };
-
-    EXPECT_FALSE(read(first, first_owner).has_value());
-    first_owner.reset();
-    ASSERT_TRUE(backend->ProbeRead().has_value());
-    EXPECT_FALSE(read(second, second_owner).has_value());
-    second_owner.reset();
-    ASSERT_TRUE(backend->ProbeRead().has_value());
+              {{first.data(), first.size()}}, first_owner}});
+    });
+    std::thread second_reader([&] {
+        second_result = backend->BatchRead(
+            {{"limited_read", descriptor,
+              {{second.data(), second.size()}}, second_owner}});
+    });
+    ASSERT_TRUE(
+        adapter_ptr->WaitUntilStarted(2, std::chrono::seconds(2)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     const auto started_before_admission_wait = adapter_ptr->StartedReads();
     std::atomic<bool> third_returned{false};
     std::vector<tl::expected<void, ErrorCode>> third_result;
@@ -1066,6 +1082,19 @@ TEST(DfsBackendTimeoutTest, LimitsTimedReadsUntilRealCompletion) {
     EXPECT_FALSE(third_returned.load());
     EXPECT_EQ(started_before_admission_wait, 2u);
     EXPECT_EQ(adapter_ptr->StartedReads(), started_before_admission_wait);
+    first_reader.join();
+    second_reader.join();
+    first_owner.reset();
+    second_owner.reset();
+    ASSERT_EQ(first_result.size(), 1u);
+    ASSERT_EQ(second_result.size(), 1u);
+    ASSERT_FALSE(first_result[0].has_value());
+    ASSERT_FALSE(second_result[0].has_value());
+    EXPECT_EQ(first_result[0].error(), ErrorCode::DFS_BATCH_GET_TIMEOUT);
+    EXPECT_EQ(second_result[0].error(), ErrorCode::DFS_BATCH_GET_TIMEOUT);
+    // The lightweight probe itself can read, but recovery must stay closed
+    // while the detached timed-out workers still own in-flight capacity.
+    EXPECT_FALSE(backend->ProbeRead().has_value());
     adapter_ptr->ReleaseReads();
     third_reader.join();
     ASSERT_TRUE(
@@ -1077,7 +1106,80 @@ TEST(DfsBackendTimeoutTest, LimitsTimedReadsUntilRealCompletion) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     ASSERT_EQ(released_owners.load(), 2u);
+    // Mooncake requires consecutive gated successes before clearing the read
+    // timeout latch. SGLang may apply an additional health threshold.
+    EXPECT_FALSE(backend->ProbeRead().has_value());
     ASSERT_TRUE(backend->ProbeRead().has_value());
+}
+
+TEST(DfsBackendTimeoutTest, RecoveryWaitsForAdmissionQuietPeriod) {
+    TempDir tmp("dfs_read_recovery_quiet");
+    ASSERT_TRUE(WriteTestDfsRootIdentity(tmp.path()));
+    {
+        std::ofstream probe(tmp.file(kDfsReadProbeFileName), std::ios::binary);
+        const auto contents = BuildDfsReadProbeContents(kTestDfsRootIdentity);
+        probe.write(contents.data(), contents.size());
+    }
+
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp.path();
+    DistributedStorageConfig config;
+    config.fsdir = tmp.path();
+    config.fs_adapter_type = "posix";
+    config.shard_count = 1;
+    config.shard_capacity = 64 * 1024;
+    config.alignment = 4096;
+    config.direct_read_enabled = false;
+    config.batch_get_timeout_ms = 20;
+    config.batch_get_max_inflight_batches = 1;
+    config.batch_get_max_inflight_bytes = 4096;
+    config.dfs_read_recovery_success_threshold = 1;
+    config.dfs_read_recovery_quiet_ms = 200;
+
+    auto adapter = std::make_unique<BlockingReadPosixFsAdapter>();
+    auto* adapter_ptr = adapter.get();
+    auto backend = std::make_shared<DistributedStorageBackend>(
+        file_config, config, std::move(adapter), kTestDfsRootIdentity);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    const std::string shard =
+        tmp.file("dfs_shard_" + DfsGlobalAllocator::FormatShardIdx(0, 1) +
+                 ".data");
+    const DistributedFSDescriptor descriptor{shard, 0, 4096, 4096, 0};
+    std::string source(4096, 'R');
+    ASSERT_TRUE(backend->BatchWrite(
+        {{"quiet_read", descriptor, {{source.data(), source.size()}}}})[0]);
+
+    std::string first(4096, '1'), second(4096, '2');
+    auto first_owner = std::shared_ptr<void>(first.data(), [](void*) {});
+    adapter_ptr->BlockReads();
+    std::vector<tl::expected<void, ErrorCode>> timed_out;
+    std::thread first_reader([&] {
+        timed_out = backend->BatchRead(
+            {{"quiet_read", descriptor,
+              {{first.data(), first.size()}}, first_owner}});
+    });
+    ASSERT_TRUE(
+        adapter_ptr->WaitUntilStarted(1, std::chrono::seconds(2)));
+    auto admission = backend->BatchRead(
+        {{"quiet_read", descriptor, {{second.data(), second.size()}}}});
+    ASSERT_EQ(admission.size(), 1u);
+    ASSERT_FALSE(admission[0].has_value());
+    EXPECT_EQ(admission[0].error(),
+              ErrorCode::DFS_BATCH_GET_ADMISSION_TIMEOUT);
+    first_reader.join();
+    ASSERT_EQ(timed_out.size(), 1u);
+    ASSERT_FALSE(timed_out[0].has_value());
+    EXPECT_EQ(timed_out[0].error(), ErrorCode::DFS_BATCH_GET_TIMEOUT);
+    adapter_ptr->ReleaseReads();
+    ASSERT_TRUE(
+        adapter_ptr->WaitUntilCompleted(1, std::chrono::seconds(2)));
+    first_owner.reset();
+
+    EXPECT_FALSE(backend->ProbeRead().has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(220));
+    EXPECT_TRUE(backend->ProbeRead().has_value());
 }
 
 TEST(DfsBackendTimeoutTest, RejectsReadThatExceedsInflightByteLimit) {

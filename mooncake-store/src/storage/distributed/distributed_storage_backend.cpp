@@ -179,6 +179,11 @@ bool DistributedStorageConfig::Validate() const {
                    << ", bytes=" << batch_get_max_inflight_bytes;
         return false;
     }
+    if (dfs_read_recovery_success_threshold == 0) {
+        LOG(ERROR) << "DistributedStorageConfig: DFS read recovery success "
+                      "threshold must be positive";
+        return false;
+    }
     if (allocator_type == DfsAllocatorType::BUCKET &&
         !ValidateForBucketAllocator()) {
         return false;
@@ -419,6 +424,12 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     config.batch_get_max_inflight_bytes = Environ::GetUInt64(
         "MOONCAKE_DFS_BATCH_GET_MAX_INFLIGHT_BYTES",
         config.batch_get_max_inflight_bytes);
+    config.dfs_read_recovery_success_threshold = Environ::GetUInt64(
+        "MOONCAKE_DFS_READ_RECOVERY_SUCCESS_THRESHOLD",
+        config.dfs_read_recovery_success_threshold);
+    config.dfs_read_recovery_quiet_ms = Environ::GetUInt64(
+        "MOONCAKE_DFS_READ_RECOVERY_QUIET_MS",
+        config.dfs_read_recovery_quiet_ms);
     LOG(INFO) << config.FormatStr();
     return config;
 }
@@ -458,7 +469,10 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", batch_get_max_inflight_batches="
         << batch_get_max_inflight_batches
         << ", batch_get_max_inflight_bytes="
-        << batch_get_max_inflight_bytes;
+        << batch_get_max_inflight_bytes
+        << ", dfs_read_recovery_success_threshold="
+        << dfs_read_recovery_success_threshold
+        << ", dfs_read_recovery_quiet_ms=" << dfs_read_recovery_quiet_ms;
     return oss.str();
 }
 
@@ -704,12 +718,19 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::InitLocked() {
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeRead() {
     auto initialized = TryEnsureInitialized();
-    if (!initialized) return initialized;
-    if (UsesObjectStorage()) return {};
+    if (!initialized) {
+        ResetReadRecoveryProbeStreak();
+        return initialized;
+    }
+    if (UsesObjectStorage()) return FinishSuccessfulReadProbe();
     const std::string probe_path = root_dir_ + "/" + kDfsReadProbeFileName;
     auto size = fs_adapter_->GetFileSize(probe_path);
-    if (!size) return tl::make_unexpected(size.error());
+    if (!size) {
+        ResetReadRecoveryProbeStreak();
+        return tl::make_unexpected(size.error());
+    }
     if (*size != kDfsReadProbeSize) {
+        ResetReadRecoveryProbeStreak();
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
 
@@ -722,6 +743,7 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeRead() {
     void* raw = nullptr;
     if (::posix_memalign(&raw, kDfsReadProbeBlockSize,
                          kDfsReadProbeBlockSize) != 0) {
+        ResetReadRecoveryProbeStreak();
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
     std::unique_ptr<void, decltype(&::free)> buffer(raw, &::free);
@@ -729,24 +751,81 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeRead() {
     // Open and close on every probe. Strict open has no buffered fallback and
     // PosixFsAdapter uses exactly O_RDONLY|O_DIRECT|O_CLOEXEC|O_NOFOLLOW.
     auto fd = fs_adapter_->OpenFileDirectStrict(probe_path);
-    if (!fd) return tl::make_unexpected(fd.error());
+    if (!fd) {
+        ResetReadRecoveryProbeStreak();
+        return tl::make_unexpected(fd.error());
+    }
     iovec iov{buffer.get(), kDfsReadProbeBlockSize};
     auto read = fs_adapter_->DirectReadAt(
         *fd, &iov, 1,
         static_cast<int64_t>(block * kDfsReadProbeBlockSize));
     const auto close = fs_adapter_->CloseFile(*fd);
-    if (!read) return tl::make_unexpected(read.error());
-    if (!close) return tl::make_unexpected(close.error());
+    if (!read) {
+        ResetReadRecoveryProbeStreak();
+        return tl::make_unexpected(read.error());
+    }
+    if (!close) {
+        ResetReadRecoveryProbeStreak();
+        return tl::make_unexpected(close.error());
+    }
     if (*read != kDfsReadProbeBlockSize) {
+        ResetReadRecoveryProbeStreak();
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
 
     alignas(4096) char expected[kDfsReadProbeBlockSize];
     FillDfsReadProbeBlock(expected_root_identity_, block, expected);
     if (std::memcmp(buffer.get(), expected, kDfsReadProbeBlockSize) != 0) {
+        ResetReadRecoveryProbeStreak();
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
+    return FinishSuccessfulReadProbe();
+}
+
+void DistributedStorageBackend::ResetReadRecoveryProbeStreak() {
+    std::lock_guard lock(inflight_read_mutex_);
+    read_recovery_probe_successes_ = 0;
+}
+
+tl::expected<void, ErrorCode>
+DistributedStorageBackend::FinishSuccessfulReadProbe() {
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard lock(inflight_read_mutex_);
+    if (!dfs_read_timed_out_.load(std::memory_order_acquire)) {
+        read_recovery_probe_successes_ = 0;
+        return {};
+    }
+    const bool admission_quiet =
+        last_read_admission_timeout_ ==
+            std::chrono::steady_clock::time_point{} ||
+        now - last_read_admission_timeout_ >=
+            std::chrono::milliseconds(
+                distributed_config_.dfs_read_recovery_quiet_ms);
+    const bool reads_drained = inflight_read_batches_ == 0 &&
+                               inflight_read_bytes_ == 0 &&
+                               detached_timed_out_read_workers_ == 0;
+    if (!reads_drained || !admission_quiet) {
+        read_recovery_probe_successes_ = 0;
+        LOG_EVERY_N(WARNING, 64)
+            << "DFS read probe succeeded but recovery gates are not ready: "
+            << "inflight_batches=" << inflight_read_batches_
+            << ", inflight_bytes=" << inflight_read_bytes_
+            << ", detached_timed_out_workers="
+            << detached_timed_out_read_workers_
+            << ", admission_quiet=" << admission_quiet;
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
+
+    ++read_recovery_probe_successes_;
+    if (read_recovery_probe_successes_ <
+        distributed_config_.dfs_read_recovery_success_threshold) {
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
+    read_recovery_probe_successes_ = 0;
     dfs_read_timed_out_.store(false, std::memory_order_release);
+    LOG(INFO) << "DFS read timeout latch cleared after recovery gates and "
+              << distributed_config_.dfs_read_recovery_success_threshold
+              << " consecutive probes succeeded";
     return {};
 }
 
@@ -1862,13 +1941,18 @@ bool DistributedStorageBackend::AcquireInflightReadUntil(
     return true;
 }
 
-void DistributedStorageBackend::ReleaseInflightRead(uint64_t bytes) {
+void DistributedStorageBackend::ReleaseInflightRead(uint64_t bytes,
+                                                    bool timed_out_worker) {
     {
         std::lock_guard lock(inflight_read_mutex_);
         CHECK_GT(inflight_read_batches_, 0);
         CHECK_GE(inflight_read_bytes_, bytes);
         --inflight_read_batches_;
         inflight_read_bytes_ -= bytes;
+        if (timed_out_worker) {
+            CHECK_GT(detached_timed_out_read_workers_, 0);
+            --detached_timed_out_read_workers_;
+        }
     }
     inflight_read_cv_.notify_all();
 }
@@ -1912,7 +1996,15 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
         base_timeout_ms == 0
             ? std::chrono::steady_clock::time_point::max()
             : DfsIoDeadlineFromNow(timeout_ms);
+    const bool request_fits_inflight_limit =
+        inflight_bytes <=
+        distributed_config_.batch_get_max_inflight_bytes;
     if (!AcquireInflightReadUntil(inflight_bytes, admission_deadline)) {
+        if (request_fits_inflight_limit) {
+            std::lock_guard lock(inflight_read_mutex_);
+            last_read_admission_timeout_ = std::chrono::steady_clock::now();
+            read_recovery_probe_successes_ = 0;
+        }
         LOG_EVERY_N(WARNING, 64)
             << "DFS BatchGet admission timed out waiting for in-flight "
                "capacity: "
@@ -1950,13 +2042,16 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
         std::mutex mutex;
         std::condition_variable cv;
         bool done = false;
+        bool counted_timed_out_worker = false;
         std::chrono::steady_clock::time_point completed_at;
         std::vector<DfsReadRequest> requests;
         std::vector<tl::expected<void, ErrorCode>> results;
-        std::function<void()> release_inflight;
+        std::function<void(bool)> release_inflight;
 
         ~TimedReadContext() {
-            if (release_inflight) release_inflight();
+            if (release_inflight) {
+                release_inflight(counted_timed_out_worker);
+            }
         }
     };
     std::shared_ptr<TimedReadContext> context;
@@ -1995,8 +2090,9 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     // destruction order of separate thread-lambda captures would leave a
     // narrow use-after-free window during shutdown.
     try {
-        context->release_inflight = [owner = self, inflight_bytes]() {
-            owner->ReleaseInflightRead(inflight_bytes);
+        context->release_inflight = [owner = self, inflight_bytes](
+                                        bool timed_out_worker) {
+            owner->ReleaseInflightRead(inflight_bytes, timed_out_worker);
         };
     } catch (const std::bad_alloc&) {
         ReleaseInflightRead(inflight_bytes);
@@ -2006,7 +2102,11 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     }
 
     if (std::chrono::steady_clock::now() >= deadline) {
-        dfs_read_timed_out_.store(true, std::memory_order_release);
+        {
+            std::lock_guard lock(inflight_read_mutex_);
+            dfs_read_timed_out_.store(true, std::memory_order_release);
+            read_recovery_probe_successes_ = 0;
+        }
         const auto elapsed_ms = std::chrono::duration_cast<
             std::chrono::milliseconds>(std::chrono::steady_clock::now() -
                                        request_start)
@@ -2066,7 +2166,15 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
         lock, deadline, [&context] { return context->done; });
     const auto finished_at = std::chrono::steady_clock::now();
     if (!completed_before_deadline || context->completed_at > deadline) {
-        dfs_read_timed_out_.store(true, std::memory_order_release);
+        {
+            std::lock_guard inflight_lock(inflight_read_mutex_);
+            dfs_read_timed_out_.store(true, std::memory_order_release);
+            read_recovery_probe_successes_ = 0;
+            if (!context->done) {
+                ++detached_timed_out_read_workers_;
+                context->counted_timed_out_worker = true;
+            }
+        }
         const auto elapsed_ms = std::chrono::duration_cast<
             std::chrono::milliseconds>(finished_at - request_start)
                                      .count();
