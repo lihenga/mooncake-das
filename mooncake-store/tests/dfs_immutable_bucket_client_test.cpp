@@ -641,6 +641,8 @@ TEST_F(DfsBucketEpochClientTest,
     const auto old_desc = old_query->replicas[0].get_dfs_descriptor();
     auto holder_backend = HolderBackfillBackend();
     ASSERT_NE(holder_backend, nullptr);
+    // The production executor initializes this lazily created backend.
+    ASSERT_TRUE(holder_backend->Init());
     std::string output(old_value.size(), '\0');
     ASSERT_TRUE(
         holder_backend
