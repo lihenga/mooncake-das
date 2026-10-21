@@ -32,6 +32,10 @@
 
 namespace mooncake {
 
+namespace test {
+class DfsBucketClientTest;
+}
+
 class PutOperation;
 class DistributedStorageBackend;
 class RealClient;
@@ -835,6 +839,8 @@ class Client {
                                     uint64_t quota_bytes = 0);
 
    private:
+    friend class test::DfsBucketClientTest;
+
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
@@ -1124,6 +1130,10 @@ class Client {
     // Native memory holders need not attach a foreground DFS backend.
     std::mutex dfs_backfill_backend_mutex_;
     std::shared_ptr<DistributedStorageBackend> dfs_backfill_backend_;
+    // Holder-wide I/O backoff, protected by dfs_backfill_backend_mutex_.
+    uint32_t dfs_backfill_failures_{0};
+    std::chrono::steady_clock::time_point dfs_backfill_retry_after_{};
+    UUID dfs_backfill_probe_task_{};
     // Preserve existing behavior for non-SGLang callers. SGLang explicitly
     // installs memory-only immediately after setup and before warmup.
     std::atomic<bool> dfs_read_allowed_{true};
@@ -1172,6 +1182,9 @@ class Client {
 
     tl::expected<std::shared_ptr<DistributedStorageBackend>, ErrorCode>
     GetDfsBackfillBackend();
+    bool BeginDfsBackfillAttempt(const UUID& task_id);
+    void FinishDfsBackfillAttempt(const UUID& task_id, ErrorCode result,
+                                 bool storage_failure);
 
     tl::expected<void, ErrorCode> ExecuteReplicaTransfer(
         const std::string& key, const std::string& action_name,
