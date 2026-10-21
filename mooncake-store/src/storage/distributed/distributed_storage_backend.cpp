@@ -1876,11 +1876,7 @@ void DistributedStorageBackend::ReleaseInflightRead(uint64_t bytes) {
 std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     const std::vector<DfsReadRequest>& requests) {
     if (requests.empty()) return {};
-    if (dfs_read_timed_out_.load(std::memory_order_acquire)) {
-        return std::vector<tl::expected<void, ErrorCode>>(
-            requests.size(),
-            tl::make_unexpected(ErrorCode::DFS_BATCH_GET_TIMEOUT));
-    }
+    const auto request_start = std::chrono::steady_clock::now();
     uint64_t total_bytes = 0;
     uint64_t inflight_bytes = 0;
     bool all_buffers_owned = true;
@@ -1892,6 +1888,23 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
                 all_buffers_owned = false;
             }
         }
+    }
+    if (dfs_read_timed_out_.load(std::memory_order_acquire)) {
+        LOG_EVERY_N(WARNING, 64)
+            << "DFS BatchGet rejected by timeout latch: "
+            << "reason=previous_read_timeout_latched, requests="
+            << requests.size() << ", total_bytes=" << total_bytes
+            << ", inflight_bytes=" << inflight_bytes
+            << ", configured_timeout_ms="
+            << distributed_config_.batch_get_timeout_ms
+            << ", max_inflight_batches="
+            << distributed_config_.batch_get_max_inflight_batches
+            << ", max_inflight_bytes="
+            << distributed_config_.batch_get_max_inflight_bytes
+            << ", error=" << ErrorCode::DFS_BATCH_GET_TIMEOUT;
+        return std::vector<tl::expected<void, ErrorCode>>(
+            requests.size(),
+            tl::make_unexpected(ErrorCode::DFS_BATCH_GET_TIMEOUT));
     }
     const auto base_timeout_ms = distributed_config_.batch_get_timeout_ms;
     const auto timeout_ms = DfsBatchGetTimeoutMs(base_timeout_ms, total_bytes);
@@ -1994,6 +2007,22 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
 
     if (std::chrono::steady_clock::now() >= deadline) {
         dfs_read_timed_out_.store(true, std::memory_order_release);
+        const auto elapsed_ms = std::chrono::duration_cast<
+            std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                       request_start)
+                                     .count();
+        LOG_EVERY_N(WARNING, 64)
+            << "DFS BatchGet timed out before worker launch: "
+            << "reason=deadline_expired_after_admission, requests="
+            << requests.size() << ", total_bytes=" << total_bytes
+            << ", inflight_bytes=" << inflight_bytes
+            << ", timeout_ms=" << timeout_ms
+            << ", elapsed_ms=" << elapsed_ms
+            << ", max_inflight_batches="
+            << distributed_config_.batch_get_max_inflight_batches
+            << ", max_inflight_bytes="
+            << distributed_config_.batch_get_max_inflight_bytes
+            << ", error=" << ErrorCode::DFS_BATCH_GET_TIMEOUT;
         return std::vector<tl::expected<void, ErrorCode>>(
             requests.size(),
             tl::make_unexpected(ErrorCode::DFS_BATCH_GET_TIMEOUT));
@@ -2033,10 +2062,36 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     }
 
     std::unique_lock lock(context->mutex);
-    if (!context->cv.wait_until(lock, deadline,
-                                [&context] { return context->done; }) ||
-        context->completed_at > deadline) {
+    const bool completed_before_deadline = context->cv.wait_until(
+        lock, deadline, [&context] { return context->done; });
+    const auto finished_at = std::chrono::steady_clock::now();
+    if (!completed_before_deadline || context->completed_at > deadline) {
         dfs_read_timed_out_.store(true, std::memory_order_release);
+        const auto elapsed_ms = std::chrono::duration_cast<
+            std::chrono::milliseconds>(finished_at - request_start)
+                                     .count();
+        const auto worker_elapsed_ms =
+            context->done
+                ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                      context->completed_at - request_start)
+                      .count()
+                : -1;
+        LOG_EVERY_N(WARNING, 64)
+            << "DFS BatchGet I/O timed out: "
+            << "reason="
+            << (completed_before_deadline ? "worker_completed_after_deadline"
+                                          : "worker_not_completed_by_deadline")
+            << ", requests=" << requests.size()
+            << ", total_bytes=" << total_bytes
+            << ", inflight_bytes=" << inflight_bytes
+            << ", timeout_ms=" << timeout_ms
+            << ", elapsed_ms=" << elapsed_ms
+            << ", worker_elapsed_ms=" << worker_elapsed_ms
+            << ", max_inflight_batches="
+            << distributed_config_.batch_get_max_inflight_batches
+            << ", max_inflight_bytes="
+            << distributed_config_.batch_get_max_inflight_bytes
+            << ", error=" << ErrorCode::DFS_BATCH_GET_TIMEOUT;
         return std::vector<tl::expected<void, ErrorCode>>(
             requests.size(),
             tl::make_unexpected(ErrorCode::DFS_BATCH_GET_TIMEOUT));
