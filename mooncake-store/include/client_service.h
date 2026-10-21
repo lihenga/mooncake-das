@@ -212,13 +212,17 @@ class Client {
      * @param object_keys Keys of the objects
      * @param query_results Previously queried object metadata for each key
      * @param slices Map of object keys to their data slices
+     * @param dfs_buffer_owners Optional owners that keep DFS destination
+     * buffers alive until timed-out filesystem reads actually complete
      * @return Vector of ErrorCode results for each object
      */
     std::vector<tl::expected<void, ErrorCode>> BatchGet(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices,
-        bool prefer_same_node = false);
+        bool prefer_same_node = false,
+        const std::unordered_map<std::string, std::shared_ptr<void>>*
+            dfs_buffer_owners = nullptr);
 
     /**
      * @brief Stores data with replication

@@ -1221,11 +1221,14 @@ TEST_F(DfsBucketClientTest, ReadTimeoutDoesNotChangeClientAccessPolicy) {
     ASSERT_TRUE(backend_->Init().has_value());
     writer_->SetDfsStorageBackend(backend_);
 
-    std::string output(value.size(), '\0');
+    auto output = std::make_shared<std::string>(value.size(), '\0');
     std::unordered_map<std::string, std::vector<Slice>> read_slices;
-    read_slices[key] = {{output.data(), output.size()}};
+    read_slices[key] = {{output->data(), output->size()}};
+    std::unordered_map<std::string, std::shared_ptr<void>> buffer_owners;
+    buffer_owners.emplace(key, output);
     adapter_->BlockReads();
-    auto timed_out = writer_->BatchGet({key}, {*query}, read_slices);
+    auto timed_out = writer_->BatchGet({key}, {*query}, read_slices, false,
+                                       &buffer_owners);
     ASSERT_EQ(timed_out.size(), 1u);
     ASSERT_FALSE(timed_out[0].has_value());
     EXPECT_EQ(timed_out[0].error(), ErrorCode::DFS_BATCH_GET_TIMEOUT);
@@ -1234,11 +1237,12 @@ TEST_F(DfsBucketClientTest, ReadTimeoutDoesNotChangeClientAccessPolicy) {
     adapter_->ReleaseReads();
     ASSERT_TRUE(adapter_->WaitUntilReadDone(std::chrono::seconds(2)));
     ASSERT_TRUE(backend_->ProbeRead().has_value());
-    std::fill(output.begin(), output.end(), '\0');
-    auto recovered = writer_->BatchGet({key}, {*query}, read_slices);
+    std::fill(output->begin(), output->end(), '\0');
+    auto recovered = writer_->BatchGet({key}, {*query}, read_slices, false,
+                                       &buffer_owners);
     ASSERT_EQ(recovered.size(), 1u);
     ASSERT_TRUE(recovered[0].has_value());
-    EXPECT_EQ(output, value);
+    EXPECT_EQ(*output, value);
 }
 
 TEST_F(DfsBucketClientTest, ClientDestructionDrainsInFlightAsyncWrites) {

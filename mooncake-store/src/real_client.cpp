@@ -4157,14 +4157,14 @@ RealClient::batch_get_buffer_internal(
         size_t original_index;
         std::string key;
         QueryResult query_result;
-        std::unique_ptr<BufferHandle> buffer_handle;
+        std::shared_ptr<BufferHandle> buffer_handle;
         std::vector<Slice> slices;
     };
     struct DiskKeyOp {
         size_t original_index;
         std::string key;
         QueryResult query_result;
-        std::unique_ptr<BufferHandle> buffer_handle;
+        std::shared_ptr<BufferHandle> buffer_handle;
         uint64_t total_size;
     };
     std::vector<KeyOp> valid_ops;
@@ -4213,7 +4213,7 @@ RealClient::batch_get_buffer_internal(
         }
 
         auto buffer_handle =
-            std::make_unique<BufferHandle>(std::move(*alloc_result));
+            std::make_shared<BufferHandle>(std::move(*alloc_result));
         std::vector<Slice> slices;
         allocateSlices(slices, replica, buffer_handle->ptr());
 
@@ -4269,16 +4269,20 @@ RealClient::batch_get_buffer_internal(
             batch_slices[op.key] = op.slices;
         }
 
-        auto batch_get_results =
-            client_->BatchGet(batch_keys, batch_query_results, batch_slices);
+        std::unordered_map<std::string, std::shared_ptr<void>>
+            batch_buffer_owners;
+        for (const auto &op : valid_ops) {
+            batch_buffer_owners.emplace(op.key, op.buffer_handle);
+        }
+        auto batch_get_results = client_->BatchGet(
+            batch_keys, batch_query_results, batch_slices, false,
+            &batch_buffer_owners);
 
         // 4. Process results and create BufferHandles
         for (size_t i = 0; i < valid_ops.size(); ++i) {
             if (batch_get_results[i]) {
                 auto &op = valid_ops[i];
-                final_results[op.original_index] =
-                    std::make_shared<BufferHandle>(
-                        std::move(*op.buffer_handle));
+                final_results[op.original_index] = op.buffer_handle;
             } else {
                 LOG(ERROR) << "BatchGet failed for key '" << valid_ops[i].key
                            << "': " << toString(batch_get_results[i].error());
@@ -4336,9 +4340,7 @@ RealClient::batch_get_buffer_internal(
                             << "': " << toString(checksum_result.error());
                         continue;
                     }
-                    final_results[op.original_index] =
-                        std::make_shared<BufferHandle>(
-                            std::move(*op.buffer_handle));
+                    final_results[op.original_index] = op.buffer_handle;
                 } else {
                     LOG(ERROR) << "SSD read failed for key '" << key
                                << "': " << toString(read_result.error());
@@ -6222,7 +6224,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         std::vector<QueryResult> disk_batch_qrs;
         std::unordered_map<std::string, std::vector<Slice>> disk_batch_slices;
         std::vector<size_t> disk_batch_indices;
-        std::unordered_map<std::string, std::unique_ptr<BufferHandle>>
+        std::unordered_map<std::string, std::shared_ptr<BufferHandle>>
             disk_temp_handles;
 
         for (size_t di = 0; di < disk_operations.size(); ++di) {
@@ -6241,7 +6243,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                 continue;
             }
             auto handle =
-                std::make_unique<BufferHandle>(std::move(*alloc_result));
+                std::make_shared<BufferHandle>(std::move(*alloc_result));
             std::vector<Slice> disk_slices;
             allocateSlices(disk_slices, replica, handle->ptr());
             disk_batch_keys.push_back(op.key);
@@ -6253,8 +6255,14 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         }
 
         if (!disk_batch_keys.empty()) {
+            std::unordered_map<std::string, std::shared_ptr<void>>
+                disk_buffer_owners;
+            for (const auto &[key, handle] : disk_temp_handles) {
+                disk_buffer_owners.emplace(key, handle);
+            }
             auto disk_results = client_->BatchGet(
-                disk_batch_keys, disk_batch_qrs, disk_batch_slices);
+                disk_batch_keys, disk_batch_qrs, disk_batch_slices, false,
+                &disk_buffer_owners);
 
             for (size_t di = 0; di < disk_batch_indices.size(); ++di) {
                 const auto &key = disk_batch_keys[di];
@@ -7846,9 +7854,15 @@ void RealClient::execute_session_dfs_range_reads_batch(
     }
     auto t_io_done = std::chrono::steady_clock::now();
     if (!disk_batch_keys.empty()) {
+        std::unordered_map<std::string, std::shared_ptr<void>>
+            disk_buffer_owners;
+        for (const auto &[key, handle] : disk_temp_handles) {
+            disk_buffer_owners.emplace(key, handle);
+        }
         const auto io_start = std::chrono::steady_clock::now();
         auto disk_results = client_->BatchGet(disk_batch_keys, disk_batch_qrs,
-                                              disk_batch_slices);
+                                              disk_batch_slices, false,
+                                              &disk_buffer_owners);
         const double io_duration =
             std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                           io_start)
@@ -8829,7 +8843,7 @@ RealClient::batch_get_into_multi_buffers_internal(
             std::unordered_map<std::string, std::vector<Slice>>
                 disk_batch_slices;
             std::vector<std::string> disk_key_order;
-            std::unordered_map<std::string, std::unique_ptr<BufferHandle>>
+            std::unordered_map<std::string, std::shared_ptr<BufferHandle>>
                 temp_handles;
 
             for (auto &[key, op] : valid_local_disk_ops) {
@@ -8848,7 +8862,7 @@ RealClient::batch_get_into_multi_buffers_internal(
                     continue;
                 }
                 auto handle =
-                    std::make_unique<BufferHandle>(std::move(*alloc_result));
+                    std::make_shared<BufferHandle>(std::move(*alloc_result));
                 std::vector<Slice> disk_slices;
                 allocateSlices(disk_slices, replica, handle->ptr());
                 disk_batch_keys.push_back(key);
@@ -8860,9 +8874,14 @@ RealClient::batch_get_into_multi_buffers_internal(
             }
 
             if (!disk_batch_keys.empty()) {
+                std::unordered_map<std::string, std::shared_ptr<void>>
+                    disk_buffer_owners;
+                for (const auto &[key, handle] : temp_handles) {
+                    disk_buffer_owners.emplace(key, handle);
+                }
                 auto disk_results = client_->BatchGet(
                     disk_batch_keys, disk_batch_qrs, disk_batch_slices,
-                    prefer_alloc_in_same_node);
+                    prefer_alloc_in_same_node, &disk_buffer_owners);
 
                 for (size_t di = 0; di < disk_key_order.size(); ++di) {
                     const auto &key = disk_key_order[di];

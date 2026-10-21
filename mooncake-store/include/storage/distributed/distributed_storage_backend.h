@@ -76,6 +76,10 @@ struct DistributedStorageConfig {
     bool direct_read_enabled = true;
     // Baseline for the size-scaled DFS BatchGet deadline. Zero disables it.
     uint64_t batch_get_timeout_ms = 10000;
+    // Bound DFS reads whose filesystem I/O has not actually completed. A
+    // timeout keeps both charges until the background read really returns.
+    uint64_t batch_get_max_inflight_batches = 2;
+    uint64_t batch_get_max_inflight_bytes = 2ULL * 1024 * 1024 * 1024;
     // Cleared by FromEnvironment() when MOONCAKE_DFS_ALLOCATOR_TYPE names an
     // unknown allocator, so the master can reject the configuration instead of
     // silently defaulting to SHARD.
@@ -99,6 +103,10 @@ struct DfsReadRequest {
     std::string key;
     DistributedFSDescriptor descriptor;
     std::vector<Slice> slices;
+    // Owns the allocation addressed by slices. A timed read copies this owner
+    // into its background context so the allocator cannot reuse the memory
+    // before the underlying preadv has really returned.
+    std::shared_ptr<void> buffer_owner;
 };
 
 /**
@@ -330,6 +338,9 @@ class DistributedStorageBackend
         const std::vector<DfsReadRequest>& requests,
         std::vector<tl::expected<void, ErrorCode>>& results);
 
+    bool TryAcquireInflightRead(uint64_t bytes);
+    void ReleaseInflightRead(uint64_t bytes);
+
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
     std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
     DistributedStorageConfig distributed_config_;
@@ -341,6 +352,9 @@ class DistributedStorageBackend
     uint64_t health_probe_generation_{0};
     std::atomic<uint64_t> read_probe_generation_{0};
     std::atomic<bool> dfs_read_timed_out_{false};
+    mutable std::mutex inflight_read_mutex_;
+    uint64_t inflight_read_batches_{0};
+    uint64_t inflight_read_bytes_{0};
     std::mutex health_probe_write_mutex_;
     // Canonical form of root_dir_, used to reject descriptor paths that try to
     // escape the configured DFS root.

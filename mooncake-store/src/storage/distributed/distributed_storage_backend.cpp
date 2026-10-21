@@ -174,6 +174,14 @@ bool DistributedStorageConfig::Validate() const {
                       "single_tenant=true";
         return false;
     }
+    if (batch_get_max_inflight_batches == 0 ||
+        batch_get_max_inflight_bytes == 0) {
+        LOG(ERROR) << "DistributedStorageConfig: BatchGet in-flight limits "
+                      "must be positive, batches="
+                   << batch_get_max_inflight_batches
+                   << ", bytes=" << batch_get_max_inflight_bytes;
+        return false;
+    }
     if (allocator_type == DfsAllocatorType::BUCKET &&
         !ValidateForBucketAllocator()) {
         return false;
@@ -368,6 +376,12 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
         "MOONCAKE_DFS_DIRECT_READ_ENABLED", config.direct_read_enabled);
     config.batch_get_timeout_ms = Environ::GetUInt64(
         "MOONCAKE_DFS_BATCH_GET_TIMEOUT_MS", config.batch_get_timeout_ms);
+    config.batch_get_max_inflight_batches = Environ::GetUInt64(
+        "MOONCAKE_DFS_BATCH_GET_MAX_INFLIGHT_BATCHES",
+        config.batch_get_max_inflight_batches);
+    config.batch_get_max_inflight_bytes = Environ::GetUInt64(
+        "MOONCAKE_DFS_BATCH_GET_MAX_INFLIGHT_BYTES",
+        config.batch_get_max_inflight_bytes);
     LOG(INFO) << config.FormatStr();
     return config;
 }
@@ -397,7 +411,11 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", batch_read_threads=" << batch_read_threads
         << ", batch_read_merge_enabled=" << batch_read_merge_enabled
         << ", direct_read_enabled=" << direct_read_enabled
-        << ", batch_get_timeout_ms=" << batch_get_timeout_ms;
+        << ", batch_get_timeout_ms=" << batch_get_timeout_ms
+        << ", batch_get_max_inflight_batches="
+        << batch_get_max_inflight_batches
+        << ", batch_get_max_inflight_bytes="
+        << batch_get_max_inflight_bytes;
     return oss.str();
 }
 
@@ -1764,20 +1782,77 @@ DistributedStorageBackend::BatchReadBlocking(
     return results;
 }
 
+bool DistributedStorageBackend::TryAcquireInflightRead(uint64_t bytes) {
+    std::lock_guard lock(inflight_read_mutex_);
+    if (inflight_read_batches_ >=
+            distributed_config_.batch_get_max_inflight_batches ||
+        bytes > distributed_config_.batch_get_max_inflight_bytes ||
+        inflight_read_bytes_ >
+            distributed_config_.batch_get_max_inflight_bytes - bytes) {
+        return false;
+    }
+    ++inflight_read_batches_;
+    inflight_read_bytes_ += bytes;
+    return true;
+}
+
+void DistributedStorageBackend::ReleaseInflightRead(uint64_t bytes) {
+    std::lock_guard lock(inflight_read_mutex_);
+    CHECK_GT(inflight_read_batches_, 0);
+    CHECK_GE(inflight_read_bytes_, bytes);
+    --inflight_read_batches_;
+    inflight_read_bytes_ -= bytes;
+}
+
 std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     const std::vector<DfsReadRequest>& requests) {
-    const auto base_timeout_ms = distributed_config_.batch_get_timeout_ms;
-    if (base_timeout_ms == 0 || requests.empty()) {
-        return BatchReadBlocking(requests);
-    }
+    if (requests.empty()) return {};
     if (dfs_read_timed_out_.load(std::memory_order_acquire)) {
         return std::vector<tl::expected<void, ErrorCode>>(
             requests.size(),
             tl::make_unexpected(ErrorCode::DFS_BATCH_GET_TIMEOUT));
     }
     uint64_t total_bytes = 0;
+    uint64_t inflight_bytes = 0;
+    bool all_buffers_owned = true;
     for (const auto& request : requests) {
         SaturatingAddBytes(request.descriptor.object_size, &total_bytes);
+        for (const auto& slice : request.slices) {
+            SaturatingAddBytes(slice.size, &inflight_bytes);
+            if (slice.size != 0 && !request.buffer_owner) {
+                all_buffers_owned = false;
+            }
+        }
+    }
+    if (!TryAcquireInflightRead(inflight_bytes)) {
+        dfs_read_timed_out_.store(true, std::memory_order_release);
+        LOG_EVERY_N(WARNING, 64)
+            << "Rejecting DFS BatchGet because the in-flight limit is full: "
+            << "request_bytes=" << inflight_bytes << ", max_batches="
+            << distributed_config_.batch_get_max_inflight_batches
+            << ", max_bytes="
+            << distributed_config_.batch_get_max_inflight_bytes;
+        return std::vector<tl::expected<void, ErrorCode>>(
+            requests.size(),
+            tl::make_unexpected(ErrorCode::DFS_BATCH_GET_TIMEOUT));
+    }
+
+    const auto base_timeout_ms = distributed_config_.batch_get_timeout_ms;
+    if (base_timeout_ms == 0 || !all_buffers_owned) {
+        if (base_timeout_ms != 0 && !all_buffers_owned) {
+            LOG_EVERY_N(WARNING, 64)
+                << "DFS BatchGet destination has no lifetime owner; using "
+                   "blocking I/O to prevent buffer reuse while preadv is "
+                   "still running";
+        }
+        try {
+            auto results = BatchReadBlocking(requests);
+            ReleaseInflightRead(inflight_bytes);
+            return results;
+        } catch (...) {
+            ReleaseInflightRead(inflight_bytes);
+            throw;
+        }
     }
     const auto timeout_ms =
         DfsBatchGetTimeoutMs(base_timeout_ms, total_bytes);
@@ -1790,17 +1865,24 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
         std::chrono::steady_clock::time_point completed_at;
         std::vector<DfsReadRequest> requests;
         std::vector<tl::expected<void, ErrorCode>> results;
+        std::function<void()> release_inflight;
+
+        ~TimedReadContext() {
+            if (release_inflight) release_inflight();
+        }
     };
-    auto context = std::make_shared<TimedReadContext>();
+    std::shared_ptr<TimedReadContext> context;
     try {
+        context = std::make_shared<TimedReadContext>();
         // Preserve the request metadata for the detached worker, but read
         // directly into the caller-provided slices. This keeps aligned pinned
         // buffers on the O_DIRECT zero-copy path and avoids a private buffer
-        // allocation plus a completion-time memcpy for every object. A timed-out
-        // worker may still access these slices, so the caller must keep them alive
-        // and must not reuse them until the underlying read has actually ended.
+        // allocation plus a completion-time memcpy for every object. Production
+        // callers attach the staging allocation through buffer_owner, and this
+        // copied request quarantines it until the underlying read really ends.
         context->requests = requests;
     } catch (const std::bad_alloc&) {
+        ReleaseInflightRead(inflight_bytes);
         return std::vector<tl::expected<void, ErrorCode>>(
             requests.size(),
             tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE));
@@ -1812,7 +1894,27 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     } catch (const std::bad_weak_ptr&) {
         // Test-only/legacy stack ownership cannot safely outlive this call.
         // Keep the old blocking lifetime contract in that configuration.
-        return BatchReadBlocking(requests);
+        try {
+            auto results = BatchReadBlocking(requests);
+            ReleaseInflightRead(inflight_bytes);
+            return results;
+        } catch (...) {
+            ReleaseInflightRead(inflight_bytes);
+            throw;
+        }
+    }
+    // Keep the backend alive through quota release too; relying on the
+    // destruction order of separate thread-lambda captures would leave a
+    // narrow use-after-free window during shutdown.
+    try {
+        context->release_inflight = [owner = self, inflight_bytes]() {
+            owner->ReleaseInflightRead(inflight_bytes);
+        };
+    } catch (const std::bad_alloc&) {
+        ReleaseInflightRead(inflight_bytes);
+        return std::vector<tl::expected<void, ErrorCode>>(
+            requests.size(),
+            tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE));
     }
 
     if (std::chrono::steady_clock::now() >= deadline) {

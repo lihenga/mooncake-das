@@ -471,6 +471,8 @@ TEST(DistributedStorageConfigTest, ReadsValidatesAndFormatsEnvironment) {
     env.Set("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.65");
     env.Set("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "12");
     env.Set("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL", "3");
+    env.Set("MOONCAKE_DFS_BATCH_GET_MAX_INFLIGHT_BATCHES", "7");
+    env.Set("MOONCAKE_DFS_BATCH_GET_MAX_INFLIGHT_BYTES", "12345678");
 
     const auto config = DistributedStorageConfig::FromEnvironment();
     EXPECT_EQ(config.fsdir, tmp.path());
@@ -483,6 +485,8 @@ TEST(DistributedStorageConfigTest, ReadsValidatesAndFormatsEnvironment) {
     EXPECT_DOUBLE_EQ(config.eviction_low_watermark, 0.65);
     EXPECT_EQ(config.deferred_free_duration, std::chrono::seconds(12));
     EXPECT_EQ(config.eviction_check_interval, std::chrono::seconds(3));
+    EXPECT_EQ(config.batch_get_max_inflight_batches, 7u);
+    EXPECT_EQ(config.batch_get_max_inflight_bytes, 12345678u);
     EXPECT_TRUE(config.Validate());
     EXPECT_TRUE(config.ValidateForAllocator());
 
@@ -874,21 +878,32 @@ class BlockingReadPosixFsAdapter : public PosixFsAdapter {
         blocked_ = false;
         cv_.notify_all();
     }
-    bool WaitUntilDone(std::chrono::milliseconds timeout) {
+    bool WaitUntilCompleted(size_t count, std::chrono::milliseconds timeout) {
         std::unique_lock lock(mutex_);
-        return cv_.wait_for(lock, timeout, [this] { return done_; });
+        return cv_.wait_for(lock, timeout,
+                            [this, count] { return completed_reads_ >= count; });
+    }
+    bool WaitUntilStarted(size_t count, std::chrono::milliseconds timeout) {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, timeout,
+                            [this, count] { return started_reads_ >= count; });
+    }
+    size_t StartedReads() {
+        std::lock_guard lock(mutex_);
+        return started_reads_;
     }
     tl::expected<size_t, ErrorCode> ReadAt(int fd, iovec* iov, int iovcnt,
                                            int64_t offset) override {
         {
             std::unique_lock lock(mutex_);
+            ++started_reads_;
             cv_.notify_all();
             cv_.wait(lock, [this] { return !blocked_; });
         }
         auto result = PosixFsAdapter::ReadAt(fd, iov, iovcnt, offset);
         {
             std::lock_guard lock(mutex_);
-            done_ = true;
+            ++completed_reads_;
         }
         cv_.notify_all();
         return result;
@@ -898,10 +913,11 @@ class BlockingReadPosixFsAdapter : public PosixFsAdapter {
     std::mutex mutex_;
     std::condition_variable cv_;
     bool blocked_ = false;
-    bool done_ = false;
+    size_t started_reads_ = 0;
+    size_t completed_reads_ = 0;
 };
 
-TEST(DfsBackendTimeoutTest, LateReadContinuesIntoCallerBuffer) {
+TEST(DfsBackendTimeoutTest, RequiresOwnerForTimeoutAndQuarantinesIt) {
     TempDir tmp("dfs_read_timeout");
     ASSERT_TRUE(WriteTestDfsRootIdentity(tmp.path()));
     FileStorageConfig file_config;
@@ -933,18 +949,167 @@ TEST(DfsBackendTimeoutTest, LateReadContinuesIntoCallerBuffer) {
     ASSERT_TRUE(writes[0].has_value());
 
     std::string destination(4096, 'S');
+    std::atomic<bool> ownerless_returned{false};
+    std::vector<tl::expected<void, ErrorCode>> ownerless_result;
     adapter_ptr->BlockReads();
-    auto reads = backend->BatchRead(
-        {{"timeout_read", descriptor,
-          {{destination.data(), destination.size()}}}});
+    std::thread ownerless_reader([&] {
+        ownerless_result = backend->BatchRead(
+            {{"timeout_read", descriptor,
+              {{destination.data(), destination.size()}}}});
+        ownerless_returned.store(true);
+    });
+    EXPECT_TRUE(adapter_ptr->WaitUntilStarted(1, std::chrono::seconds(2)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    EXPECT_FALSE(ownerless_returned.load());
+    adapter_ptr->ReleaseReads();
+    ownerless_reader.join();
+    ASSERT_EQ(ownerless_result.size(), 1u);
+    ASSERT_TRUE(ownerless_result[0].has_value());
+    EXPECT_EQ(destination, source);
+
+    destination.assign(4096, 'S');
+    std::atomic<bool> owner_released{false};
+    auto owner = std::shared_ptr<void>(destination.data(),
+                                      [&owner_released](void*) {
+                                          owner_released.store(true);
+                                      });
+    adapter_ptr->BlockReads();
+    auto reads = backend->BatchRead({{"timeout_read", descriptor,
+                                     {{destination.data(), destination.size()}},
+                                     owner}});
+    owner.reset();
     ASSERT_EQ(reads.size(), 1u);
     ASSERT_FALSE(reads[0].has_value());
     EXPECT_EQ(reads[0].error(), ErrorCode::DFS_BATCH_GET_TIMEOUT);
     EXPECT_EQ(destination, std::string(4096, 'S'));
+    EXPECT_FALSE(owner_released.load());
 
     adapter_ptr->ReleaseReads();
-    ASSERT_TRUE(adapter_ptr->WaitUntilDone(std::chrono::seconds(2)));
+    ASSERT_TRUE(
+        adapter_ptr->WaitUntilCompleted(2, std::chrono::seconds(2)));
     EXPECT_EQ(destination, source);
+    for (int i = 0; i < 200 && !owner_released.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_TRUE(owner_released.load());
+}
+
+TEST(DfsBackendTimeoutTest, LimitsTimedReadsUntilRealCompletion) {
+    TempDir tmp("dfs_read_inflight_limit");
+    ASSERT_TRUE(WriteTestDfsRootIdentity(tmp.path()));
+    {
+        std::ofstream probe(tmp.file(kDfsReadProbeFileName), std::ios::binary);
+        const auto contents = BuildDfsReadProbeContents(kTestDfsRootIdentity);
+        probe.write(contents.data(), contents.size());
+    }
+
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp.path();
+    DistributedStorageConfig config;
+    config.fsdir = tmp.path();
+    config.fs_adapter_type = "posix";
+    config.shard_count = 1;
+    config.shard_capacity = 64 * 1024;
+    config.alignment = 4096;
+    config.direct_read_enabled = false;
+    config.batch_get_timeout_ms = 20;
+    config.batch_get_max_inflight_batches = 2;
+    config.batch_get_max_inflight_bytes = 12288;
+
+    auto adapter = std::make_unique<BlockingReadPosixFsAdapter>();
+    auto* adapter_ptr = adapter.get();
+    auto backend = std::make_shared<DistributedStorageBackend>(
+        file_config, config, std::move(adapter), kTestDfsRootIdentity);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    const std::string shard =
+        tmp.file("dfs_shard_" + DfsGlobalAllocator::FormatShardIdx(0, 1) +
+                 ".data");
+    const DistributedFSDescriptor descriptor{shard, 0, 4096, 4096, 0};
+    std::string source(4096, 'R');
+    ASSERT_TRUE(backend->BatchWrite(
+        {{"limited_read", descriptor, {{source.data(), source.size()}}}})[0]);
+
+    std::string first(4096, '1'), second(4096, '2'), third(4096, '3');
+    std::atomic<size_t> released_owners{0};
+    auto first_owner = std::shared_ptr<void>(first.data(), [&](void*) {
+        released_owners.fetch_add(1);
+    });
+    auto second_owner = std::shared_ptr<void>(second.data(), [&](void*) {
+        released_owners.fetch_add(1);
+    });
+    adapter_ptr->BlockReads();
+    auto read = [&](std::string& destination,
+                    std::shared_ptr<void> owner = nullptr) {
+        return backend->BatchRead(
+            {{"limited_read", descriptor,
+              {{destination.data(), destination.size()}}, std::move(owner)}})[0];
+    };
+
+    EXPECT_FALSE(read(first, first_owner).has_value());
+    first_owner.reset();
+    ASSERT_TRUE(backend->ProbeRead().has_value());
+    EXPECT_FALSE(read(second, second_owner).has_value());
+    second_owner.reset();
+    ASSERT_TRUE(backend->ProbeRead().has_value());
+    const auto started_before_limit_rejection = adapter_ptr->StartedReads();
+    EXPECT_FALSE(read(third).has_value());
+    EXPECT_EQ(started_before_limit_rejection, 2u);
+    EXPECT_EQ(adapter_ptr->StartedReads(), started_before_limit_rejection);
+
+    adapter_ptr->ReleaseReads();
+    ASSERT_TRUE(
+        adapter_ptr->WaitUntilCompleted(2, std::chrono::seconds(2)));
+    for (int i = 0; i < 200 && released_owners.load() != 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_EQ(released_owners.load(), 2u);
+    ASSERT_TRUE(backend->ProbeRead().has_value());
+    EXPECT_TRUE(read(third).has_value());
+    EXPECT_EQ(third, source);
+}
+
+TEST(DfsBackendTimeoutTest, RejectsReadThatExceedsInflightByteLimit) {
+    TempDir tmp("dfs_read_inflight_byte_limit");
+    ASSERT_TRUE(WriteTestDfsRootIdentity(tmp.path()));
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp.path();
+    DistributedStorageConfig config;
+    config.fsdir = tmp.path();
+    config.fs_adapter_type = "posix";
+    config.shard_count = 1;
+    config.shard_capacity = 64 * 1024;
+    config.alignment = 4096;
+    config.direct_read_enabled = false;
+    config.batch_get_timeout_ms = 20;
+    config.batch_get_max_inflight_batches = 2;
+    config.batch_get_max_inflight_bytes = 4095;
+
+    auto adapter = std::make_unique<BlockingReadPosixFsAdapter>();
+    auto* adapter_ptr = adapter.get();
+    auto backend = std::make_shared<DistributedStorageBackend>(
+        file_config, config, std::move(adapter), kTestDfsRootIdentity);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    const std::string shard =
+        tmp.file("dfs_shard_" + DfsGlobalAllocator::FormatShardIdx(0, 1) +
+                 ".data");
+    const DistributedFSDescriptor descriptor{shard, 0, 4096, 4096, 0};
+    std::string source(4096, 'R');
+    ASSERT_TRUE(backend->BatchWrite(
+        {{"large_read", descriptor, {{source.data(), source.size()}}}})[0]);
+
+    std::string destination(4096, 'D');
+    auto read = backend->BatchRead(
+        {{"large_read", descriptor,
+          {{destination.data(), destination.size()}}}});
+    ASSERT_EQ(read.size(), 1u);
+    ASSERT_FALSE(read[0].has_value());
+    EXPECT_EQ(read[0].error(), ErrorCode::DFS_BATCH_GET_TIMEOUT);
+    EXPECT_EQ(adapter_ptr->StartedReads(), 0u);
+    EXPECT_EQ(destination, std::string(4096, 'D'));
 }
 
 TEST(DfsRootMarkerTest, ShardAllocatorPublishesFormatMarker) {

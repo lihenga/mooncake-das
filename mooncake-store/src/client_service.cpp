@@ -1988,7 +1988,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<std::string>& object_keys,
     const std::vector<QueryResult>& query_results,
     std::unordered_map<std::string, std::vector<Slice>>& slices,
-    bool prefer_alloc_in_same_node) {
+    bool prefer_alloc_in_same_node,
+    const std::unordered_map<std::string, std::shared_ptr<void>>*
+        dfs_buffer_owners) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         std::vector<tl::expected<void, ErrorCode>> results;
@@ -2100,8 +2102,16 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 continue;
             }
             const auto& desc = replica.get_dfs_descriptor();
+            std::shared_ptr<void> buffer_owner;
+            if (dfs_buffer_owners != nullptr) {
+                auto owner_it = dfs_buffer_owners->find(key);
+                if (owner_it != dfs_buffer_owners->end()) {
+                    buffer_owner = owner_it->second;
+                }
+            }
             dfs_read_requests.push_back(
-                DfsReadRequest{key, desc, slices_it->second});
+                DfsReadRequest{key, desc, slices_it->second,
+                               std::move(buffer_owner)});
             dfs_read_indices.push_back(i);
             continue;
         } else if (replica.is_nof_replica()) {
