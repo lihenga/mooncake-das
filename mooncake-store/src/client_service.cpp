@@ -440,6 +440,31 @@ FinalizeDecision DetermineFinalizeDecision(
         return std::nullopt;
     };
 
+    // A DFS-only failure must not discard an already transferred local tier.
+    // Treat the failed DFS allocation as a missing optional replica: publish
+    // the successful non-DFS replica and revoke only DFS. This also covers a
+    // staging/enqueue failure before background completion can take ownership.
+    const bool dfs_failed = summary.allocated_dfs_replicas > 0 &&
+                            summary.failed_dfs_transfers > 0 &&
+                            summary.successful_dfs_transfers == 0;
+    if (allow_missing_dfs && !dfs_deferred && dfs_failed &&
+        NonDfsTransfersSucceeded(summary)) {
+        if (summary.allocated_memory_replicas > 0 &&
+            summary.allocated_nof_replicas == 0) {
+            return {.end_type = ReplicaType::MEMORY,
+                    .revoke_type = ReplicaType::DFS,
+                    .success = true,
+                    .error = ErrorCode::OK};
+        }
+        if (summary.allocated_nof_replicas > 0 &&
+            summary.allocated_memory_replicas == 0) {
+            return {.end_type = ReplicaType::NOF_SSD,
+                    .revoke_type = ReplicaType::DFS,
+                    .success = true,
+                    .error = ErrorCode::OK};
+        }
+    }
+
     if (write_mode != ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
         const bool all_transfers_succeeded =
             AllAllocatedTransfersSucceeded(summary);
@@ -2116,14 +2141,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
     if (!dfs_read_requests.empty()) {
         auto dfs_results = dfs_storage_backend_->BatchRead(dfs_read_requests);
-        if (std::any_of(dfs_results.begin(), dfs_results.end(),
-                        [](const auto& result) {
-                            return !result &&
-                                   result.error() ==
-                                       ErrorCode::DFS_BATCH_GET_TIMEOUT;
-                        })) {
-            SetDfsAccessPolicy(false, DfsWriteAllowed());
-        }
         std::vector<DfsMissingBucketReport> missing_bucket_reports;
         if (dfs_results.size() != dfs_read_requests.size()) {
             LOG(ERROR) << "DFS BatchRead response size mismatch: expected "
@@ -2719,11 +2736,6 @@ class PutOperation {
 
     // Error context for debugging
     std::optional<std::string> failure_context;
-    // The background DFS task owns its End/Revoke lifecycle. This override
-    // lets the public BatchPut report its timely outcome without causing the
-    // foreground finalizer to race that task.
-    std::optional<ErrorCode> reported_error;
-
     // Helper methods for robust state management
     void SetSuccess() {
         state = PutOperationState::SUCCESS;
@@ -3377,47 +3389,13 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
         }
     }
 
-    bool timed_out = false;
-    bool foreground_owns_completion = false;
-    {
-        std::lock_guard lock(context->completion_mutex);
-        context->outcomes = outcomes;
-        context->io_done = true;
-        if (context->deadline !=
-                std::chrono::steady_clock::time_point::max() &&
-            std::chrono::steady_clock::now() > context->deadline) {
-            context->timed_out = true;
-        }
-        timed_out = context->timed_out;
-        foreground_owns_completion =
-            context->deadline !=
-                std::chrono::steady_clock::time_point::max() &&
-            !timed_out;
-        if (foreground_owns_completion) {
-            for (const auto& metric : context->service_dual_writes) {
-                if (metric.eligible) CancelServiceDualWritePending();
-            }
-        }
-    }
-    if (foreground_owns_completion) {
-        // With a configured deadline, a timely data write returns ownership of
-        // PutEnd/PutRevoke to the foreground finalizer. This preserves the
-        // synchronous SHARD contract and ensures a successful BatchPut has
-        // completed its master-side publication.
-        ObserveDirectIo("write", DirectStorageMetricSource(ReplicaType::DFS),
-                        all_succeeded, successful_bytes,
-                        write_duration_seconds);
-        requests.clear();
-        context->slices.clear();
-        context->ReleaseStagingSlot();
-        context->completion_cv.notify_all();
-        return;
-    }
-    context->completion_cv.notify_all();
+    const bool timed_out =
+        context->deadline != std::chrono::steady_clock::time_point::max() &&
+        std::chrono::steady_clock::now() > context->deadline;
     if (timed_out) {
-        // The caller has already observed a timeout. A late successful write
-        // must never publish its DFS replica; retain the reservation until the
-        // blocking I/O has returned, then revoke it below.
+        // The foreground has already published any successful memory replica.
+        // Do not publish a DFS replica whose write missed its deadline; revoke
+        // only that replica after the blocking I/O has actually returned.
         std::fill(outcomes.begin(), outcomes.end(),
                   ErrorCode::DFS_BATCH_PUT_TIMEOUT);
         all_succeeded = false;
@@ -3567,13 +3545,12 @@ void Client::SubmitDfsWriteChunk(
         return;
     }
 
-    // A bounded BatchPut needs owned staging even for SHARD, because its
-    // blocking pwrite may outlive the caller after the deadline. With timeout
-    // disabled, retain the legacy allocator-specific behavior.
+    // Restore the allocator's original contract: BUCKET writes are staged and
+    // asynchronous, while SHARD writes remain synchronous. The configured
+    // deadline limits publication of an asynchronous DFS replica; it does not
+    // turn every allocator into a detached write path.
     const bool async_write =
-        allow_async &&
-        (backend->GetAllocatorType() == DfsAllocatorType::BUCKET ||
-         dfs_batch_put_timeout_ms_ > 0);
+        allow_async && backend->GetAllocatorType() == DfsAllocatorType::BUCKET;
     if (!async_write) {
         auto results = WriteDfsReplicas(keys, slice_lists, descriptors);
         for (size_t i = 0; i < results.size(); ++i) {
@@ -3635,15 +3612,9 @@ void Client::SubmitDfsWriteChunk(
                 ReplicaType::DFS,
                 staging_timed_out ? ErrorCode::DFS_BATCH_PUT_TIMEOUT
                                   : ErrorCode::TRANSFER_FAIL);
-            if (staging_timed_out) {
-                op.reported_error = ErrorCode::DFS_BATCH_PUT_TIMEOUT;
-            }
             op.AppendFailureContext(staging_timed_out
                                         ? "DFS BatchPut staging timed out"
                                         : "Failed to stage DFS write data");
-        }
-        if (staging_timed_out) {
-            SetDfsAccessPolicy(DfsReadAllowed(), false);
         }
         return;
     }
@@ -3745,48 +3716,13 @@ void Client::SubmitDfsWriteChunk(
         return;
     }
 
-    std::vector<ErrorCode> timely_outcomes;
-    bool timed_out = false;
-    if (dfs_batch_put_timeout_ms_ > 0) {
-        std::unique_lock lock(context->completion_mutex);
-        const bool completed = context->completion_cv.wait_until(
-            lock, deadline, [&context] { return context->io_done; });
-        if (!completed) {
-            context->timed_out = true;
-            timed_out = true;
-        } else if (context->timed_out) {
-            timed_out = true;
-        } else {
-            timely_outcomes = context->outcomes;
-        }
-    }
-
-    // A timed-out (or legacy enqueue-only) write leaves DFS End/Revoke with the
-    // background task. A timely bounded write returns that responsibility to
-    // FinalizeBatchPut so success includes master-side publication.
+    // The foreground never waits for DFS I/O in BUCKET mode. Publish the
+    // successful local tier now; the background task exclusively owns DFS
+    // End/Revoke and applies the deadline only to DFS publication.
     for (size_t i = 0; i < op_indices.size(); ++i) {
         auto& op = ops[op_indices[i]];
-        if (timed_out) {
-            op.transfer_summary.RecordSuccess(ReplicaType::DFS);
-            op.transfer_summary.dfs_completion_deferred = true;
-            op.reported_error = ErrorCode::DFS_BATCH_PUT_TIMEOUT;
-            op.AppendFailureContext("DFS BatchPut exceeded its deadline");
-        } else if (!timely_outcomes.empty()) {
-            if (timely_outcomes[i] == ErrorCode::OK) {
-                op.transfer_summary.RecordSuccess(ReplicaType::DFS);
-            } else {
-                op.transfer_summary.RecordFailure(ReplicaType::DFS,
-                                                  timely_outcomes[i]);
-                op.AppendFailureContext("DFS BatchPut failed: " +
-                                        toString(timely_outcomes[i]));
-            }
-        } else {
-            op.transfer_summary.RecordSuccess(ReplicaType::DFS);
-            op.transfer_summary.dfs_completion_deferred = true;
-        }
-    }
-    if (timed_out) {
-        SetDfsAccessPolicy(DfsReadAllowed(), false);
+        op.transfer_summary.RecordSuccess(ReplicaType::DFS);
+        op.transfer_summary.dfs_completion_deferred = true;
     }
 }
 
@@ -3812,8 +3748,7 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
             : DfsIoDeadlineFromNow(timeout_ms);
     const bool async_write =
         allow_async && backend &&
-        (backend->GetAllocatorType() == DfsAllocatorType::BUCKET ||
-         dfs_batch_put_timeout_ms_ > 0);
+        backend->GetAllocatorType() == DfsAllocatorType::BUCKET;
     if (!async_write) {
         std::vector<size_t> all_indices(ops.size());
         std::iota(all_indices.begin(), all_indices.end(), 0);
@@ -3910,7 +3845,6 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
                         op.transfer_summary.RecordFailure(
                             ReplicaType::DFS,
                             ErrorCode::DFS_BATCH_PUT_TIMEOUT);
-                        op.reported_error = ErrorCode::DFS_BATCH_PUT_TIMEOUT;
                         op.AppendFailureContext(
                             "DFS write staging slot wait timed out");
                     }
@@ -3938,9 +3872,11 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     BatchFinalizeGroup end_all_group;
     BatchFinalizeGroup end_memory_group;
     BatchFinalizeGroup end_nof_group;
+    BatchFinalizeGroup end_dfs_group;
     BatchFinalizeGroup revoke_all_group;
     BatchFinalizeGroup revoke_memory_group;
     BatchFinalizeGroup revoke_nof_group;
+    BatchFinalizeGroup revoke_dfs_group;
 
     std::vector<size_t> pending_finalize_actions(ops.size(), 0);
     std::vector<bool> should_succeed(ops.size(), false);
@@ -3973,6 +3909,11 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
                     break;
                 case ReplicaType::NOF_SSD:
                     add_group_entry(is_end ? end_nof_group : revoke_nof_group,
+                                    key, index);
+                    ++pending_finalize_actions[index];
+                    break;
+                case ReplicaType::DFS:
+                    add_group_entry(is_end ? end_dfs_group : revoke_dfs_group,
                                     key, index);
                     ++pending_finalize_actions[index];
                     break;
@@ -4050,7 +3991,8 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     };
 
     auto process_revoke_group = [&](BatchFinalizeGroup& group,
-                                    ReplicaType replica_type) {
+                                    ReplicaType replica_type,
+                                    bool best_effort = false) {
         if (group.keys.empty()) {
             return;
         }
@@ -4058,7 +4000,9 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
             master_client_.BatchPutRevoke(group.keys, replica_type);
         if (responses.size() != group.keys.size()) {
             for (size_t idx : group.indices) {
-                finalize_rpc_errors[idx] = ErrorCode::RPC_FAIL;
+                if (!best_effort) {
+                    finalize_rpc_errors[idx] = ErrorCode::RPC_FAIL;
+                }
                 complete_finalize_action(idx);
             }
             return;
@@ -4066,7 +4010,9 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
         for (size_t i = 0; i < responses.size(); ++i) {
             const size_t op_idx = group.indices[i];
             if (!responses[i]) {
-                finalize_rpc_errors[op_idx] = responses[i].error();
+                if (!best_effort) {
+                    finalize_rpc_errors[op_idx] = responses[i].error();
+                }
                 LOG(ERROR) << "Failed to BatchPutRevoke key " << group.keys[i]
                            << ": " << toString(responses[i].error());
                 complete_finalize_action(op_idx);
@@ -4079,9 +4025,15 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     process_end_group(end_all_group, ReplicaType::ALL);
     process_end_group(end_memory_group, ReplicaType::MEMORY);
     process_end_group(end_nof_group, ReplicaType::NOF_SSD);
+    process_end_group(end_dfs_group, ReplicaType::DFS);
     process_revoke_group(revoke_all_group, ReplicaType::ALL);
     process_revoke_group(revoke_memory_group, ReplicaType::MEMORY);
     process_revoke_group(revoke_nof_group, ReplicaType::NOF_SSD);
+    // A DFS cleanup failure must not turn an already published memory replica
+    // into a failed BatchPut. The master reclaims a stranded PROCESSING DFS
+    // replica through its put-start timeout.
+    process_revoke_group(revoke_dfs_group, ReplicaType::DFS,
+                         /*best_effort=*/true);
 
     auto append_finalize_error_context = [&](PutOperation& op, size_t index) {
         if (finalize_rpc_errors[index].has_value()) {
@@ -4262,10 +4214,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
     int no_available_handle_count = 0;
     for (const auto& op : ops) {
         // With the new structure, result is always set (never nullopt)
-        results.emplace_back(op.reported_error.has_value()
-                                 ? tl::expected<void, ErrorCode>(tl::unexpected(
-                                       *op.reported_error))
-                                 : op.result);
+        results.emplace_back(op.result);
         auto& result = results.back();
 
         // Additional validation and logging for debugging
@@ -5823,12 +5772,6 @@ ErrorCode Client::ReadDfsReplica(const std::string& key,
     const auto& desc = replica_descriptor.get_dfs_descriptor();
     std::vector<DfsReadRequest> requests{DfsReadRequest{key, desc, slices}};
     auto results = dfs_storage_backend_->BatchRead(requests);
-    if (std::any_of(results.begin(), results.end(), [](const auto& result) {
-            return !result &&
-                   result.error() == ErrorCode::DFS_BATCH_GET_TIMEOUT;
-        })) {
-        SetDfsAccessPolicy(false, DfsWriteAllowed());
-    }
     if (results.size() != 1) {
         LOG(ERROR) << "DFS BatchRead response size mismatch for key " << key;
         return ErrorCode::INTERNAL_ERROR;

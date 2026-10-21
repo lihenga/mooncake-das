@@ -1017,13 +1017,8 @@ class Client {
         std::vector<std::optional<uint64_t>> object_checksums;
         std::shared_ptr<DistributedStorageBackend> backend;
         bool is_upsert = false;
-        std::mutex completion_mutex;
-        std::condition_variable completion_cv;
-        bool io_done = false;
-        bool timed_out = false;
         std::chrono::steady_clock::time_point deadline =
             std::chrono::steady_clock::time_point::max();
-        std::vector<ErrorCode> outcomes;
 
         void ReleaseStagingSlot();
         ~AsyncDfsWriteContext();
