@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <numeric>
 #ifdef USE_NOF
 #include <numa.h>
@@ -78,17 +79,26 @@ constexpr size_t kDefaultDfsWriteChunkSize = 256ULL * 1024 * 1024;
 constexpr size_t kDefaultDfsWriteArenaCount = 2;
 
 size_t ReadDfsWriteChunkSize() {
-    const size_t size = Environ::GetSizeT(
-        FileStorageEnvironmentVariables::MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES.name,
-        kDefaultDfsWriteChunkSize);
-    return size == 0 ? kDefaultDfsWriteChunkSize : size;
+    using Variables = FileStorageEnvironmentVariables;
+    const auto configured = Environ::Read(
+        Variables::MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES);
+    if (!configured.has_value()) return kDefaultDfsWriteChunkSize;
+    return *configured > 0 ? static_cast<size_t>(*configured) : 0;
 }
 
 size_t ReadDfsWriteArenaCount() {
-    const size_t count = Environ::GetSizeT(
-        FileStorageEnvironmentVariables::MC_STORE_DFS_WRITE_ARENA_COUNT.name,
-        kDefaultDfsWriteArenaCount);
-    return count == 0 ? kDefaultDfsWriteArenaCount : count;
+    const auto configured = Environ::Read(
+        FileStorageEnvironmentVariables::MC_STORE_DFS_WRITE_ARENA_COUNT);
+    if (!configured.has_value()) return kDefaultDfsWriteArenaCount;
+    return *configured > 0 ? static_cast<size_t>(*configured) : 0;
+}
+
+std::chrono::milliseconds ReadDfsWriteArenaWait() {
+    constexpr int64_t kDefaultWaitMs = 10000;
+    const auto configured = Environ::Read(
+        FileStorageEnvironmentVariables::MC_STORE_DFS_WRITE_ARENA_WAIT_MS);
+    const int64_t wait_ms = configured.value_or(kDefaultWaitMs);
+    return std::chrono::milliseconds(std::max<int64_t>(wait_ms, 0));
 }
 
 bool IsValidServiceEndpoint(const std::string& endpoint) {
@@ -412,32 +422,73 @@ struct FinalizeDecision {
 
 FinalizeDecision DetermineFinalizeDecision(
     const ReplicateConfig& config, const ReplicaTransferSummary& summary,
-    bool allow_missing_dfs = false) {
+    bool allow_missing_dfs = false, bool allow_memory_only_fallback = false) {
     const auto write_mode = DetermineReplicaWriteMode(config);
     const bool allocation_satisfied =
         HasExpectedReplicaAllocation(config, summary, allow_missing_dfs);
 
-    // When the DFS replica's completion has been handed to the background write
-    // task, this batch must not send ReplicaType::ALL: that would also complete
-    // (or revoke) the DFS replica the task still owns. Narrow the scope to the
-    // replica types this call is actually responsible for.
     const bool dfs_deferred = summary.dfs_completion_deferred;
-    const auto scoped_all = [&]() -> std::optional<ReplicaType> {
-        if (!dfs_deferred) return ReplicaType::ALL;
-        const bool has_memory = summary.allocated_memory_replicas > 0;
-        const bool has_nof = summary.allocated_nof_replicas > 0;
-        if (has_memory && has_nof) {
-            // ReplicaType::ALL is the only value covering both, and it would
-            // also touch DFS. DFS requires replica_num > 0 and is rejected
-            // together with NoF, so this combination should be unreachable;
-            // treat it as a programming error rather than guessing.
-            LOG(ERROR) << "Deferred DFS completion combined with both MEMORY "
-                          "and NoF replicas is not supported";
-            return ReplicaType::ALL;
-        }
-        if (has_memory) return ReplicaType::MEMORY;
-        if (has_nof) return ReplicaType::NOF_SSD;
-        return std::nullopt;
+    if (dfs_deferred && summary.allocated_memory_replicas > 0 &&
+        summary.allocated_nof_replicas > 0) {
+        LOG(ERROR) << "Deferred DFS completion combined with both MEMORY and "
+                      "NoF replicas is not supported";
+    }
+    const bool best_effort_dfs_failure =
+        allow_memory_only_fallback && allow_missing_dfs &&
+        config.dfs_replica_num == 1 && !dfs_deferred &&
+        NonDfsTransfersSucceeded(summary) &&
+        (summary.allocated_dfs_replicas == 0 ||
+         (summary.allocated_dfs_replicas == 1 &&
+          summary.successful_dfs_transfers == 0 &&
+          summary.failed_dfs_transfers > 0));
+    // Return the replica type(s) owned by this finalize call whose transfers
+    // succeeded. Deferred DFS completion stays owned by the background task.
+    const auto successful_type = [&]() -> std::optional<ReplicaType> {
+        const bool memory_succeeded =
+            summary.allocated_memory_replicas > 0 &&
+            summary.successful_memory_transfers ==
+                summary.allocated_memory_replicas &&
+            summary.failed_memory_transfers == 0;
+        const bool nof_succeeded =
+            summary.allocated_nof_replicas > 0 &&
+            summary.successful_nof_transfers == summary.allocated_nof_replicas &&
+            summary.failed_nof_transfers == 0;
+        const bool dfs_succeeded =
+            !dfs_deferred && summary.allocated_dfs_replicas > 0 &&
+            summary.successful_dfs_transfers == summary.allocated_dfs_replicas &&
+            summary.failed_dfs_transfers == 0;
+        const size_t successful_types = static_cast<size_t>(memory_succeeded) +
+                                        static_cast<size_t>(nof_succeeded) +
+                                        static_cast<size_t>(dfs_succeeded);
+        if (successful_types == 0) return std::nullopt;
+        if (successful_types > 1) return ReplicaType::ALL;
+        if (memory_succeeded) return ReplicaType::MEMORY;
+        if (nof_succeeded) return ReplicaType::NOF_SSD;
+        return ReplicaType::DFS;
+    };
+
+    // Return the replica type(s) still owned by this finalize call whose
+    // transfers failed. A deferred DFS replica is excluded because the
+    // background task owns its eventual End/Revoke.
+    const auto failed_type = [&]() -> std::optional<ReplicaType> {
+        const bool memory_failed =
+            summary.allocated_memory_replicas > 0 &&
+            summary.successful_memory_transfers <
+                summary.allocated_memory_replicas;
+        const bool nof_failed =
+            summary.allocated_nof_replicas > 0 &&
+            summary.successful_nof_transfers < summary.allocated_nof_replicas;
+        const bool dfs_failed =
+            !dfs_deferred && summary.allocated_dfs_replicas > 0 &&
+            summary.successful_dfs_transfers < summary.allocated_dfs_replicas;
+        const size_t failed_types = static_cast<size_t>(memory_failed) +
+                                    static_cast<size_t>(nof_failed) +
+                                    static_cast<size_t>(dfs_failed);
+        if (failed_types == 0) return std::nullopt;
+        if (failed_types > 1) return ReplicaType::ALL;
+        if (memory_failed) return ReplicaType::MEMORY;
+        if (nof_failed) return ReplicaType::NOF_SSD;
+        return ReplicaType::DFS;
     };
 
     // A DFS-only failure must not discard an already transferred local tier.
@@ -469,13 +520,29 @@ FinalizeDecision DetermineFinalizeDecision(
         const bool all_transfers_succeeded =
             AllAllocatedTransfersSucceeded(summary);
         if (allocation_satisfied && all_transfers_succeeded) {
-            return {.end_type = scoped_all(),
+            return {.end_type = successful_type(),
                     .revoke_type = std::nullopt,
                     .success = true,
                     .error = ErrorCode::OK};
         }
-        return {.end_type = std::nullopt,
-                .revoke_type = scoped_all(),
+        if (best_effort_dfs_failure) {
+            return {.end_type = successful_type(),
+                    .revoke_type = failed_type(),
+                    .success = true,
+                    .error = ErrorCode::OK};
+        }
+        if (!dfs_deferred) {
+            return {.end_type = std::nullopt,
+                    .revoke_type = ReplicaType::ALL,
+                    .success = false,
+                    .error = allocation_satisfied
+                                 ? (summary.first_error == ErrorCode::OK
+                                        ? ErrorCode::TRANSFER_FAIL
+                                        : summary.first_error)
+                                 : ErrorCode::NO_AVAILABLE_HANDLE};
+        }
+        return {.end_type = successful_type(),
+                .revoke_type = failed_type(),
                 .success = false,
                 .error = allocation_satisfied
                              ? (summary.first_error == ErrorCode::OK
@@ -488,7 +555,7 @@ FinalizeDecision DetermineFinalizeDecision(
     const bool nof_succeeded = summary.successful_nof_transfers > 0;
 
     if (memory_succeeded && nof_succeeded) {
-        return {.end_type = scoped_all(),
+        return {.end_type = successful_type(),
                 .revoke_type = std::nullopt,
                 .success = true,
                 .error = ErrorCode::OK};
@@ -506,8 +573,8 @@ FinalizeDecision DetermineFinalizeDecision(
                 .error = ErrorCode::OK};
     }
 
-    return {.end_type = std::nullopt,
-            .revoke_type = scoped_all(),
+    return {.end_type = successful_type(),
+            .revoke_type = failed_type(),
             .success = false,
             .error = summary.first_error == ErrorCode::OK
                          ? ErrorCode::NO_AVAILABLE_HANDLE
@@ -551,6 +618,7 @@ Client::Client(const std::string& local_hostname,
           "MOONCAKE_DFS_BATCH_PUT_TIMEOUT_MS", 10000)),
       dfs_write_arena_count_(ReadDfsWriteArenaCount()),
       dfs_write_chunk_size_(ReadDfsWriteChunkSize()),
+      dfs_write_arena_wait_(ReadDfsWriteArenaWait()),
       pinned_buffer_pool_(
           std::make_shared<PinnedBufferPool>(Environ::GetSizeT(
               "MC_STORE_DFS_PINNED_POOL_BYTES",
@@ -566,19 +634,6 @@ Client::Client(const std::string& local_hostname,
     }
     LOG(INFO) << "DFS BatchPut timeout baseline: "
               << dfs_batch_put_timeout_ms_ << " ms (0 disables)";
-
-    try {
-        dfs_write_staging_pool_ = std::make_shared<DfsWriteStagingPool>(
-            dfs_write_chunk_size_, dfs_write_arena_count_);
-        LOG(INFO) << "Initialized DFS write staging arenas: count="
-                  << dfs_write_arena_count_ << ", size="
-                  << dfs_write_chunk_size_ << ", chunk_limit="
-                  << dfs_write_chunk_size_;
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "Failed to initialize DFS write staging arenas: "
-                   << e.what();
-        throw;
-    }
 
     if (metrics_) {
         if (metrics_->GetReportingInterval() > 0) {
@@ -1424,6 +1479,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     } else {
         auto config = config_response.value();
         client->dfs_root_identity_ = config.dfs_root_identity;
+        client->master_dfs_root_dir_ = config.dfs_fsdir;
         WarnOnClientDfsPathMismatch(config.dfs_fsdir);
         if (config.fsdir.empty()) {
             LOG(INFO)
@@ -2461,15 +2517,28 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
 
     const auto finalize_decision =
         DetermineFinalizeDecision(client_cfg, transfer_summary,
-                                  /*allow_missing_dfs=*/true);
+                                  /*allow_missing_dfs=*/true,
+                                  /*allow_memory_only_fallback=*/
+                                      dfs_storage_backend_ &&
+                                      dfs_storage_backend_->GetAllocatorType() ==
+                                          DfsAllocatorType::BUCKET);
 
+    if (finalize_decision.success && finalize_decision.revoke_type ==
+                                      ReplicaType::DFS) {
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(WARNING) << "Put degraded to memory-only for key " << key
+                         << ", suppressed=" << *suppressed;
+        }
+    }
+
+    std::optional<ErrorCode> finalize_error;
     if (finalize_decision.end_type.has_value()) {
         auto end_result = master_client_.PutEnd(
             ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
         if (!end_result) {
-            ErrorCode err = end_result.error();
-            LOG(ERROR) << "Failed to end put operation: " << err;
-            return tl::unexpected(err);
+            finalize_error = end_result.error();
+            LOG(ERROR) << "Failed to end put operation: " << *finalize_error;
         }
     }
 
@@ -2477,9 +2546,15 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         auto revoke_result =
             master_client_.PutRevoke(key, *finalize_decision.revoke_type);
         if (!revoke_result) {
-            LOG(ERROR) << "Failed to revoke put operation";
-            return tl::unexpected(revoke_result.error());
+            if (!finalize_error.has_value()) {
+                finalize_error = revoke_result.error();
+            }
+            LOG(ERROR) << "Failed to revoke put operation: "
+                       << toString(revoke_result.error());
         }
+    }
+    if (finalize_error.has_value()) {
+        return tl::unexpected(*finalize_error);
     }
 
     if (!finalize_decision.success) {
@@ -2617,22 +2692,28 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
 
     const auto finalize_decision =
         DetermineFinalizeDecision(config, transfer_summary);
+    std::optional<ErrorCode> finalize_error;
     if (finalize_decision.end_type.has_value()) {
         auto end_result = master_client_.UpsertEnd(
             ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
         if (!end_result) {
-            ErrorCode err = end_result.error();
-            LOG(ERROR) << "Failed to end upsert operation: " << err;
-            return tl::unexpected(err);
+            finalize_error = end_result.error();
+            LOG(ERROR) << "Failed to end upsert operation: " << *finalize_error;
         }
     }
     if (finalize_decision.revoke_type.has_value()) {
         auto revoke_result =
             master_client_.UpsertRevoke(key, *finalize_decision.revoke_type);
         if (!revoke_result) {
-            LOG(ERROR) << "Failed to revoke upsert operation";
-            return tl::unexpected(revoke_result.error());
+            if (!finalize_error.has_value()) {
+                finalize_error = revoke_result.error();
+            }
+            LOG(ERROR) << "Failed to revoke upsert operation: "
+                       << toString(revoke_result.error());
         }
+    }
+    if (finalize_error.has_value()) {
+        return tl::unexpected(*finalize_error);
     }
     if (!finalize_decision.success) {
         return tl::unexpected(finalize_decision.error);
@@ -3184,7 +3265,8 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
 std::vector<ErrorCode> Client::WriteDfsReplicas(
     const std::vector<std::string>& keys,
     const std::vector<const std::vector<Slice>*>& slice_lists,
-    const std::vector<DistributedFSDescriptor>& descriptors) {
+    const std::vector<DistributedFSDescriptor>& descriptors,
+    std::shared_ptr<DistributedStorageBackend> backend) {
     if (keys.size() != slice_lists.size() ||
         keys.size() != descriptors.size()) {
         return std::vector<ErrorCode>(keys.size(), ErrorCode::INVALID_PARAMS);
@@ -3192,7 +3274,8 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
     if (keys.empty()) {
         return {};
     }
-    if (!dfs_storage_backend_) {
+    if (!backend) backend = dfs_storage_backend_;
+    if (!backend) {
         LOG(ERROR) << "DFS backend is unavailable for synchronous write";
         return std::vector<ErrorCode>(keys.size(),
                                       ErrorCode::DFS_SERVICE_UNAVAILABLE);
@@ -3250,7 +3333,7 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
     }
 
     const auto write_started = std::chrono::steady_clock::now();
-    auto write_results = dfs_storage_backend_->BatchWrite(requests);
+    auto write_results = backend->BatchWrite(requests);
     const double write_duration_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                       write_started)
@@ -3363,7 +3446,8 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
 
     // Every request gets a definite outcome: a missing or short result vector is
     // treated as failure for the affected keys rather than silently ignored.
-    std::vector<ErrorCode> outcomes(requests.size(), ErrorCode::INTERNAL_ERROR);
+    std::vector<ErrorCode> outcomes(requests.size(),
+                                    ErrorCode::INTERNAL_ERROR);
     const auto write_started = std::chrono::steady_clock::now();
     std::vector<tl::expected<void, ErrorCode>> results;
     try {
@@ -3585,6 +3669,7 @@ void Client::SubmitDfsWriteChunk(
         context->descriptors = descriptors;
         context->backend = std::move(backend);
         context->staging_pool = dfs_write_staging_pool_;
+<<<<<<< HEAD
         const auto now = std::chrono::steady_clock::now();
         const auto staging_wait =
             deadline == std::chrono::steady_clock::time_point::max()
@@ -3594,6 +3679,10 @@ void Client::SubmitDfsWriteChunk(
                                      : std::chrono::steady_clock::duration::zero());
         context->staging_slot =
             context->staging_pool->Acquire(staging_wait, slot_timed_out);
+=======
+        context->staging_slot = context->staging_pool->Acquire(
+            dfs_write_arena_wait_, slot_timed_out);
+>>>>>>> v0.3.13.post1_l4
         if (!context->staging_slot) {
             throw std::runtime_error("DFS write staging slot unavailable");
         }
@@ -3767,6 +3856,13 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
         return;
     }
 
+    if (dfs_write_chunk_size_ == 0 || dfs_write_arena_count_ == 0) {
+        std::vector<size_t> all_indices(ops.size());
+        std::iota(all_indices.begin(), all_indices.end(), 0);
+        SubmitDfsWriteChunk(ops, all_indices, is_upsert, false);
+        return;
+    }
+
     const size_t chunk_limit = dfs_write_chunk_size_;
 
     if (!dfs_write_staging_pool_) {
@@ -3775,8 +3871,8 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
             if (!op.IsResolved() &&
                 op.transfer_summary.allocated_dfs_replicas > 0 &&
                 NonDfsTransfersSucceeded(op.transfer_summary)) {
-                op.transfer_summary.RecordFailure(ReplicaType::DFS,
-                                                  ErrorCode::TRANSFER_FAIL);
+                op.transfer_summary.RecordFailure(
+                    ReplicaType::DFS, ErrorCode::TRANSFER_FAIL);
                 op.AppendFailureContext("DFS write staging arena unavailable");
             }
         }
@@ -3873,7 +3969,8 @@ void Client::DrainAsyncDfsWrites() {
     dfs_inflight_cv_.wait(lock, [this] { return dfs_inflight_writes_ == 0; });
 }
 
-void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
+void Client::FinalizeBatchPut(std::vector<PutOperation>& ops,
+                              bool allow_memory_only_fallback) {
     struct BatchFinalizeGroup {
         std::vector<std::string> keys;
         std::vector<size_t> indices;
@@ -3961,7 +4058,7 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
 
         const auto finalize_decision = DetermineFinalizeDecision(
             op.ToReplicateConfig(), op.transfer_summary,
-            /*allow_missing_dfs=*/true);
+            /*allow_missing_dfs=*/true, allow_memory_only_fallback);
         should_succeed[i] = finalize_decision.success;
         terminal_errors[i] = finalize_decision.error;
         add_finalize_action(finalize_decision.end_type, true, op.key, i);
@@ -4039,11 +4136,15 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     process_revoke_group(revoke_all_group, ReplicaType::ALL);
     process_revoke_group(revoke_memory_group, ReplicaType::MEMORY);
     process_revoke_group(revoke_nof_group, ReplicaType::NOF_SSD);
+<<<<<<< HEAD
     // A DFS cleanup failure must not turn an already published memory replica
     // into a failed BatchPut. The master reclaims a stranded PROCESSING DFS
     // replica through its put-start timeout.
     process_revoke_group(revoke_dfs_group, ReplicaType::DFS,
                          /*best_effort=*/true);
+=======
+    process_revoke_group(revoke_dfs_group, ReplicaType::DFS);
+>>>>>>> v0.3.13.post1_l4
 
     auto append_finalize_error_context = [&](PutOperation& op, size_t index) {
         if (finalize_rpc_errors[index].has_value()) {
@@ -4218,10 +4319,17 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
 
 std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
     const std::vector<PutOperation>& ops) {
+    constexpr size_t kMaxFailureSamplesPerError = 3;
+    struct FailureSummary {
+        size_t count = 0;
+        std::vector<std::string> key_samples;
+    };
+
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(ops.size());
 
     int no_available_handle_count = 0;
+    std::map<ErrorCode, FailureSummary> failures;
     for (const auto& op : ops) {
         // With the new structure, result is always set (never nullopt)
         results.emplace_back(op.result);
@@ -4239,11 +4347,22 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
             if (result.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
                 no_available_handle_count++;
             } else {
+<<<<<<< HEAD
                 LOG(ERROR) << "Operation for key " << op.key
                            << " failed: " << toString(result.error())
                            << (op.failure_context
                                    ? (" (" + *op.failure_context + ")")
                                    : "");
+=======
+                auto& summary = failures[op.result.error()];
+                ++summary.count;
+                if (summary.key_samples.size() < kMaxFailureSamplesPerError) {
+                    summary.key_samples.push_back(
+                        op.key + (op.failure_context
+                                      ? " (" + *op.failure_context + ")"
+                                      : ""));
+                }
+>>>>>>> v0.3.13.post1_l4
             }
         } else {
             VLOG(1) << "Operation for key " << op.key
@@ -4253,6 +4372,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
     if (no_available_handle_count > 0) {
         LOG(WARNING) << "BatchPut failed for " << no_available_handle_count
                      << " keys" << PUT_NO_SPACE_HELPER_STR;
+    }
+    for (const auto& [error, summary] : failures) {
+        LOG(ERROR) << "BatchPut failed for " << summary.count
+                   << " keys, error=" << toString(error) << ", sample_keys="
+                   << boost::algorithm::join(summary.key_samples, ",");
     }
 
     return results;
@@ -4386,7 +4510,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
     if (is_upsert) {
         FinalizeBatchUpsert(ops);
     } else {
-        FinalizeBatchPut(ops);
+        const bool allow_memory_only_fallback =
+            dfs_storage_backend_ &&
+            dfs_storage_backend_->GetAllocatorType() ==
+                DfsAllocatorType::BUCKET;
+        FinalizeBatchPut(ops, allow_memory_only_fallback);
     }
     return CollectResults(ops);
 }
@@ -4455,7 +4583,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     }
 
     RecordBatchServiceDualWriteMetrics(ops);
-    FinalizeBatchPut(ops);
+    const bool allow_memory_only_fallback =
+        dfs_storage_backend_ &&
+        dfs_storage_backend_->GetAllocatorType() == DfsAllocatorType::BUCKET;
+    FinalizeBatchPut(ops, allow_memory_only_fallback);
     return CollectResults(ops);
 }
 
@@ -5040,6 +5171,19 @@ tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
 
 void Client::SetDfsStorageBackend(
     std::shared_ptr<DistributedStorageBackend> backend) {
+    if (backend && !master_dfs_root_dir_.empty()) {
+        backend->SetDescriptorRootDir(master_dfs_root_dir_);
+    }
+    const bool bucket_backend =
+        backend && backend->GetAllocatorType() == DfsAllocatorType::BUCKET;
+    if (bucket_backend && dfs_write_chunk_size_ > 0 &&
+        dfs_write_arena_count_ > 0 && !dfs_write_staging_pool_) {
+        dfs_write_staging_pool_ = std::make_shared<DfsWriteStagingPool>(
+            dfs_write_chunk_size_, dfs_write_arena_count_);
+        LOG(INFO) << "Initialized DFS write staging arenas: count="
+                  << dfs_write_arena_count_ << ", size="
+                  << dfs_write_chunk_size_;
+    }
     dfs_storage_backend_ = std::move(backend);
     EnsureStorageControlPlaneStarted();
 }
@@ -5132,7 +5276,8 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
     std::function<tl::expected<void, ErrorCode>()> end_fn,
     std::function<tl::expected<void, ErrorCode>()> revoke_fn,
     const Replica::Descriptor& source,
-    const std::vector<Replica::Descriptor>& targets) {
+    const std::vector<Replica::Descriptor>& targets,
+    std::shared_ptr<DistributedStorageBackend> dfs_backend) {
     auto revoke_lambda = [&]() {
         auto revoke_result = revoke_fn();
         if (!revoke_result.has_value()) {
@@ -5168,7 +5313,13 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
 
     // Transfer to each target
     for (const auto& target : targets) {
-        if (TransferWrite(target, slices) != ErrorCode::OK) {
+        const auto result =
+            target.is_dfs_replica()
+                ? WriteDfsReplicas({key}, {&slices},
+                                   {target.get_dfs_descriptor()}, dfs_backend)
+                      .front()
+                : TransferWrite(target, slices);
+        if (result != ErrorCode::OK) {
             revoke_lambda();
             return tl::unexpected(ErrorCode::TRANSFER_FAIL);
         }
@@ -5801,17 +5952,25 @@ ErrorCode Client::TransferReadRange(
 }
 
 void Client::PollAndDispatchTasks() {
-    if (task_running_.load()) {
+    // Drain a few full backfill batches per tick without an unbounded fetch
+    // loop or changing the normal copy/move polling cadence.
+    constexpr size_t kMaxBackfillBatches = 4;
+    for (size_t batch = 0; batch < kMaxBackfillBatches && task_running_.load();
+         ++batch) {
         auto fetch_result = FetchTasks(kTaskBatchSize);
         if (fetch_result.has_value()) {
             const auto& tasks = fetch_result.value();
+            bool has_backfill = false;
             if (!tasks.empty()) {
                 LOG(INFO) << "action=task_poll_success"
                           << ", task_count=" << tasks.size();
                 for (const auto& task_assignment : tasks) {
+                    has_backfill |=
+                        task_assignment.type == TaskType::DFS_BACKFILL;
                     SubmitTask(task_assignment);
                 }
             }
+            if (tasks.size() < kTaskBatchSize || !has_backfill) return;
         } else {
             ErrorCode error = fetch_result.error();
             // Only log if it's not an RPC failure (which is expected
@@ -5820,6 +5979,7 @@ void Client::PollAndDispatchTasks() {
                 LOG(WARNING)
                     << "action=task_poll_failed" << ", error_code=" << error;
             }
+            return;
         }
     }
 }
@@ -5849,12 +6009,116 @@ void Client::SubmitTask(const TaskAssignment& assignment) {
         [this, client_task]() { ExecuteTask(client_task); });
 }
 
+tl::expected<std::shared_ptr<DistributedStorageBackend>, ErrorCode>
+Client::GetDfsBackfillBackend() {
+    if (dfs_storage_backend_) return dfs_storage_backend_;
+    std::lock_guard<std::mutex> lock(dfs_backfill_backend_mutex_);
+    if (dfs_backfill_backend_) return dfs_backfill_backend_;
+
+    auto storage = master_client_.GetStorageConfig();
+    if (!storage) return tl::make_unexpected(storage.error());
+    if (storage->dfs_fsdir.empty() || storage->dfs_root_identity.empty()) {
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributed;
+    auto backend = CreateStorageBackend(config, storage->dfs_root_identity,
+                                        storage->dfs_fsdir);
+    if (!backend) return tl::make_unexpected(backend.error());
+    dfs_backfill_backend_ =
+        std::dynamic_pointer_cast<DistributedStorageBackend>(*backend);
+    // The executor checks initialization before acquiring a source pin.
+    return dfs_backfill_backend_;
+}
+
+bool Client::BeginDfsBackfillAttempt(const UUID& task_id) {
+    std::lock_guard<std::mutex> lock(dfs_backfill_backend_mutex_);
+    if (dfs_backfill_failures_ != 0) {
+        if (std::chrono::steady_clock::now() < dfs_backfill_retry_after_ ||
+            dfs_backfill_probe_task_ != UUID{})
+            return false;
+        // After a cooldown only one real write probes this holder's mount.
+        dfs_backfill_probe_task_ = task_id;
+    }
+    return true;
+}
+
+void Client::FinishDfsBackfillAttempt(const UUID& task_id, ErrorCode result,
+                                      bool storage_failure) {
+    std::lock_guard<std::mutex> lock(dfs_backfill_backend_mutex_);
+    const bool probe = dfs_backfill_probe_task_ == task_id;
+    if (probe) dfs_backfill_probe_task_ = UUID{};
+    if (result == ErrorCode::OK) {
+        dfs_backfill_failures_ = 0;
+        dfs_backfill_retry_after_ = {};
+    } else if (storage_failure && (dfs_backfill_failures_ == 0 || probe)) {
+        // Concurrent failures from the initial healthy batch do not keep
+        // extending the pause. Missing keys/source races do not open it.
+        dfs_backfill_failures_ = std::min(dfs_backfill_failures_ + 1, 4u);
+        dfs_backfill_retry_after_ =
+            std::chrono::steady_clock::now() +
+            std::chrono::seconds(
+                std::min(5u << (dfs_backfill_failures_ - 1), 30u));
+    }
+}
+
 void Client::ExecuteTask(const ClientTask& client_task) {
     const auto& assignment = client_task.assignment;
     ErrorCode result = ErrorCode::OK;
+    bool backfill_attempted = false;
+    bool backfill_storage_failure = false;
 
     try {
         switch (assignment.type) {
+            case TaskType::DFS_BACKFILL: {
+                if (!DfsWriteAllowed() ||
+                    !BeginDfsBackfillAttempt(assignment.id)) {
+                    result = ErrorCode::DFS_SERVICE_UNAVAILABLE;
+                    break;
+                }
+                backfill_attempted = true;
+                backfill_storage_failure = true;
+                auto backend = GetDfsBackfillBackend();
+                if (!backend) {
+                    result = backend.error();
+                    break;
+                }
+                auto initialized = (*backend)->EnsureInitialized();
+                if (!initialized) {
+                    result = initialized.error();
+                    break;
+                }
+                DfsBackfillPayload payload;
+                struct_json::from_json(payload, assignment.payload);
+                backfill_storage_failure = false;
+                auto start = master_client_.DfsBackfillStart(
+                    payload.key, payload.tenant_id, payload.source,
+                    assignment.id);
+                if (!start) {
+                    result = start.error();
+                    backfill_storage_failure =
+                        result <= ErrorCode::DFS_NETWORK_TIMEOUT &&
+                        result >= ErrorCode::DFS_PARTIAL_WRITE;
+                    break;
+                }
+                auto finish = [&](bool success) {
+                    return master_client_.DfsBackfillFinish(
+                        payload.key, payload.tenant_id, assignment.id, success);
+                };
+                backfill_storage_failure = true;
+                auto copied = ExecuteReplicaTransfer(
+                    payload.key, "dfs_backfill", [&] { return finish(true); },
+                    [&] { return finish(false); }, start->source,
+                    start->targets, *backend);
+                result = copied ? ErrorCode::OK : copied.error();
+                backfill_storage_failure =
+                    result == ErrorCode::TRANSFER_FAIL ||
+                    result == ErrorCode::FILE_OPEN_FAIL ||
+                    result == ErrorCode::FILE_WRITE_FAIL ||
+                    (result <= ErrorCode::DFS_NETWORK_TIMEOUT &&
+                     result >= ErrorCode::DFS_PARTIAL_WRITE);
+                break;
+            }
             case TaskType::REPLICA_COPY: {
                 ReplicaCopyPayload payload;
                 struct_json::from_json(payload, assignment.payload);
@@ -5899,6 +6163,11 @@ void Client::ExecuteTask(const ClientTask& client_task) {
         result = ErrorCode::INTERNAL_ERROR;
     }
 
+    if (backfill_attempted) {
+        FinishDfsBackfillAttempt(assignment.id, result,
+                                 backfill_storage_failure);
+    }
+
     if (result == ErrorCode::OK) {
         TaskCompleteRequest complete_request;
         complete_request.id = assignment.id;
@@ -5917,6 +6186,7 @@ void Client::ExecuteTask(const ClientTask& client_task) {
         // Other errors (e.g., OBJECT_NOT_FOUND, REPLICA_NOT_FOUND) should
         // not be retried
         bool should_retry =
+            assignment.type != TaskType::DFS_BACKFILL &&
             (result == ErrorCode::NO_AVAILABLE_HANDLE) &&
             (current_retry_count < assignment.max_retry_attempts);
 
@@ -5939,11 +6209,20 @@ void Client::ExecuteTask(const ClientTask& client_task) {
             task_thread_pool_.enqueue(
                 [this, retry_task]() { ExecuteTask(retry_task); });
         } else {
-            LOG(ERROR) << "action=task_execution_failed"
-                       << ", task_id=" << assignment.id
-                       << ", error_code=" << result
-                       << ", retry_count=" << current_retry_count
-                       << ", max_retry_count=" << assignment.max_retry_attempts;
+            // DFS recovery is retried by the master after a cooldown. A
+            // persistent outage must not produce one error per degraded key.
+            static DfsLogLimiter dfs_backfill_limiter;
+            auto suppressed = assignment.type == TaskType::DFS_BACKFILL
+                                  ? dfs_backfill_limiter.ShouldLog()
+                                  : std::optional<uint64_t>(0);
+            if (suppressed)
+                LOG(ERROR) << "action=task_execution_failed"
+                           << ", task_id=" << assignment.id
+                           << ", error_code=" << result
+                           << ", retry_count=" << current_retry_count
+                           << ", max_retry_count="
+                           << assignment.max_retry_attempts
+                           << ", suppressed=" << *suppressed;
             TaskCompleteRequest complete_request;
             complete_request.id = assignment.id;
             complete_request.status = TaskStatus::FAILED;
@@ -6137,8 +6416,9 @@ void Client::StorageHeartbeatThreadMain() {
             LOG(ERROR) << "Failed to ping master for " << ping_fail_count
                        << " times (non-HA); reconnecting to "
                        << current_master_address;
-            auto err = master_client_.Connect(current_master_address,
-                                              /*force_recreate=*/true);
+            // Closed connections are replaced by the pool itself. Reusing the
+            // address pool also bounds retention while the master is down.
+            auto err = master_client_.Connect(current_master_address);
             if (err != ErrorCode::OK) {
                 LOG(ERROR) << "Reconnect failed to " << current_master_address
                            << ": " << toString(err);
