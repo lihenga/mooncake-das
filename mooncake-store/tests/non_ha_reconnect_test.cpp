@@ -27,9 +27,44 @@ class MasterClientTestPeer {
     static auto Pool(const Client& client) {
         return client.master_client_.client_accessor_->GetClientPool();
     }
+    static auto Pool(const MasterClient& client) {
+        return client.client_accessor_->GetClientPool();
+    }
 };
 
 namespace testing {
+
+TEST(NonHAReconnectTest, BootstrapReadsRecoverSharedPoolAfterMasterRestart) {
+    InProcMaster master;
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder().build()));
+    const auto address = master.master_address();
+    const int port = master.rpc_port();
+    MasterClient first(generate_uuid(), nullptr);
+    ASSERT_EQ(first.Connect(address), ErrorCode::OK);
+    ASSERT_TRUE(first.GetStorageConfig());
+    const auto pool = MasterClientTestPeer::Pool(first);
+    ASSERT_NE(pool, nullptr);
+
+    // GetStorageConfig can be the first request to borrow a stale socket.
+    master.Stop();
+    ASSERT_TRUE(
+        master.Start(InProcMasterConfigBuilder().set_rpc_port(port).build()));
+    ASSERT_TRUE(first.GetStorageConfig());
+    EXPECT_EQ(MasterClientTestPeer::Pool(first), pool);
+
+    // A newly constructed client must also tolerate an idle socket retained
+    // process-wide from the preceding master, without replacing the pool.
+    master.Stop();
+    ASSERT_TRUE(
+        master.Start(InProcMasterConfigBuilder().set_rpc_port(port).build()));
+    MasterClient second(generate_uuid(), nullptr);
+    ASSERT_EQ(second.Connect(address), ErrorCode::OK);
+    EXPECT_EQ(MasterClientTestPeer::Pool(second), pool);
+    ASSERT_TRUE(second.GetStorageConfig());
+
+    master.Stop();
+    EXPECT_EQ(second.Connect(address), ErrorCode::RPC_FAIL);
+}
 
 TEST(NonHAReconnectTest, ClientRecoversAfterEstablishedConnectionBlackhole) {
     // Firewall changes are permitted only in an explicitly isolated network

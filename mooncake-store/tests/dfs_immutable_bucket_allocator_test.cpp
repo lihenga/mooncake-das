@@ -1307,6 +1307,9 @@ TEST(ImmutableBucketAllocatorTest, RecoveryDisabledReclaimsFilesAndUsesFreshBudg
     std::ofstream(tmp.file("bucket_000042.data")) << "orphan data";
     std::vector<std::string> old_files;
     for (const auto& entry : std::filesystem::directory_iterator(tmp.path())) {
+        // Root identity survives recovery-disabled sweeps; only bucket files
+        // belong to the allocator's reclamation set.
+        if (entry.path().filename() == kDfsRootMarkerFileName) continue;
         old_files.push_back(entry.path().string());
     }
 
@@ -1345,6 +1348,7 @@ TEST(ImmutableBucketAllocatorTest, RecoveryDisabledReclaimsFilesAndUsesFreshBudg
     for (const auto& path : old_files) {
         EXPECT_FALSE(std::filesystem::exists(path)) << path;
     }
+    EXPECT_TRUE(std::filesystem::exists(tmp.file(kDfsRootMarkerFileName)));
 
     // A metadata-only ID also reserves its name without loading its payload.
     std::ofstream(tmp.file("bucket_000050.meta")) << "still not metadata";
