@@ -10272,6 +10272,16 @@ void MasterService::RunDfsBackfill() {
                     auto task = task_manager_.get_read_access()
                                     .find_task_by_id(retry.task_id);
                     if (task && !task->is_finished()) continue;
+                    // A failed holder must not allocate/revoke the same DFS
+                    // object every scan when it has no local health probe.
+                    // Missing (pruned) assignments also count as failed work.
+                    if (!task || task->status == TaskStatus::FAILED) {
+                        retry.failures = std::min(retry.failures + 1, 6u);
+                        retry.retry_after = now + std::chrono::seconds(
+                            std::min(5u << retry.failures, 300u));
+                        retry.task_id = UUID{};
+                        continue;
+                    }
                 }
                 retry.retry_after = now + std::chrono::seconds(5);
                 ++attempted;

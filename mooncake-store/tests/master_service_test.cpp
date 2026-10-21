@@ -135,6 +135,52 @@ class MasterServiceTest : public ::testing::Test {
     static constexpr size_t kDefaultSegmentSize = 1024 * 1024 * 16;
     static constexpr uint64_t kStrictTenantQuotaBytes = 4 * 1024 * 1024;
 
+    TaskAssignment ExerciseBackfillFailureBackoff(
+        MasterService& service, const UUID& client, TaskAssignment task,
+        const std::string& key) {
+        const size_t index = service.getShardIndex(TenantId::Default(), key);
+        for (int failure = 1; failure <= 8; ++failure) {
+            EXPECT_EQ(service.task_manager_.get_write_access().complete_task(
+                          client, task.id, TaskStatus::FAILED, "DFS unavailable"),
+                      ErrorCode::OK);
+            {
+                MasterService::MetadataShardAccessorRW shard(&service, index);
+                shard->tenants.at(TenantId::Default())
+                    .dfs_backfill.at(key).retry_after = {};
+            }
+            const auto before = std::chrono::steady_clock::now();
+            service.RunDfsBackfill();
+            {
+                MasterService::MetadataShardAccessorRO shard(&service, index);
+                const auto& retry = shard->tenants.at(TenantId::Default())
+                                        .dfs_backfill.at(key);
+                EXPECT_EQ(retry.task_id, UUID{});
+                const auto delay = std::chrono::duration_cast<std::chrono::seconds>(
+                    retry.retry_after - before).count();
+                EXPECT_GE(delay, std::min(5 << std::min(failure, 6), 300));
+                EXPECT_LE(delay, 301);
+            }
+            service.RunDfsBackfill();
+            auto delayed = service.FetchTasks(client, 16);
+            EXPECT_TRUE(delayed.has_value());
+            if (!delayed) return task;
+            EXPECT_TRUE(delayed->empty());
+            {
+                MasterService::MetadataShardAccessorRW shard(&service, index);
+                shard->tenants.at(TenantId::Default())
+                    .dfs_backfill.at(key).retry_after = {};
+            }
+            service.RunDfsBackfill();
+            auto resumed = service.FetchTasks(client, 16);
+            EXPECT_TRUE(resumed.has_value());
+            if (!resumed) return task;
+            EXPECT_EQ(resumed->size(), 1u);
+            if (resumed->empty()) return task;
+            task = resumed->front();
+        }
+        return task;
+    }
+
     void PauseReplicaCleanup(MasterService& service) {
         service.replica_cleanup_worker_.Stop();
     }
@@ -2119,6 +2165,8 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
         EXPECT_FALSE(service.DfsBackfillStart(
             generate_uuid(), payload.key, TenantId::Default(),
             payload.source, backfill->id));
+        *backfill = ExerciseBackfillFailureBackoff(
+            service, context.client_id, *backfill, payload.key);
         auto copy = service.DfsBackfillStart(
             context.client_id, payload.key, TenantId::Default(),
             payload.source, backfill->id);
