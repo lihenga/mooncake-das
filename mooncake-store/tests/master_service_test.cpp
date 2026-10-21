@@ -2155,7 +2155,8 @@ TEST_F(MasterServiceTest, DfsRootIdentityRetriesAfterRootBecomesAvailable) {
     std::filesystem::remove_all(root);
 }
 
-TEST_F(MasterServiceTest, DfsRootGuardRecreatesMissingFilesWithPinnedContents) {
+TEST_F(MasterServiceTest,
+       DfsRootGuardRecreatesMissingProbeDirectoriesAndPinnedContents) {
     const auto root = MakeDfsTestRoot("root_guard_recreates_files");
     ScopedBucketDfsEnv env(root, "1048576", "16");
     ScopedEnvVar guard_interval("MOONCAKE_DFS_ROOT_GUARD_INTERVAL_SECONDS",
@@ -2169,16 +2170,29 @@ TEST_F(MasterServiceTest, DfsRootGuardRecreatesMissingFilesWithPinnedContents) {
         const std::string identity_path =
             root + "/" + kDfsRootIdentityFileName;
         const std::string marker_path = root + "/" + kDfsRootMarkerFileName;
-        const std::string read_probe_path = root + "/" + kDfsReadProbeFileName;
+        std::array<std::string, 2> read_probe_paths;
+        for (size_t probe_index = 0;
+             probe_index < kDfsReadProbeDirectoryNames.size(); ++probe_index) {
+            read_probe_paths[probe_index] =
+                root + "/" +
+                std::string(kDfsReadProbeDirectoryNames[probe_index]) + "/" +
+                kDfsReadProbeFileName;
+        }
         ASSERT_TRUE(std::filesystem::remove(identity_path));
         ASSERT_TRUE(std::filesystem::remove(marker_path));
-        ASSERT_TRUE(std::filesystem::remove(read_probe_path));
+        for (const auto directory_name : kDfsReadProbeDirectoryNames) {
+            ASSERT_EQ(std::filesystem::remove_all(
+                          std::filesystem::path(root) /
+                          std::string(directory_name)),
+                      2u);
+        }
 
         const auto deadline = std::chrono::steady_clock::now() +
                               std::chrono::seconds(5);
         while ((!std::filesystem::exists(identity_path) ||
                 !std::filesystem::exists(marker_path) ||
-                !std::filesystem::exists(read_probe_path)) &&
+                !std::filesystem::exists(read_probe_paths[0]) ||
+                !std::filesystem::exists(read_probe_paths[1])) &&
                std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(25));
         }
@@ -2195,13 +2209,18 @@ TEST_F(MasterServiceTest, DfsRootGuardRecreatesMissingFilesWithPinnedContents) {
             std::istreambuf_iterator<char>());
         EXPECT_EQ(restored_marker, kDfsRootMarkerPayload);
 
-        std::ifstream read_probe_file(read_probe_path, std::ios::binary);
-        const std::string restored_read_probe(
-            (std::istreambuf_iterator<char>(read_probe_file)),
-            std::istreambuf_iterator<char>());
-        EXPECT_EQ(restored_read_probe.size(), kDfsReadProbeSize);
-        EXPECT_EQ(restored_read_probe,
-                  BuildDfsReadProbeContents(storage->dfs_root_identity));
+        for (size_t probe_index = 0;
+             probe_index < read_probe_paths.size(); ++probe_index) {
+            std::ifstream read_probe_file(read_probe_paths[probe_index],
+                                          std::ios::binary);
+            const std::string restored_read_probe(
+                (std::istreambuf_iterator<char>(read_probe_file)),
+                std::istreambuf_iterator<char>());
+            EXPECT_EQ(restored_read_probe.size(), kDfsReadProbeSize);
+            EXPECT_EQ(restored_read_probe,
+                      BuildDfsReadProbeContents(storage->dfs_root_identity,
+                                                probe_index));
+        }
     }
     std::filesystem::remove_all(root);
 }

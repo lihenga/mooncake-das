@@ -36,10 +36,18 @@ const std::string kTestDfsRootIdentity =
     SerializeDfsRootIdentity("dfs_backend_test", UUID{1, 2});
 
 void WriteTestDfsReadProbe(const std::string& root) {
-    std::ofstream output(root + "/" + kDfsReadProbeFileName,
-                         std::ios::binary | std::ios::trunc);
-    const auto contents = BuildDfsReadProbeContents(kTestDfsRootIdentity);
-    output.write(contents.data(), contents.size());
+    for (size_t probe_index = 0;
+         probe_index < kDfsReadProbeDirectoryNames.size(); ++probe_index) {
+        const std::filesystem::path directory =
+            std::filesystem::path(root) /
+            kDfsReadProbeDirectoryNames[probe_index];
+        std::filesystem::create_directory(directory);
+        std::ofstream output(directory / kDfsReadProbeFileName,
+                             std::ios::binary | std::ios::trunc);
+        const auto contents =
+            BuildDfsReadProbeContents(kTestDfsRootIdentity, probe_index);
+        output.write(contents.data(), contents.size());
+    }
 }
 
 void WriteTestDfsRootIdentity(const std::filesystem::path& root,

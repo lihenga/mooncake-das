@@ -45,6 +45,32 @@ bool WriteTestDfsRootIdentity(const std::string& root) {
     return marker.good();
 }
 
+std::string TestDfsReadProbePath(const std::string& root,
+                                 size_t probe_index) {
+    return root + "/" +
+           std::string(kDfsReadProbeDirectoryNames.at(probe_index)) + "/" +
+           kDfsReadProbeFileName;
+}
+
+bool WriteTestDfsReadProbes(const std::string& root) {
+    for (size_t probe_index = 0;
+         probe_index < kDfsReadProbeDirectoryNames.size(); ++probe_index) {
+        const std::filesystem::path directory =
+            std::filesystem::path(root) /
+            kDfsReadProbeDirectoryNames[probe_index];
+        std::error_code ec;
+        std::filesystem::create_directory(directory, ec);
+        if (ec || !std::filesystem::is_directory(directory)) return false;
+        std::ofstream probe(TestDfsReadProbePath(root, probe_index),
+                            std::ios::binary | std::ios::trunc);
+        const auto contents =
+            BuildDfsReadProbeContents(kTestDfsRootIdentity, probe_index);
+        probe.write(contents.data(), contents.size());
+        if (!probe.good()) return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 class TempDir {
@@ -997,11 +1023,7 @@ TEST(DfsBackendTimeoutTest, RequiresOwnerForTimeoutAndQuarantinesIt) {
 TEST(DfsBackendTimeoutTest, LimitsTimedReadsUntilRealCompletion) {
     TempDir tmp("dfs_read_inflight_limit");
     ASSERT_TRUE(WriteTestDfsRootIdentity(tmp.path()));
-    {
-        std::ofstream probe(tmp.file(kDfsReadProbeFileName), std::ios::binary);
-        const auto contents = BuildDfsReadProbeContents(kTestDfsRootIdentity);
-        probe.write(contents.data(), contents.size());
-    }
+    ASSERT_TRUE(WriteTestDfsReadProbes(tmp.path()));
 
     FileStorageConfig file_config;
     file_config.storage_backend_type = StorageBackendType::kDistributed;
@@ -1053,21 +1075,31 @@ TEST(DfsBackendTimeoutTest, LimitsTimedReadsUntilRealCompletion) {
     EXPECT_FALSE(read(second, second_owner).has_value());
     second_owner.reset();
     ASSERT_TRUE(backend->ProbeRead().has_value());
-    const auto started_before_limit_rejection = adapter_ptr->StartedReads();
-    EXPECT_FALSE(read(third).has_value());
-    EXPECT_EQ(started_before_limit_rejection, 2u);
-    EXPECT_EQ(adapter_ptr->StartedReads(), started_before_limit_rejection);
-
+    const auto started_before_admission_wait = adapter_ptr->StartedReads();
+    std::atomic<bool> third_returned{false};
+    std::vector<tl::expected<void, ErrorCode>> third_result;
+    std::thread third_reader([&] {
+        third_result = backend->BatchRead(
+            {{"limited_read", descriptor,
+              {{third.data(), third.size()}}}});
+        third_returned.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_FALSE(third_returned.load());
+    EXPECT_EQ(started_before_admission_wait, 2u);
+    EXPECT_EQ(adapter_ptr->StartedReads(), started_before_admission_wait);
     adapter_ptr->ReleaseReads();
+    third_reader.join();
     ASSERT_TRUE(
-        adapter_ptr->WaitUntilCompleted(2, std::chrono::seconds(2)));
+        adapter_ptr->WaitUntilCompleted(3, std::chrono::seconds(2)));
+    ASSERT_EQ(third_result.size(), 1u);
+    EXPECT_TRUE(third_result[0].has_value());
+    EXPECT_EQ(third, source);
     for (int i = 0; i < 200 && released_owners.load() != 2; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     ASSERT_EQ(released_owners.load(), 2u);
     ASSERT_TRUE(backend->ProbeRead().has_value());
-    EXPECT_TRUE(read(third).has_value());
-    EXPECT_EQ(third, source);
 }
 
 TEST(DfsBackendTimeoutTest, RejectsReadThatExceedsInflightByteLimit) {
@@ -1107,7 +1139,8 @@ TEST(DfsBackendTimeoutTest, RejectsReadThatExceedsInflightByteLimit) {
           {{destination.data(), destination.size()}}}});
     ASSERT_EQ(read.size(), 1u);
     ASSERT_FALSE(read[0].has_value());
-    EXPECT_EQ(read[0].error(), ErrorCode::DFS_BATCH_GET_TIMEOUT);
+    EXPECT_EQ(read[0].error(),
+              ErrorCode::DFS_BATCH_GET_ADMISSION_TIMEOUT);
     EXPECT_EQ(adapter_ptr->StartedReads(), 0u);
     EXPECT_EQ(destination, std::string(4096, 'D'));
 }
@@ -1149,21 +1182,33 @@ TEST(DfsRootMarkerTest, ShardAllocatorDoesNotOverwriteInvalidMarker) {
 }
 
 TEST_F(DfsBackendTest, HealthProbesUseStrictDirectDedicatedFile) {
-    const std::string probe_path = tmp_->file(kDfsReadProbeFileName);
-    EXPECT_FALSE(std::filesystem::exists(probe_path));
+    const std::string first_probe_path =
+        TestDfsReadProbePath(tmp_->path(), 0);
+    const std::string second_probe_path =
+        TestDfsReadProbePath(tmp_->path(), 1);
+    EXPECT_FALSE(std::filesystem::exists(first_probe_path));
+    EXPECT_FALSE(std::filesystem::exists(second_probe_path));
 
     auto read_before_write = backend_->ProbeRead();
     ASSERT_FALSE(read_before_write.has_value());
     EXPECT_EQ(read_before_write.error(), ErrorCode::FILE_NOT_FOUND);
 
+    ASSERT_TRUE(std::filesystem::create_directory(
+        std::filesystem::path(tmp_->path()) /
+        kDfsReadProbeDirectoryNames[0]));
     {
-        std::ofstream probe(probe_path, std::ios::binary);
+        std::ofstream probe(first_probe_path, std::ios::binary);
         ASSERT_TRUE(probe.good());
         const auto contents =
-            BuildDfsReadProbeContents(kTestDfsRootIdentity);
+            BuildDfsReadProbeContents(kTestDfsRootIdentity, 0);
         probe.write(contents.data(), contents.size());
     }
-    EXPECT_EQ(std::filesystem::file_size(probe_path), kDfsReadProbeSize);
+    EXPECT_FALSE(backend_->ProbeRead().has_value())
+        << "both read-probe files are required";
+
+    ASSERT_TRUE(WriteTestDfsReadProbes(tmp_->path()));
+    EXPECT_EQ(std::filesystem::file_size(first_probe_path), kDfsReadProbeSize);
+    EXPECT_EQ(std::filesystem::file_size(second_probe_path), kDfsReadProbeSize);
     EXPECT_TRUE(backend_->ProbeRead().has_value())
         << "read probe must not depend on a prior client write probe";
 
@@ -1193,7 +1238,7 @@ TEST_F(DfsBackendTest, HealthProbesUseStrictDirectDedicatedFile) {
     EXPECT_EQ(probe_file_count, 2u);
     EXPECT_TRUE(backend_->ProbeRead().has_value());
 
-    const int fd = ::open(probe_path.c_str(), O_WRONLY | O_CLOEXEC);
+    const int fd = ::open(second_probe_path.c_str(), O_WRONLY | O_CLOEXEC);
     ASSERT_GE(fd, 0);
     constexpr char kCorruptPayload[] = "bad!";
     ASSERT_EQ(::pwrite(fd, kCorruptPayload, sizeof(kCorruptPayload) - 1,
@@ -1202,13 +1247,7 @@ TEST_F(DfsBackendTest, HealthProbesUseStrictDirectDedicatedFile) {
     ASSERT_EQ(::close(fd), 0);
     EXPECT_FALSE(backend_->ProbeRead().has_value());
 
-    {
-        std::ofstream probe(probe_path, std::ios::binary | std::ios::trunc);
-        ASSERT_TRUE(probe.good());
-        const auto contents =
-            BuildDfsReadProbeContents(kTestDfsRootIdentity);
-        probe.write(contents.data(), contents.size());
-    }
+    ASSERT_TRUE(WriteTestDfsReadProbes(tmp_->path()));
     ASSERT_TRUE(backend_->ProbeWrite().has_value());
     EXPECT_TRUE(backend_->ProbeRead().has_value());
 
@@ -1229,7 +1268,7 @@ TEST(PosixFsAdapterTest, StrictDirectOpenRejectsSymlink) {
     {
         std::ofstream output(target, std::ios::binary);
         const auto contents =
-            BuildDfsReadProbeContents(kTestDfsRootIdentity);
+            BuildDfsReadProbeContents(kTestDfsRootIdentity, 0);
         output.write(contents.data(), contents.size());
     }
     ASSERT_EQ(::symlink(target.c_str(), link.c_str()), 0);

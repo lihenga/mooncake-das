@@ -168,6 +168,22 @@ bool SyncDfsRootDirectory(const std::string& root) {
            saved_errno == EOPNOTSUPP;
 }
 
+bool EnsureDfsReadProbeDirectory(const std::string& root,
+                                 std::string_view directory_name) {
+    const std::string path = root + "/" + std::string(directory_name);
+    struct stat st {};
+    if (::lstat(path.c_str(), &st) == 0) return S_ISDIR(st.st_mode);
+    if (errno != ENOENT) return false;
+
+    if (::mkdir(path.c_str(), 0755) != 0) {
+        if (errno != EEXIST || ::lstat(path.c_str(), &st) != 0 ||
+            !S_ISDIR(st.st_mode)) {
+            return false;
+        }
+    }
+    return SyncDfsRootDirectory(root);
+}
+
 bool WriteAll(int fd, const std::string& contents) {
     size_t offset = 0;
     while (offset < contents.size()) {
@@ -1093,16 +1109,27 @@ bool MasterService::InitializeDfsRootGuard(const std::string& root,
         DfsRootFileStatus::kMatch) {
         return false;
     }
-    const std::string read_probe_path = root + "/" + kDfsReadProbeFileName;
-    const std::string read_probe = BuildDfsReadProbeContents(identity);
-    const auto probe_status =
-        ReadExpectedDfsRootFile(read_probe_path, read_probe);
-    if (probe_status == DfsRootFileStatus::kMissing) {
-        if (!PublishExpectedDfsRootFile(root, read_probe_path, read_probe)) {
+    for (size_t probe_index = 0;
+         probe_index < kDfsReadProbeDirectoryNames.size(); ++probe_index) {
+        const auto directory_name =
+            kDfsReadProbeDirectoryNames[probe_index];
+        if (!EnsureDfsReadProbeDirectory(root, directory_name)) return false;
+        const std::string probe_directory =
+            root + "/" + std::string(directory_name);
+        const std::string read_probe_path =
+            probe_directory + "/" + kDfsReadProbeFileName;
+        const std::string read_probe =
+            BuildDfsReadProbeContents(identity, probe_index);
+        const auto probe_status =
+            ReadExpectedDfsRootFile(read_probe_path, read_probe);
+        if (probe_status == DfsRootFileStatus::kMissing) {
+            if (!PublishExpectedDfsRootFile(probe_directory, read_probe_path,
+                                            read_probe)) {
+                return false;
+            }
+        } else if (probe_status != DfsRootFileStatus::kMatch) {
             return false;
         }
-    } else if (probe_status != DfsRootFileStatus::kMatch) {
-        return false;
     }
 
     std::lock_guard lock(dfs_root_guard_mutex_);
@@ -1136,15 +1163,14 @@ void MasterService::ReconcileDfsRootFiles() {
         return;
     }
 
-    const auto reconcile = [this](const char* filename,
-                                  const std::string& expected) {
-        const std::string path = dfs_root_guard_path_ + "/" + filename;
+    const auto reconcile = [](const std::string& parent, const char* filename,
+                              const std::string& expected) {
+        const std::string path = parent + "/" + filename;
         switch (ReadExpectedDfsRootFile(path, expected)) {
             case DfsRootFileStatus::kMatch:
                 return true;
             case DfsRootFileStatus::kMissing:
-                if (PublishExpectedDfsRootFile(dfs_root_guard_path_, path,
-                                               expected)) {
+                if (PublishExpectedDfsRootFile(parent, path, expected)) {
                     LOG(WARNING) << "Recreated missing DFS root file " << path;
                     return true;
                 }
@@ -1163,15 +1189,32 @@ void MasterService::ReconcileDfsRootFiles() {
         return false;
     };
 
-    // Identity is the safety boundary. Do not recreate the read-probe marker
+    // Identity is the safety boundary. Do not recreate the read-probe files
     // until the root still carries (or has atomically recovered) the exact
     // identity pinned when the allocator was initialized.
-    if (!reconcile(kDfsRootIdentityFileName, dfs_root_guard_identity_)) return;
-    reconcile(kDfsRootMarkerFileName,
+    if (!reconcile(dfs_root_guard_path_, kDfsRootIdentityFileName,
+                   dfs_root_guard_identity_)) {
+        return;
+    }
+    reconcile(dfs_root_guard_path_, kDfsRootMarkerFileName,
               std::string(kDfsRootMarkerPayload,
                           sizeof(kDfsRootMarkerPayload) - 1));
-    reconcile(kDfsReadProbeFileName,
-              BuildDfsReadProbeContents(dfs_root_guard_identity_));
+    for (size_t probe_index = 0;
+         probe_index < kDfsReadProbeDirectoryNames.size(); ++probe_index) {
+        const auto directory_name =
+            kDfsReadProbeDirectoryNames[probe_index];
+        if (!EnsureDfsReadProbeDirectory(dfs_root_guard_path_,
+                                         directory_name)) {
+            LOG(ERROR) << "Failed to create DFS read-probe directory "
+                       << dfs_root_guard_path_ << "/" << directory_name;
+            continue;
+        }
+        const std::string probe_directory =
+            dfs_root_guard_path_ + "/" + std::string(directory_name);
+        reconcile(probe_directory, kDfsReadProbeFileName,
+                  BuildDfsReadProbeContents(dfs_root_guard_identity_,
+                                            probe_index));
+    }
 }
 
 void MasterService::RefreshDfsMetrics() const {
@@ -8202,8 +8245,8 @@ void MasterService::RestoreRecoveredDfsReplicas(bool rebuild_metadata) {
                         const auto& metadata = existing->second;
                         const bool installed_by_this_recovery =
                             metadata.client_id == UUID{0, 0} &&
-                            metadata.replicas.size() == 1 &&
-                            metadata.replicas.front().is_dfs_replica();
+                            metadata.CountReplicas() == 1 &&
+                            metadata.HasReplica(&Replica::fn_is_dfs_replica);
                         if (installed_by_this_recovery) {
                             // Buckets are committed in ascending bucket_id
                             // order and the allocator's keep-max rule emits a

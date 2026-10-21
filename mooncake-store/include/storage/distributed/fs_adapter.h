@@ -253,8 +253,8 @@ class FileSystemAdapter {
 };
 
 // Created when the DFS allocator initializes and maintained by the master as a
-// stable format/version marker. Read health checks use the dedicated
-// .mooncake_dfs_read_probe file instead.
+// stable format/version marker. Read health checks use the two dedicated
+// probe files under .health1 and .health2 instead.
 inline constexpr char kDfsRootMarkerFileName[] = ".mooncake_dfs_root_marker";
 inline constexpr char kDfsRootMarkerPayload[] = "mooncake-dfs-root-v1\n";
 

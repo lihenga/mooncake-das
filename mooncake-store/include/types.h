@@ -391,6 +391,8 @@ enum class ErrorCode : int32_t {
     DFS_PARTIAL_WRITE = -1605,        ///< DFS partial write success.
     DFS_BATCH_PUT_TIMEOUT = -1606,    ///< DFS BatchPut exceeded its deadline.
     DFS_BATCH_GET_TIMEOUT = -1607,    ///< DFS BatchGet exceeded its deadline.
+    DFS_BATCH_GET_ADMISSION_TIMEOUT =
+        -1608,  ///< Timed out waiting for DFS BatchGet in-flight capacity.
     TENANT_QUOTA_EXCEEDED = -1700,    ///< Tenant memory quota exceeded.
     TENANT_NOT_REGISTERED = -1701,    ///< Tenant has no quota policy.
     TENANT_NOT_EMPTY = -1702,         ///< Tenant still owns objects or quota.
