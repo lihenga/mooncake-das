@@ -914,6 +914,25 @@ TEST_F(DfsBucketClientTest, ServiceMetricsSettleEveryChunkAndOversizedKeyOnce) {
     EXPECT_DOUBLE_EQ(*memory_only, 1.0);
 }
 
+TEST_F(DfsBucketClientTest, BackfillWaitsForHolderWriteHealthRecovery) {
+    provider_->SetDfsAccessPolicy(true, false);
+    const std::string key = "backfill_write_health";
+    const std::string value(4096, 'H');
+    std::vector<std::string> values{value};
+    auto slices = MakeSlices(values);
+    adapter_->FailAllWrites(true);
+    auto put = writer_->BatchPut({key}, slices, DfsConfig());
+    ASSERT_EQ(put.size(), 1u);
+    ASSERT_TRUE(put.front());
+    ASSERT_TRUE(WaitForKeyGone(key));
+    // The native memory holder can write this path, but its health policy
+    // forbids DFS writes. It must neither allocate nor publish a DFS replica.
+    EXPECT_FALSE(WaitForDfsReplica(key, std::chrono::seconds(6)));
+    provider_->SetDfsAccessPolicy(true, true);
+    ASSERT_TRUE(WaitForDfsReplica(key, std::chrono::seconds(12)));
+    ExpectDfsValue(key, value);
+}
+
 TEST_F(DfsBucketClientTest, FailedWriteIsBackfilledByMemoryOnlyHolder) {
     // Only writer_ has a DFS backend. The memory holder must create its own
     // backfill backend without requiring SetDfsStorageBackend from the caller.

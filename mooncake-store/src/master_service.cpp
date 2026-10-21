@@ -10352,7 +10352,7 @@ void MasterService::RunDfsBackfill() {
     // Bound recovery traffic and rotate shards so a large degraded workload
     // cannot monopolize scheduling. Failed attempts wait before reallocation.
     constexpr size_t kBatchSize = 256;
-    size_t submitted = 0;
+    size_t attempted = 0;
     const auto now = std::chrono::steady_clock::now();
     std::shared_lock<std::shared_mutex> lock(snapshot_mutex_);
     for (size_t visited = 0; visited < kNumShards; ++visited) {
@@ -10385,6 +10385,7 @@ void MasterService::RunDfsBackfill() {
                     if (task && !task->is_finished()) continue;
                 }
                 retry.retry_after = now + std::chrono::seconds(5);
+                ++attempted;
                 const auto sources = metadata.GetReplicaSegmentNames();
                 for (const auto& source : sources) {
                     auto replica = metadata.GetReplicaBySegmentName(source);
@@ -10400,11 +10401,14 @@ void MasterService::RunDfsBackfill() {
                                         owner, {tenant_id.value(), key, source});
                     if (task) {
                         retry.task_id = *task;
-                        ++submitted;
+                    } else if (task.error() ==
+                               ErrorCode::TASK_PENDING_LIMIT_EXCEEDED) {
+                        // Capacity is global: scanning more keys cannot help.
+                        return;
                     }
                     break;
                 }
-                if (submitted >= kBatchSize) return;
+                if (attempted >= kBatchSize) return;
             }
         }
     }
