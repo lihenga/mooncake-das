@@ -18,6 +18,30 @@
 namespace mooncake {
 namespace {
 
+void StampDfsEpoch(std::vector<Replica::Descriptor>& replicas,
+                   const UUID& epoch) {
+    for (auto& replica : replicas) {
+        if (replica.is_dfs_replica()) {
+            replica.get_dfs_descriptor().master_epoch = epoch;
+        }
+    }
+}
+
+void StampDfsEpoch(GetReplicaListResponse& response, const UUID& epoch) {
+    StampDfsEpoch(response.replicas, epoch);
+}
+
+template <typename T>
+void StampDfsEpoch(tl::expected<T, ErrorCode>& result, const UUID& epoch) {
+    if (result) StampDfsEpoch(*result, epoch);
+}
+
+template <typename T>
+void StampDfsEpoch(std::vector<tl::expected<T, ErrorCode>>& results,
+                   const UUID& epoch) {
+    for (auto& result : results) StampDfsEpoch(result, epoch);
+}
+
 tl::expected<TenantId, ErrorCode> ResolveRequestTenantId(std::string_view raw) {
     TenantId tenant_id{std::string(raw)};
     if (!tenant_id.IsValid()) {
@@ -309,7 +333,7 @@ WrappedMasterService::GetReplicaListByRegex(const std::string& str,
 tl::expected<GetReplicaListResponse, ErrorCode>
 WrappedMasterService::GetReplicaList(const std::string& key,
                                      const std::string& tenant_id) {
-    return execute_rpc(
+    auto result = execute_rpc(
         "GetReplicaList",
         [&] {
             return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
@@ -325,6 +349,8 @@ WrappedMasterService::GetReplicaList(const std::string& key,
         [] {
             MasterMetricManager::instance().inc_get_replica_list_failures();
         });
+    StampDfsEpoch(result, master_service_.GetDfsMasterEpoch());
+    return result;
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
@@ -374,25 +400,28 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     timer.LogResponse("total=", results.size(),
                       ", success=", results.size() - failure_count,
                       ", failures=", failure_count);
+    StampDfsEpoch(results, master_service_.GetDfsMasterEpoch());
     return results;
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 WrappedMasterService::BatchGetReplicaListForAdmin(
     const std::vector<std::string>& keys, const std::string& tenant_id) {
-    return WithRequestTenantBatch(
+    auto result = WithRequestTenantBatch(
         master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
                                                : TenantId::kDefaultValue,
         keys.size(), [&](const TenantId& resolved_tenant_id) {
             return master_service_.BatchGetReplicaListForAdmin(
                 keys, resolved_tenant_id);
         });
+    StampDfsEpoch(result, master_service_.GetDfsMasterEpoch());
+    return result;
 }
 
 tl::expected<GetReplicaListResponse, ErrorCode>
 WrappedMasterService::GetReplicaListForAdmin(const std::string& key,
                                              const std::string& tenant_id) {
-    return execute_rpc(
+    auto result = execute_rpc(
         "GetReplicaListForAdmin",
         [&] {
             return WithRequestTenant(
@@ -405,6 +434,8 @@ WrappedMasterService::GetReplicaListForAdmin(const std::string& key,
                 });
         },
         [&](auto& timer) { timer.LogRequest("key=", key); }, [] {}, [] {});
+    StampDfsEpoch(result, master_service_.GetDfsMasterEpoch());
+    return result;
 }
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
@@ -412,7 +443,7 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
                                const uint64_t slice_length,
                                const ReplicateConfig& config,
                                const std::string& tenant_id) {
-    return execute_rpc(
+    auto result = execute_rpc(
         "PutStart",
         [&] {
             return WithWriteTenant(tenant_id,
@@ -429,11 +460,19 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
         },
         [&] { MasterMetricManager::instance().inc_put_start_requests(); },
         [] { MasterMetricManager::instance().inc_put_start_failures(); });
+    StampDfsEpoch(result, master_service_.GetDfsMasterEpoch());
+    return result;
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
     const UUID& client_id, const ObjectMeta& object_meta,
-    ReplicaType replica_type, const std::string& tenant_id) {
+    ReplicaType replica_type, const std::string& tenant_id,
+    const UUID& dfs_epoch) {
+    if (dfs_epoch != UUID{} &&
+        dfs_epoch != master_service_.GetDfsMasterEpoch()) {
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+
     return execute_rpc(
         "PutEnd",
         [&] {
@@ -456,7 +495,12 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
-    const std::string& tenant_id) {
+    const std::string& tenant_id, const UUID& dfs_epoch) {
+    if (dfs_epoch != UUID{} &&
+        dfs_epoch != master_service_.GetDfsMasterEpoch()) {
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+
     return execute_rpc(
         "PutRevoke",
         [&] {
@@ -583,12 +627,20 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
     timer.LogResponse("total=", results.size(),
                       ", success=", results.size() - failure_count,
                       ", failures=", failure_count);
+    StampDfsEpoch(results, master_service_.GetDfsMasterEpoch());
     return results;
 }
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
     const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
-    ReplicaType replica_type, const std::string& tenant_id) {
+    ReplicaType replica_type, const std::string& tenant_id,
+    const UUID& dfs_epoch) {
+    if (dfs_epoch != UUID{} &&
+        dfs_epoch != master_service_.GetDfsMasterEpoch()) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            object_metas.size(), tl::make_unexpected(ErrorCode::INVALID_WRITE));
+    }
+
     ScopedVLogTimer timer(1, "BatchPutEnd");
     const size_t total_keys = object_metas.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -628,7 +680,14 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
     const UUID& client_id, const std::vector<std::string>& keys,
-    ReplicaType replica_type, const std::string& tenant_id) {
+    ReplicaType replica_type, const std::string& tenant_id,
+    const UUID& dfs_epoch) {
+    if (dfs_epoch != UUID{} &&
+        dfs_epoch != master_service_.GetDfsMasterEpoch()) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::make_unexpected(ErrorCode::INVALID_WRITE));
+    }
+
     ScopedVLogTimer timer(1, "BatchPutRevoke");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -676,7 +735,7 @@ WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                   const uint64_t slice_length,
                                   const ReplicateConfig& config,
                                   const std::string& tenant_id) {
-    return execute_rpc(
+    auto result = execute_rpc(
         "UpsertStart",
         [&] {
             return WithWriteTenant(tenant_id,
@@ -693,11 +752,19 @@ WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
         },
         [&] { MasterMetricManager::instance().inc_put_start_requests(); },
         [] { MasterMetricManager::instance().inc_put_start_failures(); });
+    StampDfsEpoch(result, master_service_.GetDfsMasterEpoch());
+    return result;
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
     const UUID& client_id, const ObjectMeta& object_meta,
-    ReplicaType replica_type, const std::string& tenant_id) {
+    ReplicaType replica_type, const std::string& tenant_id,
+    const UUID& dfs_epoch) {
+    if (dfs_epoch != UUID{} &&
+        dfs_epoch != master_service_.GetDfsMasterEpoch()) {
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+
     return execute_rpc(
         "UpsertEnd",
         [&] {
@@ -720,7 +787,12 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
 
 tl::expected<void, ErrorCode> WrappedMasterService::UpsertRevoke(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
-    const std::string& tenant_id) {
+    const std::string& tenant_id, const UUID& dfs_epoch) {
+    if (dfs_epoch != UUID{} &&
+        dfs_epoch != master_service_.GetDfsMasterEpoch()) {
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+
     return execute_rpc(
         "UpsertRevoke",
         [&] {
@@ -796,12 +868,19 @@ WrappedMasterService::BatchUpsertStart(
     timer.LogResponse("total=", results.size(),
                       ", success=", results.size() - failure_count,
                       ", failures=", failure_count);
+    StampDfsEpoch(results, master_service_.GetDfsMasterEpoch());
     return results;
 }
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchUpsertEnd(
     const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
-    const std::string& tenant_id) {
+    const std::string& tenant_id, const UUID& dfs_epoch) {
+    if (dfs_epoch != UUID{} &&
+        dfs_epoch != master_service_.GetDfsMasterEpoch()) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            object_metas.size(), tl::make_unexpected(ErrorCode::INVALID_WRITE));
+    }
+
     ScopedVLogTimer timer(1, "BatchUpsertEnd");
     const size_t total_keys = object_metas.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -842,7 +921,14 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchUpsertEnd(
 std::vector<tl::expected<void, ErrorCode>>
 WrappedMasterService::BatchUpsertRevoke(const UUID& client_id,
                                         const std::vector<std::string>& keys,
-                                        const std::string& tenant_id) {
+                                        const std::string& tenant_id,
+                                        const UUID& dfs_epoch) {
+    if (dfs_epoch != UUID{} &&
+        dfs_epoch != master_service_.GetDfsMasterEpoch()) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::make_unexpected(ErrorCode::INVALID_WRITE));
+    }
+
     ScopedVLogTimer timer(1, "BatchUpsertRevoke");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);

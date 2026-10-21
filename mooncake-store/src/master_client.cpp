@@ -713,46 +713,51 @@ MasterClient::BatchPutStart(
 }
 
 tl::expected<void, ErrorCode> MasterClient::PutEnd(
-    const ObjectMeta& object_meta, ReplicaType replica_type) {
+    const ObjectMeta& object_meta, ReplicaType replica_type,
+    const UUID& dfs_epoch) {
     ScopedVLogTimer timer(1, "MasterClient::PutEnd");
     timer.LogRequest("key=", object_meta.key);
 
     auto result = invoke_rpc<&WrappedMasterService::PutEnd, void>(
-        client_id_, object_meta, replica_type, tenant_id_.value());
+        client_id_, object_meta, replica_type, tenant_id_.value(), dfs_epoch);
     timer.LogResponseExpected(result);
     return result;
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(
-    const std::vector<ObjectMeta>& object_metas, ReplicaType replica_type) {
+    const std::vector<ObjectMeta>& object_metas, ReplicaType replica_type,
+    const UUID& dfs_epoch) {
     ScopedVLogTimer timer(1, "MasterClient::BatchPutEnd");
     timer.LogRequest("keys_count=", object_metas.size());
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutEnd, void>(
         object_metas.size(), client_id_, object_metas, replica_type,
-        tenant_id_.value());
+        tenant_id_.value(), dfs_epoch);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
 
-tl::expected<void, ErrorCode> MasterClient::PutRevoke(
-    const std::string& key, ReplicaType replica_type) {
+tl::expected<void, ErrorCode> MasterClient::PutRevoke(const std::string& key,
+                                                      ReplicaType replica_type,
+                                                      const UUID& dfs_epoch) {
     ScopedVLogTimer timer(1, "MasterClient::PutRevoke");
     timer.LogRequest("key=", key);
 
     auto result = invoke_rpc<&WrappedMasterService::PutRevoke, void>(
-        client_id_, key, replica_type, tenant_id_.value());
+        client_id_, key, replica_type, tenant_id_.value(), dfs_epoch);
     timer.LogResponseExpected(result);
     return result;
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
-    const std::vector<std::string>& keys, ReplicaType replica_type) {
+    const std::vector<std::string>& keys, ReplicaType replica_type,
+    const UUID& dfs_epoch) {
     ScopedVLogTimer timer(1, "MasterClient::BatchPutRevoke");
     timer.LogRequest("keys_count=", keys.size());
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutRevoke, void>(
-        keys.size(), client_id_, keys, replica_type, tenant_id_.value());
+        keys.size(), client_id_, keys, replica_type, tenant_id_.value(),
+        dfs_epoch);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -803,46 +808,48 @@ MasterClient::BatchUpsertStart(
 }
 
 tl::expected<void, ErrorCode> MasterClient::UpsertEnd(
-    const ObjectMeta& object_meta, ReplicaType replica_type) {
+    const ObjectMeta& object_meta, ReplicaType replica_type,
+    const UUID& dfs_epoch) {
     ScopedVLogTimer timer(1, "MasterClient::UpsertEnd");
     timer.LogRequest("key=", object_meta.key);
 
     auto result = invoke_rpc<&WrappedMasterService::UpsertEnd, void>(
-        client_id_, object_meta, replica_type, tenant_id_.value());
+        client_id_, object_meta, replica_type, tenant_id_.value(), dfs_epoch);
     timer.LogResponseExpected(result);
     return result;
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchUpsertEnd(
-    const std::vector<ObjectMeta>& object_metas) {
+    const std::vector<ObjectMeta>& object_metas, const UUID& dfs_epoch) {
     ScopedVLogTimer timer(1, "MasterClient::BatchUpsertEnd");
     timer.LogRequest("keys_count=", object_metas.size());
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchUpsertEnd, void>(
-        object_metas.size(), client_id_, object_metas, tenant_id_.value());
+        object_metas.size(), client_id_, object_metas, tenant_id_.value(),
+        dfs_epoch);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
 
 tl::expected<void, ErrorCode> MasterClient::UpsertRevoke(
-    const std::string& key, ReplicaType replica_type) {
+    const std::string& key, ReplicaType replica_type, const UUID& dfs_epoch) {
     ScopedVLogTimer timer(1, "MasterClient::UpsertRevoke");
     timer.LogRequest("key=", key);
 
     auto result = invoke_rpc<&WrappedMasterService::UpsertRevoke, void>(
-        client_id_, key, replica_type, tenant_id_.value());
+        client_id_, key, replica_type, tenant_id_.value(), dfs_epoch);
     timer.LogResponseExpected(result);
     return result;
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchUpsertRevoke(
-    const std::vector<std::string>& keys) {
+    const std::vector<std::string>& keys, const UUID& dfs_epoch) {
     ScopedVLogTimer timer(1, "MasterClient::BatchUpsertRevoke");
     timer.LogRequest("keys_count=", keys.size());
 
     auto result =
         invoke_batch_rpc<&WrappedMasterService::BatchUpsertRevoke, void>(
-            keys.size(), client_id_, keys, tenant_id_.value());
+            keys.size(), client_id_, keys, tenant_id_.value(), dfs_epoch);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }

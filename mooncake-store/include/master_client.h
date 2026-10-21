@@ -273,7 +273,8 @@ class MasterClient {
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> PutEnd(
-        const ObjectMeta& object_meta, ReplicaType replica_type);
+        const ObjectMeta& object_meta, ReplicaType replica_type,
+        const UUID& dfs_epoch = {});
 
     /**
      * @brief Ends a put operation for a batch of objects
@@ -282,7 +283,8 @@ class MasterClient {
      */
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const std::vector<ObjectMeta>& object_metas,
-        ReplicaType replica_type = ReplicaType::ALL);
+        ReplicaType replica_type = ReplicaType::ALL,
+        const UUID& dfs_epoch = {});
 
     /**
      * @brief Revokes a put operation
@@ -291,7 +293,8 @@ class MasterClient {
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> PutRevoke(
-        const std::string& key, ReplicaType replica_type);
+        const std::string& key, ReplicaType replica_type,
+        const UUID& dfs_epoch = {});
 
     /**
      * @brief Revokes a put operation for a batch of objects
@@ -300,7 +303,8 @@ class MasterClient {
      */
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const std::vector<std::string>& keys,
-        ReplicaType replica_type = ReplicaType::ALL);
+        ReplicaType replica_type = ReplicaType::ALL,
+        const UUID& dfs_epoch = {});
 
     /**
      * @brief Starts an upsert operation (insert or update)
@@ -321,16 +325,19 @@ class MasterClient {
                      const ReplicateConfig& config);
 
     [[nodiscard]] tl::expected<void, ErrorCode> UpsertEnd(
-        const ObjectMeta& object_meta, ReplicaType replica_type);
+        const ObjectMeta& object_meta, ReplicaType replica_type,
+        const UUID& dfs_epoch = {});
 
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
-        const std::vector<ObjectMeta>& object_metas);
+        const std::vector<ObjectMeta>& object_metas,
+        const UUID& dfs_epoch = {});
 
     [[nodiscard]] tl::expected<void, ErrorCode> UpsertRevoke(
-        const std::string& key, ReplicaType replica_type);
+        const std::string& key, ReplicaType replica_type,
+        const UUID& dfs_epoch = {});
 
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
-        const std::vector<std::string>& keys);
+        const std::vector<std::string>& keys, const UUID& dfs_epoch = {});
 
     /**
      * @brief Removes an object and all its replicas

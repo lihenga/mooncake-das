@@ -762,7 +762,8 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite() {
 
 tl::expected<std::shared_ptr<DistributedStorageBackend::OpenFileHandle>,
              ErrorCode>
-DistributedStorageBackend::GetOrOpenBucket(int64_t bucket_id) {
+DistributedStorageBackend::GetOrOpenBucket(int64_t bucket_id,
+                                           const UUID& epoch) {
     {
         std::lock_guard<std::mutex> lock(bucket_cache_mutex_);
         auto it = bucket_id_cache_.find(bucket_id);
@@ -787,6 +788,17 @@ DistributedStorageBackend::GetOrOpenBucket(int64_t bucket_id) {
     handle->path = path;
     handle->fd = *fd_result;
     handle->adapter = fs_adapter_.get();
+
+    // A queued operation may still carry the old epoch before this client has
+    // observed a restart. Confirm AFTER opening: an old location must never
+    // acquire a newly recreated bucket file. Cached handles need no RPC.
+    if (master_epoch_provider_) {
+        auto current_epoch = master_epoch_provider_();
+        if (!current_epoch) return tl::make_unexpected(current_epoch.error());
+        if (*current_epoch != epoch) {
+            return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
+        }
+    }
 
     std::lock_guard<std::mutex> lock(bucket_cache_mutex_);
     // Another thread may have populated the cache while we were opening; keep
@@ -833,6 +845,44 @@ DistributedStorageBackend::CleanupBucketFd(int64_t bucket_id) {
         erased = true;
     }
     return erased;
+}
+
+tl::expected<std::shared_lock<std::shared_mutex>, ErrorCode>
+DistributedStorageBackend::AcquireBucketEpoch(const UUID& epoch) {
+    std::shared_lock read_lock(bucket_epoch_mutex_);
+    if (epoch == bucket_epoch_) {
+        if (epoch == UUID{} && master_epoch_provider_) {
+            return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
+        }
+        return read_lock;
+    }
+    read_lock.unlock();
+
+    std::unique_lock write_lock(bucket_epoch_mutex_);
+    if (epoch != bucket_epoch_) {
+        if (!master_epoch_provider_ || epoch == UUID{}) {
+            return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
+        }
+        // A delayed response is not evidence of a newer master: UUIDs have no
+        // order. Confirm a different epoch once, rather than stat every I/O.
+        auto current_epoch = master_epoch_provider_();
+        if (!current_epoch) return tl::make_unexpected(current_epoch.error());
+        if (*current_epoch != epoch) {
+            return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
+        }
+        auto invalidated = InvalidateAllBucketFds();
+        if (!invalidated) return tl::make_unexpected(invalidated.error());
+        bucket_epoch_ = epoch;
+        LOG(INFO) << "Invalidated " << *invalidated
+                  << " DFS bucket handles before using a changed Master epoch";
+    }
+    write_lock.unlock();
+    read_lock.lock();
+    // Another transition may have won while the lock was being downgraded.
+    if (epoch != bucket_epoch_) {
+        return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
+    }
+    return read_lock;
 }
 
 tl::expected<size_t, ErrorCode>
@@ -912,7 +962,8 @@ DistributedStorageBackend::CleanupStaleBucketFds(
 
 tl::expected<std::shared_ptr<DistributedStorageBackend::OpenFileHandle>,
              ErrorCode>
-DistributedStorageBackend::GetOrOpenBucketDirect(int64_t bucket_id) {
+DistributedStorageBackend::GetOrOpenBucketDirect(int64_t bucket_id,
+                                                 const UUID& epoch) {
     {
         std::lock_guard<std::mutex> lock(bucket_cache_mutex_);
         auto it = bucket_id_direct_cache_.find(bucket_id);
@@ -936,6 +987,17 @@ DistributedStorageBackend::GetOrOpenBucketDirect(int64_t bucket_id) {
     handle->path = path;
     handle->fd = *fd_result;
     handle->adapter = fs_adapter_.get();
+
+    // A queued operation may still carry the old epoch before this client has
+    // observed a restart. Confirm AFTER opening: an old location must never
+    // acquire a newly recreated bucket file. Cached handles need no RPC.
+    if (master_epoch_provider_) {
+        auto current_epoch = master_epoch_provider_();
+        if (!current_epoch) return tl::make_unexpected(current_epoch.error());
+        if (*current_epoch != epoch) {
+            return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
+        }
+    }
 
     std::lock_guard<std::mutex> lock(bucket_cache_mutex_);
     // Another thread may have populated the cache while we were opening; keep
@@ -1010,13 +1072,15 @@ DistributedStorageBackend::ResolveTarget(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto handle = read_only ? GetOrOpenBucketDirect(descriptor.shard_idx)
-                            : GetOrOpenBucket(descriptor.shard_idx);
+    auto handle = read_only ? GetOrOpenBucketDirect(descriptor.shard_idx,
+                                                    descriptor.master_epoch)
+                            : GetOrOpenBucket(descriptor.shard_idx,
+                                              descriptor.master_epoch);
     if (!handle && read_only) {
         if (handle.error() != ErrorCode::NOT_SUPPORTED) {
             return tl::make_unexpected(handle.error());
         }
-        handle = GetOrOpenBucket(descriptor.shard_idx);
+        handle = GetOrOpenBucket(descriptor.shard_idx, descriptor.master_epoch);
         read_only = false;
     }
     if (!handle) return tl::make_unexpected(handle.error());
@@ -1124,7 +1188,22 @@ DistributedStorageBackend::BatchWrite(
     // padding, then issue one write per contiguous bounded-size run. SHARD
     // keeps the original one-request path because its allocator does not
     // promise contiguity.
-    if (IsBucketMode()) return BatchWriteBucket(requests);
+    if (IsBucketMode()) {
+        if (requests.empty()) return results;
+        const auto epoch = requests.front().descriptor.master_epoch;
+        auto guard = AcquireBucketEpoch(epoch);
+        if (!guard || std::any_of(requests.begin(), requests.end(),
+                                  [&](const auto& request) {
+                                      return request.descriptor.master_epoch !=
+                                             epoch;
+                                  })) {
+            results.assign(requests.size(),
+                           tl::make_unexpected(guard ? ErrorCode::INVALID_WRITE
+                                                     : guard.error()));
+            return results;
+        }
+        return BatchWriteBucket(requests);
+    }
     return BatchWriteShard(requests);
 }
 
@@ -1744,6 +1823,19 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     }
 
     if (!IsBucketMode()) return BatchReadShard(requests);
+
+    if (requests.empty()) return results;
+    const auto epoch = requests.front().descriptor.master_epoch;
+    auto guard = AcquireBucketEpoch(epoch);
+    if (!guard ||
+        std::any_of(requests.begin(), requests.end(), [&](const auto& request) {
+            return request.descriptor.master_epoch != epoch;
+        })) {
+        std::fill(results.begin(), results.end(),
+                  tl::make_unexpected(guard ? ErrorCode::INVALID_WRITE
+                                            : guard.error()));
+        return results;
+    }
 
     auto tasks = PrepareReadTasks(requests, results);
     const auto prepare_done = std::chrono::steady_clock::now();

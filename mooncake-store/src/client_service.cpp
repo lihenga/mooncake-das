@@ -73,6 +73,15 @@ std::optional<size_t> GetTransportRegistrationLimit(
 
 namespace {
 
+UUID DfsWriteEpoch(const std::vector<Replica::Descriptor>& replicas) {
+    for (const auto& replica : replicas) {
+        if (replica.is_dfs_replica()) {
+            return replica.get_dfs_descriptor().master_epoch;
+        }
+    }
+    return {};
+}
+
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
 constexpr size_t kDefaultDfsWriteChunkSize = 256ULL * 1024 * 1024;
 constexpr size_t kDefaultDfsWriteArenaCount = 2;
@@ -2495,7 +2504,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     std::optional<ErrorCode> finalize_error;
     if (finalize_decision.end_type.has_value()) {
         auto end_result = master_client_.PutEnd(
-            ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
+            ObjectMeta{key, object_checksum}, *finalize_decision.end_type,
+            DfsWriteEpoch(*start_result));
         if (!end_result) {
             finalize_error = end_result.error();
             LOG(ERROR) << "Failed to end put operation: " << *finalize_error;
@@ -2503,8 +2513,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     if (finalize_decision.revoke_type.has_value()) {
-        auto revoke_result =
-            master_client_.PutRevoke(key, *finalize_decision.revoke_type);
+        auto revoke_result = master_client_.PutRevoke(
+            key, *finalize_decision.revoke_type, DfsWriteEpoch(*start_result));
         if (!revoke_result) {
             if (!finalize_error.has_value()) {
                 finalize_error = revoke_result.error();
@@ -2655,15 +2665,16 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     std::optional<ErrorCode> finalize_error;
     if (finalize_decision.end_type.has_value()) {
         auto end_result = master_client_.UpsertEnd(
-            ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
+            ObjectMeta{key, object_checksum}, *finalize_decision.end_type,
+            DfsWriteEpoch(*start_result));
         if (!end_result) {
             finalize_error = end_result.error();
             LOG(ERROR) << "Failed to end upsert operation: " << *finalize_error;
         }
     }
     if (finalize_decision.revoke_type.has_value()) {
-        auto revoke_result =
-            master_client_.UpsertRevoke(key, *finalize_decision.revoke_type);
+        auto revoke_result = master_client_.UpsertRevoke(
+            key, *finalize_decision.revoke_type, DfsWriteEpoch(*start_result));
         if (!revoke_result) {
             if (!finalize_error.has_value()) {
                 finalize_error = revoke_result.error();
@@ -3484,15 +3495,20 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
                 completion = context->is_upsert
                                  ? master_client_.UpsertEnd(
                                        ObjectMeta{key, object_checksum},
-                                       ReplicaType::DFS)
+                                       ReplicaType::DFS,
+                                       context->descriptors[i].master_epoch)
                                  : master_client_.PutEnd(
                                        ObjectMeta{key, object_checksum},
-                                       ReplicaType::DFS);
+                                       ReplicaType::DFS,
+                                       context->descriptors[i].master_epoch);
             } else {
-                completion =
-                    context->is_upsert
-                        ? master_client_.UpsertRevoke(key, ReplicaType::DFS)
-                        : master_client_.PutRevoke(key, ReplicaType::DFS);
+                completion = context->is_upsert
+                                 ? master_client_.UpsertRevoke(
+                                       key, ReplicaType::DFS,
+                                       context->descriptors[i].master_epoch)
+                                 : master_client_.PutRevoke(
+                                       key, ReplicaType::DFS,
+                                       context->descriptors[i].master_epoch);
             }
             if (completion) break;
             // OBJECT_NOT_FOUND / INVALID_WRITE mean the object already moved on
@@ -3867,6 +3883,17 @@ void Client::DrainAsyncDfsWrites() {
 
 void Client::FinalizeBatchPut(std::vector<PutOperation>& ops,
                               bool allow_memory_only_fallback) {
+    // All allocations in this Start batch came from the same master. Fence
+    // finalization even when a group contains memory-only objects as well.
+    UUID dfs_epoch{};
+    for (const auto& op : ops) {
+        const auto epoch = DfsWriteEpoch(op.replicas);
+        if (epoch != UUID{}) {
+            dfs_epoch = epoch;
+            break;
+        }
+    }
+
     struct BatchFinalizeGroup {
         std::vector<std::string> keys;
         std::vector<size_t> indices;
@@ -3972,7 +3999,8 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops,
             object_metas.emplace_back(ObjectMeta{
                 group.keys[i], ops[group.indices[i]].object_checksum});
         }
-        auto responses = master_client_.BatchPutEnd(object_metas, replica_type);
+        auto responses =
+            master_client_.BatchPutEnd(object_metas, replica_type, dfs_epoch);
         if (responses.size() != group.keys.size()) {
             for (size_t idx : group.indices) {
                 finalize_rpc_errors[idx] = ErrorCode::RPC_FAIL;
@@ -3999,7 +4027,7 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops,
             return;
         }
         auto responses =
-            master_client_.BatchPutRevoke(group.keys, replica_type);
+            master_client_.BatchPutRevoke(group.keys, replica_type, dfs_epoch);
         if (responses.size() != group.keys.size()) {
             for (size_t idx : group.indices) {
                 finalize_rpc_errors[idx] = ErrorCode::RPC_FAIL;
@@ -4080,6 +4108,17 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops,
 }
 
 void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
+    // All allocations in this Start batch came from the same master. Fence
+    // finalization even when a group contains memory-only objects as well.
+    UUID dfs_epoch{};
+    for (const auto& op : ops) {
+        const auto epoch = DfsWriteEpoch(op.replicas);
+        if (epoch != UUID{}) {
+            dfs_epoch = epoch;
+            break;
+        }
+    }
+
     std::vector<ObjectMeta> successful_object_metas;
     std::vector<size_t> successful_indices;
     std::vector<std::string> failed_keys;
@@ -4122,7 +4161,7 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
     if (!successful_object_metas.empty()) {
         finalized_keys.reserve(successful_object_metas.size());
         auto end_responses =
-            master_client_.BatchUpsertEnd(successful_object_metas);
+            master_client_.BatchUpsertEnd(successful_object_metas, dfs_epoch);
         if (end_responses.size() != successful_object_metas.size()) {
             LOG(ERROR) << "BatchUpsertEnd response size mismatch: expected "
                        << successful_object_metas.size() << ", got "
@@ -4161,7 +4200,8 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
 
     // Process failed operations that need cleanup
     if (!failed_keys.empty()) {
-        auto revoke_responses = master_client_.BatchUpsertRevoke(failed_keys);
+        auto revoke_responses =
+            master_client_.BatchUpsertRevoke(failed_keys, dfs_epoch);
         if (revoke_responses.size() != failed_keys.size()) {
             LOG(ERROR) << "BatchUpsertRevoke response size mismatch: expected "
                        << failed_keys.size() << ", got "
@@ -5057,6 +5097,18 @@ void Client::SetDfsStorageBackend(
         LOG(INFO) << "Initialized DFS write staging arenas: count="
                   << dfs_write_arena_count_ << ", size="
                   << dfs_write_chunk_size_;
+    }
+    if (backend) {
+        backend->SetMasterEpochProvider([weak_client = weak_from_this()]()
+                                            -> tl::expected<UUID, ErrorCode> {
+            auto client = weak_client.lock();
+            if (!client) {
+                return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+            }
+            auto snapshot = client->GetDfsBucketSnapshot(UUID{}, 0);
+            if (!snapshot) return tl::make_unexpected(snapshot.error());
+            return snapshot->epoch;
+        });
     }
     dfs_storage_backend_ = std::move(backend);
     EnsureStorageControlPlaneStarted();

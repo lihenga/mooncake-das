@@ -75,7 +75,7 @@ class QueryResult {
 /**
  * @brief Client for interacting with the mooncake distributed object store
  */
-class Client {
+class Client : public std::enable_shared_from_this<Client> {
     friend class MasterClientTestPeer;
 
    public:

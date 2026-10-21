@@ -247,8 +247,11 @@ struct DistributedFSDescriptor {
     uint64_t object_size = 0;
     uint64_t aligned_size = 0;
     int shard_idx = 0;
+    // Master incarnation that issued this location. Filled on RPC responses,
+    // including recovered locations; it is not the persistent bucket identity.
+    UUID master_epoch{};
     YLT_REFL(DistributedFSDescriptor, file_path, offset, object_size,
-             aligned_size, shard_idx);
+             aligned_size, shard_idx, master_epoch);
 };
 
 struct DfsReplicaData {
