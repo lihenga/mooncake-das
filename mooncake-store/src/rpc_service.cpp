@@ -1264,7 +1264,7 @@ tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::DfsBackfillStar
     const UUID& client_id, const std::string& key,
     const std::string& tenant_id, const std::string& source,
     const UUID& task_id) {
-    return execute_rpc(
+    auto result = execute_rpc(
         "DfsBackfillStart",
         [&] {
             return WithWriteTenant(
@@ -1277,6 +1277,10 @@ tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::DfsBackfillStar
         [&](auto& timer) { timer.LogRequest("key=", key, ", task=", task_id); },
         [] { MasterMetricManager::instance().inc_copy_start_requests(); },
         [] { MasterMetricManager::instance().inc_copy_start_failures(); });
+    if (result) {
+        StampDfsEpoch(result->targets, master_service_.GetDfsMasterEpoch());
+    }
+    return result;
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::DfsBackfillFinish(

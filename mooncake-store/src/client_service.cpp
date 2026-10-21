@@ -5945,6 +5945,11 @@ Client::GetDfsBackfillBackend() {
     if (!backend) return tl::make_unexpected(backend.error());
     dfs_backfill_backend_ =
         std::dynamic_pointer_cast<DistributedStorageBackend>(*backend);
+    if (dfs_backfill_backend_) {
+        dfs_backfill_backend_->SetDescriptorRootDir(storage->dfs_fsdir);
+        dfs_backfill_backend_->SetMasterEpochProvider(
+            master_client_.MakeDfsMasterEpochProvider());
+    }
     // The executor checks initialization before acquiring a source pin.
     return dfs_backfill_backend_;
 }
