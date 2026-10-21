@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iterator>
@@ -11,12 +12,16 @@
 #include <mutex>
 #include <sstream>
 #include <sys/stat.h>
+#include <system_error>
+#include <thread>
 #include <unordered_set>
 
 #include "environ.h"
 #include "storage/distributed/bucket_entry_layout.h"
+#include "storage/distributed/dfs_io_timeout.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
 #include "storage/distributed/dfs_root_identity.h"
+#include "storage/distributed/dfs_read_probe.h"
 #include "storage/distributed/dfs_global_allocator.h"
 #include "thread_pool.h"
 #include "types.h"
@@ -361,6 +366,8 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
                          config.batch_read_merge_enabled);
     config.direct_read_enabled = Environ::GetBool(
         "MOONCAKE_DFS_DIRECT_READ_ENABLED", config.direct_read_enabled);
+    config.batch_get_timeout_ms = Environ::GetUInt64(
+        "MOONCAKE_DFS_BATCH_GET_TIMEOUT_MS", config.batch_get_timeout_ms);
     LOG(INFO) << config.FormatStr();
     return config;
 }
@@ -389,7 +396,8 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", bucket_create_concurrency=" << bucket_create_concurrency
         << ", batch_read_threads=" << batch_read_threads
         << ", batch_read_merge_enabled=" << batch_read_merge_enabled
-        << ", direct_read_enabled=" << direct_read_enabled;
+        << ", direct_read_enabled=" << direct_read_enabled
+        << ", batch_get_timeout_ms=" << batch_get_timeout_ms;
     return oss.str();
 }
 
@@ -636,17 +644,47 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeRead() {
     auto initialized = TryEnsureInitialized();
     if (!initialized) return initialized;
     if (UsesObjectStorage()) return {};
-    const std::string marker_path =
-        root_dir_ + "/" + kDfsRootMarkerFileName;
-    constexpr size_t kExpectedSize = sizeof(kDfsRootMarkerPayload) - 1;
-    char payload[sizeof(kDfsRootMarkerPayload)] = {};
-    auto read_result =
-        fs_adapter_->ReadFile(marker_path, payload, sizeof(payload));
-    if (!read_result) return tl::make_unexpected(read_result.error());
-    if (*read_result != kExpectedSize ||
-        std::memcmp(payload, kDfsRootMarkerPayload, kExpectedSize) != 0) {
+    const std::string probe_path = root_dir_ + "/" + kDfsReadProbeFileName;
+    auto size = fs_adapter_->GetFileSize(probe_path);
+    if (!size) return tl::make_unexpected(size.error());
+    if (*size != kDfsReadProbeSize) {
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
+
+    // Round-robin is deterministic and guarantees that a long-running client
+    // eventually samples the whole file instead of repeatedly hitting one
+    // filesystem/client cache line.
+    const size_t block = read_probe_generation_.fetch_add(
+                             1, std::memory_order_relaxed) %
+                         kDfsReadProbeBlockCount;
+    void* raw = nullptr;
+    if (::posix_memalign(&raw, kDfsReadProbeBlockSize,
+                         kDfsReadProbeBlockSize) != 0) {
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+    std::unique_ptr<void, decltype(&::free)> buffer(raw, &::free);
+
+    // Open and close on every probe. Strict open has no buffered fallback and
+    // PosixFsAdapter uses exactly O_RDONLY|O_DIRECT|O_CLOEXEC|O_NOFOLLOW.
+    auto fd = fs_adapter_->OpenFileDirectStrict(probe_path);
+    if (!fd) return tl::make_unexpected(fd.error());
+    iovec iov{buffer.get(), kDfsReadProbeBlockSize};
+    auto read = fs_adapter_->DirectReadAt(
+        *fd, &iov, 1,
+        static_cast<int64_t>(block * kDfsReadProbeBlockSize));
+    const auto close = fs_adapter_->CloseFile(*fd);
+    if (!read) return tl::make_unexpected(read.error());
+    if (!close) return tl::make_unexpected(close.error());
+    if (*read != kDfsReadProbeBlockSize) {
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    alignas(4096) char expected[kDfsReadProbeBlockSize];
+    FillDfsReadProbeBlock(expected_root_identity_, block, expected);
+    if (std::memcmp(buffer.get(), expected, kDfsReadProbeBlockSize) != 0) {
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    dfs_read_timed_out_.store(false, std::memory_order_release);
     return {};
 }
 
@@ -1042,6 +1080,12 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
 
 std::vector<tl::expected<void, ErrorCode>>
 DistributedStorageBackend::BatchWrite(
+    const std::vector<DfsWriteRequest>& requests) {
+    return BatchWriteBlocking(requests);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+DistributedStorageBackend::BatchWriteBlocking(
     const std::vector<DfsWriteRequest>& requests) {
     std::vector<tl::expected<void, ErrorCode>> results;
 
@@ -1663,7 +1707,8 @@ void DistributedStorageBackend::ExecuteReadTasks(
     completion_cv.wait(lock, [&pending_workers] { return pending_workers == 0; });
 }
 
-std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
+std::vector<tl::expected<void, ErrorCode>>
+DistributedStorageBackend::BatchReadBlocking(
     const std::vector<DfsReadRequest>& requests) {
     const auto timing_start = std::chrono::steady_clock::now();
     std::vector<tl::expected<void, ErrorCode>> results(
@@ -1715,6 +1760,147 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
                   << " prepare_us=" << prepare_us
                   << " read_us=" << read_us
                   << " bandwidth_GBps=" << gbps;
+    }
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
+    const std::vector<DfsReadRequest>& requests) {
+    const auto base_timeout_ms = distributed_config_.batch_get_timeout_ms;
+    if (base_timeout_ms == 0 || requests.empty()) {
+        return BatchReadBlocking(requests);
+    }
+    if (dfs_read_timed_out_.load(std::memory_order_acquire)) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            requests.size(),
+            tl::make_unexpected(ErrorCode::DFS_BATCH_GET_TIMEOUT));
+    }
+    uint64_t total_bytes = 0;
+    for (const auto& request : requests) {
+        SaturatingAddBytes(request.descriptor.object_size, &total_bytes);
+    }
+    const auto timeout_ms =
+        DfsBatchGetTimeoutMs(base_timeout_ms, total_bytes);
+    const auto deadline = DfsIoDeadlineFromNow(timeout_ms);
+
+    struct TimedReadContext {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool done = false;
+        std::chrono::steady_clock::time_point completed_at;
+        std::vector<std::vector<char>> buffers;
+        std::vector<DfsReadRequest> requests;
+        std::vector<tl::expected<void, ErrorCode>> results;
+    };
+    auto context = std::make_shared<TimedReadContext>();
+    context->buffers.resize(requests.size());
+    context->requests.reserve(requests.size());
+    try {
+        for (size_t index = 0; index < requests.size(); ++index) {
+            const auto& request = requests[index];
+            if (request.descriptor.object_size >
+                std::numeric_limits<size_t>::max()) {
+                return std::vector<tl::expected<void, ErrorCode>>(
+                    requests.size(),
+                    tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            }
+            auto& storage = context->buffers[index];
+            storage.resize(static_cast<size_t>(request.descriptor.object_size));
+            std::vector<Slice> slices;
+            slices.emplace_back(Slice{storage.data(), storage.size()});
+            context->requests.push_back(
+                DfsReadRequest{request.key, request.descriptor,
+                               std::move(slices)});
+        }
+    } catch (const std::bad_alloc&) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            requests.size(),
+            tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE));
+    }
+
+    std::shared_ptr<DistributedStorageBackend> self;
+    try {
+        self = shared_from_this();
+    } catch (const std::bad_weak_ptr&) {
+        // Test-only/legacy stack ownership cannot safely outlive this call.
+        // Keep the old blocking lifetime contract in that configuration.
+        return BatchReadBlocking(requests);
+    }
+
+    if (std::chrono::steady_clock::now() >= deadline) {
+        dfs_read_timed_out_.store(true, std::memory_order_release);
+        return std::vector<tl::expected<void, ErrorCode>>(
+            requests.size(),
+            tl::make_unexpected(ErrorCode::DFS_BATCH_GET_TIMEOUT));
+    }
+    try {
+        std::thread([self = std::move(self), context]() {
+            std::vector<tl::expected<void, ErrorCode>> results;
+            try {
+                results = self->BatchReadBlocking(context->requests);
+            } catch (const std::bad_alloc&) {
+                results.assign(
+                    context->requests.size(),
+                    tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE));
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "Timed DFS BatchGet worker failed: " << e.what();
+                results.assign(
+                    context->requests.size(),
+                    tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+            } catch (...) {
+                LOG(ERROR) << "Timed DFS BatchGet worker failed";
+                results.assign(
+                    context->requests.size(),
+                    tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+            }
+            {
+                std::lock_guard lock(context->mutex);
+                context->results = std::move(results);
+                context->completed_at = std::chrono::steady_clock::now();
+                context->done = true;
+            }
+            context->cv.notify_all();
+        }).detach();
+    } catch (const std::system_error&) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            requests.size(),
+            tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE));
+    }
+
+    std::unique_lock lock(context->mutex);
+    if (!context->cv.wait_until(lock, deadline,
+                                [&context] { return context->done; }) ||
+        context->completed_at > deadline) {
+        dfs_read_timed_out_.store(true, std::memory_order_release);
+        return std::vector<tl::expected<void, ErrorCode>>(
+            requests.size(),
+            tl::make_unexpected(ErrorCode::DFS_BATCH_GET_TIMEOUT));
+    }
+    auto results = context->results;
+    lock.unlock();
+
+    if (results.size() != requests.size()) return results;
+    for (size_t index = 0; index < requests.size(); ++index) {
+        if (!results[index]) continue;
+        const auto& storage = context->buffers[index];
+        size_t copied = 0;
+        for (const auto& slice : requests[index].slices) {
+            if (copied >= storage.size()) break;
+            const size_t bytes = std::min(slice.size, storage.size() - copied);
+            if (bytes != 0) {
+                if (slice.ptr == nullptr) {
+                    results[index] =
+                        tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                    break;
+                }
+                std::memcpy(slice.ptr, storage.data() + copied, bytes);
+                copied += bytes;
+            }
+        }
+        if (results[index] && copied != storage.size()) {
+            results[index] =
+                tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
     }
     return results;
 }

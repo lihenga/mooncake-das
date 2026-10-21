@@ -22,6 +22,7 @@
 #include "storage/distributed/immutable_bucket_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/dfs_root_identity.h"
+#include "storage/distributed/dfs_read_probe.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #include "storage_backend.h"
 
@@ -33,6 +34,13 @@ constexpr uint64_t kAlignment = 4096;
 constexpr uint64_t kBucketCapacity = 1024 * 1024;
 const std::string kTestDfsRootIdentity =
     SerializeDfsRootIdentity("dfs_backend_test", UUID{1, 2});
+
+void WriteTestDfsReadProbe(const std::string& root) {
+    std::ofstream output(root + "/" + kDfsReadProbeFileName,
+                         std::ios::binary | std::ios::trunc);
+    const auto contents = BuildDfsReadProbeContents(kTestDfsRootIdentity);
+    output.write(contents.data(), contents.size());
+}
 
 void WriteTestDfsRootIdentity(const std::filesystem::path& root,
                               const std::string& identity =
@@ -855,6 +863,7 @@ TEST(DistributedStorageBackendRootTest,
 
     WriteTestDfsRootIdentity(root.path());
     std::ofstream(root.file(kDfsRootMarkerFileName)) << kDfsRootMarkerPayload;
+    WriteTestDfsReadProbe(root.path());
     ASSERT_TRUE(backend.ProbeWrite().has_value());
     EXPECT_TRUE(backend.ProbeRead().has_value());
     EXPECT_TRUE(backend.IsInitialized());
@@ -911,6 +920,7 @@ TEST(DistributedStorageBackendRootTest,
 
     WriteTestDfsRootIdentity(root);
     std::ofstream(root + "/" + kDfsRootMarkerFileName) << kDfsRootMarkerPayload;
+    WriteTestDfsReadProbe(root);
     ASSERT_TRUE(backend.ProbeWrite().has_value());
     ASSERT_TRUE(backend.ProbeRead().has_value());
     // The master allocator must create the bucket before a client can write it.
@@ -945,6 +955,7 @@ TEST(DistributedStorageBackendRootTest,
     ASSERT_TRUE(std::filesystem::create_directory(root));
     WriteTestDfsRootIdentity(root);
     std::ofstream(root + "/" + kDfsRootMarkerFileName) << kDfsRootMarkerPayload;
+    WriteTestDfsReadProbe(root);
     ASSERT_TRUE(backend.ProbeWrite().has_value());
     EXPECT_TRUE(backend.IsInitialized());
     EXPECT_TRUE(backend.ProbeRead().has_value());

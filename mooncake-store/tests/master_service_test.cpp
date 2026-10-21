@@ -29,6 +29,7 @@
 
 #include "tenant_quota_policy_store.h"
 #include "storage/distributed/dfs_root_identity.h"
+#include "storage/distributed/dfs_read_probe.h"
 #include "storage/distributed/fs_adapter.h"
 #include "types.h"
 #include "utils.h"
@@ -2006,13 +2007,16 @@ TEST_F(MasterServiceTest, DfsRootGuardRecreatesMissingFilesWithPinnedContents) {
         const std::string identity_path =
             root + "/" + kDfsRootIdentityFileName;
         const std::string marker_path = root + "/" + kDfsRootMarkerFileName;
+        const std::string read_probe_path = root + "/" + kDfsReadProbeFileName;
         ASSERT_TRUE(std::filesystem::remove(identity_path));
         ASSERT_TRUE(std::filesystem::remove(marker_path));
+        ASSERT_TRUE(std::filesystem::remove(read_probe_path));
 
         const auto deadline = std::chrono::steady_clock::now() +
                               std::chrono::seconds(5);
         while ((!std::filesystem::exists(identity_path) ||
-                !std::filesystem::exists(marker_path)) &&
+                !std::filesystem::exists(marker_path) ||
+                !std::filesystem::exists(read_probe_path)) &&
                std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(25));
         }
@@ -2028,6 +2032,14 @@ TEST_F(MasterServiceTest, DfsRootGuardRecreatesMissingFilesWithPinnedContents) {
             (std::istreambuf_iterator<char>(marker_file)),
             std::istreambuf_iterator<char>());
         EXPECT_EQ(restored_marker, kDfsRootMarkerPayload);
+
+        std::ifstream read_probe_file(read_probe_path, std::ios::binary);
+        const std::string restored_read_probe(
+            (std::istreambuf_iterator<char>(read_probe_file)),
+            std::istreambuf_iterator<char>());
+        EXPECT_EQ(restored_read_probe.size(), kDfsReadProbeSize);
+        EXPECT_EQ(restored_read_probe,
+                  BuildDfsReadProbeContents(storage->dfs_root_identity));
     }
     std::filesystem::remove_all(root);
 }

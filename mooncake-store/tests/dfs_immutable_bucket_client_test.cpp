@@ -208,6 +208,10 @@ class DfsBucketClientTest : public ::testing::Test {
         SetEnv("MOONCAKE_DFS_EVICTION_ENABLED", "0");
         SetEnv("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
         SetEnv("MOONCAKE_DFS_SINGLE_TENANT", "true");
+        // Existing tests below exercise the legacy enqueue-only contract.
+        // Timeout behavior has a dedicated test with an explicitly bounded
+        // client.
+        SetEnv("MOONCAKE_DFS_BATCH_PUT_TIMEOUT_MS", "0");
         // Keep the shard fields valid; they are unused in bucket mode.
         SetEnv("MOONCAKE_DFS_SHARD_COUNT", "1");
         SetEnv("MOONCAKE_DFS_SHARD_CAPACITY", "1048576");
@@ -671,6 +675,63 @@ TEST_F(DfsBucketClientTest, AsyncWriteSucceedsAfterCallerBufferIsOverwritten) {
 
     ASSERT_TRUE(WaitForDfsReplica(key));
     ExpectDfsValue(key, expected);
+}
+
+TEST_F(DfsBucketClientTest,
+       BatchPutTimeoutReturnsDistinctErrorAndLateWriteIsRevoked) {
+    writer_.reset();
+    SetEnv("MOONCAKE_DFS_BATCH_PUT_TIMEOUT_MS", "50");
+    writer_ = CreateClient("127.0.0.1:18203");
+    ASSERT_NE(writer_, nullptr);
+    writer_->SetDfsStorageBackend(backend_);
+
+    adapter_->BlockWrites();
+    const std::string key = "bucket_write_timeout";
+    std::vector<std::string> values{std::string(4096, 'T')};
+    auto slices = MakeSlices(values);
+    const auto started = std::chrono::steady_clock::now();
+    auto results = writer_->BatchPut({key}, slices, DfsConfig());
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_FALSE(results[0].has_value());
+    EXPECT_EQ(results[0].error(), ErrorCode::DFS_BATCH_PUT_TIMEOUT);
+    EXPECT_LT(elapsed, std::chrono::seconds(2));
+    EXPECT_FALSE(writer_->DfsWriteAllowed());
+
+    adapter_->ReleaseWrites();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto query = writer_->Query(key);
+        if (query && std::none_of(query->replicas.begin(), query->replicas.end(),
+                                  [](const auto& replica) {
+                                      return replica.is_dfs_replica();
+                                  })) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    FAIL() << "late DFS write was not revoked after timeout";
+}
+
+TEST_F(DfsBucketClientTest, TimelyBoundedBatchPutPublishesBeforeReturning) {
+    writer_.reset();
+    SetEnv("MOONCAKE_DFS_BATCH_PUT_TIMEOUT_MS", "1000");
+    writer_ = CreateClient("127.0.0.1:18204");
+    ASSERT_NE(writer_, nullptr);
+    writer_->SetDfsStorageBackend(backend_);
+
+    const std::string key = "bounded_write_is_published";
+    std::vector<std::string> values{std::string(4096, 'P')};
+    auto slices = MakeSlices(values);
+    auto results = writer_->BatchPut({key}, slices, DfsConfig());
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_TRUE(results[0].has_value());
+
+    auto query = QueryDfsOnly(key);
+    ASSERT_TRUE(query.has_value());
+    ASSERT_EQ(query->replicas.size(), 1u);
+    EXPECT_EQ(query->replicas[0].status, ReplicaStatus::COMPLETE);
 }
 
 TEST_F(DfsBucketClientTest, FailedAsyncWriteRevokesOnlyTheDfsReplica) {

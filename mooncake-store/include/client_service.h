@@ -972,7 +972,9 @@ class Client {
     void SubmitDfsWriteChunk(std::vector<PutOperation>& ops,
                              const std::vector<size_t>& op_indices,
                              bool is_upsert, bool allow_async,
-                             bool* slot_timed_out = nullptr);
+                             bool* slot_timed_out = nullptr,
+                             std::chrono::steady_clock::time_point deadline =
+                                 std::chrono::steady_clock::time_point::max());
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
     void StartBatchUpsert(std::vector<PutOperation>& ops,
                           const ReplicateConfig& config);
@@ -1015,6 +1017,13 @@ class Client {
         std::vector<std::optional<uint64_t>> object_checksums;
         std::shared_ptr<DistributedStorageBackend> backend;
         bool is_upsert = false;
+        std::mutex completion_mutex;
+        std::condition_variable completion_cv;
+        bool io_done = false;
+        bool timed_out = false;
+        std::chrono::steady_clock::time_point deadline =
+            std::chrono::steady_clock::time_point::max();
+        std::vector<ErrorCode> outcomes;
 
         void ReleaseStagingSlot();
         ~AsyncDfsWriteContext();
@@ -1101,6 +1110,7 @@ class Client {
     const std::string metadata_connstring_;
     const std::string protocol_;
     const bool object_checksum_enabled_;
+    const uint64_t dfs_batch_put_timeout_ms_;
     const size_t dfs_write_arena_count_;
     const size_t dfs_write_chunk_size_;
 

@@ -74,6 +74,8 @@ struct DistributedStorageConfig {
     // (page-cache-bypassing where the adapter supports it, e.g. O_DIRECT on
     // POSIX). When false, reads go through the regular cached handles.
     bool direct_read_enabled = true;
+    // Baseline for the size-scaled DFS BatchGet deadline. Zero disables it.
+    uint64_t batch_get_timeout_ms = 10000;
     // Cleared by FromEnvironment() when MOONCAKE_DFS_ALLOCATOR_TYPE names an
     // unknown allocator, so the master can reject the configuration instead of
     // silently defaulting to SHARD.
@@ -106,7 +108,9 @@ struct DfsReadRequest {
  * ObjectStorageAdapter for whole-object offload operations. Does not handle
  * eviction.
  */
-class DistributedStorageBackend : public StorageBackendInterface {
+class DistributedStorageBackend
+    : public StorageBackendInterface,
+      public std::enable_shared_from_this<DistributedStorageBackend> {
    public:
     DistributedStorageBackend(
         const FileStorageConfig& file_storage_config,
@@ -264,7 +268,13 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::vector<tl::expected<void, ErrorCode>> BatchReadShard(
         const std::vector<DfsReadRequest>& requests);
 
+    std::vector<tl::expected<void, ErrorCode>> BatchReadBlocking(
+        const std::vector<DfsReadRequest>& requests);
+
     std::vector<tl::expected<void, ErrorCode>> BatchWriteBucket(
+        const std::vector<DfsWriteRequest>& requests);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchWriteBlocking(
         const std::vector<DfsWriteRequest>& requests);
 
     tl::expected<std::shared_ptr<OpenFileHandle>, ErrorCode> GetOrOpenBucket(
@@ -329,6 +339,8 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::string health_probe_path_prefix_;
     std::string active_health_probe_path_;
     uint64_t health_probe_generation_{0};
+    std::atomic<uint64_t> read_probe_generation_{0};
+    std::atomic<bool> dfs_read_timed_out_{false};
     std::mutex health_probe_write_mutex_;
     // Canonical form of root_dir_, used to reject descriptor paths that try to
     // escape the configured DFS root.

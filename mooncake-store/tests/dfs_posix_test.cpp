@@ -4,11 +4,14 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -19,7 +22,9 @@
 
 #include "replica.h"
 #include "storage/distributed/dfs_global_allocator.h"
+#include "storage/distributed/dfs_io_timeout.h"
 #include "storage/distributed/dfs_root_identity.h"
+#include "storage/distributed/dfs_read_probe.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #include "storage_backend.h"
@@ -840,7 +845,109 @@ class DfsBackendTest : public ::testing::Test {
     std::unique_ptr<DistributedStorageBackend> backend_;
 };
 
-TEST(DfsRootMarkerTest, ShardAllocatorPublishesMarkerForReadProbes) {
+TEST(DfsTimeoutPolicyTest, ScalesConfiguredBaselineByBatchSize) {
+    constexpr uint64_t kBaseMs = 10000;
+    EXPECT_EQ(DfsBatchGetTimeoutMs(kBaseMs, kDfsTimeoutOneGiB), 20000u);
+    EXPECT_EQ(DfsBatchGetTimeoutMs(kBaseMs, kDfsTimeoutOneGiB + 1), 80000u);
+    EXPECT_EQ(DfsBatchGetTimeoutMs(kBaseMs, kDfsTimeoutFourGiB), 80000u);
+    EXPECT_EQ(DfsBatchGetTimeoutMs(kBaseMs, kDfsTimeoutFourGiB + 1),
+              160000u);
+
+    EXPECT_EQ(DfsBatchPutTimeoutMs(kBaseMs, kDfsTimeoutOneGiB), 40000u);
+    EXPECT_EQ(DfsBatchPutTimeoutMs(kBaseMs, kDfsTimeoutOneGiB + 1), 160000u);
+    EXPECT_EQ(DfsBatchPutTimeoutMs(kBaseMs, kDfsTimeoutFourGiB), 160000u);
+    EXPECT_EQ(DfsBatchPutTimeoutMs(kBaseMs, kDfsTimeoutFourGiB + 1),
+              320000u);
+
+    EXPECT_EQ(DfsBatchGetTimeoutMs(0, kDfsTimeoutFourGiB + 1), 0u);
+    EXPECT_EQ(DfsBatchPutTimeoutMs(0, kDfsTimeoutFourGiB + 1), 0u);
+}
+
+class BlockingReadPosixFsAdapter : public PosixFsAdapter {
+   public:
+    void BlockReads() {
+        std::lock_guard lock(mutex_);
+        blocked_ = true;
+    }
+    void ReleaseReads() {
+        std::lock_guard lock(mutex_);
+        blocked_ = false;
+        cv_.notify_all();
+    }
+    bool WaitUntilDone(std::chrono::milliseconds timeout) {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, timeout, [this] { return done_; });
+    }
+    tl::expected<size_t, ErrorCode> ReadAt(int fd, iovec* iov, int iovcnt,
+                                           int64_t offset) override {
+        {
+            std::unique_lock lock(mutex_);
+            cv_.notify_all();
+            cv_.wait(lock, [this] { return !blocked_; });
+        }
+        auto result = PosixFsAdapter::ReadAt(fd, iov, iovcnt, offset);
+        {
+            std::lock_guard lock(mutex_);
+            done_ = true;
+        }
+        cv_.notify_all();
+        return result;
+    }
+
+   private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool blocked_ = false;
+    bool done_ = false;
+};
+
+TEST(DfsBackendTimeoutTest, LateReadCannotModifyCallerBuffer) {
+    TempDir tmp("dfs_read_timeout");
+    ASSERT_TRUE(WriteTestDfsRootIdentity(tmp.path()));
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp.path();
+    DistributedStorageConfig config;
+    config.fsdir = tmp.path();
+    config.fs_adapter_type = "posix";
+    config.shard_count = 1;
+    config.shard_capacity = 64 * 1024;
+    config.alignment = 4096;
+    config.direct_read_enabled = false;
+    config.batch_get_timeout_ms = 50;
+
+    auto adapter = std::make_unique<BlockingReadPosixFsAdapter>();
+    auto* adapter_ptr = adapter.get();
+    auto backend = std::make_shared<DistributedStorageBackend>(
+        file_config, config, std::move(adapter), kTestDfsRootIdentity);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    const std::string shard =
+        tmp.file("dfs_shard_" + DfsGlobalAllocator::FormatShardIdx(0, 1) +
+                 ".data");
+    const DistributedFSDescriptor descriptor{shard, 0, 4096, 4096, 0};
+    std::string source(4096, 'R');
+    auto writes = backend->BatchWrite(
+        {{"timeout_read", descriptor, {{source.data(), source.size()}}}});
+    ASSERT_EQ(writes.size(), 1u);
+    ASSERT_TRUE(writes[0].has_value());
+
+    std::string destination(4096, 'S');
+    adapter_ptr->BlockReads();
+    auto reads = backend->BatchRead(
+        {{"timeout_read", descriptor,
+          {{destination.data(), destination.size()}}}});
+    ASSERT_EQ(reads.size(), 1u);
+    ASSERT_FALSE(reads[0].has_value());
+    EXPECT_EQ(reads[0].error(), ErrorCode::DFS_BATCH_GET_TIMEOUT);
+    EXPECT_EQ(destination, std::string(4096, 'S'));
+
+    adapter_ptr->ReleaseReads();
+    ASSERT_TRUE(adapter_ptr->WaitUntilDone(std::chrono::seconds(2)));
+    EXPECT_EQ(destination, std::string(4096, 'S'));
+}
+
+TEST(DfsRootMarkerTest, ShardAllocatorPublishesFormatMarker) {
     TempDir tmp("dfs_root_marker");
     DistributedStorageConfig config;
     config.fsdir = tmp.path();
@@ -854,20 +961,44 @@ TEST(DfsRootMarkerTest, ShardAllocatorPublishesMarkerForReadProbes) {
     EXPECT_TRUE(std::filesystem::exists(tmp.file(kDfsRootMarkerFileName)));
 }
 
-TEST_F(DfsBackendTest, HealthProbesUseMasterMarkerAndCreateFreshClientFile) {
-    const std::string marker_path = tmp_->file(kDfsRootMarkerFileName);
-    EXPECT_FALSE(std::filesystem::exists(marker_path));
+TEST(DfsRootMarkerTest, ShardAllocatorDoesNotOverwriteInvalidMarker) {
+    TempDir tmp("dfs_root_invalid_marker");
+    const std::string marker_path = tmp.file(kDfsRootMarkerFileName);
+    {
+        std::ofstream marker(marker_path, std::ios::binary);
+        marker << "unexpected-format\n";
+    }
+    DistributedStorageConfig config;
+    config.fsdir = tmp.path();
+    config.fs_adapter_type = "posix";
+    config.shard_count = 1;
+    config.shard_capacity = 64 * 1024;
+    config.alignment = 4096;
+
+    DfsGlobalAllocator allocator;
+    EXPECT_FALSE(allocator.Init(config).has_value());
+    std::ifstream marker(marker_path, std::ios::binary);
+    const std::string contents((std::istreambuf_iterator<char>(marker)),
+                               std::istreambuf_iterator<char>());
+    EXPECT_EQ(contents, "unexpected-format\n");
+}
+
+TEST_F(DfsBackendTest, HealthProbesUseStrictDirectDedicatedFile) {
+    const std::string probe_path = tmp_->file(kDfsReadProbeFileName);
+    EXPECT_FALSE(std::filesystem::exists(probe_path));
 
     auto read_before_write = backend_->ProbeRead();
     ASSERT_FALSE(read_before_write.has_value());
     EXPECT_EQ(read_before_write.error(), ErrorCode::FILE_NOT_FOUND);
 
     {
-        std::ofstream marker(marker_path);
-        ASSERT_TRUE(marker.good());
-        marker.write(kDfsRootMarkerPayload,
-                     sizeof(kDfsRootMarkerPayload) - 1);
+        std::ofstream probe(probe_path, std::ios::binary);
+        ASSERT_TRUE(probe.good());
+        const auto contents =
+            BuildDfsReadProbeContents(kTestDfsRootIdentity);
+        probe.write(contents.data(), contents.size());
     }
+    EXPECT_EQ(std::filesystem::file_size(probe_path), kDfsReadProbeSize);
     EXPECT_TRUE(backend_->ProbeRead().has_value())
         << "read probe must not depend on a prior client write probe";
 
@@ -897,19 +1028,21 @@ TEST_F(DfsBackendTest, HealthProbesUseMasterMarkerAndCreateFreshClientFile) {
     EXPECT_EQ(probe_file_count, 2u);
     EXPECT_TRUE(backend_->ProbeRead().has_value());
 
-    const int fd = ::open(marker_path.c_str(), O_WRONLY | O_TRUNC | O_CLOEXEC);
+    const int fd = ::open(probe_path.c_str(), O_WRONLY | O_CLOEXEC);
     ASSERT_GE(fd, 0);
-    constexpr char kCorruptPayload[] = "bad";
-    ASSERT_EQ(::write(fd, kCorruptPayload, sizeof(kCorruptPayload) - 1),
+    constexpr char kCorruptPayload[] = "bad!";
+    ASSERT_EQ(::pwrite(fd, kCorruptPayload, sizeof(kCorruptPayload) - 1,
+                       2 * kDfsReadProbeBlockSize),
               static_cast<ssize_t>(sizeof(kCorruptPayload) - 1));
     ASSERT_EQ(::close(fd), 0);
     EXPECT_FALSE(backend_->ProbeRead().has_value());
 
     {
-        std::ofstream marker(marker_path, std::ios::trunc);
-        ASSERT_TRUE(marker.good());
-        marker.write(kDfsRootMarkerPayload,
-                     sizeof(kDfsRootMarkerPayload) - 1);
+        std::ofstream probe(probe_path, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(probe.good());
+        const auto contents =
+            BuildDfsReadProbeContents(kTestDfsRootIdentity);
+        probe.write(contents.data(), contents.size());
     }
     ASSERT_TRUE(backend_->ProbeWrite().has_value());
     EXPECT_TRUE(backend_->ProbeRead().has_value());
@@ -922,6 +1055,22 @@ TEST_F(DfsBackendTest, HealthProbesUseMasterMarkerAndCreateFreshClientFile) {
         }
     }
     EXPECT_EQ(probe_file_count, 2u);
+}
+
+TEST(PosixFsAdapterTest, StrictDirectOpenRejectsSymlink) {
+    TempDir tmp("strict_direct_no_follow");
+    const std::string target = tmp.file("target");
+    const std::string link = tmp.file("link");
+    {
+        std::ofstream output(target, std::ios::binary);
+        const auto contents =
+            BuildDfsReadProbeContents(kTestDfsRootIdentity);
+        output.write(contents.data(), contents.size());
+    }
+    ASSERT_EQ(::symlink(target.c_str(), link.c_str()), 0);
+    PosixFsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(tmp.path()));
+    EXPECT_FALSE(adapter.OpenFileDirectStrict(link).has_value());
 }
 
 class ControlledPosixFsAdapter : public PosixFsAdapter {

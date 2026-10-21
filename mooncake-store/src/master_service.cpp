@@ -62,6 +62,7 @@
 #include "storage/distributed/immutable_bucket_allocator.h"
 #include "storage/distributed/dfs_global_allocator.h"
 #include "storage/distributed/dfs_root_identity.h"
+#include "storage/distributed/dfs_read_probe.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "random.h"
 #include "utils.h"
@@ -942,6 +943,17 @@ bool MasterService::InitializeDfsRootGuard(const std::string& root,
         DfsRootFileStatus::kMatch) {
         return false;
     }
+    const std::string read_probe_path = root + "/" + kDfsReadProbeFileName;
+    const std::string read_probe = BuildDfsReadProbeContents(identity);
+    const auto probe_status =
+        ReadExpectedDfsRootFile(read_probe_path, read_probe);
+    if (probe_status == DfsRootFileStatus::kMissing) {
+        if (!PublishExpectedDfsRootFile(root, read_probe_path, read_probe)) {
+            return false;
+        }
+    } else if (probe_status != DfsRootFileStatus::kMatch) {
+        return false;
+    }
 
     std::lock_guard lock(dfs_root_guard_mutex_);
     dfs_root_guard_path_ = root;
@@ -1008,6 +1020,8 @@ void MasterService::ReconcileDfsRootFiles() {
     reconcile(kDfsRootMarkerFileName,
               std::string(kDfsRootMarkerPayload,
                           sizeof(kDfsRootMarkerPayload) - 1));
+    reconcile(kDfsReadProbeFileName,
+              BuildDfsReadProbeContents(dfs_root_guard_identity_));
 }
 
 void MasterService::RefreshDfsMetrics() const {
