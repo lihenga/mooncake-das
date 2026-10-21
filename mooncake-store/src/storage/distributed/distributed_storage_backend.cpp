@@ -1838,13 +1838,23 @@ DistributedStorageBackend::BatchReadBlocking(
     return results;
 }
 
-bool DistributedStorageBackend::TryAcquireInflightRead(uint64_t bytes) {
-    std::lock_guard lock(inflight_read_mutex_);
-    if (inflight_read_batches_ >=
-            distributed_config_.batch_get_max_inflight_batches ||
-        bytes > distributed_config_.batch_get_max_inflight_bytes ||
-        inflight_read_bytes_ >
-            distributed_config_.batch_get_max_inflight_bytes - bytes) {
+bool DistributedStorageBackend::AcquireInflightReadUntil(
+    uint64_t bytes, std::chrono::steady_clock::time_point deadline) {
+    if (bytes > distributed_config_.batch_get_max_inflight_bytes) {
+        return false;
+    }
+
+    std::unique_lock lock(inflight_read_mutex_);
+    const auto capacity_available = [this, bytes] {
+        return inflight_read_batches_ <
+                   distributed_config_.batch_get_max_inflight_batches &&
+               inflight_read_bytes_ <=
+                   distributed_config_.batch_get_max_inflight_bytes - bytes;
+    };
+    if (deadline == std::chrono::steady_clock::time_point::max()) {
+        inflight_read_cv_.wait(lock, capacity_available);
+    } else if (!inflight_read_cv_.wait_until(lock, deadline,
+                                             capacity_available)) {
         return false;
     }
     ++inflight_read_batches_;
@@ -1853,11 +1863,14 @@ bool DistributedStorageBackend::TryAcquireInflightRead(uint64_t bytes) {
 }
 
 void DistributedStorageBackend::ReleaseInflightRead(uint64_t bytes) {
-    std::lock_guard lock(inflight_read_mutex_);
-    CHECK_GT(inflight_read_batches_, 0);
-    CHECK_GE(inflight_read_bytes_, bytes);
-    --inflight_read_batches_;
-    inflight_read_bytes_ -= bytes;
+    {
+        std::lock_guard lock(inflight_read_mutex_);
+        CHECK_GT(inflight_read_batches_, 0);
+        CHECK_GE(inflight_read_bytes_, bytes);
+        --inflight_read_batches_;
+        inflight_read_bytes_ -= bytes;
+    }
+    inflight_read_cv_.notify_all();
 }
 
 std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
@@ -1880,20 +1893,26 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
             }
         }
     }
-    if (!TryAcquireInflightRead(inflight_bytes)) {
-        dfs_read_timed_out_.store(true, std::memory_order_release);
+    const auto base_timeout_ms = distributed_config_.batch_get_timeout_ms;
+    const auto timeout_ms = DfsBatchGetTimeoutMs(base_timeout_ms, total_bytes);
+    const auto admission_deadline =
+        base_timeout_ms == 0
+            ? std::chrono::steady_clock::time_point::max()
+            : DfsIoDeadlineFromNow(timeout_ms);
+    if (!AcquireInflightReadUntil(inflight_bytes, admission_deadline)) {
         LOG_EVERY_N(WARNING, 64)
-            << "Rejecting DFS BatchGet because the in-flight limit is full: "
+            << "DFS BatchGet admission timed out waiting for in-flight "
+               "capacity: "
             << "request_bytes=" << inflight_bytes << ", max_batches="
             << distributed_config_.batch_get_max_inflight_batches
             << ", max_bytes="
             << distributed_config_.batch_get_max_inflight_bytes;
         return std::vector<tl::expected<void, ErrorCode>>(
             requests.size(),
-            tl::make_unexpected(ErrorCode::DFS_BATCH_GET_TIMEOUT));
+            tl::make_unexpected(
+                ErrorCode::DFS_BATCH_GET_ADMISSION_TIMEOUT));
     }
 
-    const auto base_timeout_ms = distributed_config_.batch_get_timeout_ms;
     if (base_timeout_ms == 0 || !all_buffers_owned) {
         if (base_timeout_ms != 0 && !all_buffers_owned) {
             LOG_EVERY_N(WARNING, 64)
@@ -1910,10 +1929,10 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
             throw;
         }
     }
-    const auto timeout_ms =
-        DfsBatchGetTimeoutMs(base_timeout_ms, total_bytes);
+    // Admission waiting and DFS I/O have different failure semantics. Start
+    // the I/O deadline only after capacity has been acquired so queueing behind
+    // healthy reads can never set the backend-wide DFS timeout latch.
     const auto deadline = DfsIoDeadlineFromNow(timeout_ms);
-
     struct TimedReadContext {
         std::mutex mutex;
         std::condition_variable cv;

@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -356,7 +357,8 @@ class DistributedStorageBackend
         const std::vector<DfsReadRequest>& requests,
         std::vector<tl::expected<void, ErrorCode>>& results);
 
-    bool TryAcquireInflightRead(uint64_t bytes);
+    bool AcquireInflightReadUntil(
+        uint64_t bytes, std::chrono::steady_clock::time_point deadline);
     void ReleaseInflightRead(uint64_t bytes);
 
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
@@ -372,6 +374,7 @@ class DistributedStorageBackend
     std::atomic<uint64_t> read_probe_generation_{0};
     std::atomic<bool> dfs_read_timed_out_{false};
     mutable std::mutex inflight_read_mutex_;
+    std::condition_variable inflight_read_cv_;
     uint64_t inflight_read_batches_{0};
     uint64_t inflight_read_bytes_{0};
     std::mutex health_probe_write_mutex_;

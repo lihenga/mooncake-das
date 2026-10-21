@@ -1053,21 +1053,31 @@ TEST(DfsBackendTimeoutTest, LimitsTimedReadsUntilRealCompletion) {
     EXPECT_FALSE(read(second, second_owner).has_value());
     second_owner.reset();
     ASSERT_TRUE(backend->ProbeRead().has_value());
-    const auto started_before_limit_rejection = adapter_ptr->StartedReads();
-    EXPECT_FALSE(read(third).has_value());
-    EXPECT_EQ(started_before_limit_rejection, 2u);
-    EXPECT_EQ(adapter_ptr->StartedReads(), started_before_limit_rejection);
-
+    const auto started_before_admission_wait = adapter_ptr->StartedReads();
+    std::atomic<bool> third_returned{false};
+    std::vector<tl::expected<void, ErrorCode>> third_result;
+    std::thread third_reader([&] {
+        third_result = backend->BatchRead(
+            {{"limited_read", descriptor,
+              {{third.data(), third.size()}}}});
+        third_returned.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_FALSE(third_returned.load());
+    EXPECT_EQ(started_before_admission_wait, 2u);
+    EXPECT_EQ(adapter_ptr->StartedReads(), started_before_admission_wait);
     adapter_ptr->ReleaseReads();
+    third_reader.join();
     ASSERT_TRUE(
-        adapter_ptr->WaitUntilCompleted(2, std::chrono::seconds(2)));
+        adapter_ptr->WaitUntilCompleted(3, std::chrono::seconds(2)));
+    ASSERT_EQ(third_result.size(), 1u);
+    EXPECT_TRUE(third_result[0].has_value());
+    EXPECT_EQ(third, source);
     for (int i = 0; i < 200 && released_owners.load() != 2; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     ASSERT_EQ(released_owners.load(), 2u);
     ASSERT_TRUE(backend->ProbeRead().has_value());
-    EXPECT_TRUE(read(third).has_value());
-    EXPECT_EQ(third, source);
 }
 
 TEST(DfsBackendTimeoutTest, RejectsReadThatExceedsInflightByteLimit) {
@@ -1107,7 +1117,8 @@ TEST(DfsBackendTimeoutTest, RejectsReadThatExceedsInflightByteLimit) {
           {{destination.data(), destination.size()}}}});
     ASSERT_EQ(read.size(), 1u);
     ASSERT_FALSE(read[0].has_value());
-    EXPECT_EQ(read[0].error(), ErrorCode::DFS_BATCH_GET_TIMEOUT);
+    EXPECT_EQ(read[0].error(),
+              ErrorCode::DFS_BATCH_GET_ADMISSION_TIMEOUT);
     EXPECT_EQ(adapter_ptr->StartedReads(), 0u);
     EXPECT_EQ(destination, std::string(4096, 'D'));
 }
