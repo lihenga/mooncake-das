@@ -477,13 +477,23 @@ TEST_F(DfsBucketClientTest, PutThenGetRoundTrip) {
     EXPECT_EQ(out, value);
 }
 
-TEST_F(DfsBucketClientTest,
+class DfsBucketEpochClientTest : public DfsBucketClientTest {
+   protected:
+    void SetUp() override {
+        // Make bucket-id reuse deterministic instead of depending on which
+        // preallocation worker completes first.
+        SetEnv("MOONCAKE_DFS_READY_BUCKET_COUNT", "0");
+        DfsBucketClientTest::SetUp();
+    }
+};
+
+TEST_F(DfsBucketEpochClientTest,
        MasterRestartReusesBucketWithoutWaitingForHeartbeat) {
     const std::string key = "restart_reused_bucket";
     std::string old_value(4096, 'O');
     std::string new_value(4096, 'N');
-    ASSERT_TRUE(
-        writer_->Put(key, {{old_value.data(), old_value.size()}}, DfsConfig()));
+    std::vector<Slice> old_slices{{old_value.data(), old_value.size()}};
+    ASSERT_TRUE(writer_->Put(key, old_slices, DfsConfig()));
     ASSERT_TRUE(WaitForDfsReplica(key));
     auto old_query = QueryDfsOnly(key);
     ASSERT_TRUE(old_query);
@@ -521,8 +531,9 @@ TEST_F(DfsBucketClientTest,
         ASSERT_TRUE(connected);
     }
     ASSERT_TRUE(provider_->MountSegment(segment_, segment_size_, "tcp"));
-    auto puts = writer_->BatchPut(
-        {key}, {{{new_value.data(), new_value.size()}}}, DfsConfig());
+    std::vector<std::vector<Slice>> new_slices{
+        {{new_value.data(), new_value.size()}}};
+    auto puts = writer_->BatchPut({key}, new_slices, DfsConfig());
     ASSERT_EQ(puts.size(), 1u);
     ASSERT_TRUE(puts[0]);
     ASSERT_TRUE(WaitForDfsReplica(key));
@@ -545,7 +556,8 @@ TEST_F(DfsBucketClientTest,
 TEST_F(DfsBucketClientTest, AllFinalizationRpcsRejectStaleMasterEpoch) {
     const std::string key = "stale_completion_epoch";
     std::string value(4096, 'C');
-    ASSERT_TRUE(writer_->Put(key, {{value.data(), value.size()}}, DfsConfig()));
+    std::vector<Slice> slices{{value.data(), value.size()}};
+    ASSERT_TRUE(writer_->Put(key, slices, DfsConfig()));
     ASSERT_TRUE(WaitForDfsReplica(key));
     auto query = QueryDfsOnly(key);
     ASSERT_TRUE(query);
@@ -574,7 +586,8 @@ TEST_F(DfsBucketClientTest, AllFinalizationRpcsRejectStaleMasterEpoch) {
 TEST_F(DfsBucketClientTest, RegexQueryCarriesCurrentDfsEpoch) {
     const std::string key = "epoch_regex_query";
     std::string value(4096, 'R');
-    ASSERT_TRUE(writer_->Put(key, {{value.data(), value.size()}}, DfsConfig()));
+    std::vector<Slice> slices{{value.data(), value.size()}};
+    ASSERT_TRUE(writer_->Put(key, slices, DfsConfig()));
     ASSERT_TRUE(WaitForDfsReplica(key));
     auto query = QueryDfsOnly(key);
     ASSERT_TRUE(query);
