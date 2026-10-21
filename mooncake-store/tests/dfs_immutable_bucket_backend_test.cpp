@@ -344,6 +344,127 @@ TEST_F(DfsBucketBackendTest, EpochInvalidationReopensReusedBucketPath) {
     EXPECT_EQ(ReadObject("epoch_reuse", desc), new_value);
 }
 
+TEST_F(DfsBucketBackendTest, MasterEpochReopensReusedBucketBeforeReadAndWrite) {
+    const std::string key = "epoch_trigger";
+    const std::string old_value(4096, 'O');
+    const std::string new_value(4096, 'N');
+    auto old_desc = WriteObject(key, old_value);
+    UUID current_epoch{1, 1};
+    size_t confirmations = 0;
+    backend_->SetMasterEpochProvider([&]() -> tl::expected<UUID, ErrorCode> {
+        ++confirmations;
+        return current_epoch;
+    });
+    old_desc.master_epoch = current_epoch;
+    auto write = [&](const DistributedFSDescriptor& desc,
+                     const std::string& value) {
+        return backend_->BatchWrite(
+            {{key, desc, {{const_cast<char*>(value.data()), value.size()}}}});
+    };
+    ASSERT_TRUE(write(old_desc, old_value)[0]);
+    EXPECT_EQ(ReadObject(key, old_desc), old_value);
+    const size_t cached_confirmations = confirmations;
+    ASSERT_TRUE(write(old_desc, old_value)[0]);
+    EXPECT_EQ(ReadObject(key, old_desc), old_value);
+    EXPECT_EQ(confirmations, cached_confirmations);
+
+    // Both cached handle types still refer to the unlinked old inode.
+    ASSERT_TRUE(std::filesystem::remove(old_desc.file_path));
+    {
+        std::ofstream replacement(old_desc.file_path, std::ios::binary);
+        replacement.seekp(static_cast<std::streamoff>(kBucketCapacity - 1));
+        replacement.put('\0');
+        ASSERT_TRUE(replacement.good());
+    }
+    current_epoch = UUID{1, 2};
+    auto new_desc = old_desc;
+    new_desc.master_epoch = current_epoch;
+    ASSERT_TRUE(write(new_desc, new_value)[0]);
+    EXPECT_EQ(ReadObject(key, new_desc), new_value);
+
+    std::ifstream disk(new_desc.file_path, std::ios::binary);
+    disk.seekg(static_cast<std::streamoff>(new_desc.offset));
+    std::string on_disk(new_value.size(), '\0');
+    disk.read(on_disk.data(), on_disk.size());
+    ASSERT_TRUE(disk.good());
+    EXPECT_EQ(on_disk, new_value);
+
+    const int writes_before_stale = adapter_->WriteCalls();
+    auto stale_write = write(old_desc, old_value);
+    ASSERT_FALSE(stale_write[0]);
+    EXPECT_EQ(stale_write[0].error(), ErrorCode::DFS_STALE_HANDLE);
+    EXPECT_EQ(adapter_->WriteCalls(), writes_before_stale);
+    // A late old response must not discard the new epoch's cached handles.
+    const size_t confirmations_after_stale = confirmations;
+    EXPECT_EQ(ReadObject(key, new_desc), new_value);
+    EXPECT_EQ(confirmations, confirmations_after_stale);
+}
+
+TEST_F(DfsBucketBackendTest, OldEpochCannotFirstOpenRecreatedBucket) {
+    const std::string key = "queued_old_epoch";
+    const std::string old_value(4096, 'O');
+    const std::string new_value(4096, 'N');
+    auto old_desc = WriteObject(key, old_value);
+    UUID current_epoch{2, 1};
+    backend_->SetMasterEpochProvider(
+        [&]() -> tl::expected<UUID, ErrorCode> { return current_epoch; });
+    old_desc.master_epoch = current_epoch;
+    EXPECT_EQ(ReadObject(key, old_desc), old_value);
+    ASSERT_TRUE(backend_->InvalidateAllBucketFds());
+    ASSERT_TRUE(std::filesystem::remove(old_desc.file_path));
+    {
+        std::ofstream replacement(old_desc.file_path, std::ios::binary);
+        replacement.seekp(static_cast<std::streamoff>(old_desc.offset));
+        replacement.write(new_value.data(), new_value.size());
+        ASSERT_TRUE(replacement.good());
+    }
+    // No new-epoch descriptor has reached this backend yet.
+    current_epoch = UUID{2, 2};
+    const int writes_before = adapter_->WriteCalls();
+    auto stale_write = backend_->BatchWrite(
+        {{key,
+          old_desc,
+          {{const_cast<char*>(old_value.data()), old_value.size()}}}});
+    ASSERT_FALSE(stale_write[0]);
+    EXPECT_EQ(stale_write[0].error(), ErrorCode::DFS_STALE_HANDLE);
+    EXPECT_EQ(adapter_->WriteCalls(), writes_before);
+    std::string output(new_value.size(), '\0');
+    auto stale_read = backend_->BatchRead(
+        {{key, old_desc, {{output.data(), output.size()}}}});
+    ASSERT_FALSE(stale_read[0]);
+    EXPECT_EQ(stale_read[0].error(), ErrorCode::DFS_STALE_HANDLE);
+    auto new_desc = old_desc;
+    new_desc.master_epoch = current_epoch;
+    EXPECT_EQ(ReadObject(key, new_desc), new_value);
+}
+
+TEST_F(DfsBucketBackendTest, FailedEpochConfirmationPreservesCachedHandles) {
+    const std::string key = "epoch_confirmation_failure";
+    const std::string value(4096, 'V');
+    auto desc = WriteObject(key, value);
+    UUID current_epoch{3, 1};
+    bool unavailable = false;
+    size_t confirmations = 0;
+    backend_->SetMasterEpochProvider([&]() -> tl::expected<UUID, ErrorCode> {
+        ++confirmations;
+        if (unavailable) return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        return current_epoch;
+    });
+    desc.master_epoch = current_epoch;
+    EXPECT_EQ(ReadObject(key, desc), value);
+    auto unconfirmed = desc;
+    unconfirmed.master_epoch = UUID{3, 2};
+    unavailable = true;
+    std::string output(value.size(), '\0');
+    auto read = backend_->BatchRead(
+        {{key, unconfirmed, {{output.data(), output.size()}}}});
+    ASSERT_FALSE(read[0]);
+    EXPECT_EQ(read[0].error(), ErrorCode::RPC_FAIL);
+    const size_t confirmations_after_failure = confirmations;
+    EXPECT_EQ(ReadObject(key, desc), value);
+    EXPECT_EQ(confirmations, confirmations_after_failure);
+}
+
 TEST_F(DfsBucketBackendTest, WrittenEntryContainsOnlyObjectAndPadding) {
     const std::string key = "layout_key";
     const std::string value(64, 'Z');

@@ -426,7 +426,7 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_pool(
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     return invoke_rpc_with_pool<ServiceMethod, ReturnType>(
-        client_accessor_, std::forward<Args>(args)...);
+        *client_accessor_, std::forward<Args>(args)...);
 }
 
 template <auto ServiceMethod, typename ResultType, typename... Args>
@@ -437,7 +437,7 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
         return std::vector<tl::expected<ResultType, ErrorCode>>(
             input_size, tl::make_unexpected(ErrorCode::RPC_FAIL));
     }
-    auto pool = client_accessor_.GetClientPool();
+    auto pool = client_accessor_->GetClientPool();
     if (metrics_) {
         metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
     }
@@ -509,9 +509,9 @@ ErrorCode MasterClient::Connect(const std::string& master_addr,
     if (use_ha_control_pool) {
         ha_probe_client_accessor_.GetOrCreateClientPool(master_addr);
     } else if (force_recreate || client_addr_param_ != master_addr) {
-        client_accessor_.RecreateClientPool(master_addr);
+        client_accessor_->RecreateClientPool(master_addr);
     } else {
-        client_accessor_.GetOrCreateClientPool(master_addr);
+        client_accessor_->GetOrCreateClientPool(master_addr);
     }
     // The client pool does not have native connection check method, so we need
     // to use custom ServiceReady API.
@@ -520,7 +520,7 @@ ErrorCode MasterClient::Connect(const std::string& master_addr,
             ? invoke_rpc_with_pool<&WrappedMasterService::ServiceReady,
                                    std::string>(ha_probe_client_accessor_)
             : invoke_rpc_with_pool<&WrappedMasterService::ServiceReady,
-                                   std::string>(client_accessor_);
+                                   std::string>(*client_accessor_);
     if (!result.has_value()) {
         timer.LogResponse("error_code=", result.error());
         return result.error();
@@ -536,7 +536,7 @@ ErrorCode MasterClient::Connect(const std::string& master_addr,
     }
     if (use_ha_control_pool) {
         // Only move foreground traffic after the control-plane probe is ready.
-        client_accessor_.GetOrCreateClientPool(master_addr);
+        client_accessor_->GetOrCreateClientPool(master_addr);
         ha_control_client_accessor_.GetOrCreateClientPool(master_addr);
     }
     client_addr_param_ = master_addr;
@@ -1015,7 +1015,7 @@ tl::expected<PingResponse, ErrorCode> MasterClient::Ping() {
         ping_pool =
             ha_connection_policy_enabled_.load(std::memory_order_acquire)
                 ? ha_control_client_accessor_.GetClientPool()
-                : client_accessor_.GetClientPool();
+                : client_accessor_->GetClientPool();
     }
     auto result =
         invoke_rpc_with_client_pool<&WrappedMasterService::Ping, PingResponse>(
@@ -1134,6 +1134,40 @@ MasterClient::OffloadObjectHeartbeat(const UUID& client_id,
         invoke_rpc<&WrappedMasterService::OffloadObjectHeartbeat,
                    std::vector<OffloadTaskItem>>(client_id, enable_offloading);
     return result;
+}
+
+std::function<tl::expected<UUID, ErrorCode>()>
+MasterClient::MakeDfsMasterEpochProvider() {
+    return [accessor = client_accessor_,
+            client_id = client_id_]() -> tl::expected<UUID, ErrorCode> {
+        const auto pool = accessor->GetClientPool();
+        if (!pool) return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        return async_simple::coro::syncAwait(
+            [&]() -> async_simple::coro::Lazy<tl::expected<UUID, ErrorCode>> {
+                auto response = co_await pool->send_request(
+                    [&](coro_rpc::coro_rpc_client& client)
+                        -> async_simple::coro::Lazy<
+                            tl::expected<UUID, ErrorCode>> {
+                        auto result = co_await client.call<
+                            &WrappedMasterService::GetDfsBucketSnapshot>(
+                            client_id, UUID{}, uint64_t{0});
+                        if (!result) {
+                            co_return tl::make_unexpected(
+                                result.error().code == coro_rpc::errc::timed_out
+                                    ? ErrorCode::RPC_TIMEOUT
+                                    : ErrorCode::RPC_FAIL);
+                        }
+                        if (!*result) {
+                            co_return tl::make_unexpected(result->error());
+                        }
+                        co_return result->value().epoch;
+                    });
+                if (!response) {
+                    co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+                }
+                co_return std::move(*response);
+            }());
+    };
 }
 
 tl::expected<DfsBucketSnapshotResponse, ErrorCode>

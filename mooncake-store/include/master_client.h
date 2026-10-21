@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <csignal>
+#include <functional>
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -118,8 +119,9 @@ class MasterClient {
    public:
     MasterClient(const UUID& client_id, MasterClientMetric* metrics = nullptr,
                  std::string tenant_id = "default")
-        : client_accessor_(GetStoreRpcClientIoContextPool(),
-                           detail::MakeMasterRpcClientPoolConfig()),
+        : client_accessor_(std::make_shared<RpcClientPool>(
+              GetStoreRpcClientIoContextPool(),
+              detail::MakeMasterRpcClientPoolConfig())),
           ha_control_client_accessor_(
               GetStoreRpcClientIoContextPool(),
               detail::MakeMasterRpcClientPoolConfig(/*ha_enabled=*/true)),
@@ -497,6 +499,10 @@ class MasterClient {
     [[nodiscard]] tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 
+    // Independent of Client/MasterClient lifetime; follows Connect() changes
+    // through the shared pool holder and remains safe during async DFS drain.
+    std::function<tl::expected<UUID, ErrorCode>()> MakeDfsMasterEpochProvider();
+
     [[nodiscard]] tl::expected<DfsBucketSnapshotResponse, ErrorCode>
     GetDfsBucketSnapshot(const UUID& client_id, const UUID& last_epoch,
                          uint64_t last_version);
@@ -781,7 +787,7 @@ class MasterClient {
     [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
     invoke_batch_rpc(size_t input_size, Args&&... args);
 
-    RpcClientPool client_accessor_;
+    std::shared_ptr<RpcClientPool> client_accessor_;
     RpcClientPool ha_control_client_accessor_;
     RpcClientPool ha_probe_client_accessor_;
     RpcDrainGuard rpc_drain_;

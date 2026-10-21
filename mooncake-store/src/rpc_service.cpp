@@ -27,6 +27,13 @@ void StampDfsEpoch(std::vector<Replica::Descriptor>& replicas,
     }
 }
 
+void StampDfsEpoch(
+    std::unordered_map<std::string, std::vector<Replica::Descriptor>>&
+        responses,
+    const UUID& epoch) {
+    for (auto& [key, replicas] : responses) StampDfsEpoch(replicas, epoch);
+}
+
 void StampDfsEpoch(GetReplicaListResponse& response, const UUID& epoch) {
     StampDfsEpoch(response.replicas, epoch);
 }
@@ -307,7 +314,7 @@ tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
              ErrorCode>
 WrappedMasterService::GetReplicaListByRegex(const std::string& str,
                                             const std::string& tenant_id) {
-    return execute_rpc(
+    auto result = execute_rpc(
         "GetReplicaListByRegex",
         [&] {
             return WithRequestTenant(
@@ -328,6 +335,8 @@ WrappedMasterService::GetReplicaListByRegex(const std::string& str,
             MasterMetricManager::instance()
                 .inc_get_replica_list_by_regex_failures();
         });
+    StampDfsEpoch(result, master_service_.GetDfsMasterEpoch());
+    return result;
 }
 
 tl::expected<GetReplicaListResponse, ErrorCode>

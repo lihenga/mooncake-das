@@ -5099,16 +5099,8 @@ void Client::SetDfsStorageBackend(
                   << dfs_write_chunk_size_;
     }
     if (backend) {
-        backend->SetMasterEpochProvider([weak_client = weak_from_this()]()
-                                            -> tl::expected<UUID, ErrorCode> {
-            auto client = weak_client.lock();
-            if (!client) {
-                return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
-            }
-            auto snapshot = client->GetDfsBucketSnapshot(UUID{}, 0);
-            if (!snapshot) return tl::make_unexpected(snapshot.error());
-            return snapshot->epoch;
-        });
+        backend->SetMasterEpochProvider(
+            master_client_.MakeDfsMasterEpochProvider());
     }
     dfs_storage_backend_ = std::move(backend);
     EnsureStorageControlPlaneStarted();
