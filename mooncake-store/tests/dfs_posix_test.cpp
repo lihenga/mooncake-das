@@ -901,7 +901,7 @@ class BlockingReadPosixFsAdapter : public PosixFsAdapter {
     bool done_ = false;
 };
 
-TEST(DfsBackendTimeoutTest, LateReadCannotModifyCallerBuffer) {
+TEST(DfsBackendTimeoutTest, LateReadContinuesIntoCallerBuffer) {
     TempDir tmp("dfs_read_timeout");
     ASSERT_TRUE(WriteTestDfsRootIdentity(tmp.path()));
     FileStorageConfig file_config;
@@ -944,7 +944,7 @@ TEST(DfsBackendTimeoutTest, LateReadCannotModifyCallerBuffer) {
 
     adapter_ptr->ReleaseReads();
     ASSERT_TRUE(adapter_ptr->WaitUntilDone(std::chrono::seconds(2)));
-    EXPECT_EQ(destination, std::string(4096, 'S'));
+    EXPECT_EQ(destination, source);
 }
 
 TEST(DfsRootMarkerTest, ShardAllocatorPublishesFormatMarker) {

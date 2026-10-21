@@ -1788,30 +1788,18 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
         std::condition_variable cv;
         bool done = false;
         std::chrono::steady_clock::time_point completed_at;
-        std::vector<std::vector<char>> buffers;
         std::vector<DfsReadRequest> requests;
         std::vector<tl::expected<void, ErrorCode>> results;
     };
     auto context = std::make_shared<TimedReadContext>();
-    context->buffers.resize(requests.size());
-    context->requests.reserve(requests.size());
     try {
-        for (size_t index = 0; index < requests.size(); ++index) {
-            const auto& request = requests[index];
-            if (request.descriptor.object_size >
-                std::numeric_limits<size_t>::max()) {
-                return std::vector<tl::expected<void, ErrorCode>>(
-                    requests.size(),
-                    tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-            }
-            auto& storage = context->buffers[index];
-            storage.resize(static_cast<size_t>(request.descriptor.object_size));
-            std::vector<Slice> slices;
-            slices.emplace_back(Slice{storage.data(), storage.size()});
-            context->requests.push_back(
-                DfsReadRequest{request.key, request.descriptor,
-                               std::move(slices)});
-        }
+        // Preserve the request metadata for the detached worker, but read
+        // directly into the caller-provided slices. This keeps aligned pinned
+        // buffers on the O_DIRECT zero-copy path and avoids a private buffer
+        // allocation plus a completion-time memcpy for every object. A timed-out
+        // worker may still access these slices, so the caller must keep them alive
+        // and must not reuse them until the underlying read has actually ended.
+        context->requests = requests;
     } catch (const std::bad_alloc&) {
         return std::vector<tl::expected<void, ErrorCode>>(
             requests.size(),
@@ -1876,33 +1864,7 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
             requests.size(),
             tl::make_unexpected(ErrorCode::DFS_BATCH_GET_TIMEOUT));
     }
-    auto results = context->results;
-    lock.unlock();
-
-    if (results.size() != requests.size()) return results;
-    for (size_t index = 0; index < requests.size(); ++index) {
-        if (!results[index]) continue;
-        const auto& storage = context->buffers[index];
-        size_t copied = 0;
-        for (const auto& slice : requests[index].slices) {
-            if (copied >= storage.size()) break;
-            const size_t bytes = std::min(slice.size, storage.size() - copied);
-            if (bytes != 0) {
-                if (slice.ptr == nullptr) {
-                    results[index] =
-                        tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-                    break;
-                }
-                std::memcpy(slice.ptr, storage.data() + copied, bytes);
-                copied += bytes;
-            }
-        }
-        if (results[index] && copied != storage.size()) {
-            results[index] =
-                tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-    }
-    return results;
+    return context->results;
 }
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::BatchLoad(
