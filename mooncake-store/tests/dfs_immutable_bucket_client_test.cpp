@@ -673,6 +673,78 @@ TEST_F(DfsBucketClientTest, AsyncWriteSucceedsAfterCallerBufferIsOverwritten) {
     ExpectDfsValue(key, expected);
 }
 
+TEST_F(DfsBucketClientTest, BatchPutPreservesDfsAfterMemoryTransferFailure) {
+    ASSERT_TRUE(provider_->UnmountSegment(segment_, segment_size_));
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "unreachable_memory";
+    segment.base = reinterpret_cast<uintptr_t>(segment_);
+    segment.size = segment_size_;
+    segment.te_endpoint = "127.0.0.1:1";
+    segment.protocol = "tcp";
+    ASSERT_TRUE(
+        master_.service()->MountSegment(segment, provider_->getClientId()));
+
+    for (const bool same_node : {false, true}) {
+        for (const bool fail_dfs : {false, true}) {
+            std::vector<std::string> keys{"memory_failure_" +
+                                          std::to_string(same_node) + "_" +
+                                          std::to_string(fail_dfs)};
+            std::vector<std::string> values{std::string(4096, 'M')};
+            const std::string expected = values[0];
+            auto slices = MakeSlices(values);
+            auto config = DfsConfig();
+            config.prefer_alloc_in_same_node = same_node;
+            adapter_->FailAllWrites(fail_dfs);
+            adapter_->BlockWrites();
+            const int writes_before = adapter_->WriteCalls();
+
+            auto results = writer_->BatchPut(keys, slices, config);
+            ASSERT_EQ(results.size(), 1u);
+            ASSERT_FALSE(results[0].has_value());
+            EXPECT_EQ(results[0].error(), ErrorCode::TRANSFER_FAIL);
+            EXPECT_FALSE(writer_->Query(keys[0]).has_value());
+            values[0].assign(values[0].size(), 'X');
+            adapter_->ReleaseWrites();
+            if (fail_dfs) {
+                ASSERT_TRUE(WaitForKeyGone(keys[0]));
+                auto query = writer_->Query(keys[0]);
+                ASSERT_FALSE(query.has_value());
+                EXPECT_EQ(query.error(), ErrorCode::OBJECT_NOT_FOUND);
+            } else {
+                ASSERT_TRUE(WaitForDfsReplica(keys[0]));
+                auto query = writer_->Query(keys[0]);
+                ASSERT_TRUE(query.has_value());
+                ASSERT_EQ(query->replicas.size(), 1u);
+                EXPECT_TRUE(query->replicas[0].is_dfs_replica());
+                std::string output(expected.size(), '\0');
+                std::vector<Slice> read_slices{{output.data(), output.size()}};
+                ASSERT_TRUE(writer_->Get(keys[0], *query, read_slices));
+                EXPECT_EQ(output, expected);
+            }
+            EXPECT_GT(adapter_->WriteCalls(), writes_before);
+        }
+
+        // Upserts retain their all-or-nothing policy after memory failure.
+        std::vector<std::string> keys{"upsert_memory_failure_" +
+                                      std::to_string(same_node)};
+        std::vector<std::string> values{std::string(4096, 'U')};
+        auto slices = MakeSlices(values);
+        auto config = DfsConfig();
+        config.prefer_alloc_in_same_node = same_node;
+        adapter_->FailAllWrites(false);
+        const int writes_before = adapter_->WriteCalls();
+        auto results = writer_->BatchUpsert(keys, slices, config);
+        ASSERT_EQ(results.size(), 1u);
+        ASSERT_FALSE(results[0].has_value());
+        EXPECT_EQ(results[0].error(), ErrorCode::TRANSFER_FAIL);
+        EXPECT_EQ(adapter_->WriteCalls(), writes_before);
+        auto query = writer_->Query(keys[0]);
+        ASSERT_FALSE(query.has_value());
+        EXPECT_EQ(query.error(), ErrorCode::OBJECT_NOT_FOUND);
+    }
+}
+
 TEST_F(DfsBucketClientTest, FailedAsyncWriteRevokesOnlyTheDfsReplica) {
     const std::string key = "bucket_write_fail";
     std::string value(4096, 'F');

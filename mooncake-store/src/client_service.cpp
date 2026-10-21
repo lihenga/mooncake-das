@@ -3446,7 +3446,7 @@ void Client::SubmitDfsWriteChunk(
         auto& op = ops[i];
         if (op.IsResolved() ||
             op.transfer_summary.allocated_dfs_replicas == 0 ||
-            !NonDfsTransfersSucceeded(op.transfer_summary)) {
+            (is_upsert && !NonDfsTransfersSucceeded(op.transfer_summary))) {
             continue;
         }
         // In BUCKET mode, an incomplete requested topology will be revoked.
@@ -3677,7 +3677,7 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
         for (auto& op : ops) {
             if (!op.IsResolved() &&
                 op.transfer_summary.allocated_dfs_replicas > 0 &&
-                NonDfsTransfersSucceeded(op.transfer_summary)) {
+                (!is_upsert || NonDfsTransfersSucceeded(op.transfer_summary))) {
                 op.transfer_summary.RecordFailure(ReplicaType::DFS,
                                                   ErrorCode::TRANSFER_FAIL);
                 op.AppendFailureContext("DFS write staging arena unavailable");
@@ -3700,8 +3700,9 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
 
     for (size_t i = 0; i < ops.size(); ++i) {
         auto& op = ops[i];
-        if (op.IsResolved() || op.transfer_summary.allocated_dfs_replicas == 0 ||
-            !NonDfsTransfersSucceeded(op.transfer_summary)) {
+        if (op.IsResolved() ||
+            op.transfer_summary.allocated_dfs_replicas == 0 ||
+            (is_upsert && !NonDfsTransfersSucceeded(op.transfer_summary))) {
             continue;
         }
         size_t object_bytes = 0;
@@ -3783,6 +3784,7 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     BatchFinalizeGroup end_all_group;
     BatchFinalizeGroup end_memory_group;
     BatchFinalizeGroup end_nof_group;
+    BatchFinalizeGroup end_dfs_group;
     BatchFinalizeGroup revoke_all_group;
     BatchFinalizeGroup revoke_memory_group;
     BatchFinalizeGroup revoke_nof_group;
@@ -3821,6 +3823,13 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
                                     key, index);
                     ++pending_finalize_actions[index];
                     break;
+                case ReplicaType::DFS:
+                    if (is_end) {
+                        add_group_entry(end_dfs_group, key, index);
+                        ++pending_finalize_actions[index];
+                        break;
+                    }
+                    [[fallthrough]];
                 default:
                     LOG(ERROR) << "Unexpected replica type in batch finalize: "
                                << *replica_type;
@@ -3858,6 +3867,20 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
             /*allow_missing_dfs=*/true);
         should_succeed[i] = finalize_decision.success;
         terminal_errors[i] = finalize_decision.error;
+        const auto& summary = op.transfer_summary;
+        if (summary.failed_memory_transfers > 0 &&
+            summary.allocated_nof_replicas == 0 &&
+            summary.allocated_dfs_replicas > 0 &&
+            summary.successful_dfs_transfers ==
+                summary.allocated_dfs_replicas &&
+            summary.failed_dfs_transfers == 0) {
+            // Preserve DFS independently while returning the memory error.
+            if (!summary.dfs_completion_deferred) {
+                add_finalize_action(ReplicaType::DFS, true, op.key, i);
+            }
+            add_finalize_action(ReplicaType::MEMORY, false, op.key, i);
+            continue;
+        }
         add_finalize_action(finalize_decision.end_type, true, op.key, i);
         add_finalize_action(finalize_decision.revoke_type, false, op.key, i);
     }
@@ -3924,6 +3947,7 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     process_end_group(end_all_group, ReplicaType::ALL);
     process_end_group(end_memory_group, ReplicaType::MEMORY);
     process_end_group(end_nof_group, ReplicaType::NOF_SSD);
+    process_end_group(end_dfs_group, ReplicaType::DFS);
     process_revoke_group(revoke_all_group, ReplicaType::ALL);
     process_revoke_group(revoke_memory_group, ReplicaType::MEMORY);
     process_revoke_group(revoke_nof_group, ReplicaType::NOF_SSD);
@@ -4257,7 +4281,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
         op.failure_context = seg_to_ops.at(seg).failure_context;
     }
     // Puts may write asynchronously in bucket mode.
-    SubmitDfsWrites(ops, /*is_upsert=*/false, /*allow_async=*/true);
+    SubmitDfsWrites(ops, is_upsert, /*allow_async=*/!is_upsert);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
                   .count();
