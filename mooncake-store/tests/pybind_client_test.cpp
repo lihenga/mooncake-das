@@ -14,6 +14,7 @@
 #include <memory>
 #include <optional>
 #include <random>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -2225,11 +2226,25 @@ TEST_F(RealClientTest, TestGetSessionLeaseExpiredDropsSession) {
 
     auto metrics = py_client_->client_->SerializeMetrics();
     ASSERT_TRUE(metrics.has_value());
-    EXPECT_NE(metrics.value().find("mooncake_direct_access_total{source="
-                                   "\"memory\",result=\"failure\"}"),
-              std::string::npos)
-        << "the first range lease expiry must be counted as a direct access "
-           "failure";
+    std::istringstream metric_lines(metrics.value());
+    std::string line;
+    bool found_failure_metric = false;
+    while (std::getline(metric_lines, line)) {
+        if (line.rfind("mooncake_direct_access_total{", 0) != 0 ||
+            line.find("source=\"memory\"") == std::string::npos ||
+            line.find("result=\"failure\"") == std::string::npos) {
+            continue;
+        }
+        const auto labels_end = line.find('}');
+        ASSERT_NE(labels_end, std::string::npos);
+        std::istringstream value_stream(line.substr(labels_end + 1));
+        double value = 0;
+        ASSERT_TRUE(static_cast<bool>(value_stream >> value));
+        EXPECT_EQ(value, 1)
+            << "the first range lease expiry must be counted exactly once";
+        found_failure_metric = true;
+    }
+    EXPECT_TRUE(found_failure_metric);
 
     ASSERT_EQ(py_client_->unregister_buffer(src.data()), 0);
     ASSERT_EQ(py_client_->unregister_buffer(dst.data()), 0);

@@ -54,6 +54,10 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#ifdef MC_TEST_INTERPOSE_VERBS
+#include <dlfcn.h>
+#endif
+
 #include "common.h"
 #include "transfer_engine.h"
 #include "transport/rdma_transport/rdma_context.h"
@@ -319,23 +323,6 @@ std::string makeNicPriorityMatrix(const std::string& preferred_devices,
            formatted_preferred + "],[" + formatted_fallback + "]]}";
 }
 
-void waitForTransfer(TransferEngine* engine, BatchID batch_id,
-                     const std::string& op_name) {
-    bool completed = false;
-    TransferStatus status;
-    while (!completed) {
-        Status s = engine->getTransferStatus(batch_id, 0, status);
-        EXPECT_EQ(s, Status::OK());
-        if (status.s == TransferStatusEnum::COMPLETED) {
-            completed = true;
-        } else if (status.s == TransferStatusEnum::FAILED) {
-            FAIL() << op_name << " FAILED";
-        }
-    }
-    Status s = engine->freeBatchID(batch_id);
-    EXPECT_EQ(s, Status::OK());
-}
-
 bool waitForTransferWithTimeout(TransferEngine* engine, BatchID batch_id,
                                 const std::string& op_name,
                                 std::chrono::seconds timeout) {
@@ -501,7 +488,9 @@ class RDMAEndpointReestablishTest : public ::testing::Test {
 
             Status s = init_ctx.engine_->submitTransfer(batch_id, {entry});
             ASSERT_EQ(s, Status::OK());
-            waitForTransfer(init_ctx.engine_.get(), batch_id, "WRITE");
+            ASSERT_TRUE(waitForTransferWithTimeout(init_ctx.engine_.get(),
+                                                   batch_id, "WRITE",
+                                                   std::chrono::seconds(60)));
             LOG(INFO) << "Phase 1: Write Completed. Tearing down connection...";
         }
 
@@ -525,7 +514,9 @@ class RDMAEndpointReestablishTest : public ::testing::Test {
 
             Status s = init_ctx.engine_->submitTransfer(batch_id, {entry});
             ASSERT_EQ(s, Status::OK());
-            waitForTransfer(init_ctx.engine_.get(), batch_id, "READ");
+            ASSERT_TRUE(waitForTransferWithTimeout(init_ctx.engine_.get(),
+                                                   batch_id, "READ",
+                                                   std::chrono::seconds(60)));
 
             bool ok = true;
             for (size_t i = 0; i < kDataLength; ++i) {
@@ -617,8 +608,9 @@ TEST_F(RDMAEndpointReestablishTest, SenderSingleRnicDownUsesFallbackLocalRnic) {
 
     Status s = init_ctx.engine_->submitTransfer(batch_id, {entry});
     ASSERT_EQ(s, Status::OK());
-    waitForTransfer(init_ctx.engine_.get(), batch_id,
-                    "WRITE with one sender RNIC down");
+    ASSERT_TRUE(waitForTransferWithTimeout(init_ctx.engine_.get(), batch_id,
+                                           "WRITE with one sender RNIC down",
+                                           std::chrono::seconds(60)));
 
     for (size_t i = 0; i < kDataLength; ++i) {
         ASSERT_EQ(target_ctx.local_addr_[i],
@@ -901,13 +893,46 @@ TEST(RDMAEndpointSetupErrorTest, VerifyVerbsErrorCorrectlyCaptured) {
 
 }  // namespace
 
-extern "C" int __real__ibv_query_gid_ex(ibv_context* context, uint8_t port_num,
-                                        int gid_index,
+#ifdef MC_TEST_INTERPOSE_VERBS
+// Export the mock symbols so calls from libtransfer_engine use them too.
+// Forward uninjected calls to libibverbs, never back into these mocks.
+#define __wrap_ibv_modify_qp ibv_modify_qp
+#define __wrap_ibv_query_gid ibv_query_gid
+#define __wrap__ibv_query_gid_ex _ibv_query_gid_ex
+
+extern "C" int __real_ibv_modify_qp(ibv_qp* qp, ibv_qp_attr* attr, int mask) {
+    static auto real = reinterpret_cast<decltype(&ibv_modify_qp)>(
+        dlsym(RTLD_NEXT, "ibv_modify_qp"));
+    CHECK(real != nullptr);
+    return real(qp, attr, mask);
+}
+
+extern "C" int __real_ibv_query_gid(ibv_context* context, uint8_t port_num,
+                                    int gid_index, union ibv_gid* gid) {
+    static auto real = reinterpret_cast<decltype(&ibv_query_gid)>(
+        dlsym(RTLD_NEXT, "ibv_query_gid"));
+    CHECK(real != nullptr);
+    return real(context, port_num, gid_index, gid);
+}
+
+extern "C" int __real__ibv_query_gid_ex(ibv_context* context, uint32_t port_num,
+                                        uint32_t gid_index,
+                                        ibv_gid_entry* entry, uint32_t flags,
+                                        size_t entry_size) {
+    static auto real = reinterpret_cast<decltype(&_ibv_query_gid_ex)>(
+        dlsym(RTLD_NEXT, "_ibv_query_gid_ex"));
+    CHECK(real != nullptr);
+    return real(context, port_num, gid_index, entry, flags, entry_size);
+}
+#endif
+
+extern "C" int __real__ibv_query_gid_ex(ibv_context* context, uint32_t port_num,
+                                        uint32_t gid_index,
                                         struct ibv_gid_entry* entry,
                                         uint32_t flags, size_t entry_size);
 
-extern "C" int __wrap__ibv_query_gid_ex(ibv_context* context, uint8_t port_num,
-                                        int gid_index,
+extern "C" int __wrap__ibv_query_gid_ex(ibv_context* context, uint32_t port_num,
+                                        uint32_t gid_index,
                                         struct ibv_gid_entry* entry,
                                         uint32_t flags, size_t entry_size) {
     const std::string device_name = ibv_get_device_name(context->device);

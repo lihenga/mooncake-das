@@ -64,7 +64,7 @@ class TCPTransportTest : public ::testing::Test {
         if (env)
             metadata_server = env;
         else
-            metadata_server = metadata_server;
+            metadata_server = P2PHANDSHAKE;
         LOG(INFO) << "metadata_server: " << metadata_server;
 
         env = std::getenv("MC_LOCAL_SERVER_NAME");
@@ -123,7 +123,7 @@ TEST_F(TCPTransportTest, Writetest) {
         *((char *)(addr) + offset) = 'a' + lrand48() % 26;
     auto batch_id = engine->allocateBatchID(1);
     Status s;
-    auto segment_id = engine->openSegment(local_server_name);
+    auto segment_id = engine->openSegment(engine->getLocalIpAndPort());
     TransferRequest entry;
     auto segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
     uint64_t remote_base = (uint64_t)segment_desc->buffers[0].addr;
@@ -165,7 +165,7 @@ TEST_F(TCPTransportTest, WriteAndReadtest) {
     for (size_t offset = 0; offset < kDataLength; ++offset)
         *((char *)(addr) + offset) = 'a' + lrand48() % 26;
 
-    auto segment_id = engine->openSegment(local_server_name);
+    auto segment_id = engine->openSegment(engine->getLocalIpAndPort());
     auto segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
     uint64_t remote_base = (uint64_t)segment_desc->buffers[0].addr;
     {
@@ -237,7 +237,7 @@ TEST_F(TCPTransportTest, WriteAndRead2test) {
     for (size_t offset = 0; offset < kDataLength; ++offset)
         *((char *)(addr) + offset) = 'a' + lrand48() % 26;
 
-    auto segment_id = engine->openSegment(local_server_name);
+    auto segment_id = engine->openSegment(engine->getLocalIpAndPort());
     auto segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
     uint64_t remote_base = (uint64_t)segment_desc->buffers[0].addr;
 

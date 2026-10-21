@@ -1,6 +1,8 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <chrono>
+#include <thread>
 #include <thread>
 #include <memory>
 #include <cstring>
@@ -18,9 +20,9 @@ using namespace mooncake;
 #define MNNVL_PROTOCOL "nvlink"
 #endif
 
-DEFINE_string(metadata_server, "127.0.0.1:2379", "etcd server host address");
-DEFINE_string(local_server_name, "cuda_server:12345", "Local server name");
-DEFINE_string(segment_id, "cuda_server:12345", "Segment ID to access data");
+DEFINE_string(metadata_server, P2PHANDSHAKE, "Metadata server or P2PHANDSHAKE");
+DEFINE_string(local_server_name, "127.0.0.1:12345", "Local server name");
+DEFINE_string(segment_id, "", "Remote segment; empty uses the test server");
 DEFINE_int32(gpu_id, 0, "GPU ID to use");
 
 static void checkCudaError(cudaError_t result, const char* message) {
@@ -49,7 +51,8 @@ TEST(NvlinkTransportTest, WriteAndRead) {
 
     // Server (target) setup
     auto server_engine = std::make_unique<TransferEngine>(false);
-    server_engine->init(FLAGS_metadata_server, FLAGS_local_server_name);
+    ASSERT_EQ(
+        server_engine->init(FLAGS_metadata_server, FLAGS_local_server_name), 0);
 
     // Install MNNVL transport (nvlink or hip) on server
     Transport* server_transport =
@@ -61,16 +64,18 @@ TEST(NvlinkTransportTest, WriteAndRead) {
                                                 "cuda:0");
     ASSERT_EQ(rc, 0);
 
-    auto segment_id = server_engine->openSegment(FLAGS_segment_id);
-
     // Client (initiator) setup
     auto client_engine = std::make_unique<TransferEngine>(false);
-    client_engine->init(FLAGS_metadata_server, "cuda_client:12346");
+    ASSERT_EQ(client_engine->init(FLAGS_metadata_server, "127.0.0.1:12346"), 0);
 
     // Install MNNVL transport (nvlink or hip) on client
     Transport* client_transport =
         client_engine->installTransport(MNNVL_PROTOCOL, nullptr);
     ASSERT_NE(client_transport, nullptr);
+    const auto segment_id = client_engine->openSegment(
+        FLAGS_segment_id.empty() ? server_engine->getLocalIpAndPort()
+                                 : FLAGS_segment_id);
+    ASSERT_GE(segment_id, 0);
 
     void* client_buffer = allocateCudaBuffer(kDataLength * 2, gpu_id);
     rc = client_engine->registerLocalMemory(client_buffer, kDataLength * 2,
@@ -96,11 +101,16 @@ TEST(NvlinkTransportTest, WriteAndRead) {
         ASSERT_TRUE(s.ok());
 
         // Wait for completion
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(30);
         TransferStatus status;
         do {
             s = client_engine->getTransferStatus(batch_id, 0, status);
             ASSERT_TRUE(s.ok());
-        } while (status.s == TransferStatusEnum::WAITING);
+            ASSERT_LT(std::chrono::steady_clock::now(), deadline);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        } while (status.s == TransferStatusEnum::WAITING ||
+                 status.s == TransferStatusEnum::PENDING);
 
         ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
         s = client_engine->freeBatchID(batch_id);
@@ -120,11 +130,16 @@ TEST(NvlinkTransportTest, WriteAndRead) {
         ASSERT_TRUE(s.ok());
 
         // Wait for completion
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(30);
         TransferStatus status;
         do {
             s = client_engine->getTransferStatus(batch_id, 0, status);
             ASSERT_TRUE(s.ok());
-        } while (status.s == TransferStatusEnum::WAITING);
+            ASSERT_LT(std::chrono::steady_clock::now(), deadline);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        } while (status.s == TransferStatusEnum::WAITING ||
+                 status.s == TransferStatusEnum::PENDING);
 
         ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
         s = client_engine->freeBatchID(batch_id);

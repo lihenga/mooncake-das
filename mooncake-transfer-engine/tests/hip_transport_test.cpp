@@ -77,7 +77,7 @@ TEST(HipTransportTest, RestoresActiveDeviceAfterTransfer) {
                   dst, kLen, GPU_PREFIX + std::to_string(kSourceDevice)),
               0);
 
-    auto segment_id = engine->openSegment(server_name);
+    auto segment_id = engine->openSegment(engine->getLocalIpAndPort());
     ASSERT_GE(segment_id, 0);
 
     ASSERT_EQ(cudaSetDevice(kSourceDevice), cudaSuccess);

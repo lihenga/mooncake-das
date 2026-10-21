@@ -15,7 +15,7 @@
 // WorkerPool::doProcessContextEvents() must empty the async event fd on every
 // call: the fd is edge-triggered, so anything left queued is stranded until the
 // next event arrives. These tests replace the event source with a scripted
-// queue via linker wrapping, so no RDMA device is needed.
+// queue via ELF interposition or linker wrapping, so no RDMA device is needed.
 
 #include <gtest/gtest.h>
 
@@ -71,6 +71,11 @@ struct AsyncEventScript {
 AsyncEventScript g_script;
 
 }  // namespace
+
+#ifdef MC_TEST_INTERPOSE_VERBS
+#define __wrap_ibv_get_async_event ibv_get_async_event
+#define __wrap_ibv_ack_async_event ibv_ack_async_event
+#endif
 
 extern "C" int __wrap_ibv_get_async_event(struct ibv_context *context,
                                           struct ibv_async_event *event) {

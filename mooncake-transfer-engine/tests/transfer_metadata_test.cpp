@@ -46,7 +46,7 @@ class TransferMetadataTest : public ::testing::Test {
         if (env)
             metadata_server = env;
         else
-            metadata_server = metadata_server;
+            metadata_server = P2PHANDSHAKE;
         LOG(INFO) << "metadata_server: " << metadata_server;
 
         env = std::getenv("MC_LOCAL_SERVER_NAME");
@@ -187,16 +187,24 @@ TEST_F(TransferMetadataTest, NcclMetadataAndHandshakePayloadRoundTrip) {
 // add, get and remove RPCMetaEntryMeta
 TEST_F(TransferMetadataTest, RpcMetaEntryTest) {
     auto hostname_port = parseHostNameWithPort(local_server_name);
-    TransferMetadata::RpcMetaDesc desc;
+    TransferMetadata::RpcMetaDesc desc{};
     desc.ip_or_host_name = hostname_port.first.c_str();
     desc.rpc_port = hostname_port.second;
-    int re = metadata_client->addRpcMetaEntry("test_server", desc);
+    std::string server_name = "test_server";
+    if (metadata_server == P2PHANDSHAKE) {
+        desc.rpc_port = findAvailableTcpPort(desc.sockfd);
+        ASSERT_NE(desc.rpc_port, 0);
+        server_name = maybeWrapIpV6(desc.ip_or_host_name) + ":" +
+                      std::to_string(desc.rpc_port);
+    }
+    int re = metadata_client->addRpcMetaEntry(server_name, desc);
     ASSERT_EQ(re, 0);
     TransferMetadata::RpcMetaDesc desc1;
-    re = metadata_client->getRpcMetaEntry("test_server", desc1);
+    re = metadata_client->getRpcMetaEntry(server_name, desc1);
+    ASSERT_EQ(re, 0);
     ASSERT_EQ(desc.ip_or_host_name, desc1.ip_or_host_name);
     ASSERT_EQ(desc.rpc_port, desc1.rpc_port);
-    re = metadata_client->removeRpcMetaEntry("test_server");
+    re = metadata_client->removeRpcMetaEntry(server_name);
     ASSERT_EQ(re, 0);
 }
 
