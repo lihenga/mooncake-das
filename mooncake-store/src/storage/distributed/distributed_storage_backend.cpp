@@ -44,6 +44,60 @@ constexpr uint64_t kMaxMergedIo = 4ULL * 1024 * 1024;
 constexpr char kDfsHealthProbeFilePrefix[] = ".mooncake_dfs_health_probe_";
 constexpr char kDfsHealthProbePayload[] = "mooncake-dfs-health-v1\n";
 
+enum class DfsIoFailpointKind { kBatchGet, kBatchPut };
+
+enum class DfsIoFailpointAction { kContinue, kTimeout };
+
+// Test-only failpoint for exercising the SGLang DFS health circuit breaker.
+// The first selected I/O call is held for five minutes; selected calls after
+// that deadline return the DFS-specific timeout code to the caller.
+class DfsIoTimeoutFailpoint {
+   public:
+    DfsIoFailpointAction BeforeRequest(DfsIoFailpointKind kind) {
+        const auto configured_kind = ConfiguredKind();
+        if (!configured_kind.has_value() || configured_kind.value() != kind) {
+            return DfsIoFailpointAction::kContinue;
+        }
+
+        std::unique_lock lock(mutex_);
+        const auto now = std::chrono::steady_clock::now();
+        if (!deadline_.has_value() || kind_ != configured_kind) {
+            kind_ = configured_kind;
+            deadline_ = now + kTimeout;
+            const auto deadline = *deadline_;
+            lock.unlock();
+            std::this_thread::sleep_until(deadline);
+            return DfsIoFailpointAction::kContinue;
+        }
+        return now >= *deadline_ ? DfsIoFailpointAction::kTimeout
+                                  : DfsIoFailpointAction::kContinue;
+    }
+
+   private:
+    static constexpr auto kTimeout = std::chrono::minutes(5);
+
+    static std::optional<DfsIoFailpointKind> ConfiguredKind() {
+        const char* value = std::getenv("MC_TEST_BATCH_TIMEOUT");
+        if (value == nullptr || value[0] == '\0') return std::nullopt;
+        if (value[0] == '1' && value[1] == '\0') {
+            return DfsIoFailpointKind::kBatchGet;
+        }
+        if (value[0] == '2' && value[1] == '\0') {
+            return DfsIoFailpointKind::kBatchPut;
+        }
+        return std::nullopt;
+    }
+
+    std::mutex mutex_;
+    std::optional<DfsIoFailpointKind> kind_;
+    std::optional<std::chrono::steady_clock::time_point> deadline_;
+};
+
+DfsIoTimeoutFailpoint& GetDfsIoTimeoutFailpoint() {
+    static DfsIoTimeoutFailpoint failpoint;
+    return failpoint;
+}
+
 struct MergedReadScratch {
     std::vector<char> sink;
     std::vector<iovec> iovs;
@@ -1099,6 +1153,14 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
 std::vector<tl::expected<void, ErrorCode>>
 DistributedStorageBackend::BatchWrite(
     const std::vector<DfsWriteRequest>& requests) {
+    if (requests.empty()) return {};
+    if (GetDfsIoTimeoutFailpoint().BeforeRequest(
+            DfsIoFailpointKind::kBatchPut) ==
+        DfsIoFailpointAction::kTimeout) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            requests.size(),
+            tl::make_unexpected(ErrorCode::DFS_BATCH_PUT_TIMEOUT));
+    }
     return BatchWriteBlocking(requests);
 }
 
@@ -1807,6 +1869,14 @@ void DistributedStorageBackend::ReleaseInflightRead(uint64_t bytes) {
 std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     const std::vector<DfsReadRequest>& requests) {
     if (requests.empty()) return {};
+    if (GetDfsIoTimeoutFailpoint().BeforeRequest(
+            DfsIoFailpointKind::kBatchGet) ==
+        DfsIoFailpointAction::kTimeout) {
+        dfs_read_timed_out_.store(true, std::memory_order_release);
+        return std::vector<tl::expected<void, ErrorCode>>(
+            requests.size(),
+            tl::make_unexpected(ErrorCode::DFS_BATCH_GET_TIMEOUT));
+    }
     if (dfs_read_timed_out_.load(std::memory_order_acquire)) {
         return std::vector<tl::expected<void, ErrorCode>>(
             requests.size(),

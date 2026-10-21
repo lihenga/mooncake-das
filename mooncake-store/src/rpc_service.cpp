@@ -1,13 +1,8 @@
 #include "rpc_service.h"
 
-#include <chrono>
 #include <cstddef>
-#include <cstdlib>
 #include <functional>
-#include <mutex>
-#include <optional>
 #include <string_view>
-#include <thread>
 #include <type_traits>
 
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
@@ -22,56 +17,6 @@
 
 namespace mooncake {
 namespace {
-
-enum class BatchTimeoutKind { kBatchGet, kBatchPut };
-
-// Test-only failpoint used to keep one selected batch request in flight for
-// five minutes. Subsequent selected requests arriving after the deadline get
-// an explicit timeout result instead of entering the normal handler.
-class BatchTimeoutFailpoint {
-   public:
-    bool ShouldTimeout(BatchTimeoutKind kind) {
-        const auto configured_kind = ConfiguredKind();
-        if (!configured_kind.has_value() || configured_kind.value() != kind) {
-            return false;
-        }
-
-        std::unique_lock lock(mutex_);
-        const auto now = std::chrono::steady_clock::now();
-        if (!deadline_.has_value() || configured_kind != kind_) {
-            kind_ = configured_kind;
-            deadline_ = now + kTimeout;
-            lock.unlock();
-            std::this_thread::sleep_until(*deadline_);
-            return false;
-        }
-        return now >= deadline_;
-    }
-
-   private:
-    static constexpr auto kTimeout = std::chrono::minutes(5);
-
-    static std::optional<BatchTimeoutKind> ConfiguredKind() {
-        const char* value = std::getenv("MC_TEST_BATCH_TIMEOUT");
-        if (value == nullptr || value[0] == '\0') return std::nullopt;
-        if (value[0] == '1' && value[1] == '\0') {
-            return BatchTimeoutKind::kBatchGet;
-        }
-        if (value[0] == '2' && value[1] == '\0') {
-            return BatchTimeoutKind::kBatchPut;
-        }
-        return std::nullopt;
-    }
-
-    std::mutex mutex_;
-    std::optional<BatchTimeoutKind> kind_;
-    std::optional<std::chrono::steady_clock::time_point> deadline_;
-};
-
-BatchTimeoutFailpoint& GetBatchTimeoutFailpoint() {
-    static BatchTimeoutFailpoint failpoint;
-    return failpoint;
-}
 
 tl::expected<TenantId, ErrorCode> ResolveRequestTenantId(std::string_view raw) {
     TenantId tenant_id{std::string(raw)};
@@ -385,12 +330,6 @@ WrappedMasterService::GetReplicaList(const std::string& key,
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                                           const std::string& tenant_id) {
-    if (GetBatchTimeoutFailpoint().ShouldTimeout(
-            BatchTimeoutKind::kBatchGet)) {
-        return std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>(
-            keys.size(), tl::make_unexpected(ErrorCode::RPC_TIMEOUT));
-    }
-
     ScopedVLogTimer timer(1, "BatchGetReplicaList");
     const size_t total_keys = keys.size();
     timer.LogRequest("keys_count=", total_keys);
@@ -544,13 +483,6 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
                                     const std::vector<uint64_t>& slice_lengths,
                                     const ReplicateConfig& config,
                                     const std::string& tenant_id) {
-    if (GetBatchTimeoutFailpoint().ShouldTimeout(
-            BatchTimeoutKind::kBatchPut)) {
-        return std::vector<
-            tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>(
-            keys.size(), tl::make_unexpected(ErrorCode::RPC_TIMEOUT));
-    }
-
     ScopedVLogTimer timer(1, "BatchPutStart");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
