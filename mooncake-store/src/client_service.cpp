@@ -4234,8 +4234,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
                 if (summary.key_samples.size() < kMaxFailureSamplesPerError) {
                     summary.key_samples.push_back(
                         op.key + (op.failure_context
-                                     ? " (" + *op.failure_context + ")"
-                                     : ""));
+                                      ? " (" + *op.failure_context + ")"
+                                      : ""));
                 }
             }
         } else {
@@ -4249,8 +4249,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
     }
     for (const auto& [error, summary] : failures) {
         LOG(ERROR) << "BatchPut failed for " << summary.count
-                   << " keys, error=" << toString(error)
-                   << ", sample_keys="
+                   << " keys, error=" << toString(error) << ", sample_keys="
                    << boost::algorithm::join(summary.key_samples, ",");
     }
 
