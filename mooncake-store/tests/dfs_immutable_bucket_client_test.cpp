@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <glog/logging.h>
+#include <ylt/struct_json/json_reader.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -219,6 +220,71 @@ class DfsBucketClientTest : public ::testing::Test {
         auto client = Client::Create(hostname, "P2PHANDSHAKE", "tcp",
                                      std::nullopt, master_.master_address());
         return client ? *client : nullptr;
+    }
+
+    void PauseHolderPolling() {
+        provider_->task_poll_running_.store(false);
+        if (provider_->task_poll_thread_.joinable()) {
+            provider_->task_poll_thread_.join();
+        }
+    }
+
+    void ExecuteBackfill(const TaskAssignment& task) {
+        provider_->ExecuteTask(Client::ClientTask{task});
+    }
+
+    void ExpireHolderBackoff() {
+        std::lock_guard<std::mutex> lock(provider_->dfs_backfill_backend_mutex_);
+        provider_->dfs_backfill_retry_after_ = {};
+    }
+
+    std::vector<TaskAssignment> FetchBackfills(size_t count) {
+        std::vector<TaskAssignment> tasks;
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(8);
+        while (tasks.size() < count &&
+               std::chrono::steady_clock::now() < deadline) {
+            auto fetched = provider_->FetchTasks(count - tasks.size());
+            EXPECT_TRUE(fetched.has_value());
+            if (!fetched) return tasks;
+            tasks.insert(tasks.end(), fetched->begin(), fetched->end());
+            if (tasks.size() < count) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+        }
+        return tasks;
+    }
+
+    void CheckHolderBackoffBounds() {
+        for (int delay : {5, 10, 20, 30, 30}) {
+            const auto task = generate_uuid();
+            ASSERT_TRUE(provider_->BeginDfsBackfillAttempt(task));
+            provider_->FinishDfsBackfillAttempt(task, ErrorCode::TRANSFER_FAIL, true);
+            std::chrono::steady_clock::time_point deadline;
+            {
+                std::lock_guard<std::mutex> lock(provider_->dfs_backfill_backend_mutex_);
+                deadline = provider_->dfs_backfill_retry_after_;
+            }
+            const auto remaining = deadline - std::chrono::steady_clock::now();
+            EXPECT_GT(remaining, std::chrono::seconds(delay - 1));
+            EXPECT_LE(remaining, std::chrono::seconds(delay));
+            // Queued keys cannot extend the deadline or acquire another write.
+            for (int i = 0; i < 64; ++i) {
+                EXPECT_FALSE(provider_->BeginDfsBackfillAttempt(generate_uuid()));
+            }
+            ExpireHolderBackoff();
+        }
+        const auto probe = generate_uuid();
+        ASSERT_TRUE(provider_->BeginDfsBackfillAttempt(probe));
+        EXPECT_FALSE(provider_->BeginDfsBackfillAttempt(generate_uuid()));
+        provider_->FinishDfsBackfillAttempt(probe, ErrorCode::OBJECT_NOT_FOUND, false);
+        // A stale source is not a storage failure and must release the probe.
+        const auto next = generate_uuid();
+        ASSERT_TRUE(provider_->BeginDfsBackfillAttempt(next));
+        provider_->FinishDfsBackfillAttempt(next, ErrorCode::OK, false);
+        for (int i = 0; i < 64; ++i) {
+            EXPECT_TRUE(provider_->BeginDfsBackfillAttempt(generate_uuid()));
+        }
     }
 
     ReplicateConfig DfsConfig() const {
@@ -704,6 +770,70 @@ TEST_F(DfsBucketClientTest, BackfillWaitsForHolderWriteHealthRecovery) {
     provider_->SetDfsAccessPolicy(true, true);
     ASSERT_TRUE(WaitForDfsReplica(key, std::chrono::seconds(12)));
     ExpectDfsValue(key, value);
+}
+
+TEST_F(DfsBucketClientTest, HolderBackfillBackoffBoundsProbesAndResetsOnSuccess) {
+    PauseHolderPolling();
+    CheckHolderBackoffBounds();
+}
+
+TEST_F(DfsBucketClientTest, HolderBackoffCoversDistinctKeysAndRecoversTogether) {
+    provider_->SetDfsStorageBackend(backend_);
+    PauseHolderPolling();
+    std::vector<std::string> keys;
+    std::vector<std::string> values(64, std::string(4096, 'R'));
+    for (size_t i = 0; i < values.size(); ++i) {
+        keys.push_back("holder_backoff_" + std::to_string(i));
+    }
+    auto slices = MakeSlices(values);
+    adapter_->FailAllWrites(true);
+    auto put = writer_->BatchPut(keys, slices, DfsConfig());
+    ASSERT_EQ(put.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_TRUE(put[i]);
+        ASSERT_TRUE(WaitForKeyGone(keys[i]));
+    }
+    auto tasks = FetchBackfills(keys.size());
+    ASSERT_EQ(tasks.size(), keys.size());
+    auto& metrics = MasterMetricManager::instance();
+    const auto starts = metrics.get_copy_start_requests();
+    const int failures = adapter_->FailedWrites();
+    for (const auto& task : tasks) ExecuteBackfill(task);
+    // Distinct keys must not bypass the holder's pause and allocate DFS holes.
+    EXPECT_EQ(metrics.get_copy_start_requests() - starts, 1);
+    EXPECT_EQ(adapter_->FailedWrites() - failures, 1);
+
+    tasks = FetchBackfills(keys.size());
+    ASSERT_EQ(tasks.size(), keys.size());
+    adapter_->FailAllWrites(false);
+    ExpireHolderBackoff();
+    adapter_->BlockWrites();
+    const int writes = adapter_->WriteCalls();
+    const auto recovery_starts = metrics.get_copy_start_requests();
+    std::thread probe([&] { ExecuteBackfill(tasks[0]); });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (adapter_->WriteCalls() == writes && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(adapter_->WriteCalls(), writes + 1);
+    ExecuteBackfill(tasks[1]);
+    EXPECT_EQ(metrics.get_copy_start_requests() - recovery_starts, 1);
+    adapter_->ReleaseWrites();
+    probe.join();
+    DfsBackfillPayload probe_payload;
+    struct_json::from_json(probe_payload, tasks[0].payload);
+    ASSERT_TRUE(WaitForDfsReplica(probe_payload.key));
+    const auto recovered_at = std::chrono::steady_clock::now();
+    for (size_t i = 2; i < tasks.size(); ++i) ExecuteBackfill(tasks[i]);
+    // The one task held behind the probe follows only the normal 5s task retry.
+    auto remaining = FetchBackfills(1);
+    ASSERT_EQ(remaining.size(), 1u);
+    ExecuteBackfill(remaining.front());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_TRUE(WaitForDfsReplica(keys[i], std::chrono::seconds(1)));
+        ExpectDfsValue(keys[i], values[i]);
+    }
+    EXPECT_LT(std::chrono::steady_clock::now() - recovered_at, std::chrono::seconds(10));
 }
 
 TEST_F(DfsBucketClientTest, FailedWriteIsBackfilledByMemoryOnlyHolder) {

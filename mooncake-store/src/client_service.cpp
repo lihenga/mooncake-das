@@ -5257,17 +5257,49 @@ Client::GetDfsBackfillBackend() {
     return dfs_backfill_backend_;
 }
 
+bool Client::BeginDfsBackfillAttempt(const UUID& task_id) {
+    std::lock_guard<std::mutex> lock(dfs_backfill_backend_mutex_);
+    if (dfs_backfill_failures_ != 0) {
+        if (std::chrono::steady_clock::now() < dfs_backfill_retry_after_ ||
+            dfs_backfill_probe_task_ != UUID{}) return false;
+        // After a cooldown only one real write probes this holder's mount.
+        dfs_backfill_probe_task_ = task_id;
+    }
+    return true;
+}
+
+void Client::FinishDfsBackfillAttempt(const UUID& task_id, ErrorCode result,
+                                    bool storage_failure) {
+    std::lock_guard<std::mutex> lock(dfs_backfill_backend_mutex_);
+    const bool probe = dfs_backfill_probe_task_ == task_id;
+    if (probe) dfs_backfill_probe_task_ = UUID{};
+    if (result == ErrorCode::OK) {
+        dfs_backfill_failures_ = 0;
+        dfs_backfill_retry_after_ = {};
+    } else if (storage_failure && (dfs_backfill_failures_ == 0 || probe)) {
+        // Concurrent failures from the initial healthy batch do not keep
+        // extending the pause. Missing keys/source races do not open it.
+        dfs_backfill_failures_ = std::min(dfs_backfill_failures_ + 1, 4u);
+        dfs_backfill_retry_after_ = std::chrono::steady_clock::now() +
+            std::chrono::seconds(std::min(5u << (dfs_backfill_failures_ - 1), 30u));
+    }
+}
+
 void Client::ExecuteTask(const ClientTask& client_task) {
     const auto& assignment = client_task.assignment;
     ErrorCode result = ErrorCode::OK;
+    bool backfill_attempted = false;
+    bool backfill_storage_failure = false;
 
     try {
         switch (assignment.type) {
             case TaskType::DFS_BACKFILL: {
-                if (!DfsWriteAllowed()) {
+                if (!DfsWriteAllowed() || !BeginDfsBackfillAttempt(assignment.id)) {
                     result = ErrorCode::DFS_SERVICE_UNAVAILABLE;
                     break;
                 }
+                backfill_attempted = true;
+                backfill_storage_failure = true;
                 auto backend = GetDfsBackfillBackend();
                 if (!backend) {
                     result = backend.error();
@@ -5280,22 +5312,33 @@ void Client::ExecuteTask(const ClientTask& client_task) {
                 }
                 DfsBackfillPayload payload;
                 struct_json::from_json(payload, assignment.payload);
+                backfill_storage_failure = false;
                 auto start = master_client_.DfsBackfillStart(
                     payload.key, payload.tenant_id, payload.source,
                     assignment.id);
                 if (!start) {
                     result = start.error();
+                    backfill_storage_failure =
+                        result <= ErrorCode::DFS_NETWORK_TIMEOUT &&
+                        result >= ErrorCode::DFS_PARTIAL_WRITE;
                     break;
                 }
                 auto finish = [&](bool success) {
                     return master_client_.DfsBackfillFinish(
                         payload.key, payload.tenant_id, assignment.id, success);
                 };
+                backfill_storage_failure = true;
                 auto copied = ExecuteReplicaTransfer(
                     payload.key, "dfs_backfill", [&] { return finish(true); },
                     [&] { return finish(false); }, start->source,
                     start->targets, *backend);
                 result = copied ? ErrorCode::OK : copied.error();
+                backfill_storage_failure =
+                    result == ErrorCode::TRANSFER_FAIL ||
+                    result == ErrorCode::FILE_OPEN_FAIL ||
+                    result == ErrorCode::FILE_WRITE_FAIL ||
+                    (result <= ErrorCode::DFS_NETWORK_TIMEOUT &&
+                     result >= ErrorCode::DFS_PARTIAL_WRITE);
                 break;
             }
             case TaskType::REPLICA_COPY: {
@@ -5340,6 +5383,10 @@ void Client::ExecuteTask(const ClientTask& client_task) {
                    << ", task_id=" << assignment.id << ", error=exception"
                    << ", exception=" << e.what();
         result = ErrorCode::INTERNAL_ERROR;
+    }
+
+    if (backfill_attempted) {
+        FinishDfsBackfillAttempt(assignment.id, result, backfill_storage_failure);
     }
 
     if (result == ErrorCode::OK) {
