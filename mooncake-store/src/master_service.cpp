@@ -8202,8 +8202,8 @@ void MasterService::RestoreRecoveredDfsReplicas(bool rebuild_metadata) {
                         const auto& metadata = existing->second;
                         const bool installed_by_this_recovery =
                             metadata.client_id == UUID{0, 0} &&
-                            metadata.replicas.size() == 1 &&
-                            metadata.replicas.front().is_dfs_replica();
+                            metadata.CountReplicas() == 1 &&
+                            metadata.HasReplica(&Replica::fn_is_dfs_replica);
                         if (installed_by_this_recovery) {
                             // Buckets are committed in ascending bucket_id
                             // order and the allocator's keep-max rule emits a

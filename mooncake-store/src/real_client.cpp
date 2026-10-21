@@ -149,17 +149,6 @@ std::string DirectSourceForReplica(const Replica::Descriptor &replica) {
     return "unknown";
 }
 
-uint64_t SumSliceBytes(
-    const std::unordered_map<std::string, std::vector<Slice>> &objects) {
-    uint64_t total = 0;
-    for (const auto &[_, slices] : objects) {
-        for (const auto &slice : slices) {
-            total += slice.size;
-        }
-    }
-    return total;
-}
-
 bool IsHostStoreSegmentProtocol(const std::string &protocol) {
     return protocol.empty() || protocol == "tcp" || protocol == "rdma" ||
            protocol == "efa" || protocol == "cxi" || protocol == "rpc_only";
