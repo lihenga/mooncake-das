@@ -372,6 +372,26 @@ bool IsDfsReplicaFallbackError(ErrorCode error) {
            error == ErrorCode::DFS_SERVICE_UNAVAILABLE;
 }
 
+std::optional<ErrorCode> InitialDfsReplicaFallbackReason(
+    const ReplicateConfig& config, bool dfs_available) {
+    if (config.dfs_replica_num > 0 && !dfs_available) {
+        return ErrorCode::DFS_SERVICE_UNAVAILABLE;
+    }
+    return std::nullopt;
+}
+
+void RecordDfsReplicaFallback(std::string_view key, ErrorCode reason) {
+    MasterMetricManager::instance().inc_dfs_replica_skipped_total(
+        toString(reason));
+    static DfsLogLimiter fallback_log_limiter;
+    if (auto suppressed = fallback_log_limiter.ShouldLog()) {
+        LOG(WARNING) << "key=" << key
+                     << ", action=dfs_replica_skipped_memory_fallback"
+                     << ", error=" << toString(reason)
+                     << ", suppressed=" << *suppressed;
+    }
+}
+
 void LogTenantQuotaLedgerError(const TenantQuotaResult& result,
                                std::string_view operation,
                                const TenantId& tenant_id,
@@ -4720,6 +4740,9 @@ auto MasterService::AllocateAndInsertMetadata(
                            << ", error=dfs_allocator_not_initialized"
                            << ", suppressed=" << *suppressed;
             }
+            if (dfs_allocation_error != nullptr) {
+                *dfs_allocation_error = ErrorCode::DFS_SERVICE_UNAVAILABLE;
+            }
             refund_pending_quota();
             return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
         }
@@ -4871,6 +4894,16 @@ auto MasterService::PutStartInternal(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 #endif
+
+    if (!skip_dfs_replica) {
+        auto initial_fallback = InitialDfsReplicaFallbackReason(
+            config, enable_dfs_ && dfs_allocator_ != nullptr &&
+                        dfs_allocator_->IsInitialized());
+        if (initial_fallback.has_value()) {
+            skip_dfs_replica = true;
+            dfs_fallback_reason = initial_fallback;
+        }
+    }
 
     auto soft_pin_request = ResolveSoftPinRequest(config);
     if (!soft_pin_request) {
@@ -5055,16 +5088,7 @@ auto MasterService::PutStartInternal(
         }
         if (result.has_value()) {
             if (dfs_fallback_reason.has_value()) {
-                MasterMetricManager::instance().inc_dfs_replica_skipped_total(
-                    toString(*dfs_fallback_reason));
-                static DfsLogLimiter fallback_log_limiter;
-                if (auto suppressed = fallback_log_limiter.ShouldLog()) {
-                    LOG(WARNING)
-                        << "key=" << key
-                        << ", action=dfs_replica_skipped_memory_fallback"
-                        << ", error=" << toString(*dfs_fallback_reason)
-                        << ", suppressed=" << *suppressed;
-                }
+                RecordDfsReplicaFallback(key, *dfs_fallback_reason);
             }
             return result;
         }
@@ -5718,14 +5742,6 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                    << ", error=dfs_currently_requires_default_tenant";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (config.dfs_replica_num > 0 &&
-        (!enable_dfs_ || dfs_allocator_ == nullptr ||
-         !dfs_allocator_->IsInitialized())) {
-        LOG(ERROR) << "key=" << key
-                   << ", dfs_replica_num=" << config.dfs_replica_num
-                   << ", error=dfs_service_unavailable";
-        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
-    }
     if (config.prefer_alloc_in_same_node && config.nof_replica_num > 0) {
         LOG(ERROR) << "key=" << key
                    << ", nof_replica_num=" << config.nof_replica_num
@@ -5743,18 +5759,29 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     }
 #endif
 
-    auto soft_pin_request = ResolveSoftPinRequest(config);
+    std::optional<ErrorCode> dfs_fallback_reason =
+        InitialDfsReplicaFallbackReason(
+            config, enable_dfs_ && dfs_allocator_ != nullptr &&
+                        dfs_allocator_->IsInitialized());
+    const bool initially_skip_dfs_replica = dfs_fallback_reason.has_value();
+    ReplicateConfig effective_config = config;
+    if (initially_skip_dfs_replica) {
+        effective_config.dfs_replica_num = 0;
+    }
+
+    auto soft_pin_request = ResolveSoftPinRequest(effective_config);
     if (!soft_pin_request) {
         return tl::make_unexpected(soft_pin_request.error());
     }
 
-    UpdateClientHostId(client_id, config.host_id);
+    UpdateClientHostId(client_id, effective_config.host_id);
     std::string writer_host_id;
     if ((allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST ||
-         config.prefer_alloc_in_same_node) &&
-        config.replica_num == 1) {
-        writer_host_id = config.host_id.empty() ? GetClientHostId(client_id)
-                                                : config.host_id;
+         effective_config.prefer_alloc_in_same_node) &&
+        effective_config.replica_num == 1) {
+        writer_host_id = effective_config.host_id.empty()
+                             ? GetClientHostId(client_id)
+                             : effective_config.host_id;
     }
 
     if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
@@ -5766,9 +5793,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     }
 
     VLOG(1) << "key=" << key << ", value_length=" << slice_length
-            << ", config=" << config << ", action=upsert_start_begin";
+            << ", config=" << effective_config
+            << ", action=upsert_start_begin";
 
-    auto group_id_result = GetGroupIdForKey(config, 1, 0);
+    auto group_id_result = GetGroupIdForKey(effective_config, 1, 0);
     if (!group_id_result) {
         return tl::make_unexpected(group_id_result.error());
     }
@@ -5777,6 +5805,39 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     [[maybe_unused]] auto object_operation_lock =
         AcquireObjectOperationLock(object_id.tenant_id, object_id.user_key);
     uint64_t quota_deficit_bytes = 0;
+
+    auto allocate_with_dfs_fallback =
+        [&](MetadataShardAccessorRW& shard,
+            const ReplicateConfig& allocation_config,
+            const std::string& allocation_group_id,
+            const std::chrono::system_clock::time_point& now,
+            uint64_t& allocation_quota_deficit_bytes,
+            std::optional<std::chrono::system_clock::time_point>
+                committed_soft_pin_timeout = std::nullopt)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+        const bool skip_dfs_replica = dfs_fallback_reason.has_value();
+        std::optional<ErrorCode> dfs_allocation_error;
+        auto result = AllocateAndInsertMetadata(
+            shard, client_id, key, slice_length, allocation_config,
+            writer_host_id, allocation_group_id, object_id.tenant_id, now,
+            *soft_pin_request, allocation_quota_deficit_bytes,
+            committed_soft_pin_timeout, std::nullopt, skip_dfs_replica,
+            &dfs_allocation_error);
+        if (result || skip_dfs_replica || !dfs_allocation_error.has_value() ||
+            !IsDfsReplicaFallbackError(*dfs_allocation_error)) {
+            return result;
+        }
+
+        dfs_fallback_reason = dfs_allocation_error;
+        ReplicateConfig fallback_config = allocation_config;
+        fallback_config.dfs_replica_num = 0;
+        return AllocateAndInsertMetadata(
+            shard, client_id, key, slice_length, fallback_config,
+            writer_host_id, allocation_group_id, object_id.tenant_id, now,
+            *soft_pin_request, allocation_quota_deficit_bytes,
+            committed_soft_pin_timeout, std::nullopt,
+            /*skip_dfs_replica=*/true, nullptr);
+    };
 
     auto attempt_once =
         [&]() -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
@@ -5841,7 +5902,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
                 // Reject if the caller tries to change group membership.
                 // Group membership is immutable while an object exists.
-                if (config.group_ids.has_value() &&
+                if (effective_config.group_ids.has_value() &&
                     metadata.group_id != group_id) {
                     LOG(ERROR) << "key=" << key
                                << ", error=group_membership_is_immutable";
@@ -5931,11 +5992,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         shard->tenants.erase(object_id.tenant_id);
                     }
                 } else {
-                    return AllocateAndInsertMetadata(
-                        shard, client_id, key, slice_length, config,
-                        writer_host_id, group_id, object_id.tenant_id, now,
-                        *soft_pin_request, quota_deficit_bytes,
-                        std::move(case_a_committed_soft_pin_timeout));
+                    return allocate_with_dfs_fallback(
+                        shard, effective_config, group_id, now,
+                        quota_deficit_bytes,
+                        case_a_committed_soft_pin_timeout);
                 }
             } else {
                 // --- Step 2: key exists with COMPLETE replicas → Case B or C
@@ -5962,36 +6022,46 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     // existing object.
                     const size_t existing_dfs_replicas =
                         metadata.CountReplicas(&Replica::fn_is_dfs_replica);
-                    if (config.dfs_replica_num > 0 ||
+                    if (effective_config.dfs_replica_num > 0 ||
                         existing_dfs_replicas > 0) {
                         const size_t existing_memory_replicas =
                             metadata.CountReplicas(
                                 &Replica::fn_is_memory_replica);
                         const size_t existing_nof_replicas =
                             metadata.CountReplicas(&Replica::fn_is_nof_replica);
-                        if (existing_memory_replicas != config.replica_num ||
-                            existing_nof_replicas != config.nof_replica_num ||
-                            existing_dfs_replicas != config.dfs_replica_num) {
+                        if (existing_memory_replicas !=
+                                effective_config.replica_num ||
+                            existing_nof_replicas !=
+                                effective_config.nof_replica_num ||
+                            (!initially_skip_dfs_replica &&
+                             existing_dfs_replicas !=
+                                 effective_config.dfs_replica_num)) {
                             LOG(ERROR)
                                 << "key=" << key
                                 << ", error=dfs_upsert_topology_mismatch"
                                 << ", existing_memory="
                                 << existing_memory_replicas
-                                << ", requested_memory=" << config.replica_num
+                                << ", requested_memory="
+                                << effective_config.replica_num
                                 << ", existing_nof=" << existing_nof_replicas
-                                << ", requested_nof=" << config.nof_replica_num
+                                << ", requested_nof="
+                                << effective_config.nof_replica_num
                                 << ", existing_dfs=" << existing_dfs_replicas
-                                << ", requested_dfs=" << config.dfs_replica_num;
+                                << ", requested_dfs="
+                                << effective_config.dfs_replica_num;
                             return tl::make_unexpected(
                                 ErrorCode::INVALID_PARAMS);
                         }
                     }
                 }
 
-                const bool has_bucket_dfs_replica =
-                    bucket_allocator_ != nullptr &&
+                const bool has_dfs_replica =
                     metadata.HasReplica(&Replica::fn_is_dfs_replica);
-                if (metadata.size == slice_length && !has_bucket_dfs_replica) {
+                const bool must_reallocate_dfs_replica =
+                    (bucket_allocator_ != nullptr && has_dfs_replica) ||
+                    (initially_skip_dfs_replica && has_dfs_replica);
+                if (metadata.size == slice_length &&
+                    !must_reallocate_dfs_replica) {
                     metadata.client_id = client_id;
                     metadata.put_start_time = now;
 
@@ -6034,7 +6104,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // Preserve hard_pin and soft_pin from the old metadata so that
                 // eviction protection survives a size-changing upsert (RFC
                 // §2.2.2).
-                ReplicateConfig merged_config = config;
+                ReplicateConfig merged_config = effective_config;
                 merged_config.with_hard_pin =
                     merged_config.with_hard_pin || metadata.IsHardPinned();
                 auto committed_soft_pin_timeout =
@@ -6075,11 +6145,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
                 VLOG(1) << "key=" << key
                         << ", action=upsert_start_case_c_reallocate";
-                auto allocate_result = AllocateAndInsertMetadata(
-                    shard, client_id, key, slice_length, merged_config,
-                    writer_host_id, existing_group_id, object_id.tenant_id, now,
-                    *soft_pin_request, quota_deficit_bytes,
-                    std::move(committed_soft_pin_timeout));
+                auto allocate_result = allocate_with_dfs_fallback(
+                    shard, merged_config, existing_group_id, now,
+                    quota_deficit_bytes, committed_soft_pin_timeout);
                 if (!allocate_result) {
                     if (has_replacement_charge) {
                         auto rollback_result =
@@ -6136,10 +6204,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             LOG(INFO) << "key=" << key << ", info=object_already_exists";
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
-        return AllocateAndInsertMetadata(
-            shard, client_id, key, slice_length, config, writer_host_id,
-            group_id, object_id.tenant_id, now, *soft_pin_request,
-            quota_deficit_bytes, std::move(case_a_committed_soft_pin_timeout));
+        return allocate_with_dfs_fallback(
+            shard, effective_config, group_id, now, quota_deficit_bytes,
+            case_a_committed_soft_pin_timeout);
     };
 
     for (int attempt = 0; attempt <= kMaxTenantQuotaEvictionRetries;
@@ -6147,6 +6214,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         auto result = attempt_once();
         if (result.has_value() ||
             result.error() != ErrorCode::TENANT_QUOTA_EXCEEDED) {
+            if (result.has_value() && dfs_fallback_reason.has_value()) {
+                RecordDfsReplicaFallback(key, *dfs_fallback_reason);
+            }
             return result;
         }
         if (attempt == kMaxTenantQuotaEvictionRetries) {
@@ -7858,11 +7928,21 @@ void MasterService::RestoreRecoveredDfsReplicas(
 
         if (tenant_state.metadata.find(entry.key) !=
             tenant_state.metadata.end()) {
-            // Something else already owns this key. Leave it alone: the
-            // recovered DFS extent stays allocated but unreferenced rather than
-            // overwriting live metadata.
-            LOG(WARNING) << "Skipping DFS recovery for key=" << entry.key
-                         << ": metadata already present";
+            // The live metadata may have been written while DFS was
+            // unavailable. The recovered extent can therefore contain an
+            // older value and must not be attached to it. Tombstone the stale
+            // extent as well as skipping it so the allocator does not retain a
+            // hidden owner that makes a later allocation of the same key fail
+            // with OBJECT_ALREADY_EXISTS. Free() performs no I/O and is safe
+            // while the metadata shard lock is held.
+            allocator->Free(entry.key, entry.descriptor);
+            static DfsLogLimiter log_limiter;
+            if (auto suppressed = log_limiter.ShouldLog()) {
+                LOG(WARNING) << "Skipping DFS recovery for key=" << entry.key
+                             << ": metadata already present, recovered extent "
+                                "tombstoned, suppressed="
+                             << *suppressed;
+            }
             continue;
         }
 
