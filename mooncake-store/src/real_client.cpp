@@ -7316,6 +7316,25 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         return results;
     }
 
+    // A ReadPlan may have captured DFS sessions before the coordinated health
+    // policy disabled DFS reads. Re-query at the final range-read boundary so
+    // those sessions switch to a complete memory replica instead of entering
+    // the DFS path. Keys without a memory replica remain failed closed.
+    if (!client_->DfsReadAllowed() && !all_get_sessions_memory(keys)) {
+        const auto reselected = batch_get_session_start(keys);
+        if (reselected.size() != keys.size()) {
+            LOG(ERROR) << "ReadPlan session reselection result size mismatch: "
+                       << "expected=" << keys.size()
+                       << ", got=" << reselected.size();
+            return std::vector<int>(
+                keys.size(),
+                static_cast<int>(toInt(ErrorCode::INTERNAL_ERROR)));
+        }
+        for (size_t i = 0; i < reselected.size(); ++i) {
+            if (reselected[i] != 0) results[i] = reselected[i];
+        }
+    }
+
     SessionRangeReadContext context;
     context.timing_start = std::chrono::steady_clock::now();
     context.cache_gc_done = context.timing_start;
