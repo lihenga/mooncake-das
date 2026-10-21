@@ -3,7 +3,6 @@
 #include <gtest/gtest.h>
 #include <chrono>
 #include <thread>
-#include <thread>
 #include <memory>
 #include <cstring>
 

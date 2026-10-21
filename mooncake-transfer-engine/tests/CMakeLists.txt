@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-# SPDX-License-Identifier: Apache-2.0 Modified by Hygon Information Technology
-# Co., Ltd., 2026.
+# SPDX-License-Identifier: Apache-2.0
+
+# Modified by Hygon Information Technology Co., Ltd., 2026.
 
 set(WORKSPACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
