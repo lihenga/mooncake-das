@@ -31,6 +31,10 @@ namespace {
 // count would blow up both the thread and the memory budget.
 constexpr int kMaxBatchReadThreads = 256;
 constexpr int kMaxBucketCreateConcurrency = 8;
+// Upper bound on MOONCAKE_DFS_RECOVERY_WORKERS. Recovery holds one parsed
+// bucket per worker in flight, so an unbounded count would defeat the bounded
+// temporary-memory goal of progressive recovery.
+constexpr int kMaxRecoveryWorkers = 64;
 
 // Bound temporary memory and I/O latency while still collapsing the common
 // BatchAllocate output to one read. Larger batches become a few contiguous
@@ -96,13 +100,6 @@ bool IsBucketDescriptorRangeValid(const DistributedFSDescriptor& desc,
            layout->aligned_size <= kMaxFileOffset - layout->offset;
 }
 
-/**
- * @brief Canonicalize `path` without requiring it to exist yet.
- *
- * `weakly_canonical` collapses `..` and resolves the existing prefix through
- * symlinks, which is what we need to reject descriptor paths pointing outside
- * the configured DFS root.
- */
 std::string CanonicalizePath(const std::string& path) {
     std::error_code ec;
     auto canonical = std::filesystem::weakly_canonical(path, ec);
@@ -261,6 +258,27 @@ bool DistributedStorageConfig::ValidateForBucketAllocator() const {
                    << "], batch_read_threads=" << batch_read_threads;
         return false;
     }
+    if (recovery_worker_count < 0 ||
+        recovery_worker_count > kMaxRecoveryWorkers) {
+        LOG(ERROR)
+            << "DistributedStorageConfig: recovery_worker_count must be in [0, "
+            << kMaxRecoveryWorkers
+            << "], recovery_worker_count=" << recovery_worker_count;
+        return false;
+    }
+    if (recovery_max_buckets < 0) {
+        LOG(ERROR) << "DistributedStorageConfig: recovery_max_buckets must be "
+                      "non-negative (0 = unlimited), recovery_max_buckets="
+                   << recovery_max_buckets;
+        return false;
+    }
+    if (recovery_max_duration_seconds < 0) {
+        LOG(ERROR)
+            << "DistributedStorageConfig: recovery_max_duration_seconds must be "
+               "non-negative (0 = unlimited), recovery_max_duration_seconds="
+            << recovery_max_duration_seconds;
+        return false;
+    }
     return true;
 }
 
@@ -306,9 +324,11 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     config.low_utilization_threshold = Environ::GetDouble(
         "MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_THRESHOLD",
         config.low_utilization_threshold);
-    if (!std::isfinite(config.low_utilization_threshold) ||
-        config.low_utilization_threshold < 0.0 ||
-        config.low_utilization_threshold > 1.0) {
+    const bool valid_low_utilization_threshold =
+        std::isfinite(config.low_utilization_threshold) &&
+        config.low_utilization_threshold >= 0.0 &&
+        config.low_utilization_threshold < 1.0;
+    if (!valid_low_utilization_threshold) {
         LOG(WARNING) << "Invalid MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_THRESHOLD="
                      << config.low_utilization_threshold
                      << "; using default 0.05";
@@ -323,6 +343,16 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
             << config.low_utilization_evictions_per_tick
             << "; using default 1";
         config.low_utilization_evictions_per_tick = 1;
+    }
+    config.low_utilization_eviction_attempts_per_tick = Environ::GetInt(
+        "MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_ATTEMPTS_PER_TICK",
+        config.low_utilization_eviction_attempts_per_tick);
+    if (config.low_utilization_eviction_attempts_per_tick < 1) {
+        LOG(WARNING)
+            << "Invalid MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_ATTEMPTS_PER_TICK="
+            << config.low_utilization_eviction_attempts_per_tick
+            << "; using default 8";
+        config.low_utilization_eviction_attempts_per_tick = 8;
     }
     config.deferred_free_duration = std::chrono::seconds(Environ::GetInt(
         "MOONCAKE_DFS_DEFERRED_FREE_SECONDS",
@@ -354,6 +384,13 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     config.bucket_create_concurrency =
         Environ::GetInt("MOONCAKE_DFS_BUCKET_CREATE_CONCURRENCY",
                         config.bucket_create_concurrency);
+    config.recovery_worker_count = Environ::GetInt(
+        "MOONCAKE_DFS_RECOVERY_WORKERS", config.recovery_worker_count);
+    config.recovery_max_buckets = Environ::GetInt(
+        "MOONCAKE_DFS_RECOVERY_MAX_BUCKETS", config.recovery_max_buckets);
+    config.recovery_max_duration_seconds = Environ::GetInt(
+        "MOONCAKE_DFS_RECOVERY_MAX_DURATION_SECONDS",
+        config.recovery_max_duration_seconds);
     config.batch_read_threads = Environ::GetInt(
         "MOONCAKE_DFS_BATCH_READ_THREADS", config.batch_read_threads);
     config.batch_read_merge_enabled =
@@ -378,6 +415,8 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", low_utilization_threshold=" << low_utilization_threshold
         << ", low_utilization_evictions_per_tick="
         << low_utilization_evictions_per_tick
+        << ", low_utilization_eviction_attempts_per_tick="
+        << low_utilization_eviction_attempts_per_tick
         << ", deferred_free_seconds=" << deferred_free_duration.count()
         << ", eviction_check_interval_seconds="
         << eviction_check_interval.count()
@@ -387,6 +426,10 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", max_bucket_count=" << max_bucket_count
         << ", ready_bucket_target=" << ready_bucket_target
         << ", bucket_create_concurrency=" << bucket_create_concurrency
+        << ", recovery_worker_count=" << recovery_worker_count
+        << ", recovery_max_buckets=" << recovery_max_buckets
+        << ", recovery_max_duration_seconds="
+        << recovery_max_duration_seconds
         << ", batch_read_threads=" << batch_read_threads
         << ", batch_read_merge_enabled=" << batch_read_merge_enabled
         << ", direct_read_enabled=" << direct_read_enabled;
@@ -420,7 +463,8 @@ DistributedStorageBackend::DistributedStorageBackend(
       object_storage_adapter_(std::move(object_storage_adapter)),
       distributed_config_(distributed_config),
       expected_root_identity_(std::move(expected_root_identity)),
-      root_dir_(distributed_config.fsdir) {
+      root_dir_(distributed_config.fsdir),
+      descriptor_root_dir_(distributed_config.fsdir) {
     CHECK((fs_adapter_ != nullptr) != (object_storage_adapter_ != nullptr))
         << "DistributedStorageBackend: exactly one I/O adapter is required";
     if (object_storage_adapter_) {
@@ -942,6 +986,18 @@ DistributedStorageBackend::ResolveTarget(
     if (descriptor.shard_idx < 0) {
         LOG(ERROR) << "Invalid DFS bucket id " << descriptor.shard_idx
                    << " for key " << key;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const std::string expected_path =
+        descriptor_root_dir_ + "/" + kBucketFilePrefix +
+        ImmutableBucketAllocator::FormatBucketId(descriptor.shard_idx) +
+        kBucketDataSuffix;
+    // The master's mount path may not exist on this client.
+    if (std::filesystem::path(descriptor.file_path).lexically_normal() !=
+        std::filesystem::path(expected_path).lexically_normal()) {
+        LOG(ERROR) << "DFS bucket path mismatch for key " << key
+                   << ", descriptor=" << descriptor.file_path
+                   << ", expected=" << expected_path;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (!IsBucketDescriptorRangeValid(descriptor, key, distributed_config_)) {

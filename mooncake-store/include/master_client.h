@@ -113,6 +113,8 @@ inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig(
  * @brief Client for interacting with the mooncake master service
  */
 class MasterClient {
+    friend class MasterClientTestPeer;
+
    public:
     MasterClient(const UUID& client_id, MasterClientMetric* metrics = nullptr,
                  std::string tenant_id = "default")
@@ -462,6 +464,9 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<PingResponse, ErrorCode> Ping();
 
+    [[nodiscard]] tl::expected<void, ErrorCode> ReportServiceMetrics(
+        const ServiceMetricsSnapshot& snapshot);
+
     /**
      * @brief Mounts a local disk segment into the master.
      * @param enable_offloading If true, enables offloading (write-to-file).
@@ -584,6 +589,13 @@ class MasterClient {
      * @param key Object key
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
+    [[nodiscard]] tl::expected<CopyStartResponse, ErrorCode> DfsBackfillStart(
+        const std::string& key, const std::string& tenant_id,
+        const std::string& source, const UUID& task_id);
+    [[nodiscard]] tl::expected<void, ErrorCode> DfsBackfillFinish(
+        const std::string& key, const std::string& tenant_id,
+        const UUID& task_id, bool success);
+
     [[nodiscard]] tl::expected<void, ErrorCode> CopyEnd(const std::string& key);
     [[nodiscard]] tl::expected<void, ErrorCode> CopyEnd(
         const std::string& key, const std::string& tenant_id);

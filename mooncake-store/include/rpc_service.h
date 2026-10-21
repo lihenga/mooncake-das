@@ -193,6 +193,9 @@ class WrappedMasterService {
 
     tl::expected<PingResponse, ErrorCode> Ping(const UUID& client_id);
 
+    tl::expected<void, ErrorCode> ReportServiceMetrics(
+        const UUID& client_id, const ServiceMetricsSnapshot& snapshot);
+
     tl::expected<std::string, ErrorCode> ServiceReady();
 
     [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
@@ -313,6 +316,14 @@ class WrappedMasterService {
         const std::vector<std::string>& tgt_segments,
         const UUID& dynamic_replication_lease_id,
         uint64_t dynamic_replication_version_epoch);
+
+    tl::expected<CopyStartResponse, ErrorCode> DfsBackfillStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const std::string& source,
+        const UUID& task_id);
+    tl::expected<void, ErrorCode> DfsBackfillFinish(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const UUID& task_id, bool success);
 
     tl::expected<void, ErrorCode> CopyEnd(const UUID& client_id,
                                           const std::string& key,
