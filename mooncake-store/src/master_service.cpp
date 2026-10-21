@@ -7949,13 +7949,15 @@ bool MasterService::RunBucketDfsEvictionInternal(
     int low_utilization_rejections = 0;
     static DfsLogLimiter low_utilization_rejection_log_limiter;
     const auto log_low_utilization_rejection =
-        [&](int64_t bucket_id, const char* phase) {
+        [&](int64_t bucket_id, const char* phase, const std::string& key,
+            const char* reason) {
             if (!low_utilization_eviction) return;
             if (auto suppressed =
                     low_utilization_rejection_log_limiter.ShouldLog()) {
                 LOG(WARNING)
                     << "[DFS_LOW_UTILIZATION_EVICTION_REJECTED] bucket_id="
-                    << bucket_id << ", phase=" << phase
+                    << bucket_id << ", phase=" << phase << ", key=" << key
+                    << ", reason=" << reason
                     << ", suppressed=" << *suppressed;
             }
         };
@@ -8084,6 +8086,14 @@ bool MasterService::RunBucketDfsEvictionInternal(
         };
 
         bool all_accepted = true;
+        std::string phase1_reject_key;
+        const char* phase1_reject_reason = nullptr;
+        auto record_phase1_rejection = [&](const std::string& key,
+                                           const char* reason) {
+            if (phase1_reject_reason != nullptr) return;
+            phase1_reject_key = key;
+            phase1_reject_reason = reason;
+        };
         auto now = std::chrono::system_clock::now();
         for (const auto& [shard_idx, indexes] : indexes_by_shard) {
             if (!all_accepted) break;
@@ -8121,6 +8131,24 @@ bool MasterService::RunBucketDfsEvictionInternal(
                 if (!acceptable) {
                     // Whole-bucket eviction is all-or-nothing: one protected
                     // entry vetoes the bucket; undo earlier read barriers.
+                    if (candidate_is_processing) {
+                        record_phase1_rejection(candidate.key,
+                                                "replica_processing");
+                    } else if (tenant_state.processing_keys.contains(
+                                   candidate.key)) {
+                        record_phase1_rejection(candidate.key,
+                                                "key_processing");
+                    } else if (!invalidating_missing_bucket &&
+                               metadata.IsHardPinned()) {
+                        record_phase1_rejection(candidate.key, "hard_pinned");
+                    } else if (!invalidating_missing_bucket &&
+                               !metadata.IsLeaseExpired(now)) {
+                        record_phase1_rejection(candidate.key,
+                                                "lease_not_expired");
+                    } else {
+                        record_phase1_rejection(candidate.key,
+                                                "validation_rejected");
+                    }
                     all_accepted = false;
                     break;
                 }
@@ -8137,8 +8165,10 @@ bool MasterService::RunBucketDfsEvictionInternal(
         if (!all_accepted) {
             if (low_utilization_eviction) {
                 ++low_utilization_rejections;
-                log_low_utilization_rejection(evicted_bucket_id,
-                                               "phase1");
+                log_low_utilization_rejection(
+                    evicted_bucket_id, "phase1", phase1_reject_key,
+                    phase1_reject_reason != nullptr ? phase1_reject_reason
+                                                     : "validation_rejected");
             }
             clear_eviction_pending();
             bucket_allocator_->AbortEviction(std::move(pending));
@@ -8182,6 +8212,8 @@ bool MasterService::RunBucketDfsEvictionInternal(
         // candidate that became processing (e.g. a concurrent PutStart reused
         // the key after Phase 1 saw it as evictable) must not be removed.
         bool phase2_accepted = true;
+        std::string phase2_reject_key;
+        const char* phase2_reject_reason = nullptr;
         for (const auto& [shard_idx, indexes] : indexes_by_shard) {
             if (!phase2_accepted) break;
             std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
@@ -8205,6 +8237,10 @@ bool MasterService::RunBucketDfsEvictionInternal(
                     });
                 if (candidate_is_processing ||
                     tenant_state.processing_keys.contains(candidate.key)) {
+                    phase2_reject_key = candidate.key;
+                    phase2_reject_reason = candidate_is_processing
+                                               ? "replica_processing"
+                                               : "key_processing";
                     phase2_accepted = false;
                     break;
                 }
@@ -8213,8 +8249,10 @@ bool MasterService::RunBucketDfsEvictionInternal(
         if (!phase2_accepted) {
             if (low_utilization_eviction) {
                 ++low_utilization_rejections;
-                log_low_utilization_rejection(evicted_bucket_id,
-                                               "phase2");
+                log_low_utilization_rejection(
+                    evicted_bucket_id, "phase2", phase2_reject_key,
+                    phase2_reject_reason != nullptr ? phase2_reject_reason
+                                                     : "validation_rejected");
             }
             clear_eviction_pending();
             bucket_allocator_->AbortEviction(std::move(pending));
