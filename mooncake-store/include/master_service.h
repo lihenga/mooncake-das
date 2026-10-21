@@ -1736,6 +1736,7 @@ class MasterService {
     struct DfsBackfillState {
         UUID task_id{};
         std::chrono::steady_clock::time_point retry_after{};
+        uint32_t failures{0};
     };
 
     struct TenantState {
