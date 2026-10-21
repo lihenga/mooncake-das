@@ -240,6 +240,8 @@ class WrappedMasterService {
     tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 
+    tl::expected<UUID, ErrorCode> GetDfsMasterEpoch();
+
     tl::expected<DfsBucketSnapshotResponse, ErrorCode> GetDfsBucketSnapshot(
         const UUID& client_id, const UUID& last_epoch, uint64_t last_version);
 

@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -366,7 +367,9 @@ class DistributedStorageBackend : public StorageBackendInterface {
     DistributedStorageMode storage_mode_ = DistributedStorageMode::kFileSystem;
 
     std::shared_mutex bucket_epoch_mutex_;
+    std::mutex bucket_epoch_confirmation_mutex_;
     UUID bucket_epoch_{};
+    std::set<UUID> retired_bucket_epochs_;
     std::function<tl::expected<UUID, ErrorCode>()> master_epoch_provider_;
     mutable std::mutex bucket_cache_mutex_;
     // bucket id -> handle. The int key replaces a string-keyed lookup so the

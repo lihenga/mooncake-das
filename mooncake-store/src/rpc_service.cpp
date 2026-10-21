@@ -479,6 +479,9 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
     const UUID& dfs_epoch) {
     if (dfs_epoch != UUID{} &&
         dfs_epoch != master_service_.GetDfsMasterEpoch()) {
+        MasterMetricManager::instance().inc_put_end_requests();
+        MasterMetricManager::instance().inc_put_end_failures();
+        LOG(WARNING) << "Rejecting stale DFS allocation in PutEnd";
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
 
@@ -507,6 +510,9 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
     const std::string& tenant_id, const UUID& dfs_epoch) {
     if (dfs_epoch != UUID{} &&
         dfs_epoch != master_service_.GetDfsMasterEpoch()) {
+        MasterMetricManager::instance().inc_put_revoke_requests();
+        MasterMetricManager::instance().inc_put_revoke_failures();
+        LOG(WARNING) << "Rejecting stale DFS allocation in PutRevoke";
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
 
@@ -646,6 +652,11 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
     const UUID& dfs_epoch) {
     if (dfs_epoch != UUID{} &&
         dfs_epoch != master_service_.GetDfsMasterEpoch()) {
+        MasterMetricManager::instance().inc_batch_put_end_requests(
+            object_metas.size());
+        MasterMetricManager::instance().inc_batch_put_end_failures(
+            object_metas.size());
+        LOG(WARNING) << "Rejecting stale DFS allocation in BatchPutEnd";
         return std::vector<tl::expected<void, ErrorCode>>(
             object_metas.size(), tl::make_unexpected(ErrorCode::INVALID_WRITE));
     }
@@ -693,6 +704,11 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
     const UUID& dfs_epoch) {
     if (dfs_epoch != UUID{} &&
         dfs_epoch != master_service_.GetDfsMasterEpoch()) {
+        MasterMetricManager::instance().inc_batch_put_revoke_requests(
+            keys.size());
+        MasterMetricManager::instance().inc_batch_put_revoke_failures(
+            keys.size());
+        LOG(WARNING) << "Rejecting stale DFS allocation in BatchPutRevoke";
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::make_unexpected(ErrorCode::INVALID_WRITE));
     }
@@ -771,6 +787,9 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
     const UUID& dfs_epoch) {
     if (dfs_epoch != UUID{} &&
         dfs_epoch != master_service_.GetDfsMasterEpoch()) {
+        MasterMetricManager::instance().inc_put_end_requests();
+        MasterMetricManager::instance().inc_put_end_failures();
+        LOG(WARNING) << "Rejecting stale DFS allocation in UpsertEnd";
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
 
@@ -799,6 +818,9 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertRevoke(
     const std::string& tenant_id, const UUID& dfs_epoch) {
     if (dfs_epoch != UUID{} &&
         dfs_epoch != master_service_.GetDfsMasterEpoch()) {
+        MasterMetricManager::instance().inc_put_revoke_requests();
+        MasterMetricManager::instance().inc_put_revoke_failures();
+        LOG(WARNING) << "Rejecting stale DFS allocation in UpsertRevoke";
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
 
@@ -886,6 +908,11 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchUpsertEnd(
     const std::string& tenant_id, const UUID& dfs_epoch) {
     if (dfs_epoch != UUID{} &&
         dfs_epoch != master_service_.GetDfsMasterEpoch()) {
+        MasterMetricManager::instance().inc_batch_put_end_requests(
+            object_metas.size());
+        MasterMetricManager::instance().inc_batch_put_end_failures(
+            object_metas.size());
+        LOG(WARNING) << "Rejecting stale DFS allocation in BatchUpsertEnd";
         return std::vector<tl::expected<void, ErrorCode>>(
             object_metas.size(), tl::make_unexpected(ErrorCode::INVALID_WRITE));
     }
@@ -934,6 +961,11 @@ WrappedMasterService::BatchUpsertRevoke(const UUID& client_id,
                                         const UUID& dfs_epoch) {
     if (dfs_epoch != UUID{} &&
         dfs_epoch != master_service_.GetDfsMasterEpoch()) {
+        MasterMetricManager::instance().inc_batch_put_revoke_requests(
+            keys.size());
+        MasterMetricManager::instance().inc_batch_put_revoke_failures(
+            keys.size());
+        LOG(WARNING) << "Rejecting stale DFS allocation in BatchUpsertRevoke";
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::make_unexpected(ErrorCode::INVALID_WRITE));
     }
@@ -1823,6 +1855,10 @@ WrappedMasterService::OffloadObjectHeartbeat(const UUID& client_id,
     return result;
 }
 
+tl::expected<UUID, ErrorCode> WrappedMasterService::GetDfsMasterEpoch() {
+    return master_service_.GetDfsMasterEpoch();
+}
+
 tl::expected<DfsBucketSnapshotResponse, ErrorCode>
 WrappedMasterService::GetDfsBucketSnapshot(
     const UUID& client_id, const UUID& last_epoch, uint64_t last_version) {
@@ -2121,6 +2157,8 @@ void RegisterRpcService(
         &mooncake::WrappedMasterService::BatchInvalidateDfsBuckets>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PollRemoveAll>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::GetDfsMasterEpoch>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::GetDfsBucketSnapshot>(

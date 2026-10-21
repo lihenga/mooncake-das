@@ -856,32 +856,43 @@ DistributedStorageBackend::AcquireBucketEpoch(const UUID& epoch) {
         }
         return read_lock;
     }
+    if (!master_epoch_provider_ || epoch == UUID{} ||
+        retired_bucket_epochs_.contains(epoch)) {
+        return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
+    }
     read_lock.unlock();
 
-    std::unique_lock write_lock(bucket_epoch_mutex_);
-    if (epoch != bucket_epoch_) {
-        if (!master_epoch_provider_ || epoch == UUID{}) {
-            return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
-        }
-        // A delayed response is not evidence of a newer master: UUIDs have no
-        // order. Confirm a different epoch once, rather than stat every I/O.
-        auto current_epoch = master_epoch_provider_();
-        if (!current_epoch) return tl::make_unexpected(current_epoch.error());
-        if (*current_epoch != epoch) {
+    // Serialize confirmations without excluding current-epoch cache hits.
+    // Cold opens do not take this mutex: they already hold a shared I/O guard
+    // that a confirmed transition must wait for before clearing the caches.
+    std::unique_lock confirmation_lock(bucket_epoch_confirmation_mutex_);
+    read_lock.lock();
+    if (epoch == bucket_epoch_) return read_lock;
+    if (retired_bucket_epochs_.contains(epoch)) {
+        return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
+    }
+    read_lock.unlock();
+    // A delayed response is not evidence of a newer master: UUIDs have no
+    // order. Network confirmation must not hold the exclusive I/O lock.
+    auto current_epoch = master_epoch_provider_();
+    if (!current_epoch) return tl::make_unexpected(current_epoch.error());
+    if (*current_epoch != epoch) {
+        return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
+    }
+    {
+        std::unique_lock write_lock(bucket_epoch_mutex_);
+        if (retired_bucket_epochs_.contains(epoch)) {
             return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
         }
         auto invalidated = InvalidateAllBucketFds();
         if (!invalidated) return tl::make_unexpected(invalidated.error());
+        if (bucket_epoch_ != UUID{})
+            retired_bucket_epochs_.insert(bucket_epoch_);
         bucket_epoch_ = epoch;
         LOG(INFO) << "Invalidated " << *invalidated
                   << " DFS bucket handles before using a changed Master epoch";
     }
-    write_lock.unlock();
     read_lock.lock();
-    // Another transition may have won while the lock was being downgraded.
-    if (epoch != bucket_epoch_) {
-        return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
-    }
     return read_lock;
 }
 
@@ -1073,14 +1084,15 @@ DistributedStorageBackend::ResolveTarget(
     }
 
     auto handle = read_only ? GetOrOpenBucketDirect(descriptor.shard_idx,
-                                                    descriptor.master_epoch)
+                                                    descriptor.MasterEpoch())
                             : GetOrOpenBucket(descriptor.shard_idx,
-                                              descriptor.master_epoch);
+                                              descriptor.MasterEpoch());
     if (!handle && read_only) {
         if (handle.error() != ErrorCode::NOT_SUPPORTED) {
             return tl::make_unexpected(handle.error());
         }
-        handle = GetOrOpenBucket(descriptor.shard_idx, descriptor.master_epoch);
+        handle =
+            GetOrOpenBucket(descriptor.shard_idx, descriptor.MasterEpoch());
         read_only = false;
     }
     if (!handle) return tl::make_unexpected(handle.error());
@@ -1190,16 +1202,18 @@ DistributedStorageBackend::BatchWrite(
     // promise contiguity.
     if (IsBucketMode()) {
         if (requests.empty()) return results;
-        const auto epoch = requests.front().descriptor.master_epoch;
-        auto guard = AcquireBucketEpoch(epoch);
-        if (!guard || std::any_of(requests.begin(), requests.end(),
-                                  [&](const auto& request) {
-                                      return request.descriptor.master_epoch !=
-                                             epoch;
-                                  })) {
+        const auto epoch = requests.front().descriptor.MasterEpoch();
+        if (std::any_of(requests.begin(), requests.end(),
+                        [&](const auto& request) {
+                            return request.descriptor.MasterEpoch() != epoch;
+                        })) {
             results.assign(requests.size(),
-                           tl::make_unexpected(guard ? ErrorCode::INVALID_WRITE
-                                                     : guard.error()));
+                           tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            return results;
+        }
+        auto guard = AcquireBucketEpoch(epoch);
+        if (!guard) {
+            results.assign(requests.size(), tl::make_unexpected(guard.error()));
             return results;
         }
         return BatchWriteBucket(requests);
@@ -1825,15 +1839,20 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     if (!IsBucketMode()) return BatchReadShard(requests);
 
     if (requests.empty()) return results;
-    const auto epoch = requests.front().descriptor.master_epoch;
-    auto guard = AcquireBucketEpoch(epoch);
-    if (!guard ||
-        std::any_of(requests.begin(), requests.end(), [&](const auto& request) {
-            return request.descriptor.master_epoch != epoch;
+    const auto epoch = requests.front().descriptor.MasterEpoch();
+    if (std::any_of(requests.begin(), requests.end(), [&](const auto& request) {
+            return request.descriptor.MasterEpoch() != epoch;
         })) {
+        // The client can refresh this mixed batch once, without changing local
+        // epoch state based on whichever request happened to come first.
         std::fill(results.begin(), results.end(),
-                  tl::make_unexpected(guard ? ErrorCode::INVALID_WRITE
-                                            : guard.error()));
+                  tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE));
+        return results;
+    }
+    auto guard = AcquireBucketEpoch(epoch);
+    if (!guard) {
+        std::fill(results.begin(), results.end(),
+                  tl::make_unexpected(guard.error()));
         return results;
     }
 

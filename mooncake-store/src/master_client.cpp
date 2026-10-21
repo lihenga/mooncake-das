@@ -1138,8 +1138,7 @@ MasterClient::OffloadObjectHeartbeat(const UUID& client_id,
 
 std::function<tl::expected<UUID, ErrorCode>()>
 MasterClient::MakeDfsMasterEpochProvider() {
-    return [accessor = client_accessor_,
-            client_id = client_id_]() -> tl::expected<UUID, ErrorCode> {
+    return [accessor = client_accessor_]() -> tl::expected<UUID, ErrorCode> {
         const auto pool = accessor->GetClientPool();
         if (!pool) return tl::make_unexpected(ErrorCode::RPC_FAIL);
         return async_simple::coro::syncAwait(
@@ -1148,9 +1147,9 @@ MasterClient::MakeDfsMasterEpochProvider() {
                     [&](coro_rpc::coro_rpc_client& client)
                         -> async_simple::coro::Lazy<
                             tl::expected<UUID, ErrorCode>> {
-                        auto result = co_await client.call<
-                            &WrappedMasterService::GetDfsBucketSnapshot>(
-                            client_id, UUID{}, uint64_t{0});
+                        auto result = co_await client.call_for<
+                            &WrappedMasterService::GetDfsMasterEpoch>(
+                            std::chrono::seconds(2));
                         if (!result) {
                             co_return tl::make_unexpected(
                                 result.error().code == coro_rpc::errc::timed_out
@@ -1160,7 +1159,7 @@ MasterClient::MakeDfsMasterEpochProvider() {
                         if (!*result) {
                             co_return tl::make_unexpected(result->error());
                         }
-                        co_return result->value().epoch;
+                        co_return result->value();
                     });
                 if (!response) {
                     co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
