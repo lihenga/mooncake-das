@@ -7947,6 +7947,18 @@ bool MasterService::RunBucketDfsEvictionInternal(
     int low_utilization_evictions = 0;
     int low_utilization_attempts = 0;
     int low_utilization_rejections = 0;
+    static DfsLogLimiter low_utilization_rejection_log_limiter;
+    const auto log_low_utilization_rejection =
+        [&](int64_t bucket_id, const char* phase) {
+            if (!low_utilization_eviction) return;
+            if (auto suppressed =
+                    low_utilization_rejection_log_limiter.ShouldLog()) {
+                LOG(WARNING)
+                    << "[DFS_LOW_UTILIZATION_EVICTION_REJECTED] bucket_id="
+                    << bucket_id << ", phase=" << phase
+                    << ", suppressed=" << *suppressed;
+            }
+        };
     const int max_low_utilization_attempts =
         low_utilization_attempt_limit >= 0
             ? low_utilization_attempt_limit
@@ -8123,7 +8135,11 @@ bool MasterService::RunBucketDfsEvictionInternal(
         }
 
         if (!all_accepted) {
-            if (low_utilization_eviction) ++low_utilization_rejections;
+            if (low_utilization_eviction) {
+                ++low_utilization_rejections;
+                log_low_utilization_rejection(evicted_bucket_id,
+                                               "phase1");
+            }
             clear_eviction_pending();
             bucket_allocator_->AbortEviction(std::move(pending));
             if (invalidating_missing_bucket) return false;
@@ -8195,7 +8211,11 @@ bool MasterService::RunBucketDfsEvictionInternal(
             }
         }
         if (!phase2_accepted) {
-            if (low_utilization_eviction) ++low_utilization_rejections;
+            if (low_utilization_eviction) {
+                ++low_utilization_rejections;
+                log_low_utilization_rejection(evicted_bucket_id,
+                                               "phase2");
+            }
             clear_eviction_pending();
             bucket_allocator_->AbortEviction(std::move(pending));
             if (invalidating_missing_bucket) return false;
