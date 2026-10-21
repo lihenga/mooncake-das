@@ -5178,17 +5178,25 @@ ErrorCode Client::TransferReadRange(
 }
 
 void Client::PollAndDispatchTasks() {
-    if (task_running_.load()) {
+    // Drain a few full backfill batches per tick without an unbounded fetch
+    // loop or changing the normal copy/move polling cadence.
+    constexpr size_t kMaxBackfillBatches = 4;
+    for (size_t batch = 0; batch < kMaxBackfillBatches && task_running_.load();
+         ++batch) {
         auto fetch_result = FetchTasks(kTaskBatchSize);
         if (fetch_result.has_value()) {
             const auto& tasks = fetch_result.value();
+            bool has_backfill = false;
             if (!tasks.empty()) {
                 LOG(INFO) << "action=task_poll_success"
                           << ", task_count=" << tasks.size();
                 for (const auto& task_assignment : tasks) {
+                    has_backfill |=
+                        task_assignment.type == TaskType::DFS_BACKFILL;
                     SubmitTask(task_assignment);
                 }
             }
+            if (tasks.size() < kTaskBatchSize || !has_backfill) return;
         } else {
             ErrorCode error = fetch_result.error();
             // Only log if it's not an RPC failure (which is expected
@@ -5197,6 +5205,7 @@ void Client::PollAndDispatchTasks() {
                 LOG(WARNING)
                     << "action=task_poll_failed" << ", error_code=" << error;
             }
+            return;
         }
     }
 }
@@ -5255,6 +5264,10 @@ void Client::ExecuteTask(const ClientTask& client_task) {
     try {
         switch (assignment.type) {
             case TaskType::DFS_BACKFILL: {
+                if (!DfsWriteAllowed()) {
+                    result = ErrorCode::DFS_SERVICE_UNAVAILABLE;
+                    break;
+                }
                 auto backend = GetDfsBackfillBackend();
                 if (!backend) {
                     result = backend.error();
