@@ -416,40 +416,69 @@ FinalizeDecision DetermineFinalizeDecision(
     const bool allocation_satisfied =
         HasExpectedReplicaAllocation(config, summary, allow_missing_dfs);
 
-    // When the DFS replica's completion has been handed to the background write
-    // task, this batch must not send ReplicaType::ALL: that would also complete
-    // (or revoke) the DFS replica the task still owns. Narrow the scope to the
-    // replica types this call is actually responsible for.
     const bool dfs_deferred = summary.dfs_completion_deferred;
-    const auto scoped_all = [&]() -> std::optional<ReplicaType> {
-        if (!dfs_deferred) return ReplicaType::ALL;
-        const bool has_memory = summary.allocated_memory_replicas > 0;
-        const bool has_nof = summary.allocated_nof_replicas > 0;
-        if (has_memory && has_nof) {
-            // ReplicaType::ALL is the only value covering both, and it would
-            // also touch DFS. DFS requires replica_num > 0 and is rejected
-            // together with NoF, so this combination should be unreachable;
-            // treat it as a programming error rather than guessing.
-            LOG(ERROR) << "Deferred DFS completion combined with both MEMORY "
-                          "and NoF replicas is not supported";
-            return ReplicaType::ALL;
-        }
-        if (has_memory) return ReplicaType::MEMORY;
-        if (has_nof) return ReplicaType::NOF_SSD;
-        return std::nullopt;
+
+    // Return the replica type(s) owned by this finalize call whose transfers
+    // succeeded. Deferred DFS completion stays owned by the background task.
+    const auto successful_type = [&]() -> std::optional<ReplicaType> {
+        const bool memory_succeeded =
+            summary.allocated_memory_replicas > 0 &&
+            summary.successful_memory_transfers ==
+                summary.allocated_memory_replicas &&
+            summary.failed_memory_transfers == 0;
+        const bool nof_succeeded =
+            summary.allocated_nof_replicas > 0 &&
+            summary.successful_nof_transfers == summary.allocated_nof_replicas &&
+            summary.failed_nof_transfers == 0;
+        const bool dfs_succeeded =
+            !dfs_deferred && summary.allocated_dfs_replicas > 0 &&
+            summary.successful_dfs_transfers == summary.allocated_dfs_replicas &&
+            summary.failed_dfs_transfers == 0;
+        const size_t successful_types = static_cast<size_t>(memory_succeeded) +
+                                        static_cast<size_t>(nof_succeeded) +
+                                        static_cast<size_t>(dfs_succeeded);
+        if (successful_types == 0) return std::nullopt;
+        if (successful_types > 1) return ReplicaType::ALL;
+        if (memory_succeeded) return ReplicaType::MEMORY;
+        if (nof_succeeded) return ReplicaType::NOF_SSD;
+        return ReplicaType::DFS;
+    };
+
+    // Return the replica type(s) still owned by this finalize call whose
+    // transfers failed. A deferred DFS replica is excluded because the
+    // background task owns its eventual End/Revoke.
+    const auto failed_type = [&]() -> std::optional<ReplicaType> {
+        const bool memory_failed =
+            summary.allocated_memory_replicas > 0 &&
+            summary.successful_memory_transfers <
+                summary.allocated_memory_replicas;
+        const bool nof_failed =
+            summary.allocated_nof_replicas > 0 &&
+            summary.successful_nof_transfers < summary.allocated_nof_replicas;
+        const bool dfs_failed =
+            !dfs_deferred && summary.allocated_dfs_replicas > 0 &&
+            summary.successful_dfs_transfers < summary.allocated_dfs_replicas;
+        const size_t failed_types = static_cast<size_t>(memory_failed) +
+                                    static_cast<size_t>(nof_failed) +
+                                    static_cast<size_t>(dfs_failed);
+        if (failed_types == 0) return std::nullopt;
+        if (failed_types > 1) return ReplicaType::ALL;
+        if (memory_failed) return ReplicaType::MEMORY;
+        if (nof_failed) return ReplicaType::NOF_SSD;
+        return ReplicaType::DFS;
     };
 
     if (write_mode != ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
         const bool all_transfers_succeeded =
             AllAllocatedTransfersSucceeded(summary);
         if (allocation_satisfied && all_transfers_succeeded) {
-            return {.end_type = scoped_all(),
+            return {.end_type = successful_type(),
                     .revoke_type = std::nullopt,
                     .success = true,
                     .error = ErrorCode::OK};
         }
-        return {.end_type = std::nullopt,
-                .revoke_type = scoped_all(),
+        return {.end_type = successful_type(),
+                .revoke_type = failed_type(),
                 .success = false,
                 .error = allocation_satisfied
                              ? (summary.first_error == ErrorCode::OK
@@ -462,7 +491,7 @@ FinalizeDecision DetermineFinalizeDecision(
     const bool nof_succeeded = summary.successful_nof_transfers > 0;
 
     if (memory_succeeded && nof_succeeded) {
-        return {.end_type = scoped_all(),
+        return {.end_type = successful_type(),
                 .revoke_type = std::nullopt,
                 .success = true,
                 .error = ErrorCode::OK};
@@ -480,8 +509,8 @@ FinalizeDecision DetermineFinalizeDecision(
                 .error = ErrorCode::OK};
     }
 
-    return {.end_type = std::nullopt,
-            .revoke_type = scoped_all(),
+    return {.end_type = successful_type(),
+            .revoke_type = failed_type(),
             .success = false,
             .error = summary.first_error == ErrorCode::OK
                          ? ErrorCode::NO_AVAILABLE_HANDLE
@@ -3783,9 +3812,11 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     BatchFinalizeGroup end_all_group;
     BatchFinalizeGroup end_memory_group;
     BatchFinalizeGroup end_nof_group;
+    BatchFinalizeGroup end_dfs_group;
     BatchFinalizeGroup revoke_all_group;
     BatchFinalizeGroup revoke_memory_group;
     BatchFinalizeGroup revoke_nof_group;
+    BatchFinalizeGroup revoke_dfs_group;
 
     std::vector<size_t> pending_finalize_actions(ops.size(), 0);
     std::vector<bool> should_succeed(ops.size(), false);
@@ -3818,6 +3849,11 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
                     break;
                 case ReplicaType::NOF_SSD:
                     add_group_entry(is_end ? end_nof_group : revoke_nof_group,
+                                    key, index);
+                    ++pending_finalize_actions[index];
+                    break;
+                case ReplicaType::DFS:
+                    add_group_entry(is_end ? end_dfs_group : revoke_dfs_group,
                                     key, index);
                     ++pending_finalize_actions[index];
                     break;
@@ -3924,9 +3960,11 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     process_end_group(end_all_group, ReplicaType::ALL);
     process_end_group(end_memory_group, ReplicaType::MEMORY);
     process_end_group(end_nof_group, ReplicaType::NOF_SSD);
+    process_end_group(end_dfs_group, ReplicaType::DFS);
     process_revoke_group(revoke_all_group, ReplicaType::ALL);
     process_revoke_group(revoke_memory_group, ReplicaType::MEMORY);
     process_revoke_group(revoke_nof_group, ReplicaType::NOF_SSD);
+    process_revoke_group(revoke_dfs_group, ReplicaType::DFS);
 
     auto append_finalize_error_context = [&](PutOperation& op, size_t index) {
         if (finalize_rpc_errors[index].has_value()) {

@@ -190,6 +190,8 @@ std::optional<double> WaitForServiceMetricValue(
 
 class DfsBucketClientTest : public ::testing::Test {
    protected:
+    virtual void ConfigureClientEnvironment() {}
+
     void SetUp() override {
         root_ = (std::filesystem::temp_directory_path() /
                  ("dfs_bucket_client_" + std::to_string(::getpid()) + "_" +
@@ -211,6 +213,7 @@ class DfsBucketClientTest : public ::testing::Test {
         // Keep the shard fields valid; they are unused in bucket mode.
         SetEnv("MOONCAKE_DFS_SHARD_COUNT", "1");
         SetEnv("MOONCAKE_DFS_SHARD_CAPACITY", "1048576");
+        ConfigureClientEnvironment();
 
         ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
         writer_ = CreateClient("127.0.0.1:18201");
@@ -471,6 +474,31 @@ TEST_F(DfsBucketClientTest, EmptyStartupIdentityRecoversFromMasterWithoutRestart
     ASSERT_EQ(read.size(), 1u);
     ASSERT_TRUE(read[0].has_value());
     EXPECT_EQ(output, value);
+}
+
+class DfsBucketClientChunkLimitTest : public DfsBucketClientTest {
+   protected:
+    void ConfigureClientEnvironment() override {
+        SetEnv("MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES", "16384");
+        SetEnv("MC_STORE_DFS_WRITE_ARENA_COUNT", "1");
+    }
+};
+
+TEST_F(DfsBucketClientChunkLimitTest,
+       ChunkLimitFailureKeepsSuccessfulMemoryReplica) {
+    const std::string key = "chunk_limit_memory_fallback";
+    std::string value(32 * 1024, 'X');
+    std::vector<std::vector<Slice>> slices{{{value.data(), value.size()}}};
+
+    auto results = writer_->BatchPut({key}, slices, DfsConfig());
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_FALSE(results[0].has_value());
+    EXPECT_EQ(results[0].error(), ErrorCode::TRANSFER_FAIL);
+
+    auto query = writer_->Query(key);
+    ASSERT_TRUE(query.has_value());
+    ASSERT_EQ(query->replicas.size(), 1u);
+    EXPECT_TRUE(query->replicas[0].is_memory_replica());
 }
 
 TEST_F(DfsBucketClientTest, BatchPutWritesEveryKeyAndKeepsBatchContiguous) {
