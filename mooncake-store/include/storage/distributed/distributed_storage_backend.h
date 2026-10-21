@@ -42,6 +42,9 @@ struct DistributedStorageConfig {
     double low_utilization_threshold = 0.05;
     // Maximum number of low-utilization buckets reclaimed per maintenance tick.
     int low_utilization_evictions_per_tick = 1;
+    // Maximum number of low-utilization candidates inspected per maintenance
+    // tick. This bounds work when candidates are rejected by the Master.
+    int low_utilization_eviction_attempts_per_tick = 8;
     std::chrono::seconds deferred_free_duration{30};
     std::chrono::seconds eviction_check_interval{5};
 
@@ -148,6 +151,11 @@ class DistributedStorageBackend : public StorageBackendInterface {
 
     bool UsesObjectStorage() const {
         return storage_mode_ == DistributedStorageMode::kObjectStorage;
+    }
+
+    // Set the master's path namespace before publishing the backend for I/O.
+    void SetDescriptorRootDir(const std::string& root_dir) {
+        descriptor_root_dir_ = root_dir;
     }
 
     tl::expected<void, ErrorCode> Init() override;
@@ -264,13 +272,6 @@ class DistributedStorageBackend : public StorageBackendInterface {
         std::shared_ptr<OpenFileHandle> keepalive;
     };
 
-    /**
-     * @brief Resolve `descriptor` to a validated I/O target.
-     *
-     * SHARD mode validates against the fixed shard table. BUCKET mode
-     * canonicalizes the descriptor path, verifies it names the expected bucket
-     * data file under the configured DFS root, and then opens/caches it.
-     */
     tl::expected<ResolvedTarget, ErrorCode> ResolveTarget(
         const DistributedFSDescriptor& descriptor, const std::string& key,
         bool read_only = false);
@@ -343,12 +344,11 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::string expected_root_identity_;
     std::function<tl::expected<std::string, ErrorCode>()> root_identity_provider_;
     std::string root_dir_;
+    std::string descriptor_root_dir_;
     std::string health_probe_path_prefix_;
     std::string active_health_probe_path_;
     uint64_t health_probe_generation_{0};
     std::mutex health_probe_write_mutex_;
-    // Canonical form of root_dir_, used to reject descriptor paths that try to
-    // escape the configured DFS root.
     std::string canonical_root_dir_;
     std::vector<std::unique_ptr<ShardFile>> shard_files_;
     DistributedStorageMode storage_mode_ = DistributedStorageMode::kFileSystem;

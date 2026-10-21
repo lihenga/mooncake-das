@@ -2134,7 +2134,7 @@ ImmutableBucketAllocator::PrepareEvictionForAllocationFailure() {
 
 ImmutableBucketAllocator::PendingEviction
 ImmutableBucketAllocator::PrepareEvictionForLowUtilization(double threshold) {
-    if (threshold <= 0.0 || threshold > 1.0) {
+    if (threshold <= 0.0 || threshold >= 1.0) {
         return {};
     }
     return PrepareEvictionInternal(/*force_one=*/false, threshold);
@@ -2158,13 +2158,15 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
 
         const double usage = static_cast<double>(UsedBytesLocked()) /
                              static_cast<double>(capacity);
-        const bool low_utilization_scan = low_utilization_threshold >= 0.0;
-        if (!force_one && !low_utilization_scan) {
+        const bool prioritize_low_utilization =
+            low_utilization_threshold > 0.0 &&
+            low_utilization_threshold < 1.0;
+        if (!force_one && !prioritize_low_utilization) {
             if (usage >= eviction_high_watermark_) {
                 eviction_active_ = true;
             }
             if (!eviction_active_) return pending;
-            if (usage < eviction_low_watermark_) {
+            if (usage <= eviction_low_watermark_) {
                 eviction_active_ = false;
                 return pending;
             }
@@ -2181,14 +2183,12 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
             if (bucket_it == buckets_.end()) continue;
             if (bucket_it->second->frozen) continue;
             const auto& candidate = bucket_it->second;
-            if (low_utilization_scan &&
+            const bool is_low_utilization =
+                candidate->capacity > 0 &&
                 static_cast<double>(candidate->live_bytes) /
-                        static_cast<double>(candidate->capacity) >=
-                    low_utilization_threshold) {
-                continue;
-            }
-            // A PENDING entry means the client has not called PutEnd yet, so
-            // the bucket's data file must not be deleted underneath it.
+                        static_cast<double>(candidate->capacity) <
+                    low_utilization_threshold;
+            if (prioritize_low_utilization && !is_low_utilization) continue;
             if (candidate->pending_count != 0) continue;
             victim = candidate;
             break;

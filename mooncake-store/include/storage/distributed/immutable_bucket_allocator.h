@@ -271,7 +271,10 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     };
 
     /**
-     * @brief Freeze the coldest evictable bucket and return its live entries.
+     * @brief Freeze an eligible bucket and return its live entries.
+     *
+     * Watermark eviction selects the coldest eligible bucket. The dedicated
+     * low-utilization entry point restricts selection to sparse buckets.
      * Returns an empty transaction when nothing can be evicted.
      */
     PendingEviction PrepareEviction();

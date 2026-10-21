@@ -678,6 +678,13 @@ class MasterService {
         const UUID& dynamic_replication_lease_id = UUID{},
         uint64_t dynamic_replication_version_epoch = 0);
 
+    // Backfill uses the copy lifecycle, including source pinning and timeout
+    // cleanup. The task ID fences stale workers after replacement/retry.
+    tl::expected<CopyStartResponse, ErrorCode> DfsBackfillStart(
+        const UUID& client_id, const std::string& key,
+        const TenantId& tenant_id, const std::string& src_segment,
+        const UUID& task_id);
+
     tl::expected<void, ErrorCode> CopyEnd(
         const UUID& client_id, const std::string& key,
         const TenantId& tenant_id,
@@ -1726,11 +1733,19 @@ class MasterService {
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
+    struct DfsBackfillState {
+        UUID task_id{};
+        std::chrono::steady_clock::time_point retry_after{};
+    };
+
     struct TenantState {
         TenantQuotaHandle quota_account{nullptr};
         std::unordered_map<std::string, ObjectMetadata> metadata;
         std::unordered_set<std::string> processing_keys;
         std::unordered_map<std::string, ReplicationTask> replication_tasks;
+        // Only failed/degraded DFS writes enter this retry set. Capacity
+        // eviction of a successfully committed replica must not refill it.
+        std::unordered_map<std::string, DfsBackfillState> dfs_backfill;
         std::unordered_map<std::string, const OffloadingTask> offloading_tasks;
         std::unordered_map<std::string, PromotionTask> promotion_tasks;
         std::unordered_map<std::string, PromotionCandidate>
@@ -1748,7 +1763,8 @@ class MasterService {
 
         bool Empty() const {
             return metadata.empty() && processing_keys.empty() &&
-                   replication_tasks.empty() && offloading_tasks.empty() &&
+                   replication_tasks.empty() && dfs_backfill.empty() &&
+                   offloading_tasks.empty() &&
                    promotion_tasks.empty() && promotion_candidates.empty() &&
                    dynamic_replication_pending.empty() &&
                    dynamic_replication_leases.empty() &&
@@ -2111,15 +2127,16 @@ class MasterService {
                          const std::vector<Replica>& replicas);
     void RunDfsEviction();
     void ProcessInvalidatedDfsBuckets();
-    // Whole-bucket eviction (BUCKET mode). Uses a strict two-phase protocol:
-    // validate every candidate first and only mutate metadata once all of them
-    // are accepted, so a bucket file is never deleted while the master still
-    // hands out a descriptor into it.
+    // Whole-bucket eviction (BUCKET mode). Freeze reads as candidates pass
+    // validation, then remove replicas and bucket files after revalidation.
+    // Aborting eviction restores reads for the matching replica generations.
     void RunBucketDfsEviction();
     bool RunBucketDfsEvictionInternal(
         bool force_one,
         std::optional<int64_t> invalidated_bucket_id = std::nullopt,
-        double low_utilization_threshold = -1.0);
+        double low_utilization_threshold = -1.0,
+        int low_utilization_eviction_limit = -1,
+        int low_utilization_attempt_limit = -1);
     bool TryRecoverDfsSpaceAfterAllocationFailure();
     tl::expected<bool, ErrorCode> IsDfsBucketDataFilePresent(
         int64_t bucket_id) const;
@@ -2134,6 +2151,11 @@ class MasterService {
     void RestoreRecoveredDfsReplicas(bool rebuild_metadata);
     void InitDfsAllocatorFromEnvironment(const MasterServiceConfig& config);
     void DfsAllocatorRetryThreadFunc();
+    void RunDfsBackfill();
+    size_t dfs_backfill_shard_{0};  // owned by the DFS eviction thread
+    bool InitializeDfsRootGuard(const std::string& root,
+                                const std::string& identity);
+    void ReconcileDfsRootFiles();
     /**
      * @brief Helper to release space of expired discarded replicas.
      * @return Number of released objects that have memory replicas
@@ -2143,6 +2165,7 @@ class MasterService {
 
     // Eviction thread function
     void EvictionThreadFunc();
+    void DfsEvictionThreadFunc();
     void NofHeartbeatThreadFunc();
     bool TryUnmountNoFSegmentByHeartbeat(
         const MountedNoFSegmentSnapshot& snapshot,
@@ -2253,6 +2276,7 @@ class MasterService {
 
     // Eviction thread related members
     std::thread eviction_thread_;
+    std::thread dfs_eviction_thread_;
     std::atomic<bool> eviction_running_{false};
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
@@ -2812,6 +2836,7 @@ class MasterService {
     bool dfs_restore_from_bucket_metadata_{true};
     double dfs_bucket_low_utilization_threshold_{0.05};
     int dfs_bucket_low_utilization_evictions_per_tick_{1};
+    int dfs_bucket_low_utilization_attempts_per_tick_{8};
     // Chosen by configuration at startup: DfsGlobalAllocator (SHARD, the
     // default) or ImmutableBucketAllocator (BUCKET). The master only ever talks
     // to it through DfsAllocatorInterface.
@@ -2829,6 +2854,13 @@ class MasterService {
     std::thread dfs_retry_thread_;
     std::mutex dfs_retry_mutex_;
     std::condition_variable dfs_retry_cv_;
+    std::mutex dfs_root_guard_mutex_;
+    std::string dfs_root_guard_path_;
+    std::string dfs_root_guard_identity_;
+    uint64_t dfs_root_guard_device_{0};
+    uint64_t dfs_root_guard_inode_{0};
+    bool dfs_root_guard_ready_{false};
+    std::chrono::seconds dfs_root_guard_interval_{5};
 
     // Segment management
     SegmentManager segment_manager_;

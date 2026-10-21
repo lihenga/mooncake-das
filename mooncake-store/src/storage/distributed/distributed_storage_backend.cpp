@@ -100,13 +100,6 @@ bool IsBucketDescriptorRangeValid(const DistributedFSDescriptor& desc,
            layout->aligned_size <= kMaxFileOffset - layout->offset;
 }
 
-/**
- * @brief Canonicalize `path` without requiring it to exist yet.
- *
- * `weakly_canonical` collapses `..` and resolves the existing prefix through
- * symlinks, which is what we need to reject descriptor paths pointing outside
- * the configured DFS root.
- */
 std::string CanonicalizePath(const std::string& path) {
     std::error_code ec;
     auto canonical = std::filesystem::weakly_canonical(path, ec);
@@ -331,9 +324,11 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     config.low_utilization_threshold = Environ::GetDouble(
         "MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_THRESHOLD",
         config.low_utilization_threshold);
-    if (!std::isfinite(config.low_utilization_threshold) ||
-        config.low_utilization_threshold < 0.0 ||
-        config.low_utilization_threshold > 1.0) {
+    const bool valid_low_utilization_threshold =
+        std::isfinite(config.low_utilization_threshold) &&
+        config.low_utilization_threshold >= 0.0 &&
+        config.low_utilization_threshold < 1.0;
+    if (!valid_low_utilization_threshold) {
         LOG(WARNING) << "Invalid MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_THRESHOLD="
                      << config.low_utilization_threshold
                      << "; using default 0.05";
@@ -348,6 +343,16 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
             << config.low_utilization_evictions_per_tick
             << "; using default 1";
         config.low_utilization_evictions_per_tick = 1;
+    }
+    config.low_utilization_eviction_attempts_per_tick = Environ::GetInt(
+        "MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_ATTEMPTS_PER_TICK",
+        config.low_utilization_eviction_attempts_per_tick);
+    if (config.low_utilization_eviction_attempts_per_tick < 1) {
+        LOG(WARNING)
+            << "Invalid MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_ATTEMPTS_PER_TICK="
+            << config.low_utilization_eviction_attempts_per_tick
+            << "; using default 8";
+        config.low_utilization_eviction_attempts_per_tick = 8;
     }
     config.deferred_free_duration = std::chrono::seconds(Environ::GetInt(
         "MOONCAKE_DFS_DEFERRED_FREE_SECONDS",
@@ -410,6 +415,8 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", low_utilization_threshold=" << low_utilization_threshold
         << ", low_utilization_evictions_per_tick="
         << low_utilization_evictions_per_tick
+        << ", low_utilization_eviction_attempts_per_tick="
+        << low_utilization_eviction_attempts_per_tick
         << ", deferred_free_seconds=" << deferred_free_duration.count()
         << ", eviction_check_interval_seconds="
         << eviction_check_interval.count()
@@ -456,7 +463,8 @@ DistributedStorageBackend::DistributedStorageBackend(
       object_storage_adapter_(std::move(object_storage_adapter)),
       distributed_config_(distributed_config),
       expected_root_identity_(std::move(expected_root_identity)),
-      root_dir_(distributed_config.fsdir) {
+      root_dir_(distributed_config.fsdir),
+      descriptor_root_dir_(distributed_config.fsdir) {
     CHECK((fs_adapter_ != nullptr) != (object_storage_adapter_ != nullptr))
         << "DistributedStorageBackend: exactly one I/O adapter is required";
     if (object_storage_adapter_) {
@@ -978,6 +986,18 @@ DistributedStorageBackend::ResolveTarget(
     if (descriptor.shard_idx < 0) {
         LOG(ERROR) << "Invalid DFS bucket id " << descriptor.shard_idx
                    << " for key " << key;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const std::string expected_path =
+        descriptor_root_dir_ + "/" + kBucketFilePrefix +
+        ImmutableBucketAllocator::FormatBucketId(descriptor.shard_idx) +
+        kBucketDataSuffix;
+    // The master's mount path may not exist on this client.
+    if (std::filesystem::path(descriptor.file_path).lexically_normal() !=
+        std::filesystem::path(expected_path).lexically_normal()) {
+        LOG(ERROR) << "DFS bucket path mismatch for key " << key
+                   << ", descriptor=" << descriptor.file_path
+                   << ", expected=" << expected_path;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (!IsBucketDescriptorRangeValid(descriptor, key, distributed_config_)) {

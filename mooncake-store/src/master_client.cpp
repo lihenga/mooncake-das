@@ -198,6 +198,11 @@ struct RpcNameTraits<&WrappedMasterService::Ping> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::ReportServiceMetrics> {
+    static constexpr const char* value = "ReportServiceMetrics";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::GetFsdir> {
     static constexpr const char* value = "GetFsdir";
 };
@@ -269,6 +274,16 @@ struct RpcNameTraits<&WrappedMasterService::CopyStart> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::DynamicReplicaCopyStart> {
     static constexpr const char* value = "DynamicReplicaCopyStart";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::DfsBackfillStart> {
+    static constexpr const char* value = "DfsBackfillStart";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::DfsBackfillFinish> {
+    static constexpr const char* value = "DfsBackfillFinish";
 };
 
 template <>
@@ -1002,6 +1017,12 @@ tl::expected<PingResponse, ErrorCode> MasterClient::Ping() {
     return result;
 }
 
+tl::expected<void, ErrorCode> MasterClient::ReportServiceMetrics(
+    const ServiceMetricsSnapshot& snapshot) {
+    return invoke_rpc<&WrappedMasterService::ReportServiceMetrics, void>(
+        client_id_, snapshot);
+}
+
 tl::expected<std::string, ErrorCode> MasterClient::GetFsdir() {
     ScopedVLogTimer timer(1, "MasterClient::GetFsdir");
     timer.LogRequest("action=get_fsdir");
@@ -1248,6 +1269,21 @@ tl::expected<CopyStartResponse, ErrorCode> MasterClient::CopyStart(
             client_id_, key, tenant_id, src_segment, tgt_segments);
     timer.LogResponseExpected(result);
     return result;
+}
+
+tl::expected<CopyStartResponse, ErrorCode> MasterClient::DfsBackfillStart(
+    const std::string& key, const std::string& tenant_id,
+    const std::string& source, const UUID& task_id) {
+    return invoke_rpc<&WrappedMasterService::DfsBackfillStart,
+                      CopyStartResponse>(client_id_, key, tenant_id, source,
+                                         task_id);
+}
+
+tl::expected<void, ErrorCode> MasterClient::DfsBackfillFinish(
+    const std::string& key, const std::string& tenant_id,
+    const UUID& task_id, bool success) {
+    return invoke_rpc<&WrappedMasterService::DfsBackfillFinish, void>(
+        client_id_, key, tenant_id, task_id, success);
 }
 
 tl::expected<CopyStartResponse, ErrorCode>
