@@ -113,6 +113,8 @@ inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig(
  * @brief Client for interacting with the mooncake master service
  */
 class MasterClient {
+    friend class MasterClientTestPeer;
+
    public:
     MasterClient(const UUID& client_id, MasterClientMetric* metrics = nullptr,
                  std::string tenant_id = "default")
@@ -461,6 +463,9 @@ class MasterClient {
      * containing view version and client status
      */
     [[nodiscard]] tl::expected<PingResponse, ErrorCode> Ping();
+
+    [[nodiscard]] tl::expected<void, ErrorCode> ReportServiceMetrics(
+        const ServiceMetricsSnapshot& snapshot);
 
     /**
      * @brief Mounts a local disk segment into the master.

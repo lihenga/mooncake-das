@@ -77,6 +77,47 @@ namespace {
 
 constexpr int kMaxTenantQuotaEvictionRetries = 2;
 
+enum class DfsRootFileStatus {
+    kMatch,
+    kMissing,
+    kInvalid,
+    kIoError,
+};
+
+DfsRootFileStatus ReadExpectedDfsRootFile(const std::string& path,
+                                          std::string_view expected) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        return errno == ENOENT ? DfsRootFileStatus::kMissing
+                              : DfsRootFileStatus::kIoError;
+    }
+
+    struct stat st {};
+    bool valid = ::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+                 static_cast<uint64_t>(st.st_size) == expected.size();
+    std::string contents;
+    if (valid) {
+        contents.resize(expected.size());
+        size_t offset = 0;
+        while (offset < contents.size()) {
+            const ssize_t count =
+                ::read(fd, contents.data() + offset, contents.size() - offset);
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) {
+                valid = false;
+                break;
+            }
+            offset += static_cast<size_t>(count);
+        }
+    }
+    const int close_result = ::close(fd);
+    if (close_result != 0) return DfsRootFileStatus::kIoError;
+    if (!valid || std::string_view(contents) != expected) {
+        return DfsRootFileStatus::kInvalid;
+    }
+    return DfsRootFileStatus::kMatch;
+}
+
 bool ReadDfsRootIdentity(const std::string& marker_path,
                          const std::string& cluster_id,
                          std::string& identity, bool& missing) {
@@ -138,6 +179,56 @@ bool WriteAll(int fd, const std::string& contents) {
     return ::fsync(fd) == 0;
 }
 
+bool PublishExpectedDfsRootFile(const std::string& root,
+                                const std::string& path,
+                                const std::string& contents) {
+    const UUID suffix = generate_uuid();
+    const std::string temp_path =
+        path + "." + std::to_string(::getpid()) + "." +
+        UuidToString(suffix) + ".tmp";
+    const int temp_fd = ::open(temp_path.c_str(),
+                               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC |
+                                   O_NOFOLLOW,
+                               0644);
+    if (temp_fd < 0) {
+        LOG(ERROR) << "Failed to create DFS root temp file " << temp_path
+                   << ": " << std::strerror(errno);
+        return false;
+    }
+
+    const bool temp_written = WriteAll(temp_fd, contents);
+    const int close_result = ::close(temp_fd);
+    if (!temp_written || close_result != 0) {
+        const int saved_errno = errno;
+        ::unlink(temp_path.c_str());
+        LOG(ERROR) << "Failed to write DFS root temp file " << temp_path
+                   << ": " << std::strerror(saved_errno);
+        return false;
+    }
+
+    const int link_result = ::link(temp_path.c_str(), path.c_str());
+    const int link_errno = errno;
+    if (link_result != 0 && link_errno != EEXIST) {
+        ::unlink(temp_path.c_str());
+        LOG(ERROR) << "Failed to publish DFS root file " << path << ": "
+                   << std::strerror(link_errno);
+        return false;
+    }
+    ::unlink(temp_path.c_str());
+
+    // EEXIST means another writer won the race, not that it published the
+    // expected bytes. Re-read in both cases before declaring success.
+    if (ReadExpectedDfsRootFile(path, contents) !=
+        DfsRootFileStatus::kMatch) {
+        return false;
+    }
+    if (!SyncDfsRootDirectory(root)) {
+        LOG(ERROR) << "Failed to sync DFS root after publishing " << path;
+        return false;
+    }
+    return true;
+}
+
 bool EnsureDfsRootIdentity(const std::string& root,
                            const std::string& cluster_id,
                            std::string& identity) {
@@ -166,62 +257,40 @@ bool EnsureDfsRootIdentity(const std::string& root,
         return false;
     }
 
-    const UUID token{
-        randomUniform<uint64_t>(0, std::numeric_limits<uint64_t>::max()),
-        randomUniform<uint64_t>(0, std::numeric_limits<uint64_t>::max())};
-    const std::string candidate = SerializeDfsRootIdentity(cluster_id, token);
-    if (candidate.empty()) return false;
-
-    const std::string temp_path =
-        marker_path + "." + std::to_string(::getpid()) + "." +
-        UuidToString(token) + ".tmp";
-    const int temp_fd = ::open(temp_path.c_str(),
-                               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC |
-                                   O_NOFOLLOW,
-                               0644);
-    if (temp_fd < 0) {
-        LOG(ERROR) << "Failed to create DFS root identity temp file "
-                   << temp_path << ": " << std::strerror(errno);
-        return false;
-    }
-    const bool temp_written = WriteAll(temp_fd, candidate);
-    const int close_result = ::close(temp_fd);
-    if (!temp_written || close_result != 0) {
-        const int saved_errno = errno;
-        ::unlink(temp_path.c_str());
-        LOG(ERROR) << "Failed to write DFS root identity temp file "
-                   << temp_path << ": " << std::strerror(saved_errno);
-        return false;
-    }
-
-    if (::link(temp_path.c_str(), marker_path.c_str()) == 0) {
-        ::unlink(temp_path.c_str());
-        if (!SyncDfsRootDirectory(root)) {
-            LOG(ERROR) << "Failed to sync DFS root after publishing identity "
+    const bool restoring_cached_identity = !identity.empty();
+    std::string candidate = identity;
+    if (restoring_cached_identity) {
+        std::string parsed;
+        if (!ParseDfsRootIdentity(candidate, cluster_id, parsed) ||
+            parsed != candidate) {
+            LOG(ERROR) << "Refusing to restore an invalid cached DFS root "
+                          "identity for "
                        << marker_path;
             return false;
         }
-        identity = candidate;
-        return true;
+    } else {
+        const UUID token{
+            randomUniform<uint64_t>(0, std::numeric_limits<uint64_t>::max()),
+            randomUniform<uint64_t>(0, std::numeric_limits<uint64_t>::max())};
+        candidate = SerializeDfsRootIdentity(cluster_id, token);
+        if (candidate.empty()) return false;
     }
 
-    const int link_error = errno;
-    ::unlink(temp_path.c_str());
-    if (link_error != EEXIST) {
-        LOG(ERROR) << "Failed to publish DFS root identity marker "
-                   << marker_path << ": " << std::strerror(link_error);
+    if (!PublishExpectedDfsRootFile(root, marker_path, candidate)) {
+        // Concurrent first-time initializers legitimately generate different
+        // candidates. The atomic link chooses one; initializers that lose the
+        // race adopt the complete, valid winner. Recovery from a cached
+        // identity must remain exact and may never adopt a different value.
+        if (!restoring_cached_identity &&
+            ReadDfsRootIdentity(marker_path, cluster_id, identity, missing)) {
+            return true;
+        }
+        LOG(ERROR) << "Failed to publish or validate DFS root identity "
+                   << marker_path;
         return false;
     }
-
-    // Another initializer atomically published the marker first. Its file is
-    // already complete because the temporary inode was synced before link().
-    if (ReadDfsRootIdentity(marker_path, cluster_id, identity, missing)) {
-        return true;
-    }
-    LOG(ERROR) << "Concurrent DFS root identity marker is invalid or belongs "
-                  "to a different cluster: "
-               << marker_path;
-    return false;
+    identity = std::move(candidate);
+    return true;
 }
 
 // Per-cycle offload cap as a fraction of `offloading_queue_limit_`. Used only
@@ -402,6 +471,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
                 uint32_t{300}),
             1),
         std::memory_order_release);
+    dfs_root_guard_interval_ = std::chrono::seconds(std::max(
+        Environ::GetInt("MOONCAKE_DFS_ROOT_GUARD_INTERVAL_SECONDS", 5), 1));
     LOG(INFO) << "DFS heartbeat interval initialized to "
               << dfs_heartbeat_interval_seconds_.load(
                      std::memory_order_acquire)
@@ -655,6 +726,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
     VLOG(1) << "action=start_eviction_thread";
+    // DFS initialization may succeed later on the allocator retry thread.
+    dfs_eviction_thread_ =
+        std::thread(&MasterService::DfsEvictionThreadFunc, this);
+    VLOG(1) << "action=start_dfs_eviction_thread";
 
     // Start client monitor thread in all modes so TTL/heartbeat works
     client_monitor_running_ = true;
@@ -762,6 +837,8 @@ void MasterService::InitDfsAllocatorFromEnvironment(
         dfs_config.low_utilization_threshold;
     dfs_bucket_low_utilization_evictions_per_tick_ =
         dfs_config.low_utilization_evictions_per_tick;
+    dfs_bucket_low_utilization_attempts_per_tick_ =
+        dfs_config.low_utilization_eviction_attempts_per_tick;
     if (!dfs_config.allocator_type_valid) {
         // An unknown allocator type is a configuration error, not something to
         // paper over by silently defaulting to SHARD.
@@ -802,6 +879,14 @@ void MasterService::InitDfsAllocatorFromEnvironment(
         LOG(ERROR) << "Failed to initialize DFS allocator, error="
                    << init_result.error() << ", config={"
                    << dfs_config.FormatStr() << "}";
+        enable_dfs_ = false;
+        dfs_retry_needed_.store(true, std::memory_order_release);
+        return;
+    }
+
+    if (!InitializeDfsRootGuard(dfs_config.fsdir, dfs_root_identity_)) {
+        LOG(ERROR) << "Failed to initialize DFS root file guard for "
+                   << dfs_config.fsdir;
         enable_dfs_ = false;
         dfs_retry_needed_.store(true, std::memory_order_release);
         return;
@@ -849,6 +934,86 @@ void MasterService::DfsAllocatorRetryThreadFunc() {
         }
         if (!dfs_retry_needed_.load(std::memory_order_acquire)) break;
     }
+}
+
+bool MasterService::InitializeDfsRootGuard(const std::string& root,
+                                           const std::string& identity) {
+    struct stat st {};
+    if (::stat(root.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+        return false;
+    }
+
+    const std::string identity_path = root + "/" + kDfsRootIdentityFileName;
+    if (ReadExpectedDfsRootFile(identity_path, identity) !=
+        DfsRootFileStatus::kMatch) {
+        return false;
+    }
+
+    std::lock_guard lock(dfs_root_guard_mutex_);
+    dfs_root_guard_path_ = root;
+    dfs_root_guard_identity_ = identity;
+    dfs_root_guard_device_ = static_cast<uint64_t>(st.st_dev);
+    dfs_root_guard_inode_ = static_cast<uint64_t>(st.st_ino);
+    dfs_root_guard_ready_ = true;
+    return true;
+}
+
+void MasterService::ReconcileDfsRootFiles() {
+    std::lock_guard lock(dfs_root_guard_mutex_);
+    if (!dfs_root_guard_ready_ ||
+        !enable_dfs_.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    struct stat st {};
+    if (::stat(dfs_root_guard_path_.c_str(), &st) != 0 ||
+        !S_ISDIR(st.st_mode) ||
+        static_cast<uint64_t>(st.st_dev) != dfs_root_guard_device_ ||
+        static_cast<uint64_t>(st.st_ino) != dfs_root_guard_inode_) {
+        static DfsLogLimiter mount_log_limiter;
+        if (auto suppressed = mount_log_limiter.ShouldLog()) {
+            LOG(ERROR) << "DFS root mount identity changed; refusing to "
+                          "recreate guard files, root="
+                       << dfs_root_guard_path_
+                       << ", suppressed=" << *suppressed;
+        }
+        return;
+    }
+
+    const auto reconcile = [this](const char* filename,
+                                  const std::string& expected) {
+        const std::string path = dfs_root_guard_path_ + "/" + filename;
+        switch (ReadExpectedDfsRootFile(path, expected)) {
+            case DfsRootFileStatus::kMatch:
+                return true;
+            case DfsRootFileStatus::kMissing:
+                if (PublishExpectedDfsRootFile(dfs_root_guard_path_, path,
+                                               expected)) {
+                    LOG(WARNING) << "Recreated missing DFS root file " << path;
+                    return true;
+                }
+                LOG(ERROR) << "Failed to recreate missing DFS root file "
+                           << path;
+                return false;
+            case DfsRootFileStatus::kInvalid:
+                LOG(ERROR) << "DFS root file has unexpected contents; "
+                              "refusing to overwrite "
+                           << path;
+                return false;
+            case DfsRootFileStatus::kIoError:
+                LOG(ERROR) << "Failed to inspect DFS root file " << path;
+                return false;
+        }
+        return false;
+    };
+
+    // Identity is the safety boundary. Do not recreate the read-probe marker
+    // until the root still carries (or has atomically recovered) the exact
+    // identity pinned when the allocator was initialized.
+    if (!reconcile(kDfsRootIdentityFileName, dfs_root_guard_identity_)) return;
+    reconcile(kDfsRootMarkerFileName,
+              std::string(kDfsRootMarkerPayload,
+                          sizeof(kDfsRootMarkerPayload) - 1));
 }
 
 void MasterService::RefreshDfsMetrics() const {
@@ -940,6 +1105,9 @@ MasterService::~MasterService() {
 
     if (eviction_thread_.joinable()) {
         eviction_thread_.join();
+    }
+    if (dfs_eviction_thread_.joinable()) {
+        dfs_eviction_thread_.join();
     }
     if (client_monitor_thread_.joinable()) {
         client_monitor_thread_.join();
@@ -3868,8 +4036,8 @@ auto MasterService::BatchReplicaClear(
 }
 
 bool MasterService::IsReplicaReadable(const Replica& replica) const {
-    if (!replica.is_completed() || replica.has_invalid_mem_handle() ||
-        replica.has_invalid_nof_handle()) {
+    if (!replica.is_completed() || replica.is_eviction_pending() ||
+        replica.has_invalid_mem_handle() || replica.has_invalid_nof_handle()) {
         return false;
     }
     const auto descriptor = replica.get_descriptor();
@@ -7838,11 +8006,15 @@ void MasterService::RunDfsEviction() {
 }
 
 void MasterService::RunBucketDfsEviction() {
-    if (dfs_bucket_low_utilization_threshold_ > 0.0 &&
-        dfs_bucket_low_utilization_evictions_per_tick_ > 0) {
+    const bool low_utilization_enabled =
+        dfs_bucket_low_utilization_threshold_ > 0.0 &&
+        dfs_bucket_low_utilization_evictions_per_tick_ > 0;
+    if (low_utilization_enabled) {
         (void)RunBucketDfsEvictionInternal(
             /*force_one=*/false, std::nullopt,
-            dfs_bucket_low_utilization_threshold_);
+            dfs_bucket_low_utilization_threshold_,
+            dfs_bucket_low_utilization_evictions_per_tick_,
+            dfs_bucket_low_utilization_attempts_per_tick_);
     }
     (void)RunBucketDfsEvictionInternal(/*force_one=*/false);
 }
@@ -7865,12 +8037,15 @@ bool MasterService::TryRecoverDfsSpaceAfterAllocationFailure() {
 
 bool MasterService::RunBucketDfsEvictionInternal(
     bool force_one, std::optional<int64_t> invalidated_bucket_id,
-    double low_utilization_threshold) {
+    double low_utilization_threshold, int low_utilization_eviction_limit,
+    int low_utilization_attempt_limit) {
     if (bucket_allocator_ == nullptr) return false;
     const bool invalidating_missing_bucket = invalidated_bucket_id.has_value();
     const bool low_utilization_eviction = low_utilization_threshold >= 0.0;
     const int max_low_utilization_evictions =
-        dfs_bucket_low_utilization_evictions_per_tick_;
+        low_utilization_eviction_limit >= 0
+            ? low_utilization_eviction_limit
+            : dfs_bucket_low_utilization_evictions_per_tick_;
 
     // Free() defers its metadata write so it never fsyncs under a metadata
     // shard lock. This tick holds no master lock, so it is the right place to
@@ -7883,8 +8058,32 @@ bool MasterService::RunBucketDfsEvictionInternal(
     std::set<int64_t> attempted;
     bool evicted = false;
     int low_utilization_evictions = 0;
+    int low_utilization_attempts = 0;
+    int low_utilization_rejections = 0;
+    static DfsLogLimiter low_utilization_rejection_log_limiter;
+    const auto log_low_utilization_rejection =
+        [&](int64_t bucket_id, const char* phase, const std::string& key,
+            const char* reason) {
+            if (!low_utilization_eviction) return;
+            if (auto suppressed =
+                    low_utilization_rejection_log_limiter.ShouldLog()) {
+                LOG(WARNING)
+                    << "[DFS_LOW_UTILIZATION_EVICTION_REJECTED] bucket_id="
+                    << bucket_id << ", phase=" << phase << ", key=" << key
+                    << ", reason=" << reason
+                    << ", suppressed=" << *suppressed;
+            }
+        };
+    const int max_low_utilization_attempts =
+        low_utilization_attempt_limit >= 0
+            ? low_utilization_attempt_limit
+            : dfs_bucket_low_utilization_attempts_per_tick_;
 
     while (true) {
+        if (low_utilization_eviction && max_low_utilization_attempts >= 0 &&
+            low_utilization_attempts >= max_low_utilization_attempts) {
+            break;
+        }
         ImmutableBucketAllocator::PendingEviction pending;
         if (invalidated_bucket_id.has_value()) {
             pending = bucket_allocator_->PrepareInvalidation(
@@ -7906,12 +8105,13 @@ bool MasterService::RunBucketDfsEvictionInternal(
             return evicted;
         }
         const int64_t evicted_bucket_id = pending.bucket_id();
+        if (low_utilization_eviction) ++low_utilization_attempts;
         if (!invalidating_missing_bucket) {
             if (low_utilization_eviction) {
                 MasterMetricManager::instance()
+                    .inc_dfs_bucket_eviction_attempts();
+                MasterMetricManager::instance()
                     .inc_dfs_bucket_low_utilization_eviction_attempts();
-                LOG(INFO) << "[DFS_LOW_UTILIZATION_EVICTION_ATTEMPT] bucket_id="
-                          << evicted_bucket_id;
             } else {
                 MasterMetricManager::instance()
                     .inc_dfs_bucket_eviction_attempts();
@@ -7924,26 +8124,29 @@ bool MasterService::RunBucketDfsEvictionInternal(
             // master to validate, so it can be reclaimed immediately.
             const bool committed =
                 bucket_allocator_->CommitEviction(std::move(pending));
+            if (committed && !invalidating_missing_bucket) {
+                MasterMetricManager::instance().inc_dfs_bucket_evictions();
+            }
             if (committed && low_utilization_eviction) {
                 MasterMetricManager::instance()
                     .inc_dfs_bucket_low_utilization_evictions();
                 ++low_utilization_evictions;
                 LOG(INFO) << "[DFS_LOW_UTILIZATION_EVICTION] bucket_id="
                           << evicted_bucket_id << ", committed=true";
-            } else if (committed && !invalidating_missing_bucket) {
-                MasterMetricManager::instance().inc_dfs_bucket_evictions();
             }
-            evicted = true;
-            if (invalidating_missing_bucket || force_one ||
-                (low_utilization_eviction &&
-                 low_utilization_evictions >= max_low_utilization_evictions)) {
+            if (committed) evicted = true;
+            if (committed &&
+                (invalidating_missing_bucket || force_one ||
+                 (low_utilization_eviction &&
+                  max_low_utilization_evictions >= 0 &&
+                  low_utilization_evictions >= max_low_utilization_evictions))) {
                 return true;
             }
             continue;
         }
 
-        // Phase 1 (validate): decide every candidate without mutating any
-        // metadata. Group by shard first and always take shard locks in
+        // Phase 1 (validate and freeze reads): mark accepted replicas before
+        // releasing their shard lock. Always take shard locks in
         // ascending index order so concurrent evictions cannot deadlock.
         std::map<size_t, std::vector<size_t>> indexes_by_shard;
         for (size_t i = 0; i < candidates.size(); ++i) {
@@ -7967,7 +8170,43 @@ bool MasterService::RunBucketDfsEvictionInternal(
                        desc.file_path == candidate.descriptor.file_path;
             };
 
+        auto clear_eviction_pending = [&] {
+            for (const auto& [shard_idx, indexes] : indexes_by_shard) {
+                std::shared_lock<std::shared_mutex> snapshot_lock(
+                    snapshot_mutex_);
+                SharedMutexLocker shard_lock(
+                    &metadata_shards_[shard_idx].mutex);
+                auto tenant_it =
+                    metadata_shards_[shard_idx].tenants.find(tenant_id);
+                if (tenant_it == metadata_shards_[shard_idx].tenants.end()) {
+                    continue;
+                }
+                for (const size_t i : indexes) {
+                    const auto& candidate = candidates[i];
+                    auto metadata_it =
+                        tenant_it->second.metadata.find(candidate.key);
+                    if (metadata_it == tenant_it->second.metadata.end())
+                        continue;
+                    metadata_it->second.VisitReplicas(
+                        [&](const Replica& replica) {
+                            return matches_candidate(replica, candidate);
+                        },
+                        [](Replica& replica) {
+                            replica.set_eviction_pending(false);
+                        });
+                }
+            }
+        };
+
         bool all_accepted = true;
+        std::string phase1_reject_key;
+        const char* phase1_reject_reason = nullptr;
+        auto record_phase1_rejection = [&](const std::string& key,
+                                           const char* reason) {
+            if (phase1_reject_reason != nullptr) return;
+            phase1_reject_key = key;
+            phase1_reject_reason = reason;
+        };
         auto now = std::chrono::system_clock::now();
         for (const auto& [shard_idx, indexes] : indexes_by_shard) {
             if (!all_accepted) break;
@@ -8004,14 +8243,47 @@ bool MasterService::RunBucketDfsEvictionInternal(
                      (!metadata.IsHardPinned() && metadata.IsLeaseExpired(now)));
                 if (!acceptable) {
                     // Whole-bucket eviction is all-or-nothing: one protected
-                    // entry vetoes the bucket, and no metadata was touched.
+                    // entry vetoes the bucket; undo earlier read barriers.
+                    if (candidate_is_processing) {
+                        record_phase1_rejection(candidate.key,
+                                                "replica_processing");
+                    } else if (tenant_state.processing_keys.contains(
+                                   candidate.key)) {
+                        record_phase1_rejection(candidate.key,
+                                                "key_processing");
+                    } else if (!invalidating_missing_bucket &&
+                               metadata.IsHardPinned()) {
+                        record_phase1_rejection(candidate.key, "hard_pinned");
+                    } else if (!invalidating_missing_bucket &&
+                               !metadata.IsLeaseExpired(now)) {
+                        record_phase1_rejection(candidate.key,
+                                                "lease_not_expired");
+                    } else {
+                        record_phase1_rejection(candidate.key,
+                                                "validation_rejected");
+                    }
                     all_accepted = false;
                     break;
                 }
+                metadata.VisitReplicas(
+                    [&](const Replica& replica) {
+                        return matches_candidate(replica, candidate);
+                    },
+                    [](Replica& replica) {
+                        replica.set_eviction_pending(true);
+                    });
             }
         }
 
         if (!all_accepted) {
+            if (low_utilization_eviction) {
+                ++low_utilization_rejections;
+                log_low_utilization_rejection(
+                    evicted_bucket_id, "phase1", phase1_reject_key,
+                    phase1_reject_reason != nullptr ? phase1_reject_reason
+                                                     : "validation_rejected");
+            }
+            clear_eviction_pending();
             bucket_allocator_->AbortEviction(std::move(pending));
             if (invalidating_missing_bucket) return false;
             continue;
@@ -8053,6 +8325,8 @@ bool MasterService::RunBucketDfsEvictionInternal(
         // candidate that became processing (e.g. a concurrent PutStart reused
         // the key after Phase 1 saw it as evictable) must not be removed.
         bool phase2_accepted = true;
+        std::string phase2_reject_key;
+        const char* phase2_reject_reason = nullptr;
         for (const auto& [shard_idx, indexes] : indexes_by_shard) {
             if (!phase2_accepted) break;
             std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
@@ -8076,12 +8350,24 @@ bool MasterService::RunBucketDfsEvictionInternal(
                     });
                 if (candidate_is_processing ||
                     tenant_state.processing_keys.contains(candidate.key)) {
+                    phase2_reject_key = candidate.key;
+                    phase2_reject_reason = candidate_is_processing
+                                               ? "replica_processing"
+                                               : "key_processing";
                     phase2_accepted = false;
                     break;
                 }
             }
         }
         if (!phase2_accepted) {
+            if (low_utilization_eviction) {
+                ++low_utilization_rejections;
+                log_low_utilization_rejection(
+                    evicted_bucket_id, "phase2", phase2_reject_key,
+                    phase2_reject_reason != nullptr ? phase2_reject_reason
+                                                     : "validation_rejected");
+            }
+            clear_eviction_pending();
             bucket_allocator_->AbortEviction(std::move(pending));
             if (invalidating_missing_bucket) return false;
             continue;
@@ -8139,21 +8425,30 @@ bool MasterService::RunBucketDfsEvictionInternal(
         // into this bucket, so it is now safe to drop the files.
         const bool committed =
             bucket_allocator_->CommitEviction(std::move(pending));
+        if (committed && !invalidating_missing_bucket) {
+            MasterMetricManager::instance().inc_dfs_bucket_evictions();
+        }
         if (committed && low_utilization_eviction) {
             MasterMetricManager::instance()
                 .inc_dfs_bucket_low_utilization_evictions();
             ++low_utilization_evictions;
             LOG(INFO) << "[DFS_LOW_UTILIZATION_EVICTION] bucket_id="
                       << evicted_bucket_id << ", committed=true";
-        } else if (committed && !invalidating_missing_bucket) {
-            MasterMetricManager::instance().inc_dfs_bucket_evictions();
         }
-        evicted = true;
-        if (force_one ||
-            (low_utilization_eviction &&
-             low_utilization_evictions >= max_low_utilization_evictions)) {
+        if (committed) evicted = true;
+        if (committed &&
+            (invalidating_missing_bucket || force_one ||
+             (low_utilization_eviction &&
+              max_low_utilization_evictions >= 0 &&
+              low_utilization_evictions >= max_low_utilization_evictions))) {
             return true;
         }
+    }
+    if (low_utilization_eviction) {
+        LOG(INFO) << "[DFS_LOW_UTILIZATION_EVICTION_SUMMARY] attempted="
+                  << low_utilization_attempts << ", committed="
+                  << low_utilization_evictions << ", rejected="
+                  << low_utilization_rejections;
     }
     return evicted;
 }
@@ -10307,8 +10602,6 @@ void MasterService::EvictionThreadFunc() {
     VLOG(1) << "action=eviction_thread_started";
 
     auto last_discard_time = std::chrono::system_clock::now();
-    auto next_dfs_eviction_time = std::chrono::steady_clock::now();
-    auto next_dfs_backfill_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
         double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
@@ -10357,6 +10650,24 @@ void MasterService::EvictionThreadFunc() {
         }
 #endif
 
+        if (promotion_candidate_count_.load(std::memory_order_relaxed) > 0) {
+            RunPromotionCandidateRetry();
+        }
+
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kEvictionThreadSleepMs));
+    }
+
+    VLOG(1) << "action=eviction_thread_stopped";
+}
+
+void MasterService::DfsEvictionThreadFunc() {
+    VLOG(1) << "action=dfs_eviction_thread_started";
+
+    auto next_dfs_eviction_time = std::chrono::steady_clock::now();
+    auto next_dfs_backfill_time = std::chrono::steady_clock::now();
+    auto next_dfs_root_guard_time = std::chrono::steady_clock::now();
+    while (eviction_running_) {
         if (dfs_allocator_ && dfs_allocator_->IsEvictionEnabled()) {
             ProcessInvalidatedDfsBuckets();
             const auto steady_now = std::chrono::steady_clock::now();
@@ -10379,8 +10690,10 @@ void MasterService::EvictionThreadFunc() {
             }
         }
 
-        if (promotion_candidate_count_.load(std::memory_order_relaxed) > 0) {
-            RunPromotionCandidateRetry();
+        const auto guard_now = std::chrono::steady_clock::now();
+        if (guard_now >= next_dfs_root_guard_time) {
+            ReconcileDfsRootFiles();
+            next_dfs_root_guard_time = guard_now + dfs_root_guard_interval_;
         }
 
         if (std::chrono::steady_clock::now() >= next_dfs_backfill_time) {
@@ -10393,7 +10706,7 @@ void MasterService::EvictionThreadFunc() {
             std::chrono::milliseconds(kEvictionThreadSleepMs));
     }
 
-    VLOG(1) << "action=eviction_thread_stopped";
+    VLOG(1) << "action=dfs_eviction_thread_stopped";
 }
 
 void MasterService::DiscardExpiredProcessingReplicas(

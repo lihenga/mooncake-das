@@ -1122,6 +1122,7 @@ ImmutableBucketAllocator::ReserveInBucketLocked(BucketState& bucket,
     bucket.entries[key] = entry;
     bucket.append_offset = layout->end();
     bucket.live_bytes += layout->aligned_size;
+    ++bucket.pending_entries;
     key_index_[key] = bucket.bucket_id;
 
     // Reservations in the active bucket touch no file at all. A reservation in
@@ -1156,6 +1157,8 @@ void ImmutableBucketAllocator::UnreserveInBucketLocked(
     } else {
         bucket.live_bytes = 0;
     }
+
+    if (bucket.pending_entries > 0) --bucket.pending_entries;
 
     // The reservation existed only in memory, so undoing it is just erasing it.
     // If the bucket happens to be sealed already, its `.meta` file has to be
@@ -1446,6 +1449,10 @@ bool ImmutableBucketAllocator::MarkCommitted(
                    << ", state=" << static_cast<int32_t>(entry->state);
         return false;
     }
+    if (entry->state == BucketEntryState::PENDING &&
+        bucket->pending_entries > 0) {
+        --bucket->pending_entries;
+    }
     entry->state = BucketEntryState::COMMITTED;
     // PutEnd never touches a file. For the active bucket the transition is
     // simply part of the state that gets written when the bucket is sealed; for
@@ -1472,6 +1479,10 @@ void ImmutableBucketAllocator::Free(const std::string& key,
     // Buckets are append-only, so freeing leaves a tombstone rather than
     // reclaiming the middle of the file. Space comes back only when the
     // whole bucket is evicted.
+    if (entry->state == BucketEntryState::PENDING &&
+        bucket->pending_entries > 0) {
+        --bucket->pending_entries;
+    }
     entry->state = BucketEntryState::TOMBSTONE;
     ++bucket->tombstones;
     if (bucket->live_bytes >= entry->reserved_size) {
@@ -1727,11 +1738,7 @@ ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
         }
         const bool was_active = active_bucket_id_ == bucket_id;
         const BucketPtr& victim = bucket_it->second;
-        const bool has_pending = std::any_of(
-            victim->entries.begin(), victim->entries.end(), [](const auto& item) {
-                return item.second.state == BucketEntryState::PENDING;
-            });
-        if (has_pending) return pending;
+        if (victim->pending_entries != 0) return pending;
 
         std::vector<DfsAllocatorInterface::EvictionCandidate> candidates;
         for (const auto& [key, entry] : victim->entries) {
@@ -1780,7 +1787,7 @@ ImmutableBucketAllocator::PrepareEvictionForAllocationFailure() {
 
 ImmutableBucketAllocator::PendingEviction
 ImmutableBucketAllocator::PrepareEvictionForLowUtilization(double threshold) {
-    if (threshold <= 0.0 || threshold > 1.0) {
+    if (threshold <= 0.0 || threshold >= 1.0) {
         return {};
     }
     return PrepareEvictionInternal(/*force_one=*/false, threshold);
@@ -1803,22 +1810,22 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
 
         const double usage = static_cast<double>(UsedBytesLocked()) /
                              static_cast<double>(capacity);
-        const bool low_utilization_scan = low_utilization_threshold >= 0.0;
-        if (!force_one && !low_utilization_scan) {
+        const bool prioritize_low_utilization =
+            low_utilization_threshold > 0.0 &&
+            low_utilization_threshold < 1.0;
+        if (!force_one && !prioritize_low_utilization) {
             if (usage >= eviction_high_watermark_) {
                 eviction_active_ = true;
             }
             if (!eviction_active_) return pending;
-            if (usage < eviction_low_watermark_) {
+            if (usage <= eviction_low_watermark_) {
                 eviction_active_ = false;
                 return pending;
             }
         }
 
-        // Walk the LRU from the cold end and take the first bucket that is
-        // neither active, frozen, nor still waiting for an async write to
-        // finish. A PENDING entry means the client has not called PutEnd yet,
-        // so the bucket's data file must not be deleted underneath it.
+        // Walk the LRU from the cold end. A low-utilization eviction pass
+        // restricts candidates to sparse buckets.
         BucketPtr victim;
         for (auto it = lru_list_.rbegin(); it != lru_list_.rend(); ++it) {
             const int64_t bucket_id = *it;
@@ -1827,18 +1834,13 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
             if (bucket_it == buckets_.end()) continue;
             if (bucket_it->second->frozen) continue;
             const auto& candidate = bucket_it->second;
-            if (low_utilization_scan &&
+            const bool is_low_utilization =
+                candidate->capacity > 0 &&
                 static_cast<double>(candidate->live_bytes) /
-                        static_cast<double>(candidate->capacity) >=
-                    low_utilization_threshold) {
-                continue;
-            }
-            const bool has_pending = std::any_of(
-                candidate->entries.begin(), candidate->entries.end(),
-                [](const auto& item) {
-                    return item.second.state == BucketEntryState::PENDING;
-                });
-            if (has_pending) continue;
+                        static_cast<double>(candidate->capacity) <
+                    low_utilization_threshold;
+            if (prioritize_low_utilization && !is_low_utilization) continue;
+            if (candidate->pending_entries != 0) continue;
             victim = candidate;
             break;
         }
@@ -1910,12 +1912,7 @@ bool ImmutableBucketAllocator::CommitEviction(PendingEviction&& pending) {
         if (it == buckets_.end() || it->second.get() != bucket_identity.get()) {
             return false;
         }
-        const bool has_pending = std::any_of(
-            it->second->entries.begin(), it->second->entries.end(),
-            [](const auto& item) {
-                return item.second.state == BucketEntryState::PENDING;
-            });
-        if (has_pending) {
+        if (it->second->pending_entries != 0) {
             it->second->frozen = false;
             // Restore cold LRU position so the next round can reconsider it
             // after the pending write completes or times out.
@@ -2228,6 +2225,9 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
             bucket->append_offset =
                 std::max(bucket->append_offset, layout->end());
             bucket->entries[persisted.key] = entry;
+            if (entry.state == BucketEntryState::PENDING) {
+                ++bucket->pending_entries;
+            }
         }
         if (!bucket_ok) {
             DeleteBucketFiles(bucket_id);
@@ -2268,6 +2268,9 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
                 }
                 bucket->live_bytes += entry.reserved_size;
                 continue;
+            }
+            if (entry.state == BucketEntryState::PENDING) {
+                --bucket->pending_entries;
             }
             entry.state = BucketEntryState::TOMBSTONE;
             ++bucket->tombstones;
