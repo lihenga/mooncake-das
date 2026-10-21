@@ -2746,6 +2746,17 @@ TEST_F(MasterServiceTest, DfsBucketRestartRestoresQueryableReplicas) {
             ASSERT_NE(dfs, nullptr);
             before.push_back(dfs->get_dfs_descriptor());
         }
+        // Active buckets are intentionally not persisted. Seal the source
+        // bucket so this fixture exercises durable metadata recovery.
+        auto rollover = service.PutStart(context.client_id, "restart_rollover",
+                                         TenantId::Default(), 1048576, config);
+        ASSERT_TRUE(rollover.has_value());
+        const auto* rollover_dfs = FindDfsDescriptor(*rollover);
+        ASSERT_NE(rollover_dfs, nullptr);
+        ASSERT_NE(rollover_dfs->get_dfs_descriptor().shard_idx,
+                  before.front().shard_idx);
+        ASSERT_TRUE(service.PutRevoke(context.client_id, "restart_rollover",
+                                      TenantId::Default(), ReplicaType::ALL));
     }
 
     {

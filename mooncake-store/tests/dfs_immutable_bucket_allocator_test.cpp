@@ -1641,7 +1641,10 @@ TEST(ImmutableBucketAllocatorTest, EvictionDoesNotRewriteMetadata) {
         // metadata by committing. Prepare must not flush that change.
         auto active = alloc.Allocate("active", 100);
         ASSERT_TRUE(active.has_value());
-        ASSERT_GE(alloc.FlushDirtyMetadata(), 1u);
+        alloc.FlushDirtyMetadata();
+        // Allocation may already have flushed the sealed bucket.
+        ASSERT_TRUE(
+            std::filesystem::exists(BucketMetaFile(tmp, victim->shard_idx)));
         ASSERT_TRUE(alloc.MarkCommitted("victim", *victim));
         const auto meta_path = BucketMetaFile(tmp, victim->shard_idx);
         const auto saved_path = tmp.file("saved_metadata");
@@ -1870,7 +1873,8 @@ TEST(ImmutableBucketAllocatorTest, FreePendingReservationMakesBucketEvictable) {
     alloc.Free("pending", *descriptor);
     auto pending = alloc.PrepareEvictionForLowUtilization(0.6);
     ASSERT_GE(pending.bucket_id(), 0);
-    EXPECT_TRUE(pending.Empty());
+    EXPECT_FALSE(pending.Empty());
+    EXPECT_TRUE(pending.Candidates().empty());
     EXPECT_EQ(pending.bucket_id(), descriptor->shard_idx);
     EXPECT_TRUE(alloc.CommitEviction(std::move(pending)));
 }
@@ -1895,7 +1899,8 @@ TEST(ImmutableBucketAllocatorTest, LowUtilizationEvictionIgnoresGlobalWatermark)
     EXPECT_LT(alloc.GetUsedBytes(), alloc.GetTotalCapacity() * 0.9);
     auto pending = alloc.PrepareEvictionForLowUtilization(0.05);
     ASSERT_GE(pending.bucket_id(), 0);
-    EXPECT_TRUE(pending.Empty());
+    EXPECT_FALSE(pending.Empty());
+    EXPECT_TRUE(pending.Candidates().empty());
     EXPECT_EQ(pending.bucket_id(), first->shard_idx);
     ASSERT_TRUE(alloc.CommitEviction(std::move(pending)));
     EXPECT_FALSE(alloc.GetBucketIdForKey("first").has_value());
