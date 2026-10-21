@@ -770,7 +770,6 @@ TEST_F(DfsBucketClientTest,
                   Environ::Get().GetStoreChecksumEnabled() ? 2 : 1);
         auto query = writer_->Query(keys[0]);
         ASSERT_TRUE(query.has_value());
-<<<<<<< HEAD
         ASSERT_TRUE(std::any_of(query->replicas.begin(), query->replicas.end(),
                                 [](const auto& replica) {
                                     return replica.is_memory_replica();
@@ -779,10 +778,6 @@ TEST_F(DfsBucketClientTest,
                                  [](const auto& replica) {
                                      return replica.is_dfs_replica();
                                  }));
-=======
-        ASSERT_EQ(query->replicas.size(), 1u);
-        ASSERT_TRUE(query->replicas[0].is_memory_replica());
->>>>>>> v0.3.13.post1_l4
         ASSERT_TRUE(writer_->Remove(keys[0], true).has_value());
         staging_device.Reset(value.data(), value.size());
         results = writer_->BatchPut(keys, slices, DfsConfig());
@@ -815,15 +810,10 @@ TEST_F(DfsBucketClientTest, MissingBackendKeepsMemoryAndOriginalD2hPath) {
     staging_device.Reset(value.data(), value.size());
     std::vector<std::vector<Slice>> slices{{{value.data(), value.size()}}};
     auto results = writer_->BatchPut(keys, slices, DfsConfig());
-<<<<<<< HEAD
     ASSERT_EQ(results.size(), 1u);
     ASSERT_TRUE(results[0].has_value());
     EXPECT_EQ(staging_device.copies,
               Environ::Get().GetStoreChecksumEnabled() ? 1 : 0);
-=======
-    ASSERT_TRUE(results.size() == 1u);
-    ASSERT_FALSE(results[0].has_value());
->>>>>>> v0.3.13.post1_l4
     auto query = writer_->Query(keys[0]);
     ASSERT_TRUE(query.has_value());
     ASSERT_TRUE(std::any_of(query->replicas.begin(), query->replicas.end(),

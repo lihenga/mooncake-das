@@ -984,16 +984,11 @@ class Client {
     void SubmitDfsWriteChunk(std::vector<PutOperation>& ops,
                              const std::vector<size_t>& op_indices,
                              bool is_upsert, bool allow_async,
-<<<<<<< HEAD
                              bool* slot_timed_out = nullptr,
                              std::chrono::steady_clock::time_point deadline =
                                  std::chrono::steady_clock::time_point::max());
-    void FinalizeBatchPut(std::vector<PutOperation>& ops);
-=======
-                             bool* slot_timed_out = nullptr);
     void FinalizeBatchPut(std::vector<PutOperation>& ops,
                           bool allow_memory_only_fallback);
->>>>>>> v0.3.13.post1_l4
     void StartBatchUpsert(std::vector<PutOperation>& ops,
                           const ReplicateConfig& config);
     void FinalizeBatchUpsert(std::vector<PutOperation>& ops);

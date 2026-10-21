@@ -433,11 +433,14 @@ FinalizeDecision DetermineFinalizeDecision(
         LOG(ERROR) << "Deferred DFS completion combined with both MEMORY and "
                       "NoF replicas is not supported";
     }
+    // Preserve a completed local tier when an allocated DFS write fails on any
+    // backend. Missing DFS allocation is degradable only for callers that
+    // explicitly enable the bucket-mode memory-only fallback.
     const bool best_effort_dfs_failure =
-        allow_memory_only_fallback && allow_missing_dfs &&
-        config.dfs_replica_num == 1 && !dfs_deferred &&
+        allow_missing_dfs && config.dfs_replica_num == 1 && !dfs_deferred &&
         NonDfsTransfersSucceeded(summary) &&
-        (summary.allocated_dfs_replicas == 0 ||
+        ((allow_memory_only_fallback &&
+          summary.allocated_dfs_replicas == 0) ||
          (summary.allocated_dfs_replicas == 1 &&
           summary.successful_dfs_transfers == 0 &&
           summary.failed_dfs_transfers > 0));
@@ -490,31 +493,6 @@ FinalizeDecision DetermineFinalizeDecision(
         if (nof_failed) return ReplicaType::NOF_SSD;
         return ReplicaType::DFS;
     };
-
-    // A DFS-only failure must not discard an already transferred local tier.
-    // Treat the failed DFS allocation as a missing optional replica: publish
-    // the successful non-DFS replica and revoke only DFS. This also covers a
-    // staging/enqueue failure before background completion can take ownership.
-    const bool dfs_failed = summary.allocated_dfs_replicas > 0 &&
-                            summary.failed_dfs_transfers > 0 &&
-                            summary.successful_dfs_transfers == 0;
-    if (allow_missing_dfs && !dfs_deferred && dfs_failed &&
-        NonDfsTransfersSucceeded(summary)) {
-        if (summary.allocated_memory_replicas > 0 &&
-            summary.allocated_nof_replicas == 0) {
-            return {.end_type = ReplicaType::MEMORY,
-                    .revoke_type = ReplicaType::DFS,
-                    .success = true,
-                    .error = ErrorCode::OK};
-        }
-        if (summary.allocated_nof_replicas > 0 &&
-            summary.allocated_memory_replicas == 0) {
-            return {.end_type = ReplicaType::NOF_SSD,
-                    .revoke_type = ReplicaType::DFS,
-                    .success = true,
-                    .error = ErrorCode::OK};
-        }
-    }
 
     if (write_mode != ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
         const bool all_transfers_succeeded =
@@ -3669,20 +3647,17 @@ void Client::SubmitDfsWriteChunk(
         context->descriptors = descriptors;
         context->backend = std::move(backend);
         context->staging_pool = dfs_write_staging_pool_;
-<<<<<<< HEAD
+        auto staging_wait = dfs_write_arena_wait_;
         const auto now = std::chrono::steady_clock::now();
-        const auto staging_wait =
-            deadline == std::chrono::steady_clock::time_point::max()
-                ? std::chrono::milliseconds::max()
-                : std::chrono::duration_cast<std::chrono::milliseconds>(
-                      deadline > now ? deadline - now
-                                     : std::chrono::steady_clock::duration::zero());
+        if (deadline != std::chrono::steady_clock::time_point::max()) {
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline > now ? deadline - now
+                                   : std::chrono::steady_clock::duration::zero());
+            staging_wait = std::min(staging_wait, remaining);
+        }
         context->staging_slot =
             context->staging_pool->Acquire(staging_wait, slot_timed_out);
-=======
-        context->staging_slot = context->staging_pool->Acquire(
-            dfs_write_arena_wait_, slot_timed_out);
->>>>>>> v0.3.13.post1_l4
         if (!context->staging_slot) {
             throw std::runtime_error("DFS write staging slot unavailable");
         }
@@ -4136,15 +4111,11 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops,
     process_revoke_group(revoke_all_group, ReplicaType::ALL);
     process_revoke_group(revoke_memory_group, ReplicaType::MEMORY);
     process_revoke_group(revoke_nof_group, ReplicaType::NOF_SSD);
-<<<<<<< HEAD
     // A DFS cleanup failure must not turn an already published memory replica
     // into a failed BatchPut. The master reclaims a stranded PROCESSING DFS
     // replica through its put-start timeout.
     process_revoke_group(revoke_dfs_group, ReplicaType::DFS,
                          /*best_effort=*/true);
-=======
-    process_revoke_group(revoke_dfs_group, ReplicaType::DFS);
->>>>>>> v0.3.13.post1_l4
 
     auto append_finalize_error_context = [&](PutOperation& op, size_t index) {
         if (finalize_rpc_errors[index].has_value()) {
@@ -4347,14 +4318,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
             if (result.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
                 no_available_handle_count++;
             } else {
-<<<<<<< HEAD
-                LOG(ERROR) << "Operation for key " << op.key
-                           << " failed: " << toString(result.error())
-                           << (op.failure_context
-                                   ? (" (" + *op.failure_context + ")")
-                                   : "");
-=======
-                auto& summary = failures[op.result.error()];
+                auto& summary = failures[result.error()];
                 ++summary.count;
                 if (summary.key_samples.size() < kMaxFailureSamplesPerError) {
                     summary.key_samples.push_back(
@@ -4362,7 +4326,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
                                       ? " (" + *op.failure_context + ")"
                                       : ""));
                 }
->>>>>>> v0.3.13.post1_l4
             }
         } else {
             VLOG(1) << "Operation for key " << op.key

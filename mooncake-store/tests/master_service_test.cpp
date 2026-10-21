@@ -2268,7 +2268,6 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
                         .PutEnd(initial_context.client_id, "retry_existing",
                                  TenantId::Default(), ReplicaType::ALL)
                         .has_value());
-<<<<<<< HEAD
         ASSERT_TRUE(initial_service
                         .PutStart(initial_context.client_id, "retry_conflict",
                                   TenantId::Default(), 4096, config)
@@ -2277,7 +2276,6 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
                         .PutEnd(initial_context.client_id, "retry_conflict",
                                 TenantId::Default(), ReplicaType::ALL)
                         .has_value());
-=======
         // Recovery deliberately ignores an active bucket without metadata.
         // Roll over to persist the committed source bucket before restart.
         auto rollover = initial_service.PutStart(
@@ -2294,7 +2292,6 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
         persisted_meta = std::filesystem::path(
             dfs->get_dfs_descriptor().file_path);
         persisted_meta.replace_extension(".meta");
->>>>>>> v0.3.13.post1_l4
     }
 
     // The clean shutdown flushes sealed metadata; consuming a preallocated
@@ -2315,17 +2312,23 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
         config.replica_num = 1;
         config.dfs_replica_num = 1;
 
-        auto degraded = service.PutStart(context.client_id, "retry_conflict",
-                                         TenantId::Default(), 4096, config);
-        ASSERT_TRUE(degraded.has_value()) << toString(degraded.error());
-        ASSERT_EQ(degraded->size(), 1u);
-        EXPECT_TRUE(degraded->front().is_memory_replica());
-<<<<<<< HEAD
+        auto conflict_start = service.PutStart(
+            context.client_id, "retry_conflict", TenantId::Default(), 4096,
+            config);
+        ASSERT_TRUE(conflict_start.has_value())
+            << toString(conflict_start.error());
+        ASSERT_EQ(conflict_start->size(), 1u);
+        EXPECT_TRUE(conflict_start->front().is_memory_replica());
         ASSERT_TRUE(service
                         .PutEnd(context.client_id, "retry_conflict",
                                 TenantId::Default(), ReplicaType::MEMORY)
                         .has_value());
-=======
+
+        auto degraded = service.PutStart(context.client_id, "retry_degraded",
+                                         TenantId::Default(), 4096, config);
+        ASSERT_TRUE(degraded.has_value()) << toString(degraded.error());
+        ASSERT_EQ(degraded->size(), 1u);
+        EXPECT_TRUE(degraded->front().is_memory_replica());
         ASSERT_TRUE(service.PutEnd(context.client_id, "retry_degraded",
                                    TenantId::Default(), ReplicaType::MEMORY));
         auto batch = service.BatchPutStart(
@@ -2337,7 +2340,6 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
             ASSERT_EQ(result->size(), 1u);
             EXPECT_TRUE(result->front().is_memory_replica());
         }
->>>>>>> v0.3.13.post1_l4
 
         std::error_code ec;
         ASSERT_TRUE(std::filesystem::remove(root, ec));
@@ -2359,12 +2361,11 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
         ASSERT_EQ(existing->replicas.size(), 1u);
         EXPECT_TRUE(existing->replicas.front().is_dfs_replica());
 
-<<<<<<< HEAD
-        auto conflict =
+        auto conflict_metadata =
             service.GetReplicaList("retry_conflict", TenantId::Default());
-        ASSERT_TRUE(conflict.has_value());
-        ASSERT_EQ(conflict->replicas.size(), 1u);
-        EXPECT_TRUE(conflict->replicas.front().is_memory_replica());
+        ASSERT_TRUE(conflict_metadata.has_value());
+        ASSERT_EQ(conflict_metadata->replicas.size(), 1u);
+        EXPECT_TRUE(conflict_metadata->replicas.front().is_memory_replica());
         ASSERT_TRUE(
             service.Remove("retry_conflict", TenantId::Default()).has_value());
         auto conflict_rewrite = service.PutStart(
@@ -2374,22 +2375,28 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
             << toString(conflict_rewrite.error());
         ASSERT_EQ(conflict_rewrite->size(), 2u);
         EXPECT_NE(FindDfsDescriptor(*conflict_rewrite), nullptr);
-=======
+
         std::optional<TaskAssignment> backfill;
+        DfsBackfillPayload payload;
         const auto task_deadline = std::chrono::steady_clock::now() +
                                    std::chrono::seconds(5);
         while (!backfill && std::chrono::steady_clock::now() < task_deadline) {
             auto tasks = service.FetchTasks(context.client_id, 16);
             ASSERT_TRUE(tasks.has_value());
             for (const auto& task : *tasks) {
-                if (task.type == TaskType::DFS_BACKFILL) backfill = task;
+                if (task.type != TaskType::DFS_BACKFILL) continue;
+                DfsBackfillPayload candidate;
+                struct_json::from_json(candidate, task.payload);
+                if (candidate.key == "retry_degraded") {
+                    payload = std::move(candidate);
+                    backfill = task;
+                    break;
+                }
             }
             if (!backfill) std::this_thread::sleep_for(
                 std::chrono::milliseconds(20));
         }
         ASSERT_TRUE(backfill.has_value());
-        DfsBackfillPayload payload;
-        struct_json::from_json(payload, backfill->payload);
         EXPECT_EQ(payload.key, "retry_degraded");
         EXPECT_FALSE(service.DfsBackfillStart(
             generate_uuid(), payload.key, TenantId::Default(),
@@ -2407,7 +2414,6 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
         auto repaired = service.GetReplicaList(payload.key, TenantId::Default());
         ASSERT_TRUE(repaired.has_value());
         EXPECT_NE(FindDfsDescriptor(repaired->replicas), nullptr);
->>>>>>> v0.3.13.post1_l4
 
         auto recovered = service.PutStart(context.client_id, "retry_recovered",
                                           TenantId::Default(), 4096, config);

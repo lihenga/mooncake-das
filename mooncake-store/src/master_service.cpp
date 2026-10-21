@@ -8171,37 +8171,20 @@ void MasterService::RestoreRecoveredDfsReplicas(bool rebuild_metadata) {
     size_t restored = 0;
     size_t superseded = 0;
     size_t candidates = 0;
+    size_t preserved_live = 0;
 
-<<<<<<< HEAD
-        if (tenant_state.metadata.find(entry.key) !=
-            tenant_state.metadata.end()) {
-            // The live metadata may have been written while DFS was
-            // unavailable. The recovered extent can therefore contain an
-            // older value and must not be attached to it. Tombstone the stale
-            // extent as well as skipping it so the allocator does not retain a
-            // hidden owner that makes a later allocation of the same key fail
-            // with OBJECT_ALREADY_EXISTS. Free() performs no I/O and is safe
-            // while the metadata shard lock is held.
-            allocator->Free(entry.key, entry.descriptor);
-            static DfsLogLimiter log_limiter;
-            if (auto suppressed = log_limiter.ShouldLog()) {
-                LOG(WARNING) << "Skipping DFS recovery for key=" << entry.key
-                             << ": metadata already present, recovered extent "
-                                "tombstoned, suppressed="
-                             << *suppressed;
-            }
-            continue;
-        }
-=======
     // The allocator calls this once per recovered bucket, on this thread and
     // with its own mutex released, so the counters below need no synchronization
     // and the allocator mutex and the shard mutex are never nested.
     ImmutableBucketAllocator::RecoveredBatchConsumer consumer;
     if (rebuild_metadata) {
-        consumer = [this, tenant_id, &restored, &superseded, &candidates](
+        consumer = [this, tenant_id, &restored, &superseded, &candidates,
+                    &preserved_live](
                        std::vector<ImmutableBucketAllocator::RecoveredReplica>&&
                            batch) {
             candidates += batch.size();
+            std::vector<ImmutableBucketAllocator::RecoveredReplica>
+                stale_recovered;
             // Group by shard so one batch takes each shard lock once rather
             // than once per key.
             std::unordered_map<size_t, std::vector<size_t>> indices_by_shard;
@@ -8216,15 +8199,39 @@ void MasterService::RestoreRecoveredDfsReplicas(bool rebuild_metadata) {
                     auto& entry = batch[i];
                     auto existing = tenant_state.metadata.find(entry.key);
                     if (existing != tenant_state.metadata.end()) {
-                        // Buckets are committed in ascending bucket_id order and
-                        // the allocator's keep-max rule emits a strictly greater
-                        // candidate every time a key is seen again, so the last
-                        // emission of a key is its final winner. Drop the
-                        // superseded descriptor instead of keeping stale bytes.
-                        tenant_state.metadata.erase(existing);
-                        ++superseded;
+                        const auto& metadata = existing->second;
+                        const bool installed_by_this_recovery =
+                            metadata.client_id == UUID{0, 0} &&
+                            metadata.replicas.size() == 1 &&
+                            metadata.replicas.front().is_dfs_replica();
+                        if (installed_by_this_recovery) {
+                            // Buckets are committed in ascending bucket_id
+                            // order and the allocator's keep-max rule emits a
+                            // strictly greater candidate every time a key is
+                            // seen again. Replace only metadata installed by
+                            // this recovery pass.
+                            tenant_state.metadata.erase(existing);
+                            ++superseded;
+                        } else {
+                            // Initialization may be a retry after the service
+                            // has accepted a memory-only write. That live value
+                            // is newer than the recovered DFS extent, so keep
+                            // the live metadata and tombstone the stale extent.
+                            ++preserved_live;
+                            static DfsLogLimiter log_limiter;
+                            if (auto suppressed = log_limiter.ShouldLog()) {
+                                LOG(WARNING)
+                                    << "Skipping stale DFS recovery for key="
+                                    << entry.key
+                                    << ": live metadata already present, "
+                                       "recovered extent tombstoned, "
+                                       "suppressed="
+                                    << *suppressed;
+                            }
+                            stale_recovered.push_back(std::move(entry));
+                            continue;
+                        }
                     }
->>>>>>> v0.3.13.post1_l4
 
                     const uint64_t object_size = entry.descriptor.object_size;
                     std::vector<Replica> replicas;
@@ -8244,6 +8251,10 @@ void MasterService::RestoreRecoveredDfsReplicas(bool rebuild_metadata) {
                     ++restored;
                 }
             }
+            // Do not nest the allocator mutex under a metadata shard lock.
+            for (const auto& entry : stale_recovered) {
+                bucket_allocator_->Free(entry.key, entry.descriptor);
+            }
         };
     }
 
@@ -8256,7 +8267,8 @@ void MasterService::RestoreRecoveredDfsReplicas(bool rebuild_metadata) {
     LOG(INFO) << "Restored " << restored
               << " DFS replicas from bucket metadata (" << candidates
               << " candidates, " << superseded
-              << " superseded, metadata_rebuilt="
+              << " superseded, " << preserved_live
+              << " live entries preserved, metadata_rebuilt="
               << (rebuild_metadata ? "true" : "false") << ")";
 }
 

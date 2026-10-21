@@ -36,17 +36,11 @@ std::shared_ptr<DfsWriteStagingPool::Slot> DfsWriteStagingPool::Acquire(
     std::chrono::milliseconds timeout, bool* timed_out) {
     if (timed_out) *timed_out = false;
     std::unique_lock<std::mutex> lock(mutex_);
-<<<<<<< HEAD
     const auto ready = [this] { return shutting_down_ || !free_slots_.empty(); };
     const bool acquired = timeout == std::chrono::milliseconds::max()
                               ? (cv_.wait(lock, ready), true)
                               : cv_.wait_for(lock, timeout, ready);
     if (!acquired) {
-=======
-    if (!cv_.wait_for(
-            lock, timeout,
-            [this] { return shutting_down_ || !free_slots_.empty(); })) {
->>>>>>> v0.3.13.post1_l4
         if (timed_out) *timed_out = true;
         return nullptr;
     }
