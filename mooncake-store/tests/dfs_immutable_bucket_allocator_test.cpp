@@ -756,6 +756,43 @@ TEST(ImmutableBucketAllocatorTest, BatchAllocateRejectsBadRequestsAtomically) {
     }
 }
 
+TEST(ImmutableBucketAllocatorTest,
+     BatchRollbackUndoesReservationInAlreadyPersistedBucket) {
+    TempDir tmp("bucket_batch_cross_bucket_rollback");
+    const uint64_t capacity = kAlignment;  // one entry per bucket
+    ImmutableBucketAllocator alloc;
+    ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), capacity, 2)));
+
+    // "a" fills bucket 0, "b" rolls the batch over to bucket 1 - which seals
+    // bucket 0 and writes its `.meta`, so bucket 0 keeps no placement in
+    // memory any more - and "c" cannot get a third bucket, so the batch
+    // unwinds and has to undo "a" in a bucket that was already persisted.
+    std::vector<BatchAllocateRequest> requests{
+        {"a", 100}, {"b", 100}, {"c", 100}};
+    auto results = alloc.BatchAllocate(requests);
+    ASSERT_EQ(results.size(), 3u);
+    for (const auto& result : results) EXPECT_FALSE(result.success);
+    EXPECT_EQ(results[2].error, ErrorCode::NO_AVAILABLE_HANDLE);
+
+    // Nothing may survive the rollback: a leftover key_index_ record is what
+    // makes the key report OBJECT_ALREADY_EXISTS, and a leftover PENDING count
+    // is what makes the bucket unevictable.
+    EXPECT_FALSE(alloc.GetBucketIdForKey("a").has_value());
+    EXPECT_FALSE(alloc.GetBucketIdForKey("b").has_value());
+    EXPECT_EQ(alloc.GetUsedBytes(), 0u);
+    // Undoing the reservation of a persisted bucket must schedule its rewrite.
+    EXPECT_GE(alloc.FlushDirtyMetadata(), 1u);
+
+    auto pending = alloc.PrepareEvictionForAllocationFailure();
+    EXPECT_EQ(pending.bucket_id(), 0)
+        << "the rolled-back bucket stays pinned by a PENDING count";
+    alloc.AbortEviction(std::move(pending));
+
+    auto retry = alloc.Allocate("a", 100);
+    ASSERT_TRUE(retry.has_value());
+    EXPECT_TRUE(alloc.GetBucketIdForKey("a").has_value());
+}
+
 // ---------------------------------------------------------------------------
 // ImmutableBucketAllocator: Free / MarkCommitted
 // ---------------------------------------------------------------------------

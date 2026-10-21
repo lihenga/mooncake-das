@@ -550,7 +550,15 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     // same batch fails). BatchAllocate unwinds in reverse order, so the target
     // is normally the most recent placement; a concurrent batch's interleaved
     // reservation is handled by scanning for the key instead of assuming the
-    // tail. Only a tail rollback returns its space to `append_offset`.
+    // tail. Only a rollback at the append frontier returns its space to
+    // `append_offset`.
+    //
+    // Ownership comes from `key_index_`, not from `bucket.placed`: a bucket
+    // whose `.meta` was already written drops `placed`, so its rollback falls
+    // back to the descriptor handed out at reserve time. Judging by `placed`
+    // alone would skip that bucket entirely and leave a PENDING record behind,
+    // which strands both the bucket (never evictable) and the key (always
+    // OBJECT_ALREADY_EXISTS) until the next restart.
     void UnreserveInBucketLocked(BucketState& bucket, const std::string& key,
                                  const DistributedFSDescriptor& descriptor);
 

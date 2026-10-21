@@ -1378,6 +1378,23 @@ ImmutableBucketAllocator::ReserveInBucketLocked(BucketState& bucket,
 void ImmutableBucketAllocator::UnreserveInBucketLocked(
     BucketState& bucket, const std::string& key,
     const DistributedFSDescriptor& descriptor) {
+    // key_index_ decides whether this bucket still owns the reservation: it is
+    // written together with the placement, pending_count and live_bytes, and
+    // unlike `bucket.placed` it is never dropped. A bucket whose `.meta` was
+    // written successfully clears `placed`, because from then on the per-key
+    // layout lives on disk and in the descriptor handed back to the caller.
+    // Going by `placed` alone would skip the rollback of a bucket that a
+    // mid-batch bucket switch sealed and flushed, leaving its PENDING record
+    // behind: the bucket stays unevictable and the key reports
+    // OBJECT_ALREADY_EXISTS for the rest of this process's life.
+    auto index_it = key_index_.find(key);
+    if (index_it == key_index_.end() ||
+        index_it->second.bucket_id != bucket.bucket_id) {
+        return;
+    }
+    const bool was_pending =
+        index_it->second.state == BucketEntryState::PENDING;
+
     auto matches = [&key, &descriptor](const PlacedEntry& placed) {
         return placed.key == key &&
                placed.object_size == descriptor.object_size &&
@@ -1385,11 +1402,8 @@ void ImmutableBucketAllocator::UnreserveInBucketLocked(
     };
     // BatchAllocate unwinds in reverse order, so the reservation being undone
     // is normally the most recent placement and the reverse scan below matches
-    // on its first step. A concurrent batch can interleave its own reservation
-    // into the same bucket during an EnsureActiveBucket unlock window, though;
-    // silently skipping a non-tail unreserve would leak a PENDING index record
-    // and strand the bucket's pending_count forever. Scanning from the back
-    // also picks the live placement when a key was freed and re-placed.
+    // on its first step. Scanning from the back also picks the live placement
+    // when a key was freed and re-placed.
     auto placed_it = bucket.placed.end();
     for (auto rit = bucket.placed.rbegin(); rit != bucket.placed.rend();
          ++rit) {
@@ -1398,24 +1412,29 @@ void ImmutableBucketAllocator::UnreserveInBucketLocked(
             break;
         }
     }
-    if (placed_it == bucket.placed.end()) return;
 
-    const uint64_t reserved_size = placed_it->reserved_size;
-    const uint64_t entry_end = placed_it->entry_offset + reserved_size;
-    if (std::next(placed_it) == bucket.placed.end() &&
-        bucket.append_offset == entry_end) {
-        // Only the most recent reservation can give its space back; an entry
-        // erased from the middle stays reserved (the bucket is append-only).
-        bucket.append_offset = placed_it->entry_offset;
+    // A bucket that was already persisted keeps no placement in memory, so the
+    // descriptor this batch handed out is the layout reference left; it records
+    // exactly the offset and reserved size the placement held.
+    const uint64_t entry_offset =
+        placed_it != bucket.placed.end() ? placed_it->entry_offset
+                                         : descriptor.offset;
+    const uint64_t reserved_size =
+        placed_it != bucket.placed.end() ? placed_it->reserved_size
+                                         : descriptor.aligned_size;
+    if (bucket.append_offset == entry_offset + reserved_size) {
+        // Only the reservation at the append frontier can give its space back:
+        // one erased from the middle stays reserved, the bucket is append-only.
+        bucket.append_offset = entry_offset;
     }
 
-    // The reservation existed only in memory, so undoing it means dropping the
-    // placement and its index record. If the bucket happens to be sealed
-    // already, its `.meta` file has to be rewritten without this entry.
+    // If the bucket happens to be sealed already, its `.meta` file still lists
+    // this entry and has to be rewritten without it. For the still-active
+    // bucket the change is simply part of what gets written when it is sealed.
     MarkMetaDirtyLocked(bucket);
 
-    bucket.placed.erase(placed_it);
-    if (bucket.pending_count > 0) --bucket.pending_count;
+    if (placed_it != bucket.placed.end()) bucket.placed.erase(placed_it);
+    if (was_pending && bucket.pending_count > 0) --bucket.pending_count;
     // The reservation no longer holds live bytes. The space itself stays
     // reserved in the append-only bucket until the whole bucket is evicted.
     if (bucket.live_bytes >= reserved_size) {
@@ -1424,11 +1443,7 @@ void ImmutableBucketAllocator::UnreserveInBucketLocked(
         bucket.live_bytes = 0;
     }
 
-    auto index_it = key_index_.find(key);
-    if (index_it != key_index_.end() &&
-        index_it->second.bucket_id == bucket.bucket_id) {
-        key_index_.erase(index_it);
-    }
+    key_index_.erase(index_it);
 }
 
 ImmutableBucketAllocator::LiveKeyRecord*
@@ -1684,8 +1699,10 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
 
     if (reserved.size() + already_exists_count != requests.size()) {
         // Roll back in reverse reservation order, across every bucket touched
-        // by this batch. Nothing was written to disk, so undoing the in-memory
-        // state is all it takes.
+        // by this batch. A bucket that a mid-batch switch sealed may already
+        // have been persisted, so the unreserve also has to undo it there:
+        // UnreserveInBucketLocked falls back to the descriptor for the layout
+        // and marks the bucket dirty so the `.meta` rewrite drops the entry.
         for (auto it = reserved.rbegin(); it != reserved.rend(); ++it) {
             auto bucket_it = buckets_.find(it->bucket_id);
             if (bucket_it != buckets_.end() &&
