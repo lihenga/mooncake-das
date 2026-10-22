@@ -971,7 +971,9 @@ extern "C" int __wrap_ibv_modify_qp(ibv_qp* qp, ibv_qp_attr* attr,
         int sgid_index = attr->ah_attr.grh.sgid_index;
         union ibv_gid actual_gid = {};
         std::string gid_string;
-        if (__real_ibv_query_gid(qp->context, attr->ah_attr.port_num,
+        // Observe the same synthetic GID mapping used by the context under
+        // test, rather than bypassing it while recording the first attempt.
+        if (__wrap_ibv_query_gid(qp->context, attr->ah_attr.port_num,
                                  sgid_index, &actual_gid) == 0) {
             gid_string = formatGidBytes(actual_gid.raw);
         }

@@ -39,8 +39,24 @@
 #include "config.h"
 #include "transfer_engine.h"
 #include "transport/rdma_twosided/rdma_twosided_transport.h"
+#include "transport/rdma_twosided/ctrl_channel.h"
 
 using namespace mooncake;
+
+namespace mooncake {
+class RdmaTwoSidedTransportTestPeer {
+   public:
+    static bool disconnectPeer(RdmaTwoSidedTransport &transport,
+                               const std::string &peer) {
+        std::lock_guard<std::mutex> lock(transport.ctrl_mutex_);
+        auto it = transport.ctrl_channels_.find(peer);
+        if (it == transport.ctrl_channels_.end() || !it->second) return false;
+        // Leave the disconnected entry in the map to exercise reclamation.
+        it->second->disconnect();
+        return true;
+    }
+};
+}  // namespace mooncake
 
 namespace {
 
@@ -288,13 +304,17 @@ TEST_F(RdmaNotifyTest, NotifyAfterPeerGoneIsBounded) {
     std::vector<TransferMetadata::NotifyDesc> got;
     ASSERT_TRUE(waitForNotifies(*receiver_, 1, got));
 
-    // Drop the peer: the ctrl QP moves to error, connected_ flips to false and
-    // the entry is left stale in ctrl_channels_.
+    // Drop the peer and explicitly inject the disconnected-channel state.
+    // Provider error-WC latency is unrelated to stale-entry reclamation.
     receiver_.reset();
+    auto *transport = dynamic_cast<RdmaTwoSidedTransport *>(
+        sender_->getTransport("rdma_twosided"));
+    ASSERT_NE(transport, nullptr);
+    ASSERT_TRUE(RdmaTwoSidedTransportTestPeer::disconnectPeer(*transport,
+                                                              receiver_name_));
 
-    // The error WC lands shortly after the peer is gone. Keep notifying until
-    // the transport reports the failure: it must reclaim the stale entry and
-    // return an error rather than block. Before the fix this loop hung.
+    // It must reclaim the stale entry and return an error rather than block.
+    // Before the fix this call waited on an entry with no connect in flight.
     auto start = std::chrono::steady_clock::now();
     bool reported_failure = false;
     for (int i = 0; i < 40 && !reported_failure; ++i) {
