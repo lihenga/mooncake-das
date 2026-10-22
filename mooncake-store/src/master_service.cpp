@@ -1031,15 +1031,18 @@ MasterService::DfsInitResult MasterService::InitDfsAllocatorFromEnvironment(
         return DfsInitResult::kRetryableFailure;
     }
 
-    // Snapshot is the metadata recovery source when enabled. Do not rebuild
-    // DFS replicas from bucket state in that mode.
-    if (bucket_allocator != nullptr && dfs_restore_from_bucket_metadata_) {
-        RestoreRecoveredDfsReplicas(bucket_allocator);
-    }
-
+    // Publish the allocator before recovery because the recovery helper uses
+    // the member pointer when releasing stale recovered extents.
     dfs_allocator_owner_ = std::move(allocator);
     bucket_allocator_.store(bucket_allocator);
     dfs_allocator_.store(dfs_allocator_owner_.get());
+
+    // The allocator has already rebuilt its bucket state during Init(). When
+    // snapshot recovery owns metadata, consume the recovered list without
+    // registering duplicate object metadata.
+    if (bucket_allocator != nullptr) {
+        RestoreRecoveredDfsReplicas(dfs_restore_from_bucket_metadata_);
+    }
     enable_dfs_.store(true, std::memory_order_release);
     dfs_retry_needed_.store(false, std::memory_order_release);
 
@@ -5999,24 +6002,12 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                    << ", error=dfs_currently_requires_default_tenant";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-<<<<<<< HEAD
-=======
     if (config.dfs_replica_num > 0 &&
         (dfs_filter_mode_.load(std::memory_order_acquire) & 1) != 0) {
         LOG(INFO) << "key=" << key
                   << ", error=dfs_upsert_disabled_by_filter_mode";
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
-    if (config.dfs_replica_num > 0 &&
-        (dfs_filter_mode_.load(std::memory_order_acquire) & 1) == 0 &&
-        (!enable_dfs_ || dfs_allocator_ == nullptr ||
-         !dfs_allocator_->IsInitialized())) {
-        LOG(ERROR) << "key=" << key
-                   << ", dfs_replica_num=" << config.dfs_replica_num
-                   << ", error=dfs_service_unavailable";
-        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
-    }
->>>>>>> v0.3.13.post1_l4
     if (config.prefer_alloc_in_same_node && config.nof_replica_num > 0) {
         LOG(ERROR) << "key=" << key
                    << ", nof_replica_num=" << config.nof_replica_num
@@ -6304,7 +6295,6 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                 &Replica::fn_is_memory_replica);
                         const size_t existing_nof_replicas =
                             metadata.CountReplicas(&Replica::fn_is_nof_replica);
-<<<<<<< HEAD
                         if (existing_memory_replicas !=
                                 effective_config.replica_num ||
                             existing_nof_replicas !=
@@ -6312,16 +6302,6 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                             (!initially_skip_dfs_replica &&
                              existing_dfs_replicas !=
                                  effective_config.dfs_replica_num)) {
-=======
-                        const size_t expected_dfs_replicas =
-                            (dfs_filter_mode_.load(std::memory_order_acquire) &
-                             1) != 0
-                                ? 0
-                                : config.dfs_replica_num;
-                        if (existing_memory_replicas != config.replica_num ||
-                            existing_nof_replicas != config.nof_replica_num ||
-                            existing_dfs_replicas != expected_dfs_replicas) {
->>>>>>> v0.3.13.post1_l4
                             LOG(ERROR)
                                 << "key=" << key
                                 << ", error=dfs_upsert_topology_mismatch"
@@ -6343,23 +6323,11 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
                 const bool has_dfs_replica =
                     metadata.HasReplica(&Replica::fn_is_dfs_replica);
-<<<<<<< HEAD
                 const bool must_reallocate_dfs_replica =
                     (bucket_allocator_ != nullptr && has_dfs_replica) ||
                     (initially_skip_dfs_replica && has_dfs_replica);
                 if (metadata.size == slice_length &&
                     !must_reallocate_dfs_replica) {
-=======
-                if (has_bucket_dfs_replica && config.dfs_replica_num > 0 &&
-                    (dfs_filter_mode_.load(std::memory_order_acquire) & 1) !=
-                        0) {
-                    LOG(INFO)
-                        << "key=" << key << ", info=object_already_exists";
-                    return tl::make_unexpected(
-                        ErrorCode::OBJECT_ALREADY_EXISTS);
-                }
-                if (metadata.size == slice_length && !has_bucket_dfs_replica) {
->>>>>>> v0.3.13.post1_l4
                     metadata.client_id = client_id;
                     metadata.put_start_time = now;
                     if (config.dfs_replica_num > 0 &&
@@ -8315,109 +8283,82 @@ void MasterService::FreeDfsReplicas(const std::string& key,
     }
 }
 
-void MasterService::RestoreRecoveredDfsReplicas(
-    ImmutableBucketAllocator* allocator) {
-    if (allocator == nullptr) return;
+void MasterService::RestoreRecoveredDfsReplicas(bool rebuild_metadata) {
+    if (bucket_allocator_ == nullptr) return;
 
-    auto recovered = allocator->TakeRecoveredReplicas();
+    auto recovered = bucket_allocator_->TakeRecoveredReplicas();
     if (recovered.empty()) return;
 
     const TenantId tenant_id = TenantId::Default();
     size_t restored = 0;
-<<<<<<< HEAD
     size_t superseded = 0;
-    size_t candidates = 0;
+    const size_t candidates = recovered.size();
     size_t preserved_live = 0;
 
-    // The allocator calls this once per recovered bucket, on this thread and
-    // with its own mutex released, so the counters below need no synchronization
-    // and the allocator mutex and the shard mutex are never nested.
-    ImmutableBucketAllocator::RecoveredBatchConsumer consumer;
     if (rebuild_metadata) {
-        consumer = [this, tenant_id, &restored, &superseded, &candidates,
-                    &preserved_live](
-                       std::vector<ImmutableBucketAllocator::RecoveredReplica>&&
-                           batch) {
-            candidates += batch.size();
-            std::vector<ImmutableBucketAllocator::RecoveredReplica>
-                stale_recovered;
-            // Group by shard so one batch takes each shard lock once rather
-            // than once per key.
-            std::unordered_map<size_t, std::vector<size_t>> indices_by_shard;
-            for (size_t i = 0; i < batch.size(); ++i) {
-                indices_by_shard[getMetadataShardIndex(tenant_id, batch[i].key)]
-                    .push_back(i);
-            }
-            for (auto& [shard_idx, indices] : indices_by_shard) {
-                MetadataShardAccessorRW shard(this, shard_idx);
-                auto& tenant_state = shard->tenants[tenant_id];
-                for (const size_t i : indices) {
-                    auto& entry = batch[i];
-                    auto existing = tenant_state.metadata.find(entry.key);
-                    if (existing != tenant_state.metadata.end()) {
-                        const auto& metadata = existing->second;
-                        const bool installed_by_this_recovery =
-                            metadata.client_id == UUID{0, 0} &&
-                            metadata.CountReplicas() == 1 &&
-                            metadata.HasReplica(&Replica::fn_is_dfs_replica);
-                        if (installed_by_this_recovery) {
-                            // Buckets are committed in ascending bucket_id
-                            // order and the allocator's keep-max rule emits a
-                            // strictly greater candidate every time a key is
-                            // seen again. Replace only metadata installed by
-                            // this recovery pass.
-                            tenant_state.metadata.erase(existing);
-                            ++superseded;
-                        } else {
-                            // Initialization may be a retry after the service
-                            // has accepted a memory-only write. That live value
-                            // is newer than the recovered DFS extent, so keep
-                            // the live metadata and tombstone the stale extent.
-                            ++preserved_live;
-                            static DfsLogLimiter log_limiter;
-                            if (auto suppressed = log_limiter.ShouldLog()) {
-                                LOG(WARNING)
-                                    << "Skipping stale DFS recovery for key="
-                                    << entry.key
-                                    << ": live metadata already present, "
-                                       "recovered extent tombstoned, "
-                                       "suppressed="
-                                    << *suppressed;
-                            }
-                            stale_recovered.push_back(std::move(entry));
-                            continue;
+        std::vector<ImmutableBucketAllocator::RecoveredReplica>
+            stale_recovered;
+        std::unordered_map<size_t, std::vector<size_t>> indices_by_shard;
+        for (size_t i = 0; i < recovered.size(); ++i) {
+            indices_by_shard[getMetadataShardIndex(tenant_id,
+                                                   recovered[i].key)]
+                .push_back(i);
+        }
+
+        for (auto& [shard_idx, indices] : indices_by_shard) {
+            MetadataShardAccessorRW shard(this, shard_idx);
+            auto& tenant_state = shard->tenants[tenant_id];
+            for (const size_t i : indices) {
+                auto& entry = recovered[i];
+                auto existing = tenant_state.metadata.find(entry.key);
+                if (existing != tenant_state.metadata.end()) {
+                    const auto& metadata = existing->second;
+                    const bool installed_by_this_recovery =
+                        metadata.client_id == UUID{0, 0} &&
+                        metadata.CountReplicas() == 1 &&
+                        metadata.HasReplica(&Replica::fn_is_dfs_replica);
+                    if (installed_by_this_recovery) {
+                        tenant_state.metadata.erase(existing);
+                        ++superseded;
+                    } else {
+                        // A retry can race with a successful memory-only write.
+                        // Keep the live value and tombstone only the stale DFS
+                        // extent after releasing all metadata shard locks.
+                        ++preserved_live;
+                        static DfsLogLimiter log_limiter;
+                        if (auto suppressed = log_limiter.ShouldLog()) {
+                            LOG(WARNING)
+                                << "Skipping stale DFS recovery for key="
+                                << entry.key
+                                << ": live metadata already present, recovered "
+                                   "extent tombstoned, suppressed="
+                                << *suppressed;
                         }
+                        stale_recovered.push_back(std::move(entry));
+                        continue;
                     }
-
-                    const uint64_t object_size = entry.descriptor.object_size;
-                    std::vector<Replica> replicas;
-                    replicas.emplace_back(entry.descriptor,
-                                          ReplicaStatus::COMPLETE);
-                    tenant_state.metadata.emplace(
-                        std::piecewise_construct,
-                        std::forward_as_tuple(entry.key),
-                        std::forward_as_tuple(
-                            UUID{0, 0}, std::chrono::system_clock::now(),
-                            object_size, std::move(replicas), std::nullopt,
-                            /*enable_hard_pin=*/false, ObjectDataType::UNKNOWN,
-                            std::string(), tenant_id, entry.key));
-                    // No quota ledger adoption: a recovered object holds only a
-                    // DFS replica, which carries no memory quota charge, so
-                    // there is no pending charge to adopt.
-                    ++restored;
                 }
-            }
-            // Do not nest the allocator mutex under a metadata shard lock.
-            for (const auto& entry : stale_recovered) {
-                bucket_allocator_->Free(entry.key, entry.descriptor);
-            }
-        };
-    }
 
-    auto result = bucket_allocator_->RecoverBucketsProgressively(consumer);
-    if (!result) {
-        LOG(ERROR) << "DFS bucket recovery failed, error=" << result.error();
-        return;
+                const uint64_t object_size = entry.descriptor.object_size;
+                std::vector<Replica> replicas;
+                replicas.emplace_back(entry.descriptor,
+                                      ReplicaStatus::COMPLETE);
+                tenant_state.metadata.emplace(
+                    std::piecewise_construct,
+                    std::forward_as_tuple(entry.key),
+                    std::forward_as_tuple(
+                        UUID{0, 0}, std::chrono::system_clock::now(),
+                        object_size, std::move(replicas), std::nullopt,
+                        /*enable_hard_pin=*/false, ObjectDataType::UNKNOWN,
+                        std::string(), tenant_id, entry.key));
+                ++restored;
+            }
+        }
+
+        // Never nest allocator and metadata-shard locks.
+        for (const auto& entry : stale_recovered) {
+            bucket_allocator_->Free(entry.key, entry.descriptor);
+        }
     }
 
     LOG(INFO) << "Restored " << restored
@@ -8426,43 +8367,6 @@ void MasterService::RestoreRecoveredDfsReplicas(
               << " superseded, " << preserved_live
               << " live entries preserved, metadata_rebuilt="
               << (rebuild_metadata ? "true" : "false") << ")";
-=======
-    for (auto& entry : recovered) {
-        const size_t shard_idx = getMetadataShardIndex(tenant_id, entry.key);
-        MetadataShardAccessorRW shard(this, shard_idx);
-        auto& tenant_state = shard->tenants[tenant_id];
-
-        if (tenant_state.metadata.find(entry.key) !=
-            tenant_state.metadata.end()) {
-            // Something else already owns this key. Leave it alone: the
-            // recovered DFS extent stays allocated but unreferenced rather than
-            // overwriting live metadata.
-            LOG(WARNING) << "Skipping DFS recovery for key=" << entry.key
-                         << ": metadata already present";
-            continue;
-        }
-
-        const uint64_t object_size = entry.descriptor.object_size;
-        std::vector<Replica> replicas;
-        replicas.emplace_back(entry.descriptor, ReplicaStatus::COMPLETE);
-        tenant_state.metadata.emplace(
-            std::piecewise_construct, std::forward_as_tuple(entry.key),
-            std::forward_as_tuple(UUID{0, 0}, std::chrono::system_clock::now(),
-                                  object_size, std::move(replicas),
-                                  std::nullopt,
-                                  /*enable_hard_pin=*/false,
-                                  ObjectDataType::UNKNOWN, std::string(),
-                                  tenant_id, entry.key));
-        // No quota ledger adoption: a recovered object holds only a DFS
-        // replica, which carries no memory quota charge, so there is no
-        // pending charge to adopt.
-        ++restored;
-    }
-
-    LOG(INFO) << "Restored " << restored
-              << " DFS replicas from bucket metadata (" << recovered.size()
-              << " candidates)";
->>>>>>> v0.3.13.post1_l4
 }
 
 void MasterService::RunDfsEviction() {

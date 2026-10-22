@@ -854,7 +854,9 @@ class Client {
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices,
-        bool prefer_same_node);
+        bool prefer_same_node,
+        const std::unordered_map<std::string, std::shared_ptr<void>>*
+            dfs_buffer_owners);
 
     friend class test::DfsBucketClientTest;
 

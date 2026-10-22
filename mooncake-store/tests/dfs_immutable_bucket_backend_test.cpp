@@ -37,7 +37,6 @@ constexpr uint64_t kBucketCapacity = 1024 * 1024;
 const std::string kTestDfsRootIdentity =
     SerializeDfsRootIdentity("dfs_backend_test", UUID{1, 2});
 
-<<<<<<< HEAD
 void WriteTestDfsReadProbe(const std::string& root) {
     for (size_t probe_index = 0;
          probe_index < kDfsReadProbeDirectoryNames.size(); ++probe_index) {
@@ -50,7 +49,9 @@ void WriteTestDfsReadProbe(const std::string& root) {
         const auto contents =
             BuildDfsReadProbeContents(kTestDfsRootIdentity, probe_index);
         output.write(contents.data(), contents.size());
-=======
+    }
+}
+
 // Exact pre-epoch struct_pack layouts, including the nested replica variant.
 struct LegacyDfsDescriptor {
     std::string file_path;
@@ -117,7 +118,6 @@ TEST(DfsEpochSerializationTest, OldAndNewOplogPayloadsRemainReadable) {
                           .offset,
                       8192u);
         }
->>>>>>> v0.3.13.post1_l4
     }
 }
 

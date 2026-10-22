@@ -2124,14 +2124,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<std::string>& object_keys,
     const std::vector<QueryResult>& query_results,
     std::unordered_map<std::string, std::vector<Slice>>& slices,
-<<<<<<< HEAD
     bool prefer_alloc_in_same_node,
     const std::unordered_map<std::string, std::shared_ptr<void>>*
         dfs_buffer_owners) {
-=======
-    bool prefer_alloc_in_same_node) {
     auto results = BatchGetImpl(object_keys, query_results, slices,
-                                prefer_alloc_in_same_node);
+                                prefer_alloc_in_same_node, dfs_buffer_owners);
     std::vector<std::string> retry_keys;
     std::vector<size_t> retry_indices;
     for (size_t i = 0; i < results.size(); ++i) {
@@ -2167,7 +2164,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     }
     if (!valid_keys.empty()) {
         auto retried = BatchGetImpl(valid_keys, valid_queries, slices,
-                                    prefer_alloc_in_same_node);
+                                    prefer_alloc_in_same_node,
+                                    dfs_buffer_owners);
         for (size_t i = 0; i < retried.size(); ++i)
             results[valid_indices[i]] = std::move(retried[i]);
     }
@@ -2178,8 +2176,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetImpl(
     const std::vector<std::string>& object_keys,
     const std::vector<QueryResult>& query_results,
     std::unordered_map<std::string, std::vector<Slice>>& slices,
-    bool prefer_alloc_in_same_node) {
->>>>>>> v0.3.13.post1_l4
+    bool prefer_alloc_in_same_node,
+    const std::unordered_map<std::string, std::shared_ptr<void>>*
+        dfs_buffer_owners) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         std::vector<tl::expected<void, ErrorCode>> results;

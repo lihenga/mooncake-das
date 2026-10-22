@@ -2155,7 +2155,6 @@ class MasterService {
         int64_t bucket_id) const;
     // Shard-mode per-key eviction (unchanged behaviour).
     void RunShardDfsEviction();
-<<<<<<< HEAD
     enum class DfsInitResult {
         kInitialized,
         kDisabled,
@@ -2170,12 +2169,6 @@ class MasterService {
     void RestoreRecoveredDfsReplicas(bool rebuild_metadata);
     DfsInitResult InitDfsAllocatorFromEnvironment(
         const MasterServiceConfig& config);
-=======
-    // Re-registers DFS replicas recovered from bucket metadata as COMPLETE so
-    // the master can serve them after startup or allocator recovery.
-    void RestoreRecoveredDfsReplicas(ImmutableBucketAllocator* allocator);
-    void InitDfsAllocatorFromEnvironment(const MasterServiceConfig& config);
->>>>>>> v0.3.13.post1_l4
     void DfsAllocatorRetryThreadFunc();
     void RunDfsBackfill();
     size_t dfs_backfill_shard_{0};  // owned by the DFS eviction thread
