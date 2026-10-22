@@ -896,13 +896,15 @@ TEST(RDMAEndpointSetupErrorTest, VerifyVerbsErrorCorrectlyCaptured) {
 #ifdef MC_TEST_INTERPOSE_VERBS
 // Export the mock symbols so calls from libtransfer_engine use them too.
 // Forward uninjected calls to libibverbs, never back into these mocks.
+// Select the current ABI explicitly: RTLD_NEXT dlsym can resolve the legacy
+// IBVERBS_1.0 compatibility entry points on older glibc releases.
 #define __wrap_ibv_modify_qp ibv_modify_qp
 #define __wrap_ibv_query_gid ibv_query_gid
 #define __wrap__ibv_query_gid_ex _ibv_query_gid_ex
 
 extern "C" int __real_ibv_modify_qp(ibv_qp* qp, ibv_qp_attr* attr, int mask) {
     static auto real = reinterpret_cast<decltype(&ibv_modify_qp)>(
-        dlsym(RTLD_NEXT, "ibv_modify_qp"));
+        dlvsym(RTLD_NEXT, "ibv_modify_qp", "IBVERBS_1.1"));
     CHECK(real != nullptr);
     return real(qp, attr, mask);
 }
@@ -910,7 +912,7 @@ extern "C" int __real_ibv_modify_qp(ibv_qp* qp, ibv_qp_attr* attr, int mask) {
 extern "C" int __real_ibv_query_gid(ibv_context* context, uint8_t port_num,
                                     int gid_index, union ibv_gid* gid) {
     static auto real = reinterpret_cast<decltype(&ibv_query_gid)>(
-        dlsym(RTLD_NEXT, "ibv_query_gid"));
+        dlvsym(RTLD_NEXT, "ibv_query_gid", "IBVERBS_1.1"));
     CHECK(real != nullptr);
     return real(context, port_num, gid_index, gid);
 }
@@ -920,7 +922,7 @@ extern "C" int __real__ibv_query_gid_ex(ibv_context* context, uint32_t port_num,
                                         ibv_gid_entry* entry, uint32_t flags,
                                         size_t entry_size) {
     static auto real = reinterpret_cast<decltype(&_ibv_query_gid_ex)>(
-        dlsym(RTLD_NEXT, "_ibv_query_gid_ex"));
+        dlvsym(RTLD_NEXT, "_ibv_query_gid_ex", "IBVERBS_1.11"));
     CHECK(real != nullptr);
     return real(context, port_num, gid_index, entry, flags, entry_size);
 }

@@ -120,16 +120,16 @@ class RdmaNotifyTest : public ::testing::Test {
         ASSERT_TRUE(globalConfig().rdma_notify_enabled);
         ASSERT_FALSE(globalConfig().rdma_notify_oob_fallback);
 
-        std::vector<std::string> filter{device_};
-        sender_ = std::make_unique<TransferEngine>(true, filter);
-        receiver_ = std::make_unique<TransferEngine>(true, filter);
+        sender_ = std::make_unique<TransferEngine>(false);
+        receiver_ = std::make_unique<TransferEngine>(false);
         ASSERT_EQ(sender_->init("P2PHANDSHAKE", "127.0.0.1:0"), 0);
         ASSERT_EQ(receiver_->init("P2PHANDSHAKE", "127.0.0.1:0"), 0);
-        // Auto-discovery installs classic RDMA. Install the two-sided transport
-        // exercised by this suite before registering memory.
-        ASSERT_NE(sender_->installTransport("rdma_twosided", nullptr), nullptr);
-        ASSERT_NE(receiver_->installTransport("rdma_twosided", nullptr),
-                  nullptr);
+        // Select only two-sided RDMA: classic RDMA and two-sided RDMA cannot
+        // coexist in one engine. Pin its topology to the selected usable NIC.
+        std::string matrix = "{\"cpu:0\":[[\"" + device_ + "\"],[]]}";
+        void *args[] = {matrix.data()};
+        ASSERT_NE(sender_->installTransport("rdma_twosided", args), nullptr);
+        ASSERT_NE(receiver_->installTransport("rdma_twosided", args), nullptr);
         sender_name_ = sender_->getLocalIpAndPort();
         receiver_name_ = receiver_->getLocalIpAndPort();
         ASSERT_FALSE(sender_name_.empty());
