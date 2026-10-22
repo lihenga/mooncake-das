@@ -3675,6 +3675,30 @@ TEST_F(RealClientTest, PutBatchThenBatchGetBuffer) {
     }
 }
 
+TEST_F(RealClientTest, BatchGetBufferSupportsDuplicateKeys) {
+    StartMasterAndSetupClient();
+
+    const std::string key = "batch_get_duplicate_key";
+    const std::string value = "duplicate-key-value";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_EQ(py_client_->put(
+                  key, std::span<const char>(value.data(), value.size()),
+                  config),
+              0);
+
+    auto handles = py_client_->batch_get_buffer({key, key});
+    ASSERT_EQ(handles.size(), 2u);
+    ASSERT_NE(handles[0], nullptr);
+    ASSERT_NE(handles[1], nullptr);
+    EXPECT_NE(handles[0]->ptr(), handles[1]->ptr());
+    for (const auto &handle : handles) {
+        EXPECT_EQ(std::string(static_cast<const char *>(handle->ptr()),
+                              handle->size()),
+                  value);
+    }
+}
+
 // ===================== HealthCheck Tests =====================
 
 TEST_F(RealClientTest, HealthCheckAfterSetup) {
