@@ -7532,18 +7532,40 @@ void RealClient::execute_session_dfs_range_reads(
     flush_chunk();
 
     for (size_t i = 0; i < chunks.size(); ++i) {
-        execute_session_dfs_range_reads_batch(
+        const ErrorCode chunk_error = execute_session_dfs_range_reads_batch(
             chunks[i], results, trace_id, false, i + 1, chunks.size(),
             chunk_limit_bytes, request_planned_bytes);
+        if (chunk_error != ErrorCode::DFS_BATCH_GET_TIMEOUT &&
+            chunk_error != ErrorCode::DFS_BATCH_GET_ADMISSION_TIMEOUT) {
+            continue;
+        }
+
+        size_t skipped_entries = 0;
+        for (size_t remaining = i + 1; remaining < chunks.size(); ++remaining) {
+            for (const auto *entry : chunks[remaining]) {
+                results[entry->original_idx] =
+                    static_cast<int>(toInt(chunk_error));
+                ++skipped_entries;
+            }
+        }
+        LOG(ERROR) << "Stopping chunked DFS restore after timeout: trace_id="
+                   << trace_id << ", failed_chunk=" << i + 1 << "/"
+                   << chunks.size() << ", skipped_chunks="
+                   << chunks.size() - i - 1
+                   << ", skipped_entries=" << skipped_entries
+                   << ", error=" << toString(chunk_error) << " ("
+                   << toInt(chunk_error) << ")";
+        break;
     }
 }
 
-void RealClient::execute_session_dfs_range_reads_batch(
+ErrorCode RealClient::execute_session_dfs_range_reads_batch(
     std::vector<SessionRangeReadRequest *> &entries,
     std::vector<int> &results, uint64_t trace_id, bool prefetch_only,
     size_t chunk_index, size_t chunk_count, size_t chunk_limit_bytes,
     size_t request_planned_bytes) {
     const auto timing_start = std::chrono::steady_clock::now();
+    const auto chunk_entries = entries;
     const bool trace_enabled = trace_id != 0;
     const size_t input_entries = entries.size();
     size_t prefetch_cache_hits = 0;
@@ -8067,6 +8089,19 @@ void RealClient::execute_session_dfs_range_reads_batch(
             << ", scatter_finalize_us=" << scatter_finalize_us
             << ", scatter_GBps=" << scatter_gbps;
     }
+
+    ErrorCode chunk_error = ErrorCode::OK;
+    for (const auto *entry : chunk_entries) {
+        const int result = results[entry->original_idx];
+        if (result >= 0) continue;
+        const auto error = static_cast<ErrorCode>(result);
+        if (error == ErrorCode::DFS_BATCH_GET_TIMEOUT ||
+            error == ErrorCode::DFS_BATCH_GET_ADMISSION_TIMEOUT) {
+            return error;
+        }
+        if (chunk_error == ErrorCode::OK) chunk_error = error;
+    }
+    return chunk_error;
 }
 
 std::vector<int> RealClient::batch_put_session_start(
