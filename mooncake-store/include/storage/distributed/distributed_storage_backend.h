@@ -7,6 +7,9 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <shared_mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -66,23 +69,6 @@ struct DistributedStorageConfig {
     int ready_bucket_target = 4;
     // BUCKET mode only: maximum number of concurrent bucket preallocations.
     int bucket_create_concurrency = 2;
-    // BUCKET mode only: number of worker threads used to parse bucket
-    // metadata concurrently during startup recovery. 0 means auto, resolved at
-    // recovery time to min(8, hardware_concurrency()). Must be in
-    // [0, 64]; see MOONCAKE_DFS_RECOVERY_WORKERS.
-    int recovery_worker_count = 0;
-    // BUCKET mode only: give up restoring replicas once this many buckets have
-    // been recovered, so the restart peak stays bounded when a huge number of
-    // buckets is found on disk. The remaining buckets are skipped and their
-    // files are deleted asynchronously. 0 means no bucket-count limit. See
-    // MOONCAKE_DFS_RECOVERY_MAX_BUCKETS.
-    int recovery_max_buckets = 1000;
-    // BUCKET mode only: give up restoring replicas once this many seconds have
-    // elapsed since recovery started, so a slow disk cannot stall startup
-    // indefinitely. The remaining buckets are skipped and their files are
-    // deleted asynchronously. 0 means no time limit. See
-    // MOONCAKE_DFS_RECOVERY_MAX_DURATION_SECONDS.
-    int recovery_max_duration_seconds = 20;
     // BUCKET mode only: number of threads for parallel batch reads across
     // buckets. Set to 1 to disable parallelism. Must be in
     // [1, kMaxBatchReadThreads].
@@ -233,6 +219,17 @@ class DistributedStorageBackend
     }
 
     tl::expected<size_t, ErrorCode> InvalidateAllBucketFds();
+    // Configured before I/O starts; consulted on epoch changes and cache
+    // misses.
+    void SetMasterEpochProvider(
+        std::function<tl::expected<UUID, ErrorCode>()> provider) {
+        std::unique_lock lock(bucket_epoch_mutex_);
+        master_epoch_provider_ = std::move(provider);
+    }
+    // Observe an epoch before using its bucket locations. The returned guard
+    // keeps a heartbeat or another request from changing epochs during I/O.
+    tl::expected<std::shared_lock<std::shared_mutex>, ErrorCode>
+    AcquireBucketEpoch(const UUID& epoch);
     tl::expected<size_t, ErrorCode> CleanupStaleBucketFds(
         const std::vector<int64_t>& active_bucket_ids);
     tl::expected<bool, ErrorCode> CleanupBucketFd(int64_t bucket_id);
@@ -305,7 +302,7 @@ class DistributedStorageBackend
         const std::vector<DfsWriteRequest>& requests);
 
     tl::expected<std::shared_ptr<OpenFileHandle>, ErrorCode> GetOrOpenBucket(
-        int64_t bucket_id);
+        int64_t bucket_id, const UUID& epoch);
 
     /**
      * @brief Open/cache the direct (page-cache-bypassing) read handle for a
@@ -313,7 +310,7 @@ class DistributedStorageBackend
      * read path; callers then fall back to the regular handle.
      */
     tl::expected<std::shared_ptr<OpenFileHandle>, ErrorCode>
-    GetOrOpenBucketDirect(int64_t bucket_id);
+    GetOrOpenBucketDirect(int64_t bucket_id, const UUID& epoch);
 
     /**
      * @brief One contiguous read scheduled as a single task.
@@ -381,6 +378,15 @@ class DistributedStorageBackend
     std::vector<std::unique_ptr<ShardFile>> shard_files_;
     DistributedStorageMode storage_mode_ = DistributedStorageMode::kFileSystem;
 
+    std::shared_mutex bucket_epoch_mutex_;
+    std::mutex bucket_epoch_confirmation_mutex_;
+    // Protected by the confirmation mutex; current-epoch cache hits bypass it.
+    std::optional<ErrorCode> bucket_epoch_confirmation_error_;
+    std::chrono::steady_clock::time_point
+        bucket_epoch_confirmation_retry_after_{};
+    UUID bucket_epoch_{};
+    std::set<UUID> retired_bucket_epochs_;
+    std::function<tl::expected<UUID, ErrorCode>()> master_epoch_provider_;
     mutable std::mutex bucket_cache_mutex_;
     // bucket id -> handle. The int key replaces a string-keyed lookup so the
     // common PrepareReadTasks path avoids a hash + lock per request.
