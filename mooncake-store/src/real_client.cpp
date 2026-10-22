@@ -4257,20 +4257,18 @@ RealClient::batch_get_buffer_internal(
     if (!valid_ops.empty()) {
         std::vector<std::string> batch_keys;
         std::vector<QueryResult> batch_query_results;
-        std::unordered_map<std::string, std::vector<Slice>> batch_slices;
+        std::vector<std::vector<Slice>> batch_slices;
+        std::vector<std::shared_ptr<void>> batch_buffer_owners;
         batch_keys.reserve(valid_ops.size());
         batch_query_results.reserve(valid_ops.size());
+        batch_slices.reserve(valid_ops.size());
+        batch_buffer_owners.reserve(valid_ops.size());
 
         for (auto &op : valid_ops) {
             batch_keys.push_back(op.key);
             batch_query_results.push_back(op.query_result);
-            batch_slices[op.key] = op.slices;
-        }
-
-        std::unordered_map<std::string, std::shared_ptr<void>>
-            batch_buffer_owners;
-        for (const auto &op : valid_ops) {
-            batch_buffer_owners.emplace(op.key, op.buffer_handle);
+            batch_slices.push_back(op.slices);
+            batch_buffer_owners.push_back(op.buffer_handle);
         }
         auto batch_get_results = client_->BatchGet(
             batch_keys, batch_query_results, batch_slices, false,
