@@ -136,8 +136,8 @@ std::vector<tl::expected<void, ErrorCode>> FinalizeSessionsByEpoch(
 }
 
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
-constexpr size_t kDefaultDfsWriteChunkSize = 256ULL * 1024 * 1024;
-constexpr size_t kDefaultDfsWriteArenaCount = 2;
+constexpr size_t kDefaultDfsWriteChunkSize = 1ULL * 1024 * 1024 * 1024;
+constexpr size_t kDefaultDfsWriteArenaSize = 8ULL * 1024 * 1024 * 1024;
 
 size_t ReadDfsWriteChunkSize() {
     using Variables = FileStorageEnvironmentVariables;
@@ -147,10 +147,10 @@ size_t ReadDfsWriteChunkSize() {
     return *configured > 0 ? static_cast<size_t>(*configured) : 0;
 }
 
-size_t ReadDfsWriteArenaCount() {
+size_t ReadDfsWriteArenaSize() {
     const auto configured = Environ::Read(
-        FileStorageEnvironmentVariables::MC_STORE_DFS_WRITE_ARENA_COUNT);
-    if (!configured.has_value()) return kDefaultDfsWriteArenaCount;
+        FileStorageEnvironmentVariables::MC_STORE_DFS_WRITE_ARENA_SIZE_BYTES);
+    if (!configured.has_value()) return kDefaultDfsWriteArenaSize;
     return *configured > 0 ? static_cast<size_t>(*configured) : 0;
 }
 
@@ -655,8 +655,8 @@ Client::Client(const std::string& local_hostname,
       object_checksum_enabled_(Environ::Get().GetStoreChecksumEnabled()),
       dfs_batch_put_timeout_ms_(Environ::GetUInt64(
           "MOONCAKE_DFS_BATCH_PUT_TIMEOUT_MS", 10000)),
-      dfs_write_arena_count_(ReadDfsWriteArenaCount()),
       dfs_write_chunk_size_(ReadDfsWriteChunkSize()),
+      dfs_write_arena_size_(ReadDfsWriteArenaSize()),
       dfs_write_arena_wait_(ReadDfsWriteArenaWait()),
       pinned_buffer_pool_(
           std::make_shared<PinnedBufferPool>(Environ::GetSizeT(
@@ -3530,7 +3530,7 @@ Client::AsyncDfsWriteContext::~AsyncDfsWriteContext() {
 bool Client::StageDfsWriteData(
     AsyncDfsWriteContext& context,
     const std::vector<const std::vector<Slice>*>& slice_lists) {
-    if (!context.staging_slot || !context.staging_slot->backing.data) return false;
+    if (!context.staging_slot || !context.staging_slot->data()) return false;
 
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
@@ -3551,15 +3551,14 @@ bool Client::StageDfsWriteData(
                 return false;
             }
 
-            if (staging_offset > context.staging_slot->backing.capacity ||
-                slice.size > context.staging_slot->backing.capacity -
+            if (staging_offset > context.staging_slot->capacity() ||
+                slice.size > context.staging_slot->capacity() -
                                  staging_offset) {
                 LOG(ERROR) << "DFS write staging arena exhausted for key "
                            << context.keys[i];
                 return false;
             }
-            char* destination =
-                context.staging_slot->backing.data + staging_offset;
+            char* destination = context.staging_slot->data() + staging_offset;
             staging_offset += slice.size;
 
             device::PointerInfo info{};
@@ -3811,8 +3810,23 @@ void Client::SubmitDfsWriteChunk(
         return;
     }
 
+    size_t staging_bytes = 0;
+    for (const auto* slices : slice_lists) {
+        if (slices == nullptr) {
+            throw std::invalid_argument("Missing slices for async DFS write");
+        }
+        for (const auto& slice : *slices) {
+            if (slice.size > std::numeric_limits<size_t>::max() - staging_bytes) {
+                throw std::overflow_error(
+                    "DFS write staging size overflow");
+            }
+            staging_bytes += slice.size;
+        }
+    }
+
     std::shared_ptr<AsyncDfsWriteContext> context;
     bool staged = false;
+    const size_t staging_allocation_bytes = std::max<size_t>(staging_bytes, 1);
     try {
         context = std::make_shared<AsyncDfsWriteContext>();
         context->deadline = deadline;
@@ -3820,17 +3834,11 @@ void Client::SubmitDfsWriteChunk(
         context->descriptors = descriptors;
         context->backend = std::move(backend);
         context->staging_pool = dfs_write_staging_pool_;
-        auto staging_wait = dfs_write_arena_wait_;
-        const auto now = std::chrono::steady_clock::now();
-        if (deadline != std::chrono::steady_clock::time_point::max()) {
-            const auto remaining =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    deadline > now ? deadline - now
-                                   : std::chrono::steady_clock::duration::zero());
-            staging_wait = std::min(staging_wait, remaining);
-        }
-        context->staging_slot =
-            context->staging_pool->Acquire(staging_wait, slot_timed_out);
+        // ARENA_WAIT_MS only controls admission to the staging arena. The DFS
+        // I/O deadline is checked after BatchWrite returns and must not cause
+        // an allocation held by a blocked I/O task to be released early.
+        context->staging_slot = context->staging_pool->Acquire(
+            staging_allocation_bytes, dfs_write_arena_wait_, slot_timed_out);
         if (!context->staging_slot) {
             throw std::runtime_error("DFS write staging slot unavailable");
         }
@@ -4004,7 +4012,7 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
         return;
     }
 
-    if (dfs_write_chunk_size_ == 0 || dfs_write_arena_count_ == 0) {
+    if (dfs_write_chunk_size_ == 0 || dfs_write_arena_size_ == 0) {
         std::vector<size_t> all_indices(ops.size());
         std::iota(all_indices.begin(), all_indices.end(), 0);
         SubmitDfsWriteChunk(ops, all_indices, is_upsert, false);
@@ -4022,6 +4030,21 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
                 op.transfer_summary.RecordFailure(
                     ReplicaType::DFS, ErrorCode::TRANSFER_FAIL);
                 op.AppendFailureContext("DFS write staging arena unavailable");
+            }
+        }
+        return;
+    }
+
+    if (dfs_write_arena_size_ < dfs_write_chunk_size_) {
+        LOG(ERROR) << "DFS write staging arena size " << dfs_write_arena_size_
+                   << " is smaller than chunk size " << dfs_write_chunk_size_;
+        for (auto& op : ops) {
+            if (!op.IsResolved() &&
+                op.transfer_summary.allocated_dfs_replicas > 0 &&
+                NonDfsTransfersSucceeded(op.transfer_summary)) {
+                op.transfer_summary.RecordFailure(
+                    ReplicaType::DFS, ErrorCode::TRANSFER_FAIL);
+                op.AppendFailureContext("DFS write staging arena is too small");
             }
         }
         return;
@@ -4078,7 +4101,7 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
         LOG(INFO) << "Async DFS write batch: total_payload_bytes="
                   << total_payload_bytes << ", chunks=" << chunks.size()
                   << ", chunk_limit_bytes=" << chunk_limit
-                  << ", arena_count=" << dfs_write_arena_count_
+                  << ", arena_size_bytes=" << dfs_write_arena_size_
                   << ", timeout_ms=" << timeout_ms;
     }
 
@@ -5345,12 +5368,16 @@ void Client::SetDfsStorageBackend(
     const bool bucket_backend =
         backend && backend->GetAllocatorType() == DfsAllocatorType::BUCKET;
     if (bucket_backend && dfs_write_chunk_size_ > 0 &&
-        dfs_write_arena_count_ > 0 && !dfs_write_staging_pool_) {
+        dfs_write_arena_size_ >= dfs_write_chunk_size_ &&
+        !dfs_write_staging_pool_) {
         dfs_write_staging_pool_ = std::make_shared<DfsWriteStagingPool>(
-            dfs_write_chunk_size_, dfs_write_arena_count_);
-        LOG(INFO) << "Initialized DFS write staging arenas: count="
-                  << dfs_write_arena_count_ << ", size="
-                  << dfs_write_chunk_size_;
+            dfs_write_arena_size_, protocol_);
+        LOG(INFO) << "Initialized DFS write staging arena: size="
+                  << dfs_write_arena_size_ << ", chunk_limit="
+                  << dfs_write_chunk_size_ << ", backing="
+                  << (dfs_write_staging_pool_->backing_is_pinned()
+                          ? "pinned"
+                          : "pageable");
     }
     if (backend) {
         backend->SetMasterEpochProvider(

@@ -1091,7 +1091,7 @@ class DfsBucketClientChunkLimitTest : public DfsBucketClientTest {
    protected:
     void ConfigureClientEnvironment() override {
         SetEnv("MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES", "16384");
-        SetEnv("MC_STORE_DFS_WRITE_ARENA_COUNT", "1");
+        SetEnv("MC_STORE_DFS_WRITE_ARENA_SIZE_BYTES", "32768");
     }
 };
 
@@ -1114,7 +1114,7 @@ class DfsBucketClientSlotTimeoutTest : public DfsBucketClientTest {
    protected:
     void ConfigureClientEnvironment() override {
         SetEnv("MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES", "4096");
-        SetEnv("MC_STORE_DFS_WRITE_ARENA_COUNT", "1");
+        SetEnv("MC_STORE_DFS_WRITE_ARENA_SIZE_BYTES", "4096");
         SetEnv("MC_STORE_DFS_WRITE_ARENA_WAIT_MS", "1");
     }
 };
@@ -1150,7 +1150,7 @@ class DfsBucketClientMultiChunkTest : public DfsBucketClientTest {
    protected:
     void ConfigureClientEnvironment() override {
         SetEnv("MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES", "4096");
-        SetEnv("MC_STORE_DFS_WRITE_ARENA_COUNT", "1");
+        SetEnv("MC_STORE_DFS_WRITE_ARENA_SIZE_BYTES", "8192");
     }
 };
 
