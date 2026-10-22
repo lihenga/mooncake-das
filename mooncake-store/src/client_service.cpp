@@ -2193,9 +2193,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetImpl(
         for (size_t i = 0; i < object_keys.size(); ++i) {
             if (results[i].has_value() &&
                 query_results[i].IsLeaseExpired(now)) {
-                LOG(WARNING)
-                    << "lease_expired_before_data_transfer_completed key="
-                    << object_keys[i];
                 results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
             }
         }
@@ -2440,11 +2437,27 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetImpl(
     }
 
     auto now = std::chrono::steady_clock::now();
-    for (size_t i = 0; i < object_keys.size(); ++i) {
-        if (results[i].has_value() && query_results[i].IsLeaseExpired(now)) {
-            LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
-                         << object_keys[i];
-            results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
+    size_t non_dfs_lease_expired_keys = 0;
+    for (const auto& [index, key, future, replica, cache_used] :
+         pending_transfers) {
+        if (results[index].has_value() &&
+            query_results[index].IsLeaseExpired(now)) {
+            ++non_dfs_lease_expired_keys;
+            results[index] = tl::unexpected(ErrorCode::BATCH_GET_LEASE_EXPIRED);
+        }
+    }
+    if (non_dfs_lease_expired_keys != 0) {
+        LOG(WARNING) << "BatchGet: non-DFS replicas expired, num_keys="
+                     << non_dfs_lease_expired_keys;
+    }
+    // Only validated reads from an initialized immutable bucket survive expiry.
+    const bool immutable_bucket =
+        dfs_storage_backend_ && dfs_storage_backend_->IsInitialized() &&
+        dfs_storage_backend_->GetAllocatorType() == DfsAllocatorType::BUCKET;
+    for (size_t index : dfs_read_indices) {
+        if (results[index].has_value() && !immutable_bucket &&
+            query_results[index].IsLeaseExpired(now)) {
+            results[index] = tl::unexpected(ErrorCode::BATCH_GET_LEASE_EXPIRED);
         }
     }
 
