@@ -47,6 +47,7 @@ static void freeCudaBuffer(void* addr) {
 TEST(NvlinkTransportTest, WriteAndRead) {
     const size_t kDataLength = 4096000;
     int gpu_id = FLAGS_gpu_id;
+    const std::string location = GPU_PREFIX + std::to_string(gpu_id);
 
     // Server (target) setup
     auto server_engine = std::make_unique<TransferEngine>(false);
@@ -60,7 +61,7 @@ TEST(NvlinkTransportTest, WriteAndRead) {
 
     void* server_buffer = allocateCudaBuffer(kDataLength * 2, gpu_id);
     int rc = server_engine->registerLocalMemory(server_buffer, kDataLength * 2,
-                                                "cuda:0");
+                                                location);
     ASSERT_EQ(rc, 0);
 
     // Client (initiator) setup
@@ -78,7 +79,7 @@ TEST(NvlinkTransportTest, WriteAndRead) {
 
     void* client_buffer = allocateCudaBuffer(kDataLength * 2, gpu_id);
     rc = client_engine->registerLocalMemory(client_buffer, kDataLength * 2,
-                                            "cuda:" + std::to_string(gpu_id));
+                                            location);
     ASSERT_EQ(rc, 0);
 
     // Write: client -> server
