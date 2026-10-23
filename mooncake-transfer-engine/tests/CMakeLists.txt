@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
+
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 
 set(WORKSPACE "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -54,8 +55,8 @@ add_test(NAME rdma_endpoint_state_test COMMAND rdma_endpoint_state_test)
 
 # Regression test for the reconnect storm of issue #3299: repeated local
 # completion faults toward one peer RNIC must pause that path instead of
-# re-handshaking it forever. The rail monitor is plain per-worker-pool state,
-# so this runs on every CI runner without an RDMA device.
+# re-handshaking it forever. The rail monitor is plain per-worker-pool state, so
+# this runs on every CI runner without an RDMA device.
 add_executable(worker_pool_rail_state_test
                ${WORKSPACE}/worker_pool_rail_state_test.cpp)
 target_link_libraries(worker_pool_rail_state_test PUBLIC transfer_engine gtest
@@ -113,27 +114,43 @@ add_executable(rdma_endpoint_reestablish_test
 target_link_libraries(rdma_endpoint_reestablish_test PUBLIC transfer_engine
                                                             gtest gtest_main)
 if(UNIX AND NOT APPLE)
-  target_link_options(
-    rdma_endpoint_reestablish_test PRIVATE "-Wl,--wrap=ibv_modify_qp"
-    "-Wl,--wrap=ibv_query_gid" "-Wl,--wrap=_ibv_query_gid_ex")
+  if(BUILD_SHARED_LIBS)
+    # --wrap only rewrites references at link time, not calls inside a DSO.
+    target_compile_definitions(rdma_endpoint_reestablish_test
+                               PRIVATE MC_TEST_INTERPOSE_VERBS)
+    target_link_libraries(rdma_endpoint_reestablish_test
+                          PRIVATE ${CMAKE_DL_LIBS})
+    target_link_options(rdma_endpoint_reestablish_test PRIVATE
+                        "-Wl,--export-dynamic")
+  else()
+    target_link_options(
+      rdma_endpoint_reestablish_test PRIVATE "-Wl,--wrap=ibv_modify_qp"
+      "-Wl,--wrap=ibv_query_gid" "-Wl,--wrap=_ibv_query_gid_ex")
+  endif()
 endif()
 add_test(NAME rdma_endpoint_reestablish_test
          COMMAND rdma_endpoint_reestablish_test)
 set_tests_properties(rdma_endpoint_reestablish_test PROPERTIES LABELS "rdma")
 
 # Regression test for the edge-triggered async event fd: one epoll wakeup must
-# drain the whole queue. Wraps ibv_get_async_event to script the event source,
-# so it needs no RDMA device. -Wl,--wrap is a GNU ld / lld feature that Apple's
-# linker lacks, and the test is meaningless without it, so skip the target there
-# rather than build one that calls the real symbols.
+# drain the whole queue. Replaces ibv_get_async_event to script the event
+# source, so it needs no RDMA device. Uses ELF interposition for shared builds
+# and GNU linker wrapping for static builds; neither is supported here on Apple.
 if(UNIX AND NOT APPLE)
   add_executable(rdma_async_event_drain_test
                  ${WORKSPACE}/rdma_async_event_drain_test.cpp)
   target_link_libraries(rdma_async_event_drain_test PUBLIC transfer_engine
                                                            gtest gtest_main)
-  target_link_options(
-    rdma_async_event_drain_test PRIVATE "-Wl,--wrap=ibv_get_async_event"
-    "-Wl,--wrap=ibv_ack_async_event")
+  if(BUILD_SHARED_LIBS)
+    target_compile_definitions(rdma_async_event_drain_test
+                               PRIVATE MC_TEST_INTERPOSE_VERBS)
+    target_link_options(rdma_async_event_drain_test PRIVATE
+                        "-Wl,--export-dynamic")
+  else()
+    target_link_options(
+      rdma_async_event_drain_test PRIVATE "-Wl,--wrap=ibv_get_async_event"
+      "-Wl,--wrap=ibv_ack_async_event")
+  endif()
   add_test(NAME rdma_async_event_drain_test COMMAND rdma_async_event_drain_test)
 endif()
 

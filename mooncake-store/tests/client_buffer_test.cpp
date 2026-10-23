@@ -213,6 +213,7 @@ TEST_F(ClientBufferTest, AlignedExternalAllocationPreservesDeviceAlias) {
     void* device_base = device_alias.data() + 1;
     auto allocator = ClientBufferAllocator::create(host_base, host.size() - 1,
                                                    "", device_base);
+    const auto before = allocator->storageReport();
 
     auto allocation = allocator->allocate_aligned(kAllocationSize, kAlignment);
     ASSERT_TRUE(allocation.has_value());
@@ -225,7 +226,12 @@ TEST_F(ClientBufferTest, AlignedExternalAllocationPreservesDeviceAlias) {
               static_cast<char*>(device_base) + offset);
 
     allocation.reset();
-    EXPECT_TRUE(allocator->allocate(host.size() - 1).has_value());
+    const auto after = allocator->storageReport();
+    EXPECT_EQ(after.totalFreeSpace, before.totalFreeSpace);
+    EXPECT_EQ(after.largestFreeRegion, before.largestFreeRegion);
+    // Requests round up to allocator bins; the raw backing size need not be
+    // a representable bin. Check that the largest original bin is reusable.
+    EXPECT_TRUE(allocator->allocate(before.largestFreeRegion).has_value());
 }
 
 TEST_F(ClientBufferTest, StorageReportOfZeroSizeAllocatorIsEmpty) {

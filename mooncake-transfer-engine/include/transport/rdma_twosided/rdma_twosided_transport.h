@@ -35,6 +35,7 @@ class CtrlChannel;
 // "rdma_twosided" (mutually exclusive with classic "rdma" in MultiTransport).
 class RdmaTwoSidedTransport : public RdmaTransport {
     friend class CtrlChannel;
+    friend class RdmaTwoSidedTransportTestPeer;
 
    public:
     using NotifyDesc = TransferMetadata::NotifyDesc;
