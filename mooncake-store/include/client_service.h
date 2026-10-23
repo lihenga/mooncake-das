@@ -1034,9 +1034,8 @@ class Client {
      *
      * The background task must not reference the caller's CPU or GPU buffers,
      * which may be freed or overwritten as soon as BatchPut returns. All slice
-     * bytes are copied into one dynamically allocated region of the fixed-size
-     * staging arena before the task is queued, and `slices` points into that
-     * region.
+     * bytes are copied into one fixed-capacity arena slot before the task is
+     * queued, and `slices` points into that slot.
      *
      * `backend` and `staging_pool` are held by shared_ptr so the task keeps
      * them alive while the write is in flight.
@@ -1148,8 +1147,8 @@ class Client {
     const std::string protocol_;
     const bool object_checksum_enabled_;
     const uint64_t dfs_batch_put_timeout_ms_;
+    const size_t dfs_write_arena_count_;
     const size_t dfs_write_chunk_size_;
-    const size_t dfs_write_arena_size_;
     const std::chrono::milliseconds dfs_write_arena_wait_;
 
     // Explicitly enabled by the serving application after setup. This reporter

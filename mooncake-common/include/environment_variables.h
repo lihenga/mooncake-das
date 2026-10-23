@@ -20,9 +20,9 @@ struct FileStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(int64_t, MC_STORE_DFS_RESTORE_CHUNK_SIZE_BYTES);
     // Fixed host staging arena and maximum payload bytes per async DFS chunk.
     MC_DEFINE_ENV_VAR(int64_t, MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES);
-    // Total bytes available for asynchronous DFS write staging.
-    MC_DEFINE_ENV_VAR(int64_t, MC_STORE_DFS_WRITE_ARENA_SIZE_BYTES);
-    // Maximum time to wait for asynchronous DFS write staging space.
+    // Number of asynchronous DFS write staging slots.
+    MC_DEFINE_ENV_VAR(int64_t, MC_STORE_DFS_WRITE_ARENA_COUNT);
+    // Maximum time to wait for an asynchronous DFS write staging slot.
     MC_DEFINE_ENV_VAR(int64_t, MC_STORE_DFS_WRITE_ARENA_WAIT_MS);
     MC_DEFINE_ENV_VAR(int64_t, MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT);

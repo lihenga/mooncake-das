@@ -134,9 +134,6 @@ Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_
 | `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR` | `bucket_storage_backend` | Storage backend type (see below) |
 | `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` | `1342177280` (1.25 GB) | Client-side staging buffer size |
 | `MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES` | `0` | Size of the additional preallocated pinned-host arena for same-process SSD-to-GPU restores. See the constraints below |
-| `MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES` | `1073741824` (1 GiB) | Maximum logical payload size of one asynchronous BUCKET DFS write chunk. Objects larger than this limit fail individually; a chunk is submitted as soon as its object-boundary payload reaches the available size and is not required to fill this limit |
-| `MC_STORE_DFS_WRITE_ARENA_SIZE_BYTES` | `8589934592` (8 GiB) | Total fixed host-memory capacity shared by asynchronous BUCKET DFS write staging allocations. Each chunk allocates its actual payload size from this arena; allocator alignment and granularity are charged against the same capacity |
-| `MC_STORE_DFS_WRITE_ARENA_WAIT_MS` | `10000` | Maximum time to wait for enough free contiguous space in the DFS write arena. This is an admission wait only; it does not cancel or release a region held by an in-flight DFS I/O |
 | `MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT` | `20000` | Max keys processed per iteration when scanning existing SSD metadata on startup |
 | `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` | `2199023255552` (2 TB) | Maximum disk usage |
 | `MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT` | `10000000` | Maximum number of objects on disk |
