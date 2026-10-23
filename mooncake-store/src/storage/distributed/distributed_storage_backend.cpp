@@ -716,7 +716,7 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeRead() {
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
     }
-    SetDfsReadTimedOut(false);
+    dfs_read_timed_out_.store(false, std::memory_order_release);
     return {};
 }
 
@@ -1932,10 +1932,10 @@ DistributedStorageBackend::BatchReadBlocking(
     return results;
 }
 
-ErrorCode DistributedStorageBackend::AcquireInflightReadUntil(
+bool DistributedStorageBackend::AcquireInflightReadUntil(
     uint64_t bytes, std::chrono::steady_clock::time_point deadline) {
     if (bytes > distributed_config_.batch_get_max_inflight_bytes) {
-        return ErrorCode::DFS_BATCH_GET_ADMISSION_TIMEOUT;
+        return false;
     }
 
     std::unique_lock lock(inflight_read_mutex_);
@@ -1945,28 +1945,15 @@ ErrorCode DistributedStorageBackend::AcquireInflightReadUntil(
                inflight_read_bytes_ <=
                    distributed_config_.batch_get_max_inflight_bytes - bytes;
     };
-    const auto capacity_available_or_dfs_timed_out =
-        [this, &capacity_available] {
-            return capacity_available() ||
-                   dfs_read_timed_out_.load(std::memory_order_acquire);
-        };
-    while (true) {
-        if (dfs_read_timed_out_.load(std::memory_order_acquire)) {
-            return ErrorCode::DFS_BATCH_GET_TIMEOUT;
-        }
-        if (capacity_available()) {
-            ++inflight_read_batches_;
-            inflight_read_bytes_ += bytes;
-            return ErrorCode::OK;
-        }
-        if (deadline == std::chrono::steady_clock::time_point::max()) {
-            inflight_read_cv_.wait(lock,
-                                   capacity_available_or_dfs_timed_out);
-        } else if (!inflight_read_cv_.wait_until(
-                       lock, deadline, capacity_available_or_dfs_timed_out)) {
-            return ErrorCode::DFS_BATCH_GET_ADMISSION_TIMEOUT;
-        }
+    if (deadline == std::chrono::steady_clock::time_point::max()) {
+        inflight_read_cv_.wait(lock, capacity_available);
+    } else if (!inflight_read_cv_.wait_until(lock, deadline,
+                                             capacity_available)) {
+        return false;
     }
+    ++inflight_read_batches_;
+    inflight_read_bytes_ += bytes;
+    return true;
 }
 
 void DistributedStorageBackend::ReleaseInflightRead(uint64_t bytes) {
@@ -1976,17 +1963,6 @@ void DistributedStorageBackend::ReleaseInflightRead(uint64_t bytes) {
         CHECK_GE(inflight_read_bytes_, bytes);
         --inflight_read_batches_;
         inflight_read_bytes_ -= bytes;
-    }
-    inflight_read_cv_.notify_all();
-}
-
-void DistributedStorageBackend::SetDfsReadTimedOut(bool timed_out) {
-    {
-        // Serialize latch changes with admission so a request cannot acquire a
-        // slot between observing the old latch value and incrementing the
-        // in-flight counters.
-        std::lock_guard lock(inflight_read_mutex_);
-        dfs_read_timed_out_.store(timed_out, std::memory_order_release);
     }
     inflight_read_cv_.notify_all();
 }
@@ -2030,21 +2006,18 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
         base_timeout_ms == 0
             ? std::chrono::steady_clock::time_point::max()
             : DfsIoDeadlineFromNow(timeout_ms);
-    const ErrorCode admission_result =
-        AcquireInflightReadUntil(inflight_bytes, admission_deadline);
-    if (admission_result != ErrorCode::OK) {
+    if (!AcquireInflightReadUntil(inflight_bytes, admission_deadline)) {
         LOG_EVERY_N(WARNING, 64)
-            << "DFS BatchGet admission rejected: reason="
-            << (admission_result == ErrorCode::DFS_BATCH_GET_TIMEOUT
-                    ? "dfs_read_timeout_latched"
-                    : "inflight_capacity_deadline_expired")
-            << ", request_bytes=" << inflight_bytes << ", max_batches="
+            << "DFS BatchGet admission timed out waiting for in-flight "
+               "capacity: "
+            << "request_bytes=" << inflight_bytes << ", max_batches="
             << distributed_config_.batch_get_max_inflight_batches
             << ", max_bytes="
-            << distributed_config_.batch_get_max_inflight_bytes
-            << ", error=" << admission_result;
+            << distributed_config_.batch_get_max_inflight_bytes;
         return std::vector<tl::expected<void, ErrorCode>>(
-            requests.size(), tl::make_unexpected(admission_result));
+            requests.size(),
+            tl::make_unexpected(
+                ErrorCode::DFS_BATCH_GET_ADMISSION_TIMEOUT));
     }
 
     if (base_timeout_ms == 0 || !all_buffers_owned) {
@@ -2127,7 +2100,7 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     }
 
     if (std::chrono::steady_clock::now() >= deadline) {
-        SetDfsReadTimedOut(true);
+        dfs_read_timed_out_.store(true, std::memory_order_release);
         const auto elapsed_ms = std::chrono::duration_cast<
             std::chrono::milliseconds>(std::chrono::steady_clock::now() -
                                        request_start)
@@ -2187,7 +2160,7 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
         lock, deadline, [&context] { return context->done; });
     const auto finished_at = std::chrono::steady_clock::now();
     if (!completed_before_deadline || context->completed_at > deadline) {
-        SetDfsReadTimedOut(true);
+        dfs_read_timed_out_.store(true, std::memory_order_release);
         const auto elapsed_ms = std::chrono::duration_cast<
             std::chrono::milliseconds>(finished_at - request_start)
                                      .count();

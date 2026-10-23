@@ -3,7 +3,6 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
-#include <atomic>
 #include <barrier>
 #include <chrono>
 #include <cstdio>
@@ -11,7 +10,6 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
-#include <future>
 #include <fcntl.h>
 #include <limits>
 #include <memory>
@@ -464,8 +462,7 @@ class RealClientDfsPrefetchTest : public RealClientTest {
         return static_cast<int>(toInt(ErrorCode::NO_AVAILABLE_HANDLE));
     }
 
-    void InstallBucketReadHook(std::function<void()> hook,
-                               uint64_t read_timeout_ms = 10000) {
+    void InstallBucketReadHook(std::function<void()> hook) {
         FileStorageConfig file_config;
         file_config.storage_backend_type = StorageBackendType::kDistributed;
         file_config.storage_filepath = ssd_path_;
@@ -473,7 +470,6 @@ class RealClientDfsPrefetchTest : public RealClientTest {
         config.fsdir = ssd_path_;
         config.allocator_type = DfsAllocatorType::BUCKET;
         config.fs_adapter_type = "posix";
-        config.batch_get_timeout_ms = read_timeout_ms;
         auto adapter = std::make_unique<CompletionReadAdapter>();
         adapter->after_read = std::move(hook);
         auto backend = std::make_shared<DistributedStorageBackend>(
@@ -676,135 +672,6 @@ TEST_F(RealClientLeasePrefetchTest,
               std::vector<int>{NoAvailableHandle()});
     EXPECT_TRUE(py_client_->get_session_prefetch_cache_.empty());
     EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
-}
-
-TEST_F(RealClientDfsPrefetchTest, DfsBatchGetIntoPreservesDuplicateTargets) {
-    DfsPrefetchTestEnv dfs_env;
-    ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
-    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES", "0");
-    const std::vector<std::string> keys{"dfs_into_duplicates"};
-    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17838", keys));
-    std::vector<std::string> outputs(2, std::string(sources_[0].size(), '?'));
-    for (auto& output : outputs) {
-        ASSERT_EQ(py_client_->register_buffer(output.data(), output.size()), 0);
-    }
-    const auto results = py_client_->batch_get_into(
-        {keys[0], keys[0]}, {outputs[0].data(), outputs[1].data()},
-        {outputs[0].size(), outputs[1].size()});
-    EXPECT_EQ(results, std::vector<int64_t>(2, sources_[0].size()));
-    EXPECT_EQ(outputs[0], sources_[0]);
-    EXPECT_EQ(outputs[1], sources_[0]);
-    for (auto& output : outputs) {
-        EXPECT_EQ(py_client_->unregister_buffer(output.data()), 0);
-    }
-}
-
-TEST_F(RealClientDfsPrefetchTest, DfsSessionRangesPreserveDuplicateRequests) {
-    DfsPrefetchTestEnv dfs_env;
-    ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
-    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES", "0");
-    const std::vector<std::string> keys{"dfs_range_duplicates"};
-    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17839", keys));
-    ASSERT_EQ(py_client_->batch_get_session_start(keys), std::vector<int>{0});
-    SetSessionDeadline(keys[0], std::chrono::steady_clock::time_point::max());
-    std::vector<std::string> outputs{std::string(512, '?'),
-                                     std::string(333, '?'),
-                                     std::string(777, '?')};
-    for (auto& output : outputs) {
-        ASSERT_EQ(py_client_->register_buffer(output.data(), output.size()), 0);
-    }
-    // The invalid middle operation must not shift the two valid requests.
-    const auto results = py_client_->batch_get_into_multi_buffer_ranges(
-        {keys[0], keys[0], keys[0]},
-        {{outputs[0].data()}, {outputs[1].data()}, {outputs[2].data()}},
-        {{outputs[0].size()}, {outputs[1].size()}, {outputs[2].size()}},
-        {{127}, {sources_[0].size()}, {2048}});
-    EXPECT_EQ(results,
-              (std::vector<int>{512, toInt(ErrorCode::INVALID_PARAMS), 777}));
-    EXPECT_EQ(outputs[0], sources_[0].substr(127, 512));
-    EXPECT_EQ(outputs[1], std::string(333, '?'));
-    EXPECT_EQ(outputs[2], sources_[0].substr(2048, 777));
-    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
-    for (auto& output : outputs) {
-        EXPECT_EQ(py_client_->unregister_buffer(output.data()), 0);
-    }
-}
-
-TEST_F(RealClientDfsPrefetchTest, DuplicateDfsTimeoutKeepsTemporaryBuffersAlive) {
-    DfsPrefetchTestEnv dfs_env;
-    ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
-    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES", "0");
-    ScopedEnvVar timeout("MOONCAKE_DFS_BATCH_GET_TIMEOUT_MS", "100");
-    const std::vector<std::string> keys{"dfs_duplicate_timeout"};
-    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17840", keys));
-    // Ordinary reads, duplicate ranges in one chunk, then one range per chunk.
-    for (int chunk_size : {0, 8192, 4096}) {
-        SCOPED_TRACE(chunk_size);
-        const auto chunk_bytes =
-            std::to_string(chunk_size == 0 ? 8192 : chunk_size);
-        ScopedEnvVar restore_chunk("MC_STORE_DFS_RESTORE_CHUNK_SIZE_BYTES",
-                                   chunk_bytes.c_str());
-        std::vector<std::string> outputs(2, std::string(sources_[0].size(), '?'));
-        for (auto& output : outputs) {
-            ASSERT_EQ(py_client_->register_buffer(output.data(), output.size()),
-                      0);
-        }
-        // A destroyed promise also wakes wait(), so a fatal assertion cannot
-        // strand the worker and deadlock fixture teardown.
-        std::promise<void> release;
-        auto released = release.get_future().share();
-        auto reads = std::make_shared<std::atomic<size_t>>(0);
-        ASSERT_NO_FATAL_FAILURE(InstallBucketReadHook(
-            [released, reads] {
-                ++*reads;
-                released.wait();
-            },
-            100));
-        const auto free_before =
-            py_client_->client_buffer_allocator_->storageReport().totalFreeSpace;
-        std::vector<int64_t> results;
-        if (chunk_size != 0) {
-            ASSERT_EQ(py_client_->batch_get_session_start(keys),
-                      std::vector<int>{0});
-            SetSessionDeadline(keys[0],
-                               std::chrono::steady_clock::time_point::max());
-            auto range_results = py_client_->batch_get_into_multi_buffer_ranges(
-                {keys[0], keys[0]}, {{outputs[0].data()}, {outputs[1].data()}},
-                {{outputs[0].size()}, {outputs[1].size()}}, {{0}, {0}});
-            results.assign(range_results.begin(), range_results.end());
-        } else {
-            results = py_client_->batch_get_into(
-                {keys[0], keys[0]}, {outputs[0].data(), outputs[1].data()},
-                {outputs[0].size(), outputs[1].size()});
-        }
-        EXPECT_EQ(results, std::vector<int64_t>(
-                               2, toInt(ErrorCode::DFS_BATCH_GET_TIMEOUT)));
-        EXPECT_GE(reads->load(), 1u);
-        const size_t live_objects = chunk_size == 4096 ? 1 : 2;
-        EXPECT_LE(py_client_->client_buffer_allocator_->storageReport()
-                      .totalFreeSpace,
-                  free_before - live_objects * sources_[0].size());
-        release.set_value();
-        const auto deadline =
-            std::chrono::steady_clock::now() + std::chrono::seconds(5);
-        while (py_client_->client_buffer_allocator_->storageReport()
-                       .totalFreeSpace != free_before &&
-               std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-        EXPECT_EQ(py_client_->client_buffer_allocator_->storageReport()
-                      .totalFreeSpace,
-                  free_before);
-        if (chunk_size == 4096) {
-            // A timeout in the first chunk must skip the remaining chunk.
-            EXPECT_EQ(reads->load(), 1u);
-        }
-        EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
-        for (auto& output : outputs) {
-            EXPECT_EQ(output, std::string(sources_[0].size(), '?'));
-            EXPECT_EQ(py_client_->unregister_buffer(output.data()), 0);
-        }
-    }
 }
 
 TEST_F(RealClientDfsPrefetchTest, FailsWithoutArenaAndOrdinaryReadWorks) {
@@ -3801,65 +3668,6 @@ TEST_F(RealClientTest, PutBatchThenBatchGetBuffer) {
                   *expected[i])
             << "Data mismatch for key " << keys[i];
     }
-}
-
-TEST_F(RealClientTest, BatchGetBufferSupportsDuplicateKeys) {
-    StartMasterAndSetupClient();
-
-    const std::string key = "batch_get_duplicate_key";
-    const std::string value = "duplicate-key-value";
-    ReplicateConfig config;
-    config.replica_num = 1;
-    ASSERT_EQ(py_client_->put(
-                  key, std::span<const char>(value.data(), value.size()),
-                  config),
-              0);
-
-    auto handles = py_client_->batch_get_buffer({key, key});
-    ASSERT_EQ(handles.size(), 2u);
-    ASSERT_NE(handles[0], nullptr);
-    ASSERT_NE(handles[1], nullptr);
-    EXPECT_NE(handles[0]->ptr(), handles[1]->ptr());
-    for (const auto &handle : handles) {
-        EXPECT_EQ(std::string(static_cast<const char *>(handle->ptr()),
-                              handle->size()),
-                  value);
-    }
-}
-
-TEST_F(RealClientTest, BatchGetIntoSupportsDuplicateKeys) {
-    StartMasterAndSetupClient();
-
-    const std::string key = "batch_get_into_duplicate_key";
-    const std::string value = "duplicate-key-into-value";
-    ReplicateConfig config;
-    config.replica_num = 1;
-    ASSERT_EQ(py_client_->put(
-                  key, std::span<const char>(value.data(), value.size()),
-                  config),
-              0);
-
-    auto first_result =
-        py_client_->client_buffer_allocator_->allocate(value.size());
-    auto second_result =
-        py_client_->client_buffer_allocator_->allocate(value.size());
-    ASSERT_TRUE(first_result.has_value());
-    ASSERT_TRUE(second_result.has_value());
-    BufferHandle first = std::move(*first_result);
-    BufferHandle second = std::move(*second_result);
-    std::memset(first.ptr(), 0, first.size());
-    std::memset(second.ptr(), 0, second.size());
-
-    auto results = py_client_->batch_get_into(
-        {key, key}, {first.ptr(), second.ptr()}, {first.size(), second.size()});
-    ASSERT_EQ(results.size(), 2u);
-    EXPECT_EQ(results[0], static_cast<int64_t>(value.size()));
-    EXPECT_EQ(results[1], static_cast<int64_t>(value.size()));
-    EXPECT_EQ(std::string(static_cast<const char *>(first.ptr()), first.size()),
-              value);
-    EXPECT_EQ(
-        std::string(static_cast<const char *>(second.ptr()), second.size()),
-        value);
 }
 
 // ===================== HealthCheck Tests =====================

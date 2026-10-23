@@ -231,19 +231,6 @@ class Client {
             dfs_buffer_owners = nullptr);
 
     /**
-     * @brief Transfers data using operation-aligned inputs.
-     *
-     * Unlike the key-indexed overload, this form preserves independent slices
-     * and lifetime owners when object_keys contains duplicate keys.
-     */
-    std::vector<tl::expected<void, ErrorCode>> BatchGet(
-        const std::vector<std::string>& object_keys,
-        const std::vector<QueryResult>& query_results,
-        std::vector<std::vector<Slice>>& batched_slices,
-        bool prefer_same_node = false,
-        const std::vector<std::shared_ptr<void>>* dfs_buffer_owners = nullptr);
-
-    /**
      * @brief Stores data with replication
      * @param key Object key
      * @param slices Vector of data slices to store
@@ -866,9 +853,10 @@ class Client {
     std::vector<tl::expected<void, ErrorCode>> BatchGetImpl(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
-        std::vector<std::vector<Slice>>& batched_slices,
+        std::unordered_map<std::string, std::vector<Slice>>& slices,
         bool prefer_same_node,
-        const std::vector<std::shared_ptr<void>>* dfs_buffer_owners);
+        const std::unordered_map<std::string, std::shared_ptr<void>>*
+            dfs_buffer_owners);
 
     friend class test::DfsBucketClientTest;
 
@@ -1103,7 +1091,7 @@ class Client {
     std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
-        std::vector<std::vector<Slice>>& batched_slices);
+        std::unordered_map<std::string, std::vector<Slice>>& slices);
     ReplicateConfig AttachConfig(const ReplicateConfig& config) const;
 
     // Client identification
