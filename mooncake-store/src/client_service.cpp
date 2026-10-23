@@ -43,6 +43,9 @@
 #include "transport/transport.h"
 #include "config.h"
 #include "ha/leadership/leader_coordinator_factory.h"
+#ifdef MOONCAKE_ENABLE_TEST_FAILPOINTS
+#include "ha/oplog/oplog_test_failpoint.h"
+#endif
 #include "types.h"
 #include "client_buffer.h"
 #include "utils.h"
@@ -3960,6 +3963,9 @@ void Client::SubmitDfsWriteChunk(
                 service_pending_writes_.push_back(context);
             }
         }
+#ifdef MOONCAKE_ENABLE_TEST_FAILPOINTS
+        TestFailPoint::Wait("dfs_write_before_enqueue");
+#endif
         write_thread_pool_.enqueue([this, context, release_inflight]() {
             try {
                 RunAsyncDfsWrite(context);
@@ -3973,16 +3979,23 @@ void Client::SubmitDfsWriteChunk(
             release_inflight();
         });
     } catch (const std::exception& e) {
-        // The pool was stopped between the shutdown check and the enqueue.
+        // Enqueue may fail after the reporter has already settled the deadline.
         LOG(ERROR) << "Failed to enqueue async DFS write: " << e.what();
         release_inflight();
-        if (!context->service_metrics_settled.exchange(true)) {
+        const bool metrics_already_settled =
+            context->service_metrics_settled.exchange(true);
+        if (!metrics_already_settled) {
             for (const auto& metric : context->service_dual_writes) {
                 if (metric.eligible) CancelServiceDualWritePending();
             }
         }
         for (const size_t index : op_indices) {
             auto& op = ops[index];
+            if (metrics_already_settled && op.service_dual_write_eligible) {
+                // The reporter owns this completion; the foreground must not
+                // count it again when it handles the rejected write.
+                op.service_metric_recorded = true;
+            }
             op.transfer_summary.RecordFailure(
                 ReplicaType::DFS, ErrorCode::DFS_SERVICE_UNAVAILABLE);
             op.AppendFailureContext("Failed to enqueue async DFS write");
