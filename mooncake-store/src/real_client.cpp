@@ -6186,15 +6186,17 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     // Prepare batch transfer data structures
     std::vector<std::string> batch_keys;
     std::vector<QueryResult> batch_query_results;
-    std::unordered_map<std::string, std::vector<Slice>> batch_slices;
+    // Operation-aligned: duplicate keys may target different user buffers.
+    std::vector<std::vector<Slice>> batch_slices;
 
     batch_keys.reserve(valid_operations.size());
     batch_query_results.reserve(valid_operations.size());
+    batch_slices.reserve(valid_operations.size());
 
     for (const auto &op : valid_operations) {
         batch_keys.push_back(op.key);
         batch_query_results.push_back(op.query_result);
-        batch_slices[op.key] = op.slices;
+        batch_slices.push_back(op.slices);
     }
     if (!valid_operations.empty()) {
         // Execute batch transfer
@@ -6218,10 +6220,16 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     if (!disk_operations.empty()) {
         std::vector<std::string> disk_batch_keys;
         std::vector<QueryResult> disk_batch_qrs;
-        std::unordered_map<std::string, std::vector<Slice>> disk_batch_slices;
+        // Keep slices and owners aligned by operation; a key is not an
+        // operation identifier and may legitimately occur more than once.
+        std::vector<std::vector<Slice>> disk_batch_slices;
         std::vector<size_t> disk_batch_indices;
-        std::unordered_map<std::string, std::shared_ptr<BufferHandle>>
-            disk_temp_handles;
+        std::vector<std::shared_ptr<BufferHandle>> disk_temp_handles;
+        disk_batch_keys.reserve(disk_operations.size());
+        disk_batch_qrs.reserve(disk_operations.size());
+        disk_batch_slices.reserve(disk_operations.size());
+        disk_batch_indices.reserve(disk_operations.size());
+        disk_temp_handles.reserve(disk_operations.size());
 
         for (size_t di = 0; di < disk_operations.size(); ++di) {
             auto &op = disk_operations[di];
@@ -6245,16 +6253,16 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             disk_batch_keys.push_back(op.key);
             disk_batch_qrs.push_back(
                 FilterQueryResult(op.query_result, replica));
-            disk_batch_slices[op.key] = std::move(disk_slices);
+            disk_batch_slices.push_back(std::move(disk_slices));
             disk_batch_indices.push_back(di);
-            disk_temp_handles.emplace(op.key, std::move(handle));
+            disk_temp_handles.push_back(std::move(handle));
         }
 
         if (!disk_batch_keys.empty()) {
-            std::unordered_map<std::string, std::shared_ptr<void>>
-                disk_buffer_owners;
-            for (const auto &[key, handle] : disk_temp_handles) {
-                disk_buffer_owners.emplace(key, handle);
+            std::vector<std::shared_ptr<void>> disk_buffer_owners;
+            disk_buffer_owners.reserve(disk_temp_handles.size());
+            for (const auto &handle : disk_temp_handles) {
+                disk_buffer_owners.push_back(handle);
             }
             auto disk_results = client_->BatchGet(
                 disk_batch_keys, disk_batch_qrs, disk_batch_slices, false,
@@ -6263,7 +6271,6 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             for (size_t di = 0; di < disk_batch_indices.size(); ++di) {
                 const auto &key = disk_batch_keys[di];
                 auto &op = disk_operations[disk_batch_indices[di]];
-                auto handle_it = disk_temp_handles.find(key);
                 const char *replica_type =
                     op.replica.is_dfs_replica() ? "DFS" : "DISK";
                 if (!disk_results[di]) {
@@ -6276,7 +6283,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                 }
                 if (auto r = scatter_host_to_maybe_device(
                         op.dst_buffer,
-                        static_cast<char *>(handle_it->second->ptr()),
+                        static_cast<char *>(disk_temp_handles[di]->ptr()),
                         op.total_size,
                         std::string(replica_type) + " read, key: " + key);
                     !r) {
