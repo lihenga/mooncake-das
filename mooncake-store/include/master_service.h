@@ -2854,6 +2854,9 @@ class MasterService {
     std::atomic<uint8_t> dfs_filter_mode_{0};
     bool enable_dfs_bucket_recovery_{false};
     bool dfs_restore_from_bucket_metadata_{true};
+    // Shared with the allocator's recovery pass: see
+    // DistributedStorageConfig::recovery_max_duration_seconds. 0 disables it.
+    int64_t dfs_recovery_max_duration_seconds_{0};
     double dfs_bucket_low_utilization_threshold_{0.05};
     int dfs_bucket_low_utilization_evictions_per_tick_{1};
     int dfs_bucket_low_utilization_attempts_per_tick_{8};

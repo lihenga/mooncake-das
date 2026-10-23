@@ -382,15 +382,15 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
                         static_cast<int>(config.max_bucket_count)));
     config.ready_bucket_target = Environ::GetInt(
         "MOONCAKE_DFS_READY_BUCKET_COUNT", config.ready_bucket_target);
-    config.bucket_create_concurrency =
-        Environ::GetInt("MOONCAKE_DFS_BUCKET_CREATE_CONCURRENCY",
-                        config.bucket_create_concurrency);
     config.recovery_max_buckets = static_cast<int64_t>(Environ::GetInt(
         "MOONCAKE_DFS_RECOVERY_MAX_BUCKETS",
         static_cast<int>(config.recovery_max_buckets)));
     config.recovery_max_duration_seconds = static_cast<int64_t>(Environ::GetInt(
         "MOONCAKE_DFS_RECOVERY_MAX_DURATION_SECONDS",
         static_cast<int>(config.recovery_max_duration_seconds)));
+    config.bucket_create_concurrency =
+        Environ::GetInt("MOONCAKE_DFS_BUCKET_CREATE_CONCURRENCY",
+                        config.bucket_create_concurrency);
     config.batch_read_threads = Environ::GetInt(
         "MOONCAKE_DFS_BATCH_READ_THREADS", config.batch_read_threads);
     config.batch_read_merge_enabled =
