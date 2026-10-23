@@ -110,18 +110,10 @@ enum class BucketEntryState : int32_t {
  * a log, so storing a key costs no metadata I/O at all.
  *
  * `FlushDirtyMetadata()` performs the deferred writes for every bucket marked
- * dirty. It runs on the master's DFS maintenance tick, on the deferred recovery
- * tail thread and at shutdown.
+ * dirty. It runs on the master's DFS maintenance tick and at shutdown.
  * Preparing and committing eviction do not persist a marker or flush metadata.
  * If deletion is interrupted and both files survive, recovery may restore the
  * cached entries; they can be evicted again after restart.
- *
- * Startup performs no optional file system work. Everything recovery decides to
- * delete (orphaned `.data` files, legacy files when recovery is disabled, and
- * buckets a recovery budget skipped) and the metadata rewrite that recovery
- * made necessary go onto the `RecoveryTailTask` queue described below, which
- * one background thread drains. Only the work needed to serve traffic stays on
- * the startup path, which has to fit the master's leader-election window.
  *
  * The accepted failure mode: if the master dies before a bucket is sealed, that
  * bucket has no `.meta` file and recovery deletes its `.data` file, so at most
@@ -219,27 +211,6 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
         DistributedFSDescriptor descriptor;
     };
     std::vector<RecoveredReplica> TakeRecoveredReplicas();
-
-    /**
-     * @brief Milliseconds the recovery pass inside Init() actually took.
-     *
-     * Re-registering the recovered replicas costs the master time too, and that
-     * work shares one startup budget with recovery, so the master needs to know
-     * what recovery already spent. 0 means recovery did not run.
-     */
-    int64_t RecoveryElapsedMs() const { return recovery_elapsed_ms_; }
-
-    /**
-     * @brief Drop buckets that were recovered but never registered.
-     *
-     * When the shared budget runs out partway through registration, the
-     * remaining (oldest) buckets are reclaimed wholesale: their data is on disk
-     * but no reader can name it once the master has no entry for it, so keeping
-     * them would only hold capacity hostage. Bucket granularity is what keeps
-     * the allocator and the master in agreement - a bucket is either fully
-     * registered or gone, never half visible.
-     */
-    void DropRecoveredBuckets(const std::vector<int64_t>& bucket_ids);
 
     /**
      * @brief Bucket-granular eviction transaction.
@@ -355,20 +326,6 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
      * @return the number of buckets whose metadata was made durable.
      */
     size_t FlushDirtyMetadata();
-
-    /**
-     * @brief Block until every queued recovery tail task has finished.
-     *
-     * Recovery defers its file system work (metadata rewrites and deletions) to
-     * a background thread so startup stays inside the master's leader-election
-     * window, which makes it asynchronous by construction. This is the
-     * deterministic point where a caller that has to observe the result - a
-     * test, or an operator draining the allocator - can wait for it. The
-     * startup path must never call it.
-     *
-     * @return true when the tail went idle, false on timeout.
-     */
-    bool WaitForRecoveryTailIdle(std::chrono::milliseconds timeout);
 
     /**
      * @brief Number of buckets currently tracked (test/metrics helper).
@@ -491,50 +448,11 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     void BucketCreateWorker();
     void StopBucketWorkers();
 
-    // --- deferred recovery tail work ---
-    //
-    // Startup has to finish inside the master's leader-election window, so
-    // nothing on the recovery path that only touches the file system runs
-    // inline. It is queued here instead and drained by one background thread:
-    // rewriting the `.meta` of buckets whose state recovery rewrote, and
-    // deleting the bucket files recovery did not adopt (orphaned `.data` files,
-    // legacy files when recovery is disabled, and - once recovery is bounded -
-    // the buckets a recovery budget skipped).
-    //
-    // Every id handed to a delete task is below `next_bucket_id_`, so no bucket
-    // this process creates or evicts can reuse the name while the sweep runs.
-    // The thread is joined by StopBucketWorkers() before the fs adapter shuts
-    // down.
-    struct RecoveryTailTask {
-        enum class Kind {
-            // Delete the `.meta` and `.data` files of every id in `bucket_ids`.
-            kDeleteBuckets,
-            // Rewrite the `.meta` of every bucket currently marked dirty.
-            kFlushDirtyMetadata,
-        };
-
-        Kind kind = Kind::kDeleteBuckets;
-        std::vector<int64_t> bucket_ids;
-    };
-
-    // Queues deferred work and returns without performing any file system I/O.
-    // A caller on the startup path must never wait for it.
-    void EnqueueRecoveryTail(RecoveryTailTask task);
-    // Runs one queued task. Called by the worker and by the shutdown drain.
-    void RunRecoveryTailTask(const RecoveryTailTask& task);
-    // Accounts for one finished task, including a task that was skipped at
-    // shutdown, so WaitForRecoveryTailIdle() observes a completed queue.
-    void FinishRecoveryTailTask();
-    void RecoveryTailWorker();
-    // Stops the worker and joins it. Deletes already queued are still executed;
-    // pending flushes are dropped because the destructor runs one final flush
-    // anyway.
-    void StopRecoveryTailWorker();
-    // Executes whatever is still queued on the calling thread. Only acceptable
-    // at shutdown, where blocking is allowed: it exists for the case where the
-    // worker thread could never be started.
-    void DrainRecoveryTailAtShutdown();
-
+    // One-shot background sweep that reclaims the bucket files recorded by the
+    // disabled-recovery scan. Their ids are all below `next_bucket_id_`, so no
+    // bucket this process creates reuses a name in the list. Joined by
+    // StopBucketWorkers() before the fs adapter shuts down.
+    void LegacyCleanupWorker(std::vector<int64_t> bucket_ids);
     std::vector<int64_t> DetachReadyBucketsLocked();
     void UpdateBucketPoolMetricsLocked() const;
 
@@ -575,18 +493,6 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     uint64_t bucket_capacity_ = 0;
     uint64_t alignment_ = 4096;
     int64_t max_bucket_count_ = 0;
-    // Recovery bounds, resolved by Init() from DistributedStorageConfig. 0
-    // means no cap on the number of buckets; the duration bounds the whole
-    // pass.
-    int64_t recovery_max_buckets_ = 0;
-    std::chrono::seconds recovery_max_duration_{0};
-    // Buckets recovery skipped because they did not fit the budget, already
-    // queued for deletion. Reported at startup so an undersized budget is
-    // visible instead of silent.
-    size_t recovery_skipped_buckets_ = 0;
-    // Wall-clock cost of the recovery pass, so the master can spend what is
-    // left of the shared startup budget on re-registering the replicas.
-    int64_t recovery_elapsed_ms_ = 0;
     size_t ready_bucket_target_ = 4;
     size_t bucket_create_concurrency_ = 2;
 
@@ -613,18 +519,9 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     std::chrono::seconds bucket_creation_retry_delay_{1};
     std::condition_variable bucket_pool_cv_;
     std::vector<std::thread> bucket_create_workers_;
-    // Deferred recovery tail work; see RecoveryTailTask. Guarded by its own
-    // mutex so the worker never competes with the allocation hot path for
-    // `mutex_`, and so `mutex_` is never held across file system I/O.
-    std::mutex tail_mutex_;
-    std::condition_variable tail_cv_;
-    std::condition_variable tail_idle_cv_;
-    std::deque<RecoveryTailTask> tail_queue_;
-    // Queued and not yet finished, so WaitForRecoveryTailIdle() has a predicate
-    // that covers both the queue and the task currently running.
-    size_t tail_pending_ = 0;
-    bool tail_stop_ = false;
-    std::thread recovery_tail_worker_;
+    // One-shot sweep of legacy bucket files, spawned only when metadata
+    // recovery is disabled. Joined by StopBucketWorkers().
+    std::thread legacy_cleanup_worker_;
     std::unordered_map<int64_t, BucketPtr> buckets_;
     std::unordered_map<std::string, int64_t> key_index_;
     int64_t next_bucket_id_ = 0;

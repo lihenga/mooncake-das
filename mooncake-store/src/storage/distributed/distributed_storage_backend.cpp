@@ -251,18 +251,6 @@ bool DistributedStorageConfig::ValidateForBucketAllocator() const {
                    << ready_bucket_target;
         return false;
     }
-    if (recovery_max_buckets < 0) {
-        LOG(ERROR) << "DistributedStorageConfig: recovery_max_buckets must be "
-                      "non-negative, recovery_max_buckets="
-                   << recovery_max_buckets;
-        return false;
-    }
-    if (recovery_max_duration_seconds < 0) {
-        LOG(ERROR) << "DistributedStorageConfig: recovery_max_duration_seconds "
-                      "must be non-negative, recovery_max_duration_seconds="
-                   << recovery_max_duration_seconds;
-        return false;
-    }
     if (bucket_create_concurrency < 1 ||
         bucket_create_concurrency > kMaxBucketCreateConcurrency) {
         LOG(ERROR)
@@ -381,12 +369,6 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
                         static_cast<int>(config.max_bucket_count)));
     config.ready_bucket_target = Environ::GetInt(
         "MOONCAKE_DFS_READY_BUCKET_COUNT", config.ready_bucket_target);
-    config.recovery_max_buckets = static_cast<int64_t>(Environ::GetInt(
-        "MOONCAKE_DFS_RECOVERY_MAX_BUCKETS",
-        static_cast<int>(config.recovery_max_buckets)));
-    config.recovery_max_duration_seconds = static_cast<int64_t>(Environ::GetInt(
-        "MOONCAKE_DFS_RECOVERY_MAX_DURATION_SECONDS",
-        static_cast<int>(config.recovery_max_duration_seconds)));
     config.bucket_create_concurrency =
         Environ::GetInt("MOONCAKE_DFS_BUCKET_CREATE_CONCURRENCY",
                         config.bucket_create_concurrency);
@@ -430,8 +412,6 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", allocator_type=" << ToString(allocator_type)
         << ", bucket_capacity=" << bucket_capacity
         << ", bucket_recovery_enabled=" << bucket_recovery_enabled
-        << ", recovery_max_buckets=" << recovery_max_buckets
-        << ", recovery_max_duration_seconds=" << recovery_max_duration_seconds
         << ", max_bucket_count=" << max_bucket_count
         << ", ready_bucket_target=" << ready_bucket_target
         << ", bucket_create_concurrency=" << bucket_create_concurrency
