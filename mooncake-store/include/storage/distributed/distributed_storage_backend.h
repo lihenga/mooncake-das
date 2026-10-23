@@ -57,9 +57,34 @@ struct DistributedStorageConfig {
     DfsAllocatorType allocator_type = DfsAllocatorType::SHARD;
     // BUCKET mode only: size of each append-only bucket data file.
     uint64_t bucket_capacity = 256ULL * 1024 * 1024;
-    // When false, retain old bucket files without recovering their replicas.
-    // max_bucket_count then budgets only buckets created by this process.
+    // When false, old bucket files are not turned into replicas AND are
+    // deleted: they would be invisible to this process's allocation, eviction
+    // and capacity accounting, so nothing could ever reclaim them. The deletion
+    // runs in the background off the startup path. max_bucket_count then
+    // budgets only buckets created by this process.
     bool bucket_recovery_enabled = true;
+    // BUCKET mode only, and only when bucket_recovery_enabled: cap on how many
+    // buckets recovery restores. Recovery runs newest bucket id first, because
+    // the newest writes are assumed to be the hottest, so the cap keeps the
+    // most recently written buckets and drops the oldest. Whatever does not fit
+    // is deleted in the background, off the startup path.
+    //
+    // 0 derives the cap from max_bucket_count, i.e. "recover at most the number
+    // of buckets this process may hold anyway". Raise it above max_bucket_count
+    // to restore a larger history than the configured capacity.
+    int64_t recovery_max_buckets = 0;
+    // BUCKET mode only: wall-clock budget shared by the whole DFS startup -
+    // the directory scan, the per-bucket loop that parses a bucket, arbitrates
+    // its duplicate keys against the newer buckets already restored and
+    // publishes the survivors, and the master's re-registration of the replicas
+    // that produced. Startup must fit inside the master's leader-election
+    // window, so exceeding the budget skips (and deletes) the remaining, oldest
+    // buckets, and leaves the replicas that do not fit unregistered, reclaiming
+    // their buckets too. One bucket may overshoot: a bucket already being
+    // parsed is always finished so it is never half-published.
+    //
+    // 0 disables the budget.
+    int64_t recovery_max_duration_seconds = 20;
     // BUCKET mode only: upper bound on live buckets. Also the fixed
     // denominator for eviction watermarks, so it must be > 0.
     int64_t max_bucket_count = 256;

@@ -950,6 +950,8 @@ MasterService::DfsInitResult MasterService::InitDfsAllocatorFromEnvironment(
         dfs_config.low_utilization_evictions_per_tick;
     dfs_bucket_low_utilization_attempts_per_tick_ =
         dfs_config.low_utilization_eviction_attempts_per_tick;
+    dfs_recovery_max_duration_seconds_ =
+        dfs_config.recovery_max_duration_seconds;
     if (!dfs_config.allocator_type_valid) {
         // An unknown allocator type is a configuration error, not something to
         // paper over by silently defaulting to SHARD.
@@ -8295,64 +8297,106 @@ void MasterService::RestoreRecoveredDfsReplicas(bool rebuild_metadata) {
     const size_t candidates = recovered.size();
     size_t preserved_live = 0;
 
+    // Registration shares one startup budget with the recovery pass that
+    // produced these replicas: the master has to answer queries inside the
+    // leader-election window, so only what recovery did not spend is left.
+    const bool budgeted = dfs_recovery_max_duration_seconds_ > 0;
+    const auto started = std::chrono::steady_clock::now();
+    const auto deadline =
+        started + std::chrono::seconds(dfs_recovery_max_duration_seconds_) -
+        std::chrono::milliseconds(bucket_allocator_->RecoveryElapsedMs());
+    std::vector<int64_t> unregistered_buckets;
+
     if (rebuild_metadata) {
         std::vector<ImmutableBucketAllocator::RecoveredReplica>
             stale_recovered;
-        std::unordered_map<size_t, std::vector<size_t>> indices_by_shard;
-        for (size_t i = 0; i < recovered.size(); ++i) {
-            indices_by_shard[getMetadataShardIndex(tenant_id,
-                                                   recovered[i].key)]
-                .push_back(i);
-        }
-
-        for (auto& [shard_idx, indices] : indices_by_shard) {
-            MetadataShardAccessorRW shard(this, shard_idx);
-            auto& tenant_state = shard->tenants[tenant_id];
-            for (const size_t i : indices) {
-                auto& entry = recovered[i];
-                auto existing = tenant_state.metadata.find(entry.key);
-                if (existing != tenant_state.metadata.end()) {
-                    const auto& metadata = existing->second;
-                    const bool installed_by_this_recovery =
-                        metadata.client_id == UUID{0, 0} &&
-                        metadata.CountReplicas() == 1 &&
-                        metadata.HasReplica(&Replica::fn_is_dfs_replica);
-                    if (installed_by_this_recovery) {
-                        tenant_state.metadata.erase(existing);
-                        ++superseded;
-                    } else {
-                        // A retry can race with a successful memory-only write.
-                        // Keep the live value and tombstone only the stale DFS
-                        // extent after releasing all metadata shard locks.
-                        ++preserved_live;
-                        static DfsLogLimiter log_limiter;
-                        if (auto suppressed = log_limiter.ShouldLog()) {
-                            LOG(WARNING)
-                                << "Skipping stale DFS recovery for key="
-                                << entry.key
-                                << ": live metadata already present, recovered "
-                                   "extent tombstoned, suppressed="
-                                << *suppressed;
-                        }
-                        stale_recovered.push_back(std::move(entry));
-                        continue;
+        // Recovery emitted the replicas newest bucket first. Walking them in
+        // that order and checking the budget only between buckets means running
+        // out of it drops the oldest data - the same choice recovery makes -
+        // and never leaves a bucket half registered.
+        size_t block_begin = 0;
+        while (block_begin < recovered.size()) {
+            // For DFS bucket replicas the shard index carries the bucket id.
+            const int64_t bucket_id =
+                recovered[block_begin].descriptor.shard_idx;
+            size_t block_end = block_begin;
+            while (block_end < recovered.size() &&
+                   recovered[block_end].descriptor.shard_idx == bucket_id) {
+                ++block_end;
+            }
+            if (budgeted && block_begin > 0 &&
+                std::chrono::steady_clock::now() >= deadline) {
+                for (size_t i = block_begin; i < recovered.size();) {
+                    const int64_t unregistered_id =
+                        recovered[i].descriptor.shard_idx;
+                    unregistered_buckets.push_back(unregistered_id);
+                    while (i < recovered.size() &&
+                           recovered[i].descriptor.shard_idx ==
+                               unregistered_id) {
+                        ++i;
                     }
                 }
-
-                const uint64_t object_size = entry.descriptor.object_size;
-                std::vector<Replica> replicas;
-                replicas.emplace_back(entry.descriptor,
-                                      ReplicaStatus::COMPLETE);
-                tenant_state.metadata.emplace(
-                    std::piecewise_construct,
-                    std::forward_as_tuple(entry.key),
-                    std::forward_as_tuple(
-                        UUID{0, 0}, std::chrono::system_clock::now(),
-                        object_size, std::move(replicas), std::nullopt,
-                        /*enable_hard_pin=*/false, ObjectDataType::UNKNOWN,
-                        std::string(), tenant_id, entry.key));
-                ++restored;
+                break;
             }
+
+            std::unordered_map<size_t, std::vector<size_t>> indices_by_shard;
+            for (size_t i = block_begin; i < block_end; ++i) {
+                indices_by_shard[getMetadataShardIndex(tenant_id,
+                                                       recovered[i].key)]
+                    .push_back(i);
+            }
+            for (auto& [shard_idx, indices] : indices_by_shard) {
+                MetadataShardAccessorRW shard(this, shard_idx);
+                auto& tenant_state = shard->tenants[tenant_id];
+                for (const size_t i : indices) {
+                    auto& entry = recovered[i];
+                    auto existing = tenant_state.metadata.find(entry.key);
+                    if (existing != tenant_state.metadata.end()) {
+                        const auto& metadata = existing->second;
+                        const bool installed_by_this_recovery =
+                            metadata.client_id == UUID{0, 0} &&
+                            metadata.CountReplicas() == 1 &&
+                            metadata.HasReplica(&Replica::fn_is_dfs_replica);
+                        if (installed_by_this_recovery) {
+                            tenant_state.metadata.erase(existing);
+                            ++superseded;
+                        } else {
+                            // A retry can race with a successful memory-only
+                            // write. Keep the live value and tombstone only
+                            // the stale DFS extent after releasing all
+                            // metadata shard locks.
+                            ++preserved_live;
+                            static DfsLogLimiter log_limiter;
+                            if (auto suppressed = log_limiter.ShouldLog()) {
+                                LOG(WARNING)
+                                    << "Skipping stale DFS recovery for key="
+                                    << entry.key
+                                    << ": live metadata already present, "
+                                       "recovered extent tombstoned, "
+                                       "suppressed=" << *suppressed;
+                            }
+                            stale_recovered.push_back(std::move(entry));
+                            continue;
+                        }
+                    }
+
+                    const uint64_t object_size = entry.descriptor.object_size;
+                    std::vector<Replica> replicas;
+                    replicas.emplace_back(entry.descriptor,
+                                          ReplicaStatus::COMPLETE);
+                    tenant_state.metadata.emplace(
+                        std::piecewise_construct,
+                        std::forward_as_tuple(entry.key),
+                        std::forward_as_tuple(
+                            UUID{0, 0}, std::chrono::system_clock::now(),
+                            object_size, std::move(replicas), std::nullopt,
+                            /*enable_hard_pin=*/false,
+                            ObjectDataType::UNKNOWN, std::string(), tenant_id,
+                            entry.key));
+                    ++restored;
+                }
+            }
+            block_begin = block_end;
         }
 
         // Never nest allocator and metadata-shard locks.
@@ -8361,12 +8405,27 @@ void MasterService::RestoreRecoveredDfsReplicas(bool rebuild_metadata) {
         }
     }
 
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started)
+            .count();
     LOG(INFO) << "Restored " << restored
               << " DFS replicas from bucket metadata (" << candidates
-              << " candidates, " << superseded
-              << " superseded, " << preserved_live
-              << " live entries preserved, metadata_rebuilt="
+              << " candidates, " << superseded << " superseded, "
+              << preserved_live << " live entries preserved, registration_ms="
+              << elapsed_ms << ", metadata_rebuilt="
               << (rebuild_metadata ? "true" : "false") << ")";
+
+    // Unregistered buckets hold data no reader can name any more, so give the
+    // space back instead of waiting for eviction to find them one at a time.
+    if (!unregistered_buckets.empty()) {
+        LOG(WARNING) << "DFS replica registration budget exhausted: registered "
+                     << restored << " of " << candidates << " replicas in "
+                     << elapsed_ms << "ms; dropping "
+                     << unregistered_buckets.size()
+                     << " recovered bucket(s) (oldest first)";
+        bucket_allocator_->DropRecoveredBuckets(unregistered_buckets);
+    }
 }
 
 void MasterService::RunDfsEviction() {

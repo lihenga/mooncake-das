@@ -40,6 +40,25 @@ int64_t CurrentTimeNs() {
         .count();
 }
 
+// Milliseconds between two steady-clock readings, for recovery timing logs.
+// Rounded up, so a pass that took a fraction of a millisecond reports 1 rather
+// than 0: a reported 0 has to mean "this never ran", which is exactly the
+// distinction the master draws on when deciding how much of the shared startup
+// budget is left for re-registering the replicas.
+int64_t DurationMsBetween(std::chrono::steady_clock::time_point from,
+                          std::chrono::steady_clock::time_point to) {
+    const auto elapsed_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(to - from)
+            .count();
+    return (elapsed_ns + 999999) / 1000000;
+}
+
+// Measured cost of re-registering one recovered replica in the master:
+// 1.5-2.0us on the test hardware, rounded up. Recovery reserves this for every
+// replica it restores so that the registration sharing the same budget is not
+// starved by a recovery that spent the whole window parsing.
+constexpr int64_t kRegistrationMicrosPerReplica = 3;
+
 bool IsLive(BucketEntryState state) {
     return state == BucketEntryState::PENDING ||
            state == BucketEntryState::COMMITTED;
@@ -186,6 +205,14 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     bucket_capacity_ = config.bucket_capacity;
     alignment_ = config.alignment;
     max_bucket_count_ = config.max_bucket_count;
+    // An unset bucket cap means "at most the number of buckets this process may
+    // hold anyway": a restored bucket beyond max_bucket_count would be evicted
+    // right after startup, so recovering it only costs memory and time.
+    recovery_max_buckets_ = config.recovery_max_buckets > 0
+                                ? config.recovery_max_buckets
+                                : max_bucket_count_;
+    recovery_max_duration_ = std::chrono::seconds(
+        std::max<int64_t>(0, config.recovery_max_duration_seconds));
     ready_bucket_target_ = static_cast<size_t>(config.ready_bucket_target);
     bucket_create_concurrency_ =
         static_cast<size_t>(config.bucket_create_concurrency);
@@ -236,8 +263,18 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
         return marker_result;
     }
 
+    // Re-arm the deferred tail: an earlier attempt on this instance may have
+    // stopped the workers, and recovery is about to queue work on it again.
+    {
+        std::lock_guard<std::mutex> tail_lock(tail_mutex_);
+        tail_stop_ = false;
+    }
+
     auto recovered = RecoverFromDisk(config.bucket_recovery_enabled);
     if (!recovered) {
+        // Nothing is queued on this path today, but the adapter must never
+        // outlive the tail thread, so stop it before tearing the adapter down.
+        StopRecoveryTailWorker();
         fs_adapter_->Shutdown();
         fs_adapter_.reset();
         return recovered;
@@ -341,9 +378,13 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     initialized_.store(true, std::memory_order_release);
 
     // Recovery may have rewritten in-memory state (legacy format upgrade,
-    // PENDING entries demoted to tombstones). Persist that immediately so the
-    // next start reads exactly what this process believes.
-    const size_t rewritten = FlushDirtyMetadata();
+    // PENDING entries demoted to tombstones). The rewrite is deferred instead
+    // of running here: startup has to finish inside the master's
+    // leader-election window, and the rewrite is idempotent, so a crash before
+    // it lands only makes the next start redo the same demotion. The
+    // maintenance tick and the destructor both flush too, so nothing is lost by
+    // waiting.
+    EnqueueRecoveryTail({RecoveryTailTask::Kind::kFlushDirtyMetadata, {}});
 
     size_t ready_bucket_count = 0;
     {
@@ -356,10 +397,14 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
               << ", max_bucket_count=" << max_bucket_count_
               << ", ready_bucket_target=" << ready_bucket_target_
               << ", bucket_create_concurrency=" << bucket_create_concurrency_
+              << ", recovery_max_buckets=" << recovery_max_buckets_
+              << ", recovery_max_duration_seconds="
+              << recovery_max_duration_.count()
               << ", recovered_buckets=" << recovered_bucket_count
+              << ", recovery_skipped_buckets=" << recovery_skipped_buckets_
               << ", ready_buckets=" << ready_bucket_count
               << ", recovered_replicas=" << recovered_replicas_.size()
-              << ", rewritten_buckets=" << rewritten;
+              << ", metadata_flush=deferred";
     return {};
 }
 
@@ -655,26 +700,149 @@ void ImmutableBucketAllocator::StopBucketWorkers() {
         if (worker.joinable()) worker.join();
     }
     bucket_create_workers_.clear();
-    // The legacy sweep deletes files through the fs adapter, so it must finish
+    // The deferred tail deletes files through the fs adapter, so it must finish
     // before the adapter is shut down.
-    if (legacy_cleanup_worker_.joinable()) {
-        legacy_cleanup_worker_.join();
+    StopRecoveryTailWorker();
+}
+
+void ImmutableBucketAllocator::EnqueueRecoveryTail(RecoveryTailTask task) {
+    {
+        std::lock_guard<std::mutex> lock(tail_mutex_);
+        if (tail_stop_) {
+            // Nothing will pick this up any more, and blocking the caller is
+            // exactly what this queue exists to avoid. Leave the files for the
+            // next start: it rescans the directory and reclaims them again.
+            LOG(WARNING) << "Dropping deferred DFS recovery tail work: the "
+                            "allocator is already shutting down";
+            return;
+        }
+        tail_queue_.push_back(std::move(task));
+        ++tail_pending_;
+        if (!recovery_tail_worker_.joinable()) {
+            try {
+                recovery_tail_worker_ = std::thread(
+                    &ImmutableBucketAllocator::RecoveryTailWorker, this);
+            } catch (const std::system_error& e) {
+                // Never fall back to doing the work inline: a caller on the
+                // startup path must not pay for a slow or unavailable DFS. The
+                // task stays queued, and DrainRecoveryTailAtShutdown() reclaims
+                // it if no later enqueue manages to start the thread either.
+                LOG(WARNING) << "Failed to start DFS recovery tail worker: "
+                             << e.what()
+                             << "; queued work will be retried or reclaimed at "
+                                "shutdown";
+            }
+        }
+    }
+    tail_cv_.notify_one();
+}
+
+void ImmutableBucketAllocator::RunRecoveryTailTask(
+    const RecoveryTailTask& task) {
+    switch (task.kind) {
+        case RecoveryTailTask::Kind::kDeleteBuckets: {
+            // Deleting these files needs no allocator lock: every id is below
+            // next_bucket_id_, so no bucket this process creates or evicts
+            // reuses a name in this list, and DeleteBucketFiles() touches only
+            // the fs adapter. DeleteBucketFiles() tolerates an already-absent
+            // `.meta` or `.data`, so an id that was recorded from only one of
+            // the two files - or whose file was removed before the sweep
+            // reached it - is not a failure.
+            for (const int64_t bucket_id : task.bucket_ids) {
+                DeleteBucketFiles(bucket_id);
+            }
+            LOG(INFO) << "DFS deferred bucket cleanup finished, buckets="
+                      << task.bucket_ids.size();
+            break;
+        }
+        case RecoveryTailTask::Kind::kFlushDirtyMetadata:
+            // FlushDirtyMetadata() is safe to call from any thread: it
+            // snapshots under `mutex_`, serializes writes on
+            // `metadata_io_mutex_` and revalidates bucket identity before each
+            // one, so it cannot resurrect a bucket that has since been removed.
+            // A failed write puts `meta_dirty` back, so the maintenance tick
+            // retries it - no retry bookkeeping is needed here.
+            FlushDirtyMetadata();
+            break;
     }
 }
 
-void ImmutableBucketAllocator::LegacyCleanupWorker(
-    std::vector<int64_t> bucket_ids) {
-    // Deleting these files needs no allocator lock: every id is below
-    // next_bucket_id_, so no bucket this process creates or evicts reuses a
-    // name in this list, and DeleteBucketFiles() touches only the fs adapter.
-    // DeleteBucketFiles() tolerates an already-absent `.meta` or `.data`, so an
-    // id that was recorded from only one of the two files - or whose file was
-    // removed before the sweep reached it - is not a failure.
-    for (const int64_t bucket_id : bucket_ids) {
-        DeleteBucketFiles(bucket_id);
+void ImmutableBucketAllocator::FinishRecoveryTailTask() {
+    {
+        std::lock_guard<std::mutex> lock(tail_mutex_);
+        if (tail_pending_ > 0) --tail_pending_;
     }
-    LOG(INFO) << "DFS legacy bucket cleanup finished, buckets="
-              << bucket_ids.size();
+    tail_idle_cv_.notify_all();
+}
+
+bool ImmutableBucketAllocator::WaitForRecoveryTailIdle(
+    std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(tail_mutex_);
+    return tail_idle_cv_.wait_for(
+        lock, timeout, [this] { return tail_pending_ == 0; });
+}
+
+void ImmutableBucketAllocator::RecoveryTailWorker() {
+    for (;;) {
+        RecoveryTailTask task;
+        bool stopping = false;
+        {
+            std::unique_lock<std::mutex> lock(tail_mutex_);
+            tail_cv_.wait(lock, [this] {
+                return tail_stop_ || !tail_queue_.empty();
+            });
+            if (tail_queue_.empty()) return;
+            task = std::move(tail_queue_.front());
+            tail_queue_.pop_front();
+            // Read under the lock: stopping is signalled by another thread.
+            stopping = tail_stop_;
+        }
+        // A flush that is still pending at shutdown is dropped: the destructor
+        // runs one final flush, so rewriting files now would only delay it.
+        // Deletes are kept so a stopped allocator does not leak bucket files.
+        if (!stopping ||
+            task.kind != RecoveryTailTask::Kind::kFlushDirtyMetadata) {
+            RunRecoveryTailTask(task);
+        }
+        FinishRecoveryTailTask();
+    }
+}
+
+void ImmutableBucketAllocator::StopRecoveryTailWorker() {
+    {
+        std::lock_guard<std::mutex> lock(tail_mutex_);
+        tail_stop_ = true;
+    }
+    tail_cv_.notify_all();
+    // The worker drains what is already queued before it returns.
+    if (recovery_tail_worker_.joinable()) {
+        recovery_tail_worker_.join();
+    }
+    DrainRecoveryTailAtShutdown();
+}
+
+void ImmutableBucketAllocator::DrainRecoveryTailAtShutdown() {
+    size_t drained = 0;
+    for (;;) {
+        RecoveryTailTask task;
+        {
+            std::lock_guard<std::mutex> lock(tail_mutex_);
+            if (tail_queue_.empty()) break;
+            task = std::move(tail_queue_.front());
+            tail_queue_.pop_front();
+        }
+        ++drained;
+        // Same rule as the worker: a pending flush is dropped because the
+        // shutdown path flushes once more after this drain.
+        if (task.kind != RecoveryTailTask::Kind::kFlushDirtyMetadata) {
+            RunRecoveryTailTask(task);
+        }
+        FinishRecoveryTailTask();
+    }
+    if (drained > 0) {
+        LOG(INFO) << "Drained " << drained
+                  << " deferred DFS recovery tail task(s) on the shutdown path";
+    }
 }
 
 void ImmutableBucketAllocator::BucketCreateWorker() {
@@ -1690,6 +1858,46 @@ ImmutableBucketAllocator::TakeRecoveredReplicas() {
     return std::move(recovered_replicas_);
 }
 
+void ImmutableBucketAllocator::DropRecoveredBuckets(
+    const std::vector<int64_t>& bucket_ids) {
+    if (bucket_ids.empty()) return;
+
+    std::vector<int64_t> dropped;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const int64_t bucket_id : bucket_ids) {
+            auto it = buckets_.find(bucket_id);
+            if (it == buckets_.end()) continue;
+            // A bucket is dropped whole, so its own keys are the only index
+            // entries that can point at it. A key won by a newer bucket keeps
+            // its entry, which is why the bucket id is compared.
+            for (const auto& [key, entry] : it->second->entries) {
+                (void)entry;
+                auto index_it = key_index_.find(key);
+                if (index_it != key_index_.end() &&
+                    index_it->second == bucket_id) {
+                    key_index_.erase(index_it);
+                }
+            }
+            buckets_.erase(it);
+            RemoveFromLruLocked(bucket_id);
+            if (active_bucket_id_ == bucket_id) active_bucket_id_ = -1;
+            dropped.push_back(bucket_id);
+        }
+        if (dropped.empty()) return;
+        PublishBucketIdSnapshotLocked();
+    }
+
+    // The buckets released their capacity slots, so a blocked allocation or a
+    // refill worker may be able to make progress.
+    bucket_pool_cv_.notify_all();
+    LOG(WARNING) << "Dropping " << dropped.size()
+                 << " recovered DFS bucket(s) that the registration budget did "
+                    "not cover (oldest first)";
+    EnqueueRecoveryTail({RecoveryTailTask::Kind::kDeleteBuckets,
+                         std::move(dropped)});
+}
+
 // === eviction ===
 
 ImmutableBucketAllocator::PendingEviction
@@ -1983,6 +2191,14 @@ void ImmutableBucketAllocator::AbortEviction(PendingEviction&& pending,
 
 tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
     bool recover_metadata) {
+    // Start the clock before the directory scan. The budget has to cover every
+    // cost of recovery, and the scan is the part that grows with the number of
+    // files a previous run left behind, so it must not sit outside the window.
+    const auto recovery_started = std::chrono::steady_clock::now();
+    // `key_index_` settles duplicate keys below, so it has to start empty: a
+    // leftover entry would make a freshly restored bucket look superseded.
+    key_index_.clear();
+    recovered_replicas_.clear();
     auto files = fs_adapter_->ListFiles(fsdir_);
     if (!files) {
         if (recover_metadata && files.error() == ErrorCode::FILE_NOT_FOUND) {
@@ -2028,41 +2244,77 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
         LOG(INFO) << "DFS bucket recovery disabled; deleting " << sweep.size()
                   << " legacy bucket(s) in the background, next_bucket_id="
                   << next_bucket_id_;
-        try {
-            // `sweep` is passed by value so the catch block below can still
-            // reclaim the files if the worker thread cannot be started.
-            legacy_cleanup_worker_ = std::thread(
-                &ImmutableBucketAllocator::LegacyCleanupWorker, this, sweep);
-        } catch (const std::system_error& e) {
-            LOG(WARNING) << "Failed to start DFS legacy bucket cleanup worker: "
-                         << e.what() << ", deleting synchronously";
-            for (const int64_t bucket_id : sweep) {
-                DeleteBucketFiles(bucket_id);
-            }
-        }
+        // Never fall back to deleting inline when the worker cannot start: this
+        // is the startup path, and one DFS round trip per file would stall it.
+        // The tail keeps the task queued and the shutdown drain reclaims it.
+        EnqueueRecoveryTail(
+            {RecoveryTailTask::Kind::kDeleteBuckets, std::move(sweep)});
         return {};
     }
-    std::sort(meta_ids.begin(), meta_ids.end());
+    // Newest bucket id first. Writes are recency-ordered, so the newest buckets
+    // are the ones most likely to be read again, and processing in this order
+    // makes anything the budget cuts off the oldest data. That is also what the
+    // LRU would drop first: it is seeded in ascending id order below, so the
+    // smallest ids sit at the cold end.
+    const auto scan_finished = std::chrono::steady_clock::now();
+    std::sort(meta_ids.begin(), meta_ids.end(),
+              [](int64_t lhs, int64_t rhs) { return lhs > rhs; });
+
+    // The budget window starts at the scan, so a slow directory listing eats
+    // into the time left for parsing instead of hiding outside the budget.
+    const bool budgeted_by_time =
+        recovery_max_duration_ > std::chrono::seconds(0);
+    const auto recovery_deadline = recovery_started + recovery_max_duration_;
+    // Buckets that did not fit the budget. They are never parsed and never
+    // published, so nothing can reference them, and they are deleted off the
+    // startup path.
+    std::vector<int64_t> skipped_ids;
+    size_t restored_buckets = 0;
+    recovery_skipped_buckets_ = 0;
 
     uint64_t max_generation = 0;
-    // Buckets already reclaimed by this pass: their metadata could not be
-    // trusted, so both files were deleted. A cache entry that cannot be proven
-    // correct is worse than a miss - the reader would recompute it anyway,
-    // while serving unverifiable bytes would silently corrupt the result.
-    // Tracked only so the orphan sweep below does not report them a second
-    // time.
+    // Buckets already handled by this pass: either their metadata could not be
+    // trusted, so both files were deleted, or they lost the budget and are
+    // queued for deletion. A cache entry that cannot be proven correct is worse
+    // than a miss - the reader would recompute it anyway, while serving
+    // unverifiable bytes would silently corrupt the result. Tracked only so the
+    // orphan sweep below does not report them a second time.
     std::unordered_set<int64_t> discarded_ids;
-    struct RecoveryWinner {
-        uint64_t generation = 0;
-        int64_t bucket_id = -1;
-        uint64_t entry_offset = 0;
-    };
-    // Resolve duplicates by the lexicographically greatest
-    // (generation, bucket_id, entry_offset). The location tie-breaker makes the
-    // result independent of unordered_map and filesystem traversal order.
-    std::unordered_map<std::string, RecoveryWinner> winners;
 
-    for (const int64_t bucket_id : meta_ids) {
+    for (size_t next_index = 0; next_index < meta_ids.size(); ++next_index) {
+        const int64_t bucket_id = meta_ids[next_index];
+        const bool out_of_buckets =
+            recovery_max_buckets_ > 0 &&
+            restored_buckets >= static_cast<size_t>(recovery_max_buckets_);
+        // Recovery and the master's re-registration share one budget, so every
+        // replica restored so far is charged the registration it will cost.
+        // Reserving it here keeps registration from being left with nothing
+        // after a recovery that used the whole window parsing.
+        const auto reserved_for_registration = std::chrono::microseconds(
+            static_cast<int64_t>(recovered_replicas_.size()) *
+            kRegistrationMicrosPerReplica);
+        const bool out_of_time =
+            budgeted_by_time &&
+            std::chrono::steady_clock::now() + reserved_for_registration >=
+                recovery_deadline;
+        if (out_of_buckets || out_of_time) {
+            // Truncate as a block, at a bucket boundary: a bucket is either
+            // published as a whole or not touched at all, so an interruption
+            // here can never leave a half-applied bucket behind. The one bucket
+            // already in progress always runs to completion, which is why the
+            // wall-clock budget can overshoot by a single bucket.
+            //
+            // No generation accounting is needed for the skipped ids: a
+            // generation is allocated when an entry is reserved, and only the
+            // active bucket reserves, so generation grows with bucket id. Every
+            // skipped id is smaller than every restored one, hence its
+            // generation is smaller too and next_generation_ cannot go
+            // backwards.
+            skipped_ids.assign(
+                meta_ids.begin() + static_cast<std::ptrdiff_t>(next_index),
+                meta_ids.end());
+            break;
+        }
         const std::string meta_path = BucketMetaPath(bucket_id);
         PersistedBucketMetadata snapshot;
         bool valid = false;
@@ -2249,42 +2501,24 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
             bucket->meta_dirty = true;
         }
 
-        for (const auto& [key, entry] : bucket->entries) {
-            if (entry.state != BucketEntryState::COMMITTED) continue;
-            auto winner_it = winners.find(key);
-            const auto candidate =
-                std::tie(entry.generation, bucket_id, entry.entry_offset);
-            if (winner_it == winners.end()) {
-                winners[key] = {entry.generation, bucket_id,
-                                entry.entry_offset};
-            } else if (candidate > std::tie(winner_it->second.generation,
-                                            winner_it->second.bucket_id,
-                                            winner_it->second.entry_offset)) {
-                LOG(WARNING)
-                    << "DFS key " << key << " found in buckets "
-                    << winner_it->second.bucket_id << " and " << bucket_id
-                    << "; keeping the greater generation/location "
-                       "tuple";
-                winner_it->second = {entry.generation, bucket_id,
-                                     entry.entry_offset};
-            } else {
-                LOG(WARNING) << "DFS key " << key << " in bucket " << bucket_id
-                             << " is superseded by bucket "
-                             << winner_it->second.bucket_id;
-            }
-        }
-
-        buckets_.emplace(bucket_id, std::move(bucket));
-    }
-
-    // Drop entries that lost the duplicate-key race, then index the winners.
-    for (auto& [bucket_id, bucket] : buckets_) {
+        // Settle cross-bucket duplicates and publish the survivors in the same
+        // pass. Buckets are processed newest first, and a generation is only
+        // ever allocated by the active bucket, so generation grows with bucket
+        // id: the first bucket to claim a key is by construction the one with
+        // the greatest (generation, bucket_id). That makes the arbitration a
+        // single insert instead of a second pass over every entry of every
+        // bucket, which is what used to put most of the recovery time outside
+        // the budget.
+        //
+        // `key_index_` doubles as the claim table, so no separate structure has
+        // to hold another copy of every key.
         for (auto& [key, entry] : bucket->entries) {
             if (entry.state != BucketEntryState::COMMITTED) continue;
-            auto winner_it = winners.find(key);
-            if (winner_it == winners.end() ||
-                winner_it->second.bucket_id != bucket_id ||
-                winner_it->second.entry_offset != entry.entry_offset) {
+            auto [claim, claimed] = key_index_.emplace(key, bucket_id);
+            if (!claimed) {
+                LOG(WARNING) << "DFS key " << key << " in bucket " << bucket_id
+                             << " is superseded by bucket " << claim->second
+                             << ", which was recovered first";
                 entry.state = BucketEntryState::TOMBSTONE;
                 ++bucket->tombstones;
                 bucket->meta_dirty = true;
@@ -2295,7 +2529,6 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
                 }
                 continue;
             }
-            key_index_[key] = bucket_id;
 
             auto layout = RebuildBucketEntryLayout(
                 entry.entry_offset, entry.value_size, alignment_);
@@ -2304,22 +2537,65 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
                 key, MakeBucketDescriptor(BucketDataPath(bucket_id), *layout,
                                           bucket_id)});
         }
+
+        buckets_.emplace(bucket_id, std::move(bucket));
+        ++restored_buckets;
+    }
+
+    // Everything still to do is O(bucket files) instead of O(entries), so the
+    // recovery budget is effectively spent once the loop ends. The two phases
+    // are still reported separately: if this one ever grows, it stops being
+    // covered by the budget and has to move inside the loop.
+    const auto loop_finished = std::chrono::steady_clock::now();
+
+    // Counted before the skipped ids join the set below, so the two reasons a
+    // bucket was not restored stay separable in the timing log.
+    const size_t rejected_buckets = discarded_ids.size();
+
+    // Advance both counters before anything is handed to the deferred tail:
+    // every id it may delete is then strictly below `next_bucket_id_`, so no
+    // bucket this process creates later can take one of those names.
+    next_bucket_id_ = max_seen_id + 1;
+    next_generation_ = std::max<uint64_t>(1, max_generation);
+
+    if (!skipped_ids.empty()) {
+        recovery_skipped_buckets_ = skipped_ids.size();
+        LOG(WARNING) << "DFS bucket recovery budget exhausted: restored="
+                     << restored_buckets << ", max_buckets="
+                     << recovery_max_buckets_ << ", max_duration_seconds="
+                     << recovery_max_duration_.count() << ", elapsed_ms="
+                     << DurationMsBetween(recovery_started,
+                                          std::chrono::steady_clock::now())
+                     << "; deleting " << skipped_ids.size()
+                     << " skipped (oldest) bucket(s) in the background";
+        // Marked as handled by this pass so the orphan sweep below does not
+        // queue the same ids a second time.
+        discarded_ids.insert(skipped_ids.begin(), skipped_ids.end());
+        EnqueueRecoveryTail({RecoveryTailTask::Kind::kDeleteBuckets,
+                             std::move(skipped_ids)});
     }
 
     // A data file with no `.meta` at all is the signature of a crash while the
     // bucket was still active: its metadata only lived in memory, so nothing
-    // can ever address the data again. Reclaim it. Buckets rejected above were
-    // already deleted, so they are skipped here to avoid a duplicate log line.
+    // can ever address the data again. Reclaim it. Buckets rejected or skipped
+    // above are already accounted for, so they are skipped here to avoid a
+    // duplicate log line.
+    //
+    // The deletes are queued instead of run here: each one costs a DFS round
+    // trip, and startup cannot afford a directory-sized pile of them.
+    std::vector<int64_t> orphan_data_ids;
     for (const int64_t data_id : data_ids) {
         if (buckets_.count(data_id) > 0) continue;
         if (discarded_ids.count(data_id) > 0) continue;
-        LOG(WARNING) << "Removing orphaned DFS bucket data file for bucket_id="
+        LOG(WARNING) << "Queueing removal of orphaned DFS bucket data file for "
+                        "bucket_id="
                      << data_id << " (no metadata, lost on an unclean restart)";
-        DeleteBucketFiles(data_id);
+        orphan_data_ids.push_back(data_id);
     }
-
-    next_bucket_id_ = max_seen_id + 1;
-    next_generation_ = std::max<uint64_t>(1, max_generation);
+    if (!orphan_data_ids.empty()) {
+        EnqueueRecoveryTail({RecoveryTailTask::Kind::kDeleteBuckets,
+                             std::move(orphan_data_ids)});
+    }
 
     // Every recovered bucket is sealed, so none of them is resumed: the next
     // allocation opens a fresh bucket. This is what keeps a sealed bucket's
@@ -2339,6 +2615,28 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
         lru_list_.push_front(bucket_id);
         lru_index_[bucket_id] = lru_list_.begin();
     }
+
+    // One line per restart that says where the startup time actually went: the
+    // directory scan, the per-bucket loop that the budget bounds, and the
+    // wrap-up after it. Together with the initializer log below it is what
+    // makes a missed budget diagnosable without re-deriving it from timestamps.
+    const auto recovery_finished = std::chrono::steady_clock::now();
+    recovery_elapsed_ms_ =
+        DurationMsBetween(recovery_started, recovery_finished);
+    LOG(INFO) << "DFS bucket recovery finished: elapsed_ms="
+              << DurationMsBetween(recovery_started, recovery_finished)
+              << ", scan_ms="
+              << DurationMsBetween(recovery_started, scan_finished)
+              << ", loop_ms="
+              << DurationMsBetween(scan_finished, loop_finished)
+              << ", finalize_ms="
+              << DurationMsBetween(loop_finished, recovery_finished)
+              << ", buckets=" << buckets_.size()
+              << ", rejected=" << rejected_buckets
+              << ", skipped=" << recovery_skipped_buckets_
+              << ", replicas=" << recovered_replicas_.size()
+              << ", budget_buckets=" << recovery_max_buckets_
+              << ", budget_seconds=" << recovery_max_duration_.count();
 
     PublishBucketIdSnapshotLocked();
     return {};

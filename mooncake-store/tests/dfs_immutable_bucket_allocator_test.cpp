@@ -888,6 +888,9 @@ TEST(ImmutableBucketAllocatorTest, RecoveryRejectsOldMetadataVersion) {
 
 TEST(ImmutableBucketAllocatorTest, RecoveryChoosesLargestEntryGeneration) {
     TempDir tmp("bucket_duplicate_generation");
+    // Still true after the single-pass rewrite: a generation is only allocated
+    // by the active bucket, so the greater generation belongs to the newer
+    // bucket, which recovery reaches first.
     ASSERT_TRUE(CreateBucketDataFile(tmp, 0, kBucketCapacity));
     ASSERT_TRUE(CreateBucketDataFile(tmp, 1, kBucketCapacity));
     ASSERT_TRUE(
@@ -904,7 +907,7 @@ TEST(ImmutableBucketAllocatorTest, RecoveryChoosesLargestEntryGeneration) {
     EXPECT_EQ(replicas[0].descriptor.shard_idx, 1);
 }
 
-TEST(ImmutableBucketAllocatorTest, RecoveryBreaksGenerationTiesByLocation) {
+TEST(ImmutableBucketAllocatorTest, RecoveryBreaksDuplicateKeyTiesByBucketId) {
     TempDir tmp("bucket_duplicate_tie");
     ASSERT_TRUE(CreateBucketDataFile(tmp, 0, kBucketCapacity));
     ASSERT_TRUE(CreateBucketDataFile(tmp, 1, kBucketCapacity));
@@ -918,8 +921,34 @@ TEST(ImmutableBucketAllocatorTest, RecoveryBreaksGenerationTiesByLocation) {
         recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
     auto replicas = recovered.TakeRecoveredReplicas();
     ASSERT_EQ(replicas.size(), 1u);
+    // Equal generations, so the newer bucket decides - not the entry location.
     EXPECT_EQ(replicas[0].descriptor.shard_idx, 1);
     EXPECT_EQ(replicas[0].descriptor.offset, 0u);
+}
+
+TEST(ImmutableBucketAllocatorTest, RecoveryPrefersNewestBucketOnDuplicateKeys) {
+    TempDir tmp("bucket_duplicate_newest");
+    ASSERT_TRUE(CreateBucketDataFile(tmp, 0, kBucketCapacity));
+    ASSERT_TRUE(CreateBucketDataFile(tmp, 1, kBucketCapacity));
+    // A generation is only ever allocated by the active bucket, so a smaller
+    // bucket id carrying the greater generation cannot happen in a healthy
+    // directory. It is spelled out on purpose: recovery no longer compares
+    // generations, it walks buckets newest first and the first claim wins, so
+    // even here the newest bucket keeps the key.
+    ASSERT_TRUE(
+        WriteBucketMetadata(tmp, MakeMetadataSnapshot(0, "duplicate", 0, 99)));
+    ASSERT_TRUE(
+        WriteBucketMetadata(tmp, MakeMetadataSnapshot(1, "duplicate", 0, 1)));
+
+    ImmutableBucketAllocator recovered;
+    ASSERT_TRUE(
+        recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
+    auto replicas = recovered.TakeRecoveredReplicas();
+    ASSERT_EQ(replicas.size(), 1u);
+    EXPECT_EQ(replicas[0].key, "duplicate");
+    EXPECT_EQ(replicas[0].descriptor.shard_idx, 1);
+    EXPECT_EQ(recovered.GetBucketIdForKey("duplicate"),
+              std::optional<int64_t>(1));
 }
 
 TEST(ImmutableBucketAllocatorTest, RecoveryRestoresOnlyCommittedEntries) {
@@ -1199,6 +1228,9 @@ TEST(ImmutableBucketAllocatorTest, RecoveryRemovesOrphanDataFiles) {
     ImmutableBucketAllocator recovered;
     ASSERT_TRUE(
         recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
+    // Reclaiming an orphan is deferred off the startup path, so wait for the
+    // tail to land instead of relying on Init to have done the delete.
+    ASSERT_TRUE(recovered.WaitForRecoveryTailIdle(std::chrono::seconds(10)));
     // A data file with no valid metadata is unreachable, so it is reclaimed.
     EXPECT_FALSE(std::filesystem::exists(orphan));
     // Bucket ids must not be reused after an orphan at a higher id.
@@ -1280,6 +1312,8 @@ TEST(ImmutableBucketAllocatorTest, RecoveryPreservesBucketIdSequence) {
     // at shutdown, so it has no metadata and its data file is reclaimed.
     EXPECT_EQ(recovered.GetBucketCount(), 2u);
     EXPECT_EQ(recovered.TakeRecoveredReplicas().size(), 2u);
+    // The reclaim of bucket 2 is deferred off the startup path.
+    ASSERT_TRUE(recovered.WaitForRecoveryTailIdle(std::chrono::seconds(10)));
     EXPECT_FALSE(std::filesystem::exists(BucketMetaFile(tmp, 2)));
     EXPECT_FALSE(std::filesystem::exists(tmp.file(
         "bucket_" + ImmutableBucketAllocator::FormatBucketId(2) + ".data")));
@@ -1307,8 +1341,14 @@ TEST(ImmutableBucketAllocatorTest, RecoveryDisabledReclaimsFilesAndUsesFreshBudg
     std::ofstream(tmp.file("bucket_000042.data")) << "orphan data";
     std::vector<std::string> old_files;
     for (const auto& entry : std::filesystem::directory_iterator(tmp.path())) {
+        // The root marker is the master's format file, not a bucket, so the
+        // startup sweep has no business deleting it.
+        if (entry.path().filename().string() == kDfsRootMarkerFileName) {
+            continue;
+        }
         old_files.push_back(entry.path().string());
     }
+    ASSERT_FALSE(old_files.empty());
 
     config.bucket_recovery_enabled = false;
     config.max_bucket_count = 2;
@@ -1345,6 +1385,8 @@ TEST(ImmutableBucketAllocatorTest, RecoveryDisabledReclaimsFilesAndUsesFreshBudg
     for (const auto& path : old_files) {
         EXPECT_FALSE(std::filesystem::exists(path)) << path;
     }
+    // Deleting every bucket file is not the same as wiping the directory.
+    EXPECT_TRUE(std::filesystem::exists(tmp.file(kDfsRootMarkerFileName)));
 
     // A metadata-only ID also reserves its name without loading its payload.
     std::ofstream(tmp.file("bucket_000050.meta")) << "still not metadata";
@@ -1354,6 +1396,171 @@ TEST(ImmutableBucketAllocatorTest, RecoveryDisabledReclaimsFilesAndUsesFreshBudg
     ASSERT_TRUE(descriptor.has_value());
     EXPECT_EQ(descriptor->shard_idx, 51);
     EXPECT_TRUE(next.TakeRecoveredReplicas().empty());
+}
+
+TEST(ImmutableBucketAllocatorTest, RecoveryBudgetKeepsNewestBuckets) {
+    TempDir tmp("bucket_recover_budget");
+    const uint64_t capacity = kAlignment;  // one entry per bucket
+    // Six sealed buckets, ids 0..5, one committed key each.
+    {
+        ImmutableBucketAllocator alloc;
+        ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), capacity, 8)));
+        for (int i = 0; i < 6; ++i) {
+            auto desc = alloc.Allocate("k" + std::to_string(i), 100);
+            ASSERT_TRUE(desc.has_value());
+            ASSERT_EQ(desc->shard_idx, static_cast<int64_t>(i));
+            ASSERT_TRUE(alloc.MarkCommitted("k" + std::to_string(i), *desc));
+        }
+        // The newest bucket is still active, so seal it to give it a `.meta`.
+        ASSERT_TRUE(
+            RollOverActiveBucket(alloc, "filler", capacity).has_value());
+    }
+    for (int64_t id = 0; id < 6; ++id) {
+        ASSERT_TRUE(std::filesystem::exists(BucketMetaFile(tmp, id))) << id;
+    }
+
+    auto config = MakeBucketConfig(tmp.path(), capacity, 8);
+    config.recovery_max_buckets = 2;
+    ImmutableBucketAllocator recovered;
+    ASSERT_TRUE(recovered.Init(config));
+    // Recovery walks bucket ids downwards, so the budget keeps the most
+    // recently written buckets and drops the oldest - the same buckets the LRU
+    // would have evicted first.
+    EXPECT_EQ(recovered.GetBucketCount(), 2u);
+    EXPECT_EQ(recovered.TakeRecoveredReplicas().size(), 2u);
+    EXPECT_TRUE(recovered.GetBucketIdForKey("k5").has_value());
+    EXPECT_TRUE(recovered.GetBucketIdForKey("k4").has_value());
+    for (const char* dropped : {"k0", "k1", "k2", "k3"}) {
+        EXPECT_FALSE(recovered.GetBucketIdForKey(dropped).has_value())
+            << dropped;
+    }
+
+    // The dropped buckets are deleted off the startup path, but their ids stay
+    // retired so a stale descriptor can never alias a freshly created bucket.
+    ASSERT_TRUE(recovered.WaitForRecoveryTailIdle(std::chrono::seconds(10)));
+    for (int64_t id = 0; id < 4; ++id) {
+        EXPECT_FALSE(std::filesystem::exists(BucketMetaFile(tmp, id))) << id;
+        EXPECT_FALSE(std::filesystem::exists(BucketDataFile(tmp, id))) << id;
+    }
+    EXPECT_TRUE(std::filesystem::exists(BucketMetaFile(tmp, 5)));
+
+    auto desc = recovered.Allocate("after", 100);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_GT(desc->shard_idx, 6);
+}
+
+// ---------------------------------------------------------------------------
+// ImmutableBucketAllocator: sharing the startup budget with the master
+// ---------------------------------------------------------------------------
+
+TEST(ImmutableBucketAllocatorTest, DropRecoveredBucketsReclaimsOldest) {
+    TempDir tmp("bucket_drop_recovered");
+    const uint64_t capacity = kAlignment;  // one entry per bucket
+    {
+        ImmutableBucketAllocator alloc;
+        ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), capacity, 8)));
+        for (int i = 0; i < 4; ++i) {
+            const std::string key = "k" + std::to_string(i);
+            auto desc = alloc.Allocate(key, 100);
+            ASSERT_TRUE(desc.has_value());
+            ASSERT_EQ(desc->shard_idx, static_cast<int64_t>(i));
+            ASSERT_TRUE(alloc.MarkCommitted(key, *desc));
+        }
+        ASSERT_TRUE(
+            RollOverActiveBucket(alloc, "filler", capacity).has_value());
+    }
+
+    ImmutableBucketAllocator recovered;
+    ASSERT_TRUE(recovered.Init(MakeBucketConfig(tmp.path(), capacity, 8)));
+    ASSERT_EQ(recovered.GetBucketCount(), 4u);
+
+    // What the master does when its share of the budget runs out partway
+    // through re-registering the replicas recovery handed it: the buckets it
+    // never got to are reclaimed as a whole.
+    recovered.DropRecoveredBuckets(std::vector<int64_t>{0, 1});
+    EXPECT_EQ(recovered.GetBucketCount(), 2u);
+    EXPECT_FALSE(recovered.GetBucketIdForKey("k0").has_value());
+    EXPECT_FALSE(recovered.GetBucketIdForKey("k1").has_value());
+    EXPECT_EQ(recovered.GetBucketIdForKey("k2"), std::optional<int64_t>(2));
+    EXPECT_EQ(recovered.GetBucketIdForKey("k3"), std::optional<int64_t>(3));
+
+    // Reclaiming is deferred, and the ids stay retired so a descriptor handed
+    // out earlier can never alias a bucket created later.
+    ASSERT_TRUE(recovered.WaitForRecoveryTailIdle(std::chrono::seconds(10)));
+    for (int64_t id : {0, 1}) {
+        EXPECT_FALSE(std::filesystem::exists(BucketMetaFile(tmp, id))) << id;
+        EXPECT_FALSE(std::filesystem::exists(BucketDataFile(tmp, id))) << id;
+    }
+    EXPECT_TRUE(std::filesystem::exists(BucketMetaFile(tmp, 3)));
+
+    auto desc = recovered.Allocate("after", 100);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_GT(desc->shard_idx, 3);
+}
+
+TEST(ImmutableBucketAllocatorTest,
+     DropRecoveredBucketsKeepsDuplicateKeyWinners) {
+    TempDir tmp("bucket_drop_duplicate");
+    ASSERT_TRUE(CreateBucketDataFile(tmp, 0, kBucketCapacity));
+    ASSERT_TRUE(CreateBucketDataFile(tmp, 1, kBucketCapacity));
+    ASSERT_TRUE(WriteBucketMetadata(
+        tmp, MakeMetadataSnapshot(0, "duplicate", 0, 1)));
+    ASSERT_TRUE(WriteBucketMetadata(
+        tmp, MakeMetadataSnapshot(1, "duplicate", 0, 2)));
+
+    ImmutableBucketAllocator recovered;
+    ASSERT_TRUE(
+        recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
+    ASSERT_EQ(recovered.GetBucketIdForKey("duplicate"),
+              std::optional<int64_t>(1));
+
+    // The key index is the claim table, so it has to be cleared by bucket id:
+    // dropping the bucket that lost the key must not take the winner's entry
+    // with it.
+    recovered.DropRecoveredBuckets(std::vector<int64_t>{0});
+    EXPECT_EQ(recovered.GetBucketIdForKey("duplicate"),
+              std::optional<int64_t>(1));
+    EXPECT_EQ(recovered.GetBucketCount(), 1u);
+
+    // Only when the winning bucket itself goes does the key disappear.
+    recovered.DropRecoveredBuckets(std::vector<int64_t>{1});
+    EXPECT_FALSE(recovered.GetBucketIdForKey("duplicate").has_value());
+    EXPECT_EQ(recovered.GetBucketCount(), 0u);
+}
+
+TEST(ImmutableBucketAllocatorTest, RecoveryElapsedMsIsReported) {
+    TempDir tmp("bucket_recovery_elapsed");
+    // Must match the capacity MakeMetadataSnapshot() bakes into the metadata,
+    // or every bucket is rejected on the capacity check before it is restored.
+    const uint64_t capacity = kBucketCapacity;
+    for (int64_t id = 0; id < 64; ++id) {
+        ASSERT_TRUE(CreateBucketDataFile(tmp, id, capacity));
+        ASSERT_TRUE(WriteBucketMetadata(
+            tmp, MakeMetadataSnapshot(id, "k" + std::to_string(id), 0,
+                                      static_cast<uint64_t>(id) + 1)));
+    }
+
+    // The master subtracts this from the shared startup budget to get its own
+    // deadline, so it has to be the measured cost of the pass rather than the
+    // configured one.
+    {
+        ImmutableBucketAllocator recovered;
+        ASSERT_TRUE(recovered.Init(MakeBucketConfig(tmp.path(), capacity, 64)));
+        EXPECT_EQ(recovered.GetBucketCount(), 64u);
+        EXPECT_GT(recovered.RecoveryElapsedMs(), 0);
+        EXPECT_LT(recovered.RecoveryElapsedMs(), 10 * 1000);
+        ASSERT_TRUE(
+            recovered.WaitForRecoveryTailIdle(std::chrono::seconds(10)));
+    }
+
+    // A recovery that never ran must report nothing: reporting a cost here
+    // would make the master start with a budget it believes already spent.
+    auto disabled = MakeBucketConfig(tmp.path(), capacity, 8);
+    disabled.bucket_recovery_enabled = false;
+    ImmutableBucketAllocator swept;
+    ASSERT_TRUE(swept.Init(disabled));
+    EXPECT_EQ(swept.RecoveryElapsedMs(), 0);
+    ASSERT_TRUE(swept.WaitForRecoveryTailIdle(std::chrono::seconds(10)));
 }
 
 // ---------------------------------------------------------------------------
@@ -2066,6 +2273,16 @@ TEST(DfsAllocatorConfigTest, DefaultsToShardAndValidatesBucketFields) {
     negative_ready_pool.ready_bucket_target = -1;
     EXPECT_FALSE(negative_ready_pool.ValidateForBucketAllocator());
 
+    // Recovery bounds may be zero (meaning "derive"/"no budget") but never
+    // negative, which would silently disarm the cap.
+    auto negative_recovery_buckets = bucket;
+    negative_recovery_buckets.recovery_max_buckets = -1;
+    EXPECT_FALSE(negative_recovery_buckets.ValidateForBucketAllocator());
+
+    auto negative_recovery_budget = bucket;
+    negative_recovery_budget.recovery_max_duration_seconds = -1;
+    EXPECT_FALSE(negative_recovery_budget.ValidateForBucketAllocator());
+
     const std::string formatted = bucket.FormatStr();
     EXPECT_NE(formatted.find("allocator_type=bucket"), std::string::npos);
     EXPECT_NE(formatted.find("bucket_capacity="), std::string::npos);
@@ -2173,10 +2390,12 @@ TEST(BucketMetadataDurabilityTest, AbruptRestartDropsTheActiveBucket) {
     ASSERT_TRUE(
         recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
     // Losing the single active bucket is the accepted trade-off for keeping the
-    // put path free of metadata I/O. Its data file must not be left behind.
+    // put path free of metadata I/O. Its data file must not be left behind;
+    // the deletion is deferred, so wait for the tail before looking.
     EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
     EXPECT_FALSE(recovered.GetBucketIdForKey("crash_a").has_value());
     EXPECT_FALSE(recovered.GetBucketIdForKey("crash_b").has_value());
+    ASSERT_TRUE(recovered.WaitForRecoveryTailIdle(std::chrono::seconds(10)));
     EXPECT_FALSE(std::filesystem::exists(data_path));
 }
 
