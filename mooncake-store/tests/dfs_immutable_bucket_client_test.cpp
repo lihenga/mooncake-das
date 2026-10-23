@@ -1860,6 +1860,62 @@ TEST_F(DfsBucketClientTest,
 }
 
 TEST_F(DfsBucketClientTest,
+       ServiceMetricsDeadlineSettlesBlockedWriteAndIgnoresLateResult) {
+    writer_.reset();
+    SetEnv("MOONCAKE_DFS_BATCH_PUT_TIMEOUT_MS", "50");
+    writer_ = CreateClient("127.0.0.1:18203");
+    ASSERT_NE(writer_, nullptr);
+    writer_->SetDfsStorageBackend(backend_);
+    const auto endpoint = NextServiceEndpoint();
+    ASSERT_EQ(writer_->SetServiceEndpoint(endpoint), 0);
+    adapter_->BlockWrites();
+
+    const std::string key = "service_metric_blocked_deadline";
+    std::vector<std::string> values{std::string(4096, 'D')};
+    auto slices = MakeSlices(values);
+    auto results = writer_->BatchPut({key}, slices, DfsConfig());
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_TRUE(results.front().has_value());
+
+    const auto started_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (adapter_->WriteCalls() == 0 &&
+           std::chrono::steady_clock::now() < started_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_GT(adapter_->WriteCalls(), 0);
+
+    // Leave the filesystem write blocked. The reporter must settle the
+    // existing publication deadline without waiting for its physical result.
+    auto memory_only =
+        WaitForServiceMetricValue("mooncake_master_service_dual_write_total",
+                                  endpoint, "outcome=\"memory_only\"", 1.0);
+    ASSERT_TRUE(memory_only.has_value());
+    EXPECT_DOUBLE_EQ(*memory_only, 1.0);
+    auto pending = FindServiceMetricValue(
+        "mooncake_master_service_dual_write_pending", endpoint);
+    ASSERT_TRUE(pending.has_value());
+    EXPECT_DOUBLE_EQ(*pending, 0.0);
+
+    adapter_->ReleaseWrites();
+    writer_.reset();  // Drain the late result and flush the final snapshot.
+    memory_only =
+        FindServiceMetricValue("mooncake_master_service_dual_write_total",
+                               endpoint, "outcome=\"memory_only\"");
+    pending = FindServiceMetricValue(
+        "mooncake_master_service_dual_write_pending", endpoint);
+    auto both_success =
+        FindServiceMetricValue("mooncake_master_service_dual_write_total",
+                               endpoint, "outcome=\"both_success\"");
+    ASSERT_TRUE(memory_only.has_value());
+    ASSERT_TRUE(pending.has_value());
+    ASSERT_TRUE(both_success.has_value());
+    EXPECT_DOUBLE_EQ(*memory_only, 1.0);
+    EXPECT_DOUBLE_EQ(*pending, 0.0);
+    EXPECT_DOUBLE_EQ(*both_success, 0.0);
+}
+
+TEST_F(DfsBucketClientTest,
        ServiceMetricsCountBatchReadFailuresOncePerKeyAndReplicaTier) {
     const auto endpoint = NextServiceEndpoint();
     ASSERT_EQ(writer_->SetServiceEndpoint(endpoint), 0);
