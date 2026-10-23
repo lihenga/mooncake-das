@@ -943,7 +943,27 @@ MasterService::DfsInitResult MasterService::InitDfsAllocatorFromEnvironment(
         throw std::invalid_argument("DFS is incompatible with oplog recovery");
     }
 
-    const auto dfs_config = DistributedStorageConfig::FromEnvironment();
+    auto dfs_config = DistributedStorageConfig::FromEnvironment();
+    // A recovery budget truncates the bucket set, and a bucket that does not
+    // fit is deleted. That is only safe when the bucket metadata is what
+    // rebuilds the master's view: nothing can then name a bucket recovery
+    // skipped. Under snapshot restore the master's metadata comes from the
+    // snapshot instead (dfs_restore_from_bucket_metadata_ == false) and it
+    // keeps DFS replicas pointing straight at those bucket files, so a
+    // truncated bucket would leave the snapshot naming data that is gone -
+    // readable per IsReplicaReadable(), but absent on disk. Restore every
+    // bucket in that mode: a slower start beats a dangling reference.
+    if (!dfs_restore_from_bucket_metadata_) {
+        if (dfs_config.recovery_max_buckets != 0 ||
+            dfs_config.recovery_max_duration_seconds != 0) {
+            LOG(INFO) << "DFS bucket recovery budget disabled: snapshot mode "
+                         "owns the metadata, so every bucket has to be "
+                         "restored for the replicas naming it to resolve";
+        }
+        dfs_config.recovery_max_buckets =
+            DistributedStorageConfig::kRecoveryMaxBucketsUnlimited;
+        dfs_config.recovery_max_duration_seconds = 0;
+    }
     dfs_bucket_low_utilization_threshold_ =
         dfs_config.low_utilization_threshold;
     dfs_bucket_low_utilization_evictions_per_tick_ =
