@@ -1673,7 +1673,13 @@ int main(int argc, char* argv[]) {
         mooncake::RegisterRpcService(server, *wrapped_master_service);
 
         static std::atomic<bool> shutdown_requested{false};
+        static std::atomic<int> shutdown_signals{0};
         auto signal_handler = [](int /* signum */) {
+            // Teardown below does synchronous filesystem I/O, so a stalled
+            // mount can leave it hanging with no way to kill the process from
+            // outside. A second signal means "stop waiting": leave at once
+            // rather than signalling a graceful path that is not progressing.
+            if (shutdown_signals.fetch_add(1) > 0) std::_Exit(130);
             shutdown_requested.store(true);
         };
         std::signal(SIGINT, signal_handler);
@@ -1688,6 +1694,45 @@ int main(int argc, char* argv[]) {
 
         while (!shutdown_requested.load() && !server_done.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        // Most of the teardown cost is not here but in the destructors that run
+        // after this scope: flushing bucket metadata, draining deferred bucket
+        // deletes, shutting the dfs adapter down. Any of those can block on a
+        // stalled mount for far longer than an operator will wait, and while
+        // blocked in the kernel the process cannot even be killed. Bound it, and
+        // leave deliberately rather than sitting in that wait.
+        // The deadline has to outlast an honest teardown - a bucket whose
+        // metadata is not flushed is unrecoverable next start, not merely
+        // slow - while still being short enough that an operator is not left
+        // waiting on a mount that will never answer. Raise it for very large
+        // bucket sets.
+        int64_t teardown_timeout_seconds = 120;
+        if (const char* env =
+                std::getenv("MOONCAKE_MASTER_SHUTDOWN_TIMEOUT_SECONDS")) {
+            try {
+                teardown_timeout_seconds = std::stoll(env);
+            } catch (const std::exception&) {
+                LOG(WARNING) << "Invalid MOONCAKE_MASTER_SHUTDOWN_TIMEOUT_"
+                                "SECONDS=\""
+                             << env << "\", using default "
+                             << teardown_timeout_seconds;
+            }
+        }
+        // Zero or negative disables the watchdog, for deployments that would
+        // rather hang than risk leaving a bucket's metadata unflushed.
+        if (teardown_timeout_seconds > 0) {
+            const std::chrono::seconds teardown_deadline(
+                teardown_timeout_seconds);
+            std::thread teardown_watchdog([teardown_deadline]() {
+                std::this_thread::sleep_for(teardown_deadline);
+                LOG(ERROR) << "Graceful shutdown still running after "
+                           << teardown_deadline.count()
+                           << "s, most likely blocked in filesystem I/O; "
+                              "exiting without finishing it";
+                std::_Exit(130);
+            });
+            teardown_watchdog.detach();
         }
 
         server.stop();
