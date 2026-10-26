@@ -8330,46 +8330,161 @@ void MasterService::RestoreRecoveredDfsReplicas(bool rebuild_metadata) {
     if (rebuild_metadata) {
         std::vector<ImmutableBucketAllocator::RecoveredReplica>
             stale_recovered;
-        // Recovery emitted the replicas newest bucket first. Walking them in
-        // that order and checking the budget only between buckets means running
-        // out of it drops the oldest data - the same choice recovery makes -
-        // and never leaves a bucket half registered.
+
+        // --- Phase 1: serial precompute ---
+        // One pass over all recovered entries to build:
+        //   (a) bucket block boundaries (newest first; block_id 0 = newest),
+        //   (b) shard routing — plain hash, group_routing_mutex_ is idle at
+        //       startup so there is no point holding its shared lock for
+        //       each of the 1.2M entries,
+        //   (c) per-entry block_id so budget enforcement can skip an entire
+        //       bucket instead of cutting it in half.
+        struct BucketBlock {
+            int64_t bucket_id;
+        };
+        struct EntrySpec {
+            size_t recovered_idx;
+            size_t block_id;  // 0 = newest bucket
+        };
+        std::vector<BucketBlock> blocks;
+        blocks.reserve(32);  // typical count for this workload
+        std::unordered_map<size_t, std::vector<EntrySpec>> indices_by_shard;
+        indices_by_shard.reserve(kNumShards);
+
         size_t block_begin = 0;
         while (block_begin < recovered.size()) {
-            // For DFS bucket replicas the shard index carries the bucket id.
-            const int64_t bucket_id =
-                recovered[block_begin].descriptor.shard_idx;
+            const int64_t bucket_id = recovered[block_begin].descriptor.shard_idx;
             size_t block_end = block_begin;
             while (block_end < recovered.size() &&
                    recovered[block_end].descriptor.shard_idx == bucket_id) {
                 ++block_end;
             }
-            if (budgeted && block_begin > 0 &&
-                std::chrono::steady_clock::now() >= deadline) {
-                for (size_t i = block_begin; i < recovered.size();) {
-                    const int64_t unregistered_id =
-                        recovered[i].descriptor.shard_idx;
-                    unregistered_buckets.push_back(unregistered_id);
-                    while (i < recovered.size() &&
-                           recovered[i].descriptor.shard_idx ==
-                               unregistered_id) {
-                        ++i;
-                    }
-                }
-                break;
-            }
-
-            std::unordered_map<size_t, std::vector<size_t>> indices_by_shard;
+            const size_t block_id = blocks.size();
+            blocks.push_back({bucket_id});
             for (size_t i = block_begin; i < block_end; ++i) {
-                indices_by_shard[getMetadataShardIndex(tenant_id,
-                                                       recovered[i].key)]
-                    .push_back(i);
+                // Direct hash — object_group_ids_ is empty during startup
+                // recovery so getMetadataShardIndex() would only waste a
+                // shared lock + one unordered_map lookup per entry.
+                const size_t shard_idx =
+                    MasterService::getShardIndex(tenant_id, recovered[i].key);
+                indices_by_shard[shard_idx].push_back({i, block_id});
             }
-            for (auto& [shard_idx, indices] : indices_by_shard) {
+            block_begin = block_end;
+        }
+
+        // Shard groups, sorted by shard_idx so the chunk partitioning is
+        // deterministic across runs. Inside each shard, entries are ordered
+        // newest-block first so a deadline cut at block_id K drops every
+        // block >= K from that point forward — exactly the semantics the
+        // serial loop had.
+        std::vector<std::pair<size_t, std::vector<EntrySpec>>> shard_groups_vec;
+        shard_groups_vec.reserve(indices_by_shard.size());
+        for (auto& [shard_idx, entries] : indices_by_shard) {
+            std::sort(entries.begin(), entries.end(),
+                      [](const EntrySpec& a, const EntrySpec& b) {
+                          return a.block_id < b.block_id;
+                      });
+            shard_groups_vec.push_back({shard_idx, std::move(entries)});
+        }
+        std::sort(shard_groups_vec.begin(), shard_groups_vec.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+
+        // Pre-reserve each shard's metadata map so the worker emplaces never
+        // rehash. Recovery is single-tenant so we only need to reserve under
+        // one TenantState, but metadata is a flat unordered_map keyed by
+        // {tenant_id, key} — we reserve bucket count from the full entry
+        // count of this shard. Lock acquisition here is serial but there is
+        // no contention (workers are not started yet) and the work per shard
+        // is tiny (one bucket-array allocation).
+        for (const auto& [shard_idx, entries] : shard_groups_vec) {
+            MetadataShardAccessorRW shard(this, shard_idx);
+            auto& tenant_state = shard->tenants[tenant_id];
+            tenant_state.metadata.reserve(entries.size() * 2);
+        }
+
+        // --- Phase 2: one fork-join for the whole registration ---
+        // Every shard has its own mutex so workers touching disjoint shards
+        // never contend. Local counters on each worker avoid any shared hot
+        // atomic — the join step is the only serialisation point.
+        struct RegistrationResult {
+            size_t restored = 0;
+            size_t superseded = 0;
+            size_t preserved_live = 0;
+            std::vector<ImmutableBucketAllocator::RecoveredReplica> stale;
+            // First dropped block_id (inclusive); std::numeric_limits<size_t>::max()
+            // means nothing was cut off. Using a sentinel instead of blocks.size()
+            // because C++ local classes cannot capture enclosing locals in
+            // default member initializers.
+            size_t cutoff_block_id = std::numeric_limits<size_t>::max();
+        };
+
+        constexpr size_t kRecoveryRegistrationConcurrency = 8;
+        const size_t num_workers =
+            std::min(shard_groups_vec.size(), kRecoveryRegistrationConcurrency);
+
+        // Shared budget-cutoff written by whichever worker first hits the
+        // deadline; other workers read it and stop at the same block_id.
+        std::atomic<size_t> global_cutoff_block{blocks.size()};
+
+        auto worker = [&](size_t sg_begin, size_t sg_end) -> RegistrationResult {
+            RegistrationResult result;
+            static DfsLogLimiter log_limiter;
+            // cutoff_block_id semantics: any entry whose block_id >= cutoff
+            // is skipped (that bucket and every older one). blocks.size() is
+            // sentinel "nothing dropped".
+            size_t my_cutoff = blocks.size();
+
+            // Check and adopt shared cutoff before starting a new shard
+            // group — avoids doing work we would only throw away.
+            auto refresh_cutoff = [&]() {
+                const size_t remote = global_cutoff_block.load();
+                if (remote < my_cutoff) my_cutoff = remote;
+            };
+
+            for (size_t gi = sg_begin; gi < sg_end; ++gi) {
+                refresh_cutoff();
+                if (my_cutoff == 0) break;  // all blocks dropped already
+
+                const size_t shard_idx = shard_groups_vec[gi].first;
+                const auto& entries = shard_groups_vec[gi].second;
                 MetadataShardAccessorRW shard(this, shard_idx);
                 auto& tenant_state = shard->tenants[tenant_id];
-                for (const size_t i : indices) {
-                    auto& entry = recovered[i];
+
+                size_t last_block_id = 0;  // dummy, set on first iteration
+                bool first_entry = true;
+                auto block_timestamp = std::chrono::system_clock::now();
+
+                for (const EntrySpec& spec : entries) {
+                    // entries are newest-block first in this shard, so once
+                    // we pass cutoff every remaining entry belongs to an
+                    // older bucket we will drop anyway.
+                    if (spec.block_id >= my_cutoff) break;
+
+                    // block_id changed — we just finished a bucket block in
+                    // this shard. This is exactly where the serial loop did
+                    // its deadline check: between buckets, never inside one.
+                    if (!first_entry && spec.block_id != last_block_id) {
+                        // Batch timestamp: one capture per bucket block instead
+                        // of one per entry — saves ~1.2M system_clock calls.
+                        block_timestamp = std::chrono::system_clock::now();
+
+                        if (budgeted) {
+                            if (std::chrono::steady_clock::now() >= deadline &&
+                                spec.block_id > 0) {
+                                // Drop from this block (inclusive) onwards.
+                                my_cutoff = std::min(my_cutoff, spec.block_id);
+                                size_t expected = blocks.size();
+                                global_cutoff_block.compare_exchange_strong(
+                                    expected, my_cutoff);
+                                result.cutoff_block_id = my_cutoff;
+                                break;
+                            }
+                        }
+                    }
+                    last_block_id = spec.block_id;
+                    first_entry = false;
+
+                    auto& entry = recovered[spec.recovered_idx];
                     auto existing = tenant_state.metadata.find(entry.key);
                     if (existing != tenant_state.metadata.end()) {
                         const auto& metadata = existing->second;
@@ -8379,14 +8494,9 @@ void MasterService::RestoreRecoveredDfsReplicas(bool rebuild_metadata) {
                             metadata.HasReplica(&Replica::fn_is_dfs_replica);
                         if (installed_by_this_recovery) {
                             tenant_state.metadata.erase(existing);
-                            ++superseded;
+                            ++result.superseded;
                         } else {
-                            // A retry can race with a successful memory-only
-                            // write. Keep the live value and tombstone only
-                            // the stale DFS extent after releasing all
-                            // metadata shard locks.
-                            ++preserved_live;
-                            static DfsLogLimiter log_limiter;
+                            ++result.preserved_live;
                             if (auto suppressed = log_limiter.ShouldLog()) {
                                 LOG(WARNING)
                                     << "Skipping stale DFS recovery for key="
@@ -8395,7 +8505,7 @@ void MasterService::RestoreRecoveredDfsReplicas(bool rebuild_metadata) {
                                        "recovered extent tombstoned, "
                                        "suppressed=" << *suppressed;
                             }
-                            stale_recovered.push_back(std::move(entry));
+                            result.stale.push_back(std::move(entry));
                             continue;
                         }
                     }
@@ -8404,23 +8514,66 @@ void MasterService::RestoreRecoveredDfsReplicas(bool rebuild_metadata) {
                     std::vector<Replica> replicas;
                     replicas.emplace_back(entry.descriptor,
                                           ReplicaStatus::COMPLETE);
+                    // entry.key would be copied twice below — once into the
+                    // unordered_map node and once into ObjectMetadata.user_key.
+                    // We materialise one copy (for the map key) and move the
+                    // second out of `entry` so the heap allocation happens
+                    // only once per entry instead of twice.
+                    std::string key_for_map = entry.key;
+                    std::string key_for_meta = std::move(entry.key);
                     tenant_state.metadata.emplace(
                         std::piecewise_construct,
-                        std::forward_as_tuple(entry.key),
+                        std::forward_as_tuple(std::move(key_for_map)),
                         std::forward_as_tuple(
-                            UUID{0, 0}, std::chrono::system_clock::now(),
+                            UUID{0, 0}, block_timestamp,
                             object_size, std::move(replicas), std::nullopt,
                             /*enable_hard_pin=*/false,
-                            ObjectDataType::UNKNOWN, std::string(), tenant_id,
-                            entry.key));
-                    ++restored;
+                            ObjectDataType::UNKNOWN, std::string(),
+                            tenant_id, std::move(key_for_meta)));
+                    ++result.restored;
                 }
             }
-            block_begin = block_end;
+            result.cutoff_block_id = my_cutoff;
+            return result;
+        };
+
+        std::vector<std::future<RegistrationResult>> futures;
+        futures.reserve(num_workers);
+        const size_t total_groups = shard_groups_vec.size();
+        const size_t chunk =
+            (total_groups + num_workers - 1) / num_workers;
+        for (size_t w = 0; w < num_workers; ++w) {
+            const size_t begin = w * chunk;
+            if (begin >= total_groups) break;
+            const size_t end = std::min(begin + chunk, total_groups);
+            futures.push_back(
+                std::async(std::launch::async, worker, begin, end));
+        }
+
+        size_t effective_cutoff = blocks.size();
+        for (auto& f : futures) {
+            auto r = f.get();
+            restored += r.restored;
+            superseded += r.superseded;
+            preserved_live += r.preserved_live;
+            effective_cutoff = std::min(effective_cutoff, r.cutoff_block_id);
+            stale_recovered.insert(
+                stale_recovered.end(),
+                std::make_move_iterator(r.stale.begin()),
+                std::make_move_iterator(r.stale.end()));
+        }
+
+        // Any block with block_id >= effective_cutoff was never registered
+        // (workers cut at that boundary). Tell the allocator so it can drop
+        // the surplus in the background.
+        if (effective_cutoff < blocks.size()) {
+            for (size_t bid = effective_cutoff; bid < blocks.size(); ++bid) {
+                unregistered_buckets.push_back(blocks[bid].bucket_id);
+            }
         }
 
         // Never nest allocator and metadata-shard locks.
-        for (const auto& entry : stale_recovered) {
+        for (auto& entry : stale_recovered) {
             bucket_allocator_->Free(entry.key, entry.descriptor);
         }
     }
