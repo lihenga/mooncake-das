@@ -6,6 +6,7 @@
 
 #include <csignal>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <ylt/coro_rpc/impl/coro_rpc_client.hpp>
 #include <ylt/util/tl/expected.hpp>
@@ -385,34 +386,52 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_client_pool(
     auto start_time = std::chrono::steady_clock::now();
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
-            auto ret = co_await client_pool->send_request(
-                [&](coro_io::client_reuse_hint,
-                    coro_rpc::coro_rpc_client& client) {
-                    return client.send_request<ServiceMethod>(
-                        std::forward<Args>(args)...);
-                });
-            if (!ret.has_value()) {
-                LOG(ERROR) << "Client not available";
-                co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
-            }
-            auto result = co_await std::move(ret.value());
-            if (!result) {
-                if (result.error().code == coro_rpc::errc::timed_out) {
-                    LOG(ERROR) << "RPC call timed out: " << result.error().msg;
-                    co_return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
+            // Shared pools may retain idle sockets to a previous master.
+            // Only bootstrap reads are safe to replay. Bound retries by the
+            // idle snapshot plus one; failed sockets are discarded by the pool.
+            constexpr bool bootstrap_read =
+                std::string_view(RpcNameTraits<ServiceMethod>::value) ==
+                    "ServiceReady" ||
+                std::string_view(RpcNameTraits<ServiceMethod>::value) ==
+                    "GetStorageConfig";
+            size_t stale_retries_left =
+                bootstrap_read ? client_pool->free_client_count() + 1 : 0;
+            while (true) {
+                auto ret = co_await client_pool->send_request(
+                    [&](coro_io::client_reuse_hint,
+                        coro_rpc::coro_rpc_client& client) {
+                        return client.send_request<ServiceMethod>(
+                            std::forward<Args>(args)...);
+                    });
+                if (!ret.has_value()) {
+                    LOG(ERROR) << "Client not available";
+                    co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
                 }
-                LOG(ERROR) << "RPC call failed: " << result.error().msg;
-                co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+                auto result = co_await std::move(ret.value());
+                if (!result) {
+                    if (result.error().code == coro_rpc::errc::timed_out) {
+                        LOG(ERROR)
+                            << "RPC call timed out: " << result.error().msg;
+                        co_return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
+                    }
+                    if (stale_retries_left > 0 &&
+                        result.error().code == coro_rpc::errc::io_error) {
+                        --stale_retries_left;
+                        continue;
+                    }
+                    LOG(ERROR) << "RPC call failed: " << result.error().msg;
+                    co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+                }
+                if (metrics_) {
+                    auto end_time = std::chrono::steady_clock::now();
+                    auto latency =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            end_time - start_time);
+                    metrics_->rpc_latency.observe(
+                        {RpcNameTraits<ServiceMethod>::value}, latency.count());
+                }
+                co_return result->result();
             }
-            if (metrics_) {
-                auto end_time = std::chrono::steady_clock::now();
-                auto latency =
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        end_time - start_time);
-                metrics_->rpc_latency.observe(
-                    {RpcNameTraits<ServiceMethod>::value}, latency.count());
-            }
-            co_return result->result();
         }());
 }
 
