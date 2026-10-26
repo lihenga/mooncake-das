@@ -79,6 +79,43 @@ TEST(RandomTest, RejectsInvalidBounds) {
     EXPECT_THROW(randomUniform(2, 1, engine), std::invalid_argument);
 }
 
+TEST(DfsReadTraceTest, ScopeRestoresNestedTraceIds) {
+    EXPECT_EQ(current_dfs_read_trace_id(), 0);
+    const uint64_t outer_id = next_dfs_read_trace_id();
+    const uint64_t inner_id = next_dfs_read_trace_id();
+    ASSERT_NE(outer_id, 0);
+    ASSERT_NE(inner_id, 0);
+    ASSERT_NE(outer_id, inner_id);
+
+    {
+        DfsReadTraceScope outer_scope(outer_id);
+        EXPECT_EQ(current_dfs_read_trace_id(), outer_id);
+        {
+            DfsReadTraceScope inner_scope(inner_id);
+            EXPECT_EQ(current_dfs_read_trace_id(), inner_id);
+        }
+        EXPECT_EQ(current_dfs_read_trace_id(), outer_id);
+    }
+    EXPECT_EQ(current_dfs_read_trace_id(), 0);
+}
+
+TEST(DfsReadTraceTest, ScopeIsThreadLocal) {
+    const uint64_t main_id = next_dfs_read_trace_id();
+    const uint64_t worker_id = next_dfs_read_trace_id();
+    DfsReadTraceScope main_scope(main_id);
+
+    std::promise<uint64_t> worker_value;
+    std::thread worker([&] {
+        EXPECT_EQ(current_dfs_read_trace_id(), 0);
+        DfsReadTraceScope worker_scope(worker_id);
+        worker_value.set_value(current_dfs_read_trace_id());
+    });
+
+    EXPECT_EQ(worker_value.get_future().get(), worker_id);
+    worker.join();
+    EXPECT_EQ(current_dfs_read_trace_id(), main_id);
+}
+
 TEST(UtilsTest, ByteSizeToString) {
     EXPECT_EQ(byte_size_to_string(999), "999 B");
     EXPECT_EQ(byte_size_to_string(2048), "2.00 KB");

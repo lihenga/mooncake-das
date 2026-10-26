@@ -482,6 +482,24 @@ int64_t time_gen();
 // true/on) to enable. The runtime API can update the current value.
 bool dfs_read_trace_enabled();
 
+// Allocate and propagate an operation id for DFS read timing logs. The scope
+// is thread-local so a batch can hand its id to asynchronous read requests
+// without adding tracing parameters to the public client API.
+uint64_t next_dfs_read_trace_id();
+uint64_t current_dfs_read_trace_id();
+
+class DfsReadTraceScope {
+   public:
+    explicit DfsReadTraceScope(uint64_t trace_id);
+    ~DfsReadTraceScope();
+
+    DfsReadTraceScope(const DfsReadTraceScope&) = delete;
+    DfsReadTraceScope& operator=(const DfsReadTraceScope&) = delete;
+
+   private:
+    uint64_t previous_trace_id_;
+};
+
 // Helper: Get integer from environment variable, fallback to default
 template <typename T>
 T GetEnvOr(const char* name, T default_value) {

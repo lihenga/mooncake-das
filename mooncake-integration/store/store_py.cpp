@@ -6,6 +6,7 @@
 #include <pybind11/stl.h>
 #include <numa.h>
 
+#include <chrono>
 #include <functional>
 #include <limits>
 #include <numeric>
@@ -23,6 +24,7 @@
 #include "read_plan.h"
 #include "device/accelerator_registry.h"
 #include "device/cuda_ipc_buffer.h"
+#include "utils.h"
 
 #include <cstdlib>  // for atexit
 #include <memory>
@@ -590,9 +592,29 @@ class MooncakeStorePyWrapper {
 
     std::vector<pybind11::bytes> get_batch(
         const std::vector<std::string> &keys) {
+        uint64_t trace_id = current_dfs_read_trace_id();
+        if (trace_id == 0 && dfs_read_trace_enabled()) {
+            trace_id = next_dfs_read_trace_id();
+        }
+        DfsReadTraceScope trace_scope(trace_id);
+        const auto trace_start = std::chrono::steady_clock::now();
+        const auto log_trace = [&](size_t success_keys, uint64_t bytes) {
+            if (trace_id == 0) return;
+            const auto elapsed_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - trace_start)
+                    .count();
+            LOG(INFO) << "get_batch_trace: trace_id=" << trace_id
+                      << ", phase=python_api"
+                      << ", requested_keys=" << keys.size()
+                      << ", success_keys=" << success_keys
+                      << ", bytes=" << bytes
+                      << ", elapsed_us=" << elapsed_us;
+        };
         const auto kNullString = pybind11::bytes("\\0", 0);
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
+            log_trace(0, 0);
             py::gil_scoped_acquire acquire_gil;
             return {kNullString};
         }
@@ -601,6 +623,7 @@ class MooncakeStorePyWrapper {
             py::gil_scoped_release release_gil;
             auto batch_data = store_->batch_get_buffer(keys);
             if (batch_data.empty()) {
+                log_trace(0, 0);
                 py::gil_scoped_acquire acquire_gil;
                 return {kNullString};
             }
@@ -612,6 +635,8 @@ class MooncakeStorePyWrapper {
             auto runtime_accelerator =
                 mooncake::device::GetAcceleratorRegistry()
                     .RuntimeAccelerators();
+            size_t success_keys = 0;
+            uint64_t total_bytes = 0;
 
             for (const auto &data : batch_data) {
                 if (!data) {
@@ -631,7 +656,10 @@ class MooncakeStorePyWrapper {
                     results.emplace_back(
                         pybind11::bytes((char *)data->ptr(), data->size()));
                 }
+                ++success_keys;
+                total_bytes += data->size();
             }
+            log_trace(success_keys, total_bytes);
             return results;
         }
     }

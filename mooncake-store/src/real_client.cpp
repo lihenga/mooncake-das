@@ -87,8 +87,6 @@ UUID DfsSessionEpoch(const std::vector<Replica::Descriptor> &replicas) {
 }
 
 constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
-std::atomic<uint64_t> g_dfs_read_trace_id{0};
-
 struct HttpLoggingUpdateRequest {
     std::optional<std::string> minloglevel;
     std::optional<int> vlog_level;
@@ -114,19 +112,6 @@ void FillLoggingResponse(HttpLoggingResponse* response) {
     response->vlog_level = config.vlog_level;
     response->ylt_severity = config.ylt_severity;
     response->dfs_read_trace = config.dfs_read_trace;
-}
-
-uint64_t NextDfsReadTraceId() {
-    uint64_t current = g_dfs_read_trace_id.load(std::memory_order_relaxed);
-    while (true) {
-        const uint64_t next =
-            current == std::numeric_limits<uint64_t>::max() ? 1 : current + 1;
-        if (g_dfs_read_trace_id.compare_exchange_weak(
-                current, next, std::memory_order_relaxed,
-                std::memory_order_relaxed)) {
-            return next;
-        }
-    }
 }
 
 size_t DivideRoundUp(size_t value, size_t divisor) {
@@ -4077,7 +4062,9 @@ tl::expected<void, ErrorCode> RealClient::batch_release_hot_cache(
 
 std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>>
 RealClient::batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
-                                       const UUID &client_id) {
+                                       const UUID &client_id,
+                                       uint64_t trace_id) {
+    DfsReadTraceScope trace_scope(trace_id);
     std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>> results(
         keys.size(), tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
 
@@ -4135,15 +4122,39 @@ std::vector<std::shared_ptr<BufferHandle>>
 RealClient::batch_get_buffer_internal(
     const std::vector<std::string> &keys,
     const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
+    uint64_t trace_id = current_dfs_read_trace_id();
+    if (trace_id == 0 && dfs_read_trace_enabled()) {
+        trace_id = next_dfs_read_trace_id();
+    }
+    DfsReadTraceScope trace_scope(trace_id);
+    const auto trace_start = std::chrono::steady_clock::now();
     std::vector<std::shared_ptr<BufferHandle>> final_results(keys.size(),
                                                              nullptr);
+    const auto log_trace = [&] {
+        if (trace_id == 0) return;
+        const size_t success_count = static_cast<size_t>(std::count_if(
+            final_results.begin(), final_results.end(),
+            [](const auto &buffer) { return buffer != nullptr; }));
+        const auto elapsed_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - trace_start)
+                .count();
+        LOG(INFO) << "get_batch_trace: trace_id=" << trace_id
+                  << ", phase=batch_get_buffer"
+                  << ", requested_keys=" << keys.size()
+                  << ", success_keys=" << success_count
+                  << ", bytes=" << sum_buffer_handle_sizes(final_results)
+                  << ", elapsed_us=" << elapsed_us;
+    };
 
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
+        log_trace();
         return final_results;
     }
 
     if (keys.empty()) {
+        log_trace();
         return final_results;
     }
 
@@ -4250,6 +4261,7 @@ RealClient::batch_get_buffer_internal(
     }
 
     if (valid_ops.empty() && disk_ops.empty()) {
+        log_trace();
         return final_results;
     }
 
@@ -4345,6 +4357,7 @@ RealClient::batch_get_buffer_internal(
         }
     }
 
+    log_trace();
     return final_results;
 }
 
@@ -6920,7 +6933,7 @@ std::vector<int> RealClient::batch_get_session_prefetch(
         // background prefetch worker, while scheduler admission waits for the
         // prefetch to reach READY on every rank before consuming the session.
         const uint64_t trace_id =
-            dfs_read_trace_enabled() ? NextDfsReadTraceId() : uint64_t{0};
+            dfs_read_trace_enabled() ? next_dfs_read_trace_id() : uint64_t{0};
         process_session_disk_dfs_reads(dfs_entries, results, trace_id,
                                        /*prefetch_only=*/true);
     }
@@ -7336,7 +7349,7 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     context.timing_start = std::chrono::steady_clock::now();
     context.cache_gc_done = context.timing_start;
     context.trace_id =
-        dfs_read_trace_enabled() ? NextDfsReadTraceId() : uint64_t{0};
+        dfs_read_trace_enabled() ? next_dfs_read_trace_id() : uint64_t{0};
     context.record_access = client_->MetricsEnabled();
 
     auto requests = prepare_session_range_read_requests(

@@ -2359,7 +2359,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetImpl(
             }
             dfs_read_requests.push_back(
                 DfsReadRequest{key, desc, object_slices,
-                               std::move(buffer_owner)});
+                               std::move(buffer_owner),
+                               current_dfs_read_trace_id()});
             dfs_read_indices.push_back(i);
             continue;
         } else if (replica.is_nof_replica()) {
@@ -6147,7 +6148,8 @@ ErrorCode Client::ReadDfsReplica(const std::string& key,
 
     const auto& desc = replica_descriptor.get_dfs_descriptor();
     std::vector<DfsReadRequest> requests{
-        DfsReadRequest{key, desc, slices, nullptr}};
+        DfsReadRequest{key, desc, slices, nullptr,
+                       current_dfs_read_trace_id()}};
     auto results = dfs_storage_backend_->BatchRead(requests);
     if (results.size() != 1) {
         LOG(ERROR) << "DFS BatchRead response size mismatch for key " << key;

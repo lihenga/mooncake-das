@@ -556,7 +556,7 @@ class RealClient : public PyClient {
     // Returns vector of (dummy_addr, size) per key.
     std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>>
     batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
-                               const UUID &client_id);
+                               const UUID &client_id, uint64_t trace_id = 0);
 
     tl::expected<std::tuple<uint64_t, size_t>, ErrorCode> allocate_buffer_dummy(
         size_t size, const UUID &client_id);

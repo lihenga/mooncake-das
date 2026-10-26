@@ -114,6 +114,9 @@ struct DfsReadRequest {
     // into its background context so the allocator cannot reuse the memory
     // before the underlying preadv has really returned.
     std::shared_ptr<void> buffer_owner;
+    // Correlates the caller's get_batch timing with worker-thread POSIX I/O.
+    // Zero means tracing is disabled for this request.
+    uint64_t trace_id = 0;
 };
 
 /**

@@ -1314,6 +1314,7 @@ DistributedStorageBackend::BatchReadShard(
         requests.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     for (size_t i = 0; i < requests.size(); ++i) {
         const auto& request = requests[i];
+        DfsReadTraceScope trace_scope(request.trace_id);
         auto target = ResolveTarget(request.descriptor, request.key, true);
         if (!target) {
             results[i] = tl::make_unexpected(target.error());
@@ -1605,6 +1606,7 @@ void DistributedStorageBackend::ExecuteSingleReadTask(
     if (task.entries.empty()) return;
     const auto& entry = task.entries.front();
     const auto& request = requests[entry.request_index];
+    DfsReadTraceScope trace_scope(request.trace_id);
     // Read the full aligned size (value + padding) in bucket mode so the
     // iovec length is a multiple of the alignment, letting O_DIRECT skip the
     // adapter's staged bounce. The trailing padding lands in the arena slot but
@@ -1691,6 +1693,8 @@ void DistributedStorageBackend::ExecuteMergedReadTask(
     const ReadTask& task, const std::vector<DfsReadRequest>& requests,
     std::vector<tl::expected<void, ErrorCode>>& results) {
     if (task.entries.empty()) return;
+    DfsReadTraceScope trace_scope(
+        requests[task.entries.front().request_index].trace_id);
     // Reuse worker-local storage. Determine the full padding size before adding
     // pointers into sink so later growth cannot invalidate existing iovecs.
     auto& scratch = merged_read_scratch;
@@ -1923,7 +1927,8 @@ DistributedStorageBackend::BatchReadBlocking(
             // bytes / us == MB/s; /1000 -> GB/s.
             gbps = static_cast<double>(total_bytes) / read_us / 1000.0;
         }
-        LOG(INFO) << "BatchRead: requests=" << requests.size()
+        LOG(INFO) << "BatchRead: trace_id=" << requests.front().trace_id
+                  << " requests=" << requests.size()
                   << " tasks=" << tasks.size() << " bytes=" << total_bytes
                   << " prepare_us=" << prepare_us
                   << " read_us=" << read_us

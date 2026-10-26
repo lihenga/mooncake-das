@@ -1026,7 +1026,8 @@ std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
     auto alloc_results =
         invoke_batch_rpc<&RealClient::batch_acquire_buffer_dummy,
                          std::tuple<uint64_t, size_t>>(miss_keys.size(),
-                                                       miss_keys, client_id_);
+                                                       miss_keys, client_id_,
+                                                       current_dfs_read_trace_id());
 
     for (size_t i = 0; i < miss_indices.size(); ++i) {
         if (!alloc_results[i].has_value()) continue;

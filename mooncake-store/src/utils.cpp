@@ -604,6 +604,37 @@ bool dfs_read_trace_enabled() {
     return GetDfsReadTraceEnabled();
 }
 
+namespace {
+std::atomic<uint64_t> g_dfs_read_trace_id{0};
+thread_local uint64_t g_current_dfs_read_trace_id = 0;
+}  // namespace
+
+uint64_t next_dfs_read_trace_id() {
+    uint64_t current = g_dfs_read_trace_id.load(std::memory_order_relaxed);
+    while (true) {
+        const uint64_t next =
+            current == std::numeric_limits<uint64_t>::max() ? 1 : current + 1;
+        if (g_dfs_read_trace_id.compare_exchange_weak(
+                current, next, std::memory_order_relaxed,
+                std::memory_order_relaxed)) {
+            return next;
+        }
+    }
+}
+
+uint64_t current_dfs_read_trace_id() {
+    return g_current_dfs_read_trace_id;
+}
+
+DfsReadTraceScope::DfsReadTraceScope(uint64_t trace_id)
+    : previous_trace_id_(g_current_dfs_read_trace_id) {
+    g_current_dfs_read_trace_id = trace_id;
+}
+
+DfsReadTraceScope::~DfsReadTraceScope() {
+    g_current_dfs_read_trace_id = previous_trace_id_;
+}
+
 std::string GetEnvStringOr(const char *name, const std::string &default_value) {
     const char *env_val = std::getenv(name);
     return env_val ? std::string(env_val) : default_value;

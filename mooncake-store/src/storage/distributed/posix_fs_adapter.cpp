@@ -6,8 +6,9 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
-#include <cerrno>
 #include <algorithm>
+#include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +18,8 @@
 #include <mutex>
 
 #include <glog/logging.h>
+
+#include "utils.h"
 
 namespace mooncake {
 
@@ -45,6 +48,33 @@ tl::expected<void, ErrorCode> ValidateIov(const iovec* iov, int iovcnt) {
         }
     }
     return {};
+}
+
+uint64_t IovBytes(const iovec* iov, int iovcnt) {
+    uint64_t bytes = 0;
+    for (int i = 0; i < iovcnt; ++i) {
+        const uint64_t length = iov[i].iov_len;
+        if (length > std::numeric_limits<uint64_t>::max() - bytes) {
+            return std::numeric_limits<uint64_t>::max();
+        }
+        bytes += length;
+    }
+    return bytes;
+}
+
+void LogPosixRead(uint64_t trace_id, const char* syscall_name, bool direct,
+                  int fd, int64_t offset, uint64_t requested_bytes,
+                  uint64_t returned_bytes, size_t syscall_count,
+                  int syscall_errno, int64_t elapsed_us) {
+    if (trace_id == 0) return;
+    LOG(INFO) << "get_batch_posix_trace: trace_id=" << trace_id
+              << ", syscall=" << syscall_name << ", direct=" << direct
+              << ", fd=" << fd << ", offset=" << offset
+              << ", requested_bytes=" << requested_bytes
+              << ", returned_bytes=" << returned_bytes
+              << ", syscall_count=" << syscall_count
+              << ", errno=" << syscall_errno
+              << ", elapsed_us=" << elapsed_us;
 }
 
 ErrorCode ReadOpenError() {
@@ -294,7 +324,18 @@ tl::expected<size_t, ErrorCode> PosixFsAdapter::ReadAt(int fd, iovec* iov,
     if (!valid) return tl::make_unexpected(valid.error());
     if (iovcnt == 0) return size_t{0};
 
-    ssize_t ret = ::preadv(fd, iov, iovcnt, static_cast<off_t>(offset));
+    const uint64_t trace_id = current_dfs_read_trace_id();
+    const uint64_t requested_bytes = IovBytes(iov, iovcnt);
+    const auto start = std::chrono::steady_clock::now();
+    const ssize_t ret = ::preadv(fd, iov, iovcnt, static_cast<off_t>(offset));
+    const int syscall_errno = ret < 0 ? errno : 0;
+    const auto elapsed_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start)
+            .count();
+    LogPosixRead(trace_id, "preadv", false, fd, offset, requested_bytes,
+                 ret > 0 ? static_cast<uint64_t>(ret) : 0, 1, syscall_errno,
+                 elapsed_us);
     if (ret < 0) return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     return static_cast<size_t>(ret);
 }
@@ -435,7 +476,18 @@ tl::expected<size_t, ErrorCode> PosixFsAdapter::DirectReadAtAligned(
     int fd, iovec* iov, int iovcnt, int64_t offset) {
     // Every direct-I/O constraint has already been checked, so preadv can
     // scatter straight into the caller's buffers without a bounce or memcpy.
+    const uint64_t trace_id = current_dfs_read_trace_id();
+    const uint64_t requested_bytes = IovBytes(iov, iovcnt);
+    const auto start = std::chrono::steady_clock::now();
     const ssize_t ret = ::preadv(fd, iov, iovcnt, static_cast<off_t>(offset));
+    const int syscall_errno = ret < 0 ? errno : 0;
+    const auto elapsed_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start)
+            .count();
+    LogPosixRead(trace_id, "preadv", true, fd, offset, requested_bytes,
+                 ret > 0 ? static_cast<uint64_t>(ret) : 0, 1, syscall_errno,
+                 elapsed_us);
     if (ret < 0) return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     return static_cast<size_t>(ret);
 }
@@ -501,14 +553,28 @@ tl::expected<size_t, ErrorCode> PosixFsAdapter::DirectReadAtStaged(
         }
     } guard{this, pooled, transient};
 
+    const uint64_t trace_id = current_dfs_read_trace_id();
+    uint64_t syscall_requested_bytes = 0;
+    int64_t syscall_elapsed_us = 0;
+    size_t syscall_count = 0;
+    int syscall_errno = 0;
     uint64_t done = 0;
     ErrorCode error = ErrorCode::OK;
     while (done < need) {
         const uint64_t left = std::min(window_size - done, kDirectIoMaxChunk);
+        const auto start = std::chrono::steady_clock::now();
         const ssize_t ret =
             ::pread(fd, window + done, static_cast<size_t>(left),
                     static_cast<off_t>(window_start + done));
+        const int current_errno = ret < 0 ? errno : 0;
+        syscall_elapsed_us +=
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - start)
+                .count();
+        ++syscall_count;
+        syscall_requested_bytes += left;
         if (ret < 0) {
+            syscall_errno = current_errno;
             error = ErrorCode::FILE_READ_FAIL;
             break;
         }
@@ -518,6 +584,10 @@ tl::expected<size_t, ErrorCode> PosixFsAdapter::DirectReadAtStaged(
     if (error == ErrorCode::OK && done < need) {
         error = ErrorCode::FILE_READ_FAIL;
     }
+
+    LogPosixRead(trace_id, "pread", true, fd,
+                 static_cast<int64_t>(window_start), syscall_requested_bytes,
+                 done, syscall_count, syscall_errno, syscall_elapsed_us);
 
     if (error == ErrorCode::OK) {
         const char* src = window + skip;
