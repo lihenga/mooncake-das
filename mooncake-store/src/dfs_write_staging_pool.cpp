@@ -1,13 +1,15 @@
 #include "dfs_write_staging_pool.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 
 namespace mooncake {
 
-DfsWriteStagingPool::DfsWriteStagingPool(size_t arena_size,
-                                         size_t arena_count)
-    : arena_size_(arena_size) {
+DfsWriteStagingPool::DfsWriteStagingPool(
+    size_t arena_size, size_t arena_count,
+    std::shared_ptr<DfsBufferUsageTracker> usage_tracker)
+    : arena_size_(arena_size), usage_tracker_(std::move(usage_tracker)) {
     if (arena_size == 0 || arena_count == 0) {
         throw std::invalid_argument("DFS write staging arena is disabled");
     }
@@ -47,12 +49,18 @@ std::shared_ptr<DfsWriteStagingPool::Slot> DfsWriteStagingPool::Acquire(
     if (shutting_down_) return nullptr;
     auto slot = std::move(free_slots_.back());
     free_slots_.pop_back();
+    slot->usage.emplace(usage_tracker_, DfsBufferUsageKind::kWrite,
+                        arena_size_);
     return slot;
 }
 
 void DfsWriteStagingPool::Release(std::shared_ptr<Slot> slot) {
     if (!slot) return;
     std::lock_guard<std::mutex> lock(mutex_);
+    if (std::find(slots_.begin(), slots_.end(), slot) == slots_.end() ||
+        !slot->usage)
+        return;
+    slot->usage.reset();
     if (shutting_down_) return;
     free_slots_.push_back(std::move(slot));
     cv_.notify_one();

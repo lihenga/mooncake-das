@@ -108,6 +108,88 @@ TEST_F(ClientBufferTest, SpdkDmaAllocatorDestroysWithSpdkFree) {
 }
 #endif
 
+TEST_F(ClientBufferTest, TracksActualAllocationAndRaiiRelease) {
+    auto tracker = std::make_shared<DfsBufferUsageTracker>();
+    auto allocator = ClientBufferAllocator::create(
+        1024 * 1024, "", false, false, tracker, DfsBufferUsageKind::kRead);
+    const auto initial_free = allocator->storageReport().totalFreeSpace;
+    auto first = allocator->allocate(1001);
+    ASSERT_TRUE(first.has_value());
+    auto second = allocator->allocate_aligned(4097, 4096);
+    ASSERT_TRUE(second.has_value());
+    const auto occupied =
+        initial_free - allocator->storageReport().totalFreeSpace;
+    EXPECT_EQ(tracker->Snapshot().read_bytes, occupied);
+    EXPECT_EQ(tracker->Snapshot().total_bytes, occupied);
+    const auto peak = tracker->Snapshot().peak_total_bytes;
+    EXPECT_GE(peak, occupied);
+
+    BufferHandle moved(std::move(*first));
+    first.reset();
+    EXPECT_EQ(tracker->Snapshot().total_bytes, occupied);
+    moved = std::move(*second);
+    second.reset();
+    EXPECT_EQ(tracker->Snapshot().total_bytes,
+              initial_free - allocator->storageReport().totalFreeSpace);
+    EXPECT_EQ(tracker->Snapshot().peak_total_bytes, peak);
+    allocator.reset();
+    EXPECT_GT(tracker->Snapshot().total_bytes, 0);
+}
+
+TEST_F(ClientBufferTest, TracksPrefetchUntilLastOwnerIsReleased) {
+    auto tracker = std::make_shared<DfsBufferUsageTracker>();
+    auto backing = std::make_shared<std::vector<char>>(65536);
+    auto allocator = ClientBufferAllocator::create(
+        backing->data(), backing->size(), "", nullptr, backing, tracker,
+        DfsBufferUsageKind::kPrefetch);
+    auto allocation = allocator->allocate_aligned(4097, 4096);
+    ASSERT_TRUE(allocation.has_value());
+    const auto used = tracker->Snapshot().prefetch_bytes;
+    EXPECT_GT(used, 0);
+    EXPECT_FALSE(allocator->allocate(backing->size()).has_value());
+    EXPECT_EQ(tracker->Snapshot().prefetch_bytes, used);
+    backing.reset();
+    allocator.reset();
+    EXPECT_EQ(tracker->Snapshot().prefetch_bytes, used);
+    allocation.reset();
+    EXPECT_EQ(tracker->Snapshot().total_bytes, 0);
+    EXPECT_GE(tracker->Snapshot().peak_total_bytes, used);
+}
+
+TEST_F(ClientBufferTest, TotalPeakIsNotSumOfCategoryPeaks) {
+    DfsBufferUsageTracker tracker;
+    tracker.Add(DfsBufferUsageKind::kRead, 100);
+    tracker.Remove(DfsBufferUsageKind::kRead, 100);
+    tracker.Add(DfsBufferUsageKind::kPrefetch, 200);
+    tracker.Add(DfsBufferUsageKind::kWrite, 50);
+    EXPECT_EQ(tracker.Snapshot().peak_total_bytes, 250);
+    tracker.Remove(DfsBufferUsageKind::kPrefetch, 200);
+    tracker.Remove(DfsBufferUsageKind::kWrite, 50);
+    EXPECT_EQ(tracker.Snapshot().total_bytes, 0);
+    EXPECT_EQ(tracker.Snapshot().peak_total_bytes, 250);
+}
+
+TEST_F(ClientBufferTest, ConcurrentBufferSnapshotsAreConsistent) {
+    auto tracker = std::make_shared<DfsBufferUsageTracker>();
+    std::vector<std::thread> workers;
+    for (size_t i = 0; i < 6; ++i) {
+        workers.emplace_back([tracker, i] {
+            const auto kind = static_cast<DfsBufferUsageKind>(i % 3);
+            for (size_t n = 0; n < 1000; ++n) {
+                tracker->Add(kind, 64);
+                const auto snapshot = tracker->Snapshot();
+                EXPECT_EQ(snapshot.total_bytes, snapshot.read_bytes +
+                                                    snapshot.prefetch_bytes +
+                                                    snapshot.write_bytes);
+                EXPECT_GE(snapshot.peak_total_bytes, snapshot.total_bytes);
+                tracker->Remove(kind, 64);
+            }
+        });
+    }
+    for (auto& worker : workers) worker.join();
+    EXPECT_EQ(tracker->Snapshot().total_bytes, 0);
+}
+
 // Test multiple allocations
 TEST_F(ClientBufferTest, MultipleAllocations) {
     const size_t buffer_size = 1024 * 1024;  // 1MB

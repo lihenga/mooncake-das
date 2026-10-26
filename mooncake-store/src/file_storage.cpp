@@ -49,14 +49,17 @@ std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
 FileStorage::FileStorage(const FileStorageConfig& config,
                          std::shared_ptr<Client> client,
                          const std::string& local_rpc_addr,
-                         SsdMetric* ssd_metric)
+                         SsdMetric* ssd_metric,
+                         std::shared_ptr<DfsBufferUsageTracker> usage_tracker)
     : config_(config),
       client_(client),
       ssd_metric_(ssd_metric),
+      usage_tracker_(std::move(usage_tracker)),
       local_rpc_addr_(local_rpc_addr),
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       client_buffer_allocator_(AlignedClientBufferAllocator::create(
-          config.local_buffer_size, client ? client->GetProtocol() : "")) {
+          config.local_buffer_size, client ? client->GetProtocol() : "", false,
+          usage_tracker_, DfsBufferUsageKind::kRead)) {
     if (config_.storage_backend_type == StorageBackendType::kDistributed) {
         config_.enable_dfs = true;
     }
@@ -89,7 +92,8 @@ FileStorage::FileStorage(const FileStorageConfig& config,
                 pinned_restore_arena_allocator_ = ClientBufferAllocator::create(
                     pinned_restore_arena_->data,
                     pinned_restore_arena_->capacity, client->GetProtocol(),
-                    pinned_restore_arena_->device_data, pinned_restore_arena_);
+                    pinned_restore_arena_->device_data, pinned_restore_arena_,
+                    usage_tracker_, DfsBufferUsageKind::kRead);
                 LOG(INFO) << "Initialized pinned SSD restore arena, size="
                           << pinned_restore_arena_->capacity
                           << ", mapped=" << pinned_restore_arena_->mapped;
@@ -206,7 +210,8 @@ void FileStorage::InitPinnedPrefetchArena(
             pinned_prefetch_arena_allocator_ = ClientBufferAllocator::create(
                 pinned_prefetch_arena_->data, pinned_prefetch_arena_->capacity,
                 client->GetProtocol(), pinned_prefetch_arena_->device_data,
-                pinned_prefetch_arena_);
+                pinned_prefetch_arena_, usage_tracker_,
+                DfsBufferUsageKind::kPrefetch);
             pinned_prefetch_arena_full_free_bytes_ =
                 pinned_prefetch_arena_allocator_->storageReport().totalFreeSpace;
             pinned_prefetch_arena_status_ = "ready";

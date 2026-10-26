@@ -1720,7 +1720,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 #endif
     client_buffer_allocator_ = ClientBufferAllocator::create(
         local_buffer_size, this->protocol, should_use_hugepage,
-        use_spdk_dma_for_client_buffer);
+        use_spdk_dma_for_client_buffer, client_->GetDfsBufferUsageTracker(),
+        DfsBufferUsageKind::kRead);
 
     if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
@@ -1979,7 +1980,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
         file_storage_ = std::make_shared<FileStorage>(
             file_storage_config, client_, this->local_rpc_addr,
-            client_->GetSsdMetricPtr());
+            client_->GetSsdMetricPtr(), client_->GetDfsBufferUsageTracker());
         auto init_result = file_storage_->Init();
         if (!init_result) {
             LOG(ERROR) << "file storage init failed with error: "

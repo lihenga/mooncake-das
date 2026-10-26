@@ -54,4 +54,41 @@ TEST(DfsWriteStagingPoolTest, ReturnedSlotCanBeReusedByNextChunk) {
     EXPECT_EQ(second->backing.data, first_address);
 }
 
+TEST(DfsWriteStagingPoolTest, TracksOccupiedChunksAndShutdownRelease) {
+    auto tracker = std::make_shared<DfsBufferUsageTracker>();
+    DfsWriteStagingPool pool(1024, 2, tracker);
+    EXPECT_EQ(tracker->Snapshot().write_bytes, 0);
+    auto first = pool.Acquire(std::chrono::milliseconds(1));
+    auto second = pool.Acquire(std::chrono::milliseconds(1));
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+    EXPECT_EQ(tracker->Snapshot().write_bytes, 2048);
+    EXPECT_EQ(tracker->Snapshot().peak_total_bytes, 2048);
+    EXPECT_EQ(pool.Acquire(std::chrono::milliseconds(1)), nullptr);
+    EXPECT_EQ(tracker->Snapshot().total_bytes, 2048);
+    pool.Release(first);
+    EXPECT_EQ(tracker->Snapshot().write_bytes, 1024);
+    pool.Release(first);
+    EXPECT_EQ(tracker->Snapshot().write_bytes, 1024);
+    pool.Shutdown();
+    EXPECT_EQ(tracker->Snapshot().write_bytes, 1024);
+    pool.Release(std::move(second));
+    EXPECT_EQ(tracker->Snapshot().total_bytes, 0);
+    EXPECT_EQ(tracker->Snapshot().peak_total_bytes, 2048);
+}
+
+TEST(DfsWriteStagingPoolTest, OutstandingSlotRetainsUsageAfterPoolDestruction) {
+    auto tracker = std::make_shared<DfsBufferUsageTracker>();
+    std::shared_ptr<DfsWriteStagingPool::Slot> slot;
+    {
+        DfsWriteStagingPool pool(1024, 1, tracker);
+        slot = pool.Acquire(std::chrono::milliseconds(1));
+        ASSERT_NE(slot, nullptr);
+    }
+    EXPECT_EQ(tracker->Snapshot().write_bytes, 1024);
+    slot.reset();
+    EXPECT_EQ(tracker->Snapshot().write_bytes, 0);
+    EXPECT_EQ(tracker->Snapshot().peak_total_bytes, 1024);
+}
+
 }  // namespace mooncake::test

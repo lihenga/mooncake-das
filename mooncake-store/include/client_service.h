@@ -722,6 +722,10 @@ class Client {
         return metrics_ ? &metrics_->ssd_metric : nullptr;
     }
 
+    std::shared_ptr<DfsBufferUsageTracker> GetDfsBufferUsageTracker() const {
+        return dfs_buffer_usage_tracker_;
+    }
+
     [[nodiscard]] std::string GetTransportEndpoint() {
         return transfer_engine_->getLocalIpAndPort();
     }
@@ -1168,6 +1172,7 @@ class Client {
     // Pinned host memory pool for synchronous and fallback staging. The fixed
     // asynchronous DFS arenas are owned by `dfs_write_staging_pool_`.
     std::shared_ptr<PinnedBufferPool> pinned_buffer_pool_;
+    std::shared_ptr<DfsBufferUsageTracker> dfs_buffer_usage_tracker_;
     std::shared_ptr<DfsWriteStagingPool> dfs_write_staging_pool_;
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;

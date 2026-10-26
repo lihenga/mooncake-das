@@ -630,15 +630,15 @@ Client::Client(const std::string& local_hostname,
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
       object_checksum_enabled_(Environ::Get().GetStoreChecksumEnabled()),
-      dfs_batch_put_timeout_ms_(Environ::GetUInt64(
-          "MOONCAKE_DFS_BATCH_PUT_TIMEOUT_MS", 10000)),
+      dfs_batch_put_timeout_ms_(
+          Environ::GetUInt64("MOONCAKE_DFS_BATCH_PUT_TIMEOUT_MS", 10000)),
       dfs_write_arena_count_(ReadDfsWriteArenaCount()),
       dfs_write_chunk_size_(ReadDfsWriteChunkSize()),
       dfs_write_arena_wait_(ReadDfsWriteArenaWait()),
-      pinned_buffer_pool_(
-          std::make_shared<PinnedBufferPool>(Environ::GetSizeT(
-              "MC_STORE_DFS_PINNED_POOL_BYTES",
-              PinnedBufferPool::kDefaultMaxCachedBytes))),
+      pinned_buffer_pool_(std::make_shared<PinnedBufferPool>(
+          Environ::GetSizeT("MC_STORE_DFS_PINNED_POOL_BYTES",
+                            PinnedBufferPool::kDefaultMaxCachedBytes))),
+      dfs_buffer_usage_tracker_(DfsBufferUsageTracker::ProcessTracker()),
       write_thread_pool_(2),
       task_thread_pool_(4),
       dfs_backfill_thread_pool_(1) {
@@ -661,8 +661,8 @@ Client::Client(const std::string& local_hostname,
                          "(interval: "
                       << metrics_->GetReportingInterval() << "s)";
         } else {
-            LOG(INFO)
-                << "Client metrics enabled but reporting disabled (interval=0)";
+            LOG(INFO) << "Full metrics report disabled (interval=0); DFS "
+                         "buffer usage logs every second";
         }
     } else {
         LOG(INFO) << "Client metrics disabled (set MC_STORE_CLIENT_METRIC=1 to "
@@ -5390,7 +5390,8 @@ void Client::SetDfsStorageBackend(
     if (bucket_backend && dfs_write_chunk_size_ > 0 &&
         dfs_write_arena_count_ > 0 && !dfs_write_staging_pool_) {
         dfs_write_staging_pool_ = std::make_shared<DfsWriteStagingPool>(
-            dfs_write_chunk_size_, dfs_write_arena_count_);
+            dfs_write_chunk_size_, dfs_write_arena_count_,
+            dfs_buffer_usage_tracker_);
         LOG(INFO) << "Initialized DFS write staging arenas: count="
                   << dfs_write_arena_count_ << ", size="
                   << dfs_write_chunk_size_;

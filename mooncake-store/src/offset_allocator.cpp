@@ -623,6 +623,12 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
     // Update lightweight metrics
     m_allocated_size += size;
     m_allocated_num++;
+    if (usage_tracker_) {
+        usage_tracker_->Add(
+            usage_kind_,
+            static_cast<uint64_t>(m_allocator->allocationSize(allocation))
+                << m_multiplier_bits);
+    }
 
     const uint64_t real_base =
         m_base + (allocation.getOffset() << m_multiplier_bits);
@@ -716,9 +722,16 @@ void OffsetAllocator::freeAllocation(const OffsetAllocation& allocation,
                                      uint64_t size) {
     MutexLocker lock(&m_mutex);
     if (m_allocator) {
+        const uint64_t allocated_bytes =
+            usage_tracker_
+                ? static_cast<uint64_t>(m_allocator->allocationSize(allocation))
+                      << m_multiplier_bits
+                : 0;
         const uint64_t freed_region =
             static_cast<uint64_t>(m_allocator->free(allocation))
             << m_multiplier_bits;
+        if (usage_tracker_)
+            usage_tracker_->Remove(usage_kind_, allocated_bytes);
         if (m_largest_free_region_tightened) {
             // Before free, the hint is an upper bound for every existing free
             // region. Only the newly merged region can raise that bound.

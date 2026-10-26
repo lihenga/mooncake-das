@@ -28,7 +28,9 @@ class AlignedClientBufferAllocator : public ClientBufferAllocator {
      */
     static std::shared_ptr<AlignedClientBufferAllocator> create(
         size_t size, const std::string& protocol = "",
-        bool use_hugepage = false);
+        bool use_hugepage = false,
+        std::shared_ptr<DfsBufferUsageTracker> usage_tracker = nullptr,
+        DfsBufferUsageKind usage_kind = DfsBufferUsageKind::kRead);
 
     /**
      * Get the base pointer of the aligned buffer
@@ -49,9 +51,10 @@ class AlignedClientBufferAllocator : public ClientBufferAllocator {
 
    private:
     // Private constructor - use create() factory method
-    AlignedClientBufferAllocator(void* aligned_buffer, size_t size,
-                                 const std::string& protocol,
-                                 bool use_hugepage);
+    AlignedClientBufferAllocator(
+        void* aligned_buffer, size_t size, const std::string& protocol,
+        bool use_hugepage, std::shared_ptr<DfsBufferUsageTracker> usage_tracker,
+        DfsBufferUsageKind usage_kind);
 
     // Store whether we own the memory (for cleanup)
     bool owns_memory_;

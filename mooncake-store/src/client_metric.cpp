@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <thread>
 
@@ -11,6 +12,27 @@
 namespace mooncake {
 
 namespace {
+
+void StartDfsBufferUsageLogging() {
+    static std::jthread reporter([](std::stop_token stop) {
+        const auto tracker = DfsBufferUsageTracker::ProcessTracker();
+        std::mutex mutex;
+        std::condition_variable_any cv;
+        std::unique_lock<std::mutex> lock(mutex);
+        while (!stop.stop_requested()) {
+            cv.wait_for(lock, stop, std::chrono::seconds(1),
+                        [] { return false; });
+            if (stop.stop_requested()) break;
+            const auto usage = tracker->Snapshot();
+            LOG(INFO) << "action=dfs_buffer_usage scope=process"
+                      << " read_bytes=" << usage.read_bytes
+                      << " prefetch_bytes=" << usage.prefetch_bytes
+                      << " write_bytes=" << usage.write_bytes
+                      << " total_bytes=" << usage.total_bytes
+                      << " peak_total_bytes=" << usage.peak_total_bytes;
+        }
+    });
+}
 
 bool parseMetricsEnabled() {
     const char* metric_env = std::getenv("MC_STORE_CLIENT_METRIC");
@@ -80,9 +102,8 @@ ClientMetric::ClientMetric(uint64_t interval_seconds,
         static_cast<uint64_t>(transfer_metric.total_read_bytes.value()),
         static_cast<uint64_t>(transfer_metric.total_write_bytes.value()),
         std::chrono::steady_clock::now()};
-    if (metrics_interval_seconds_ > 0) {
-        StartMetricsReportingThread();
-    }
+    StartDfsBufferUsageLogging();
+    if (metrics_interval_seconds_ > 0) StartMetricsReportingThread();
 }
 
 ClientMetric::~ClientMetric() { StopMetricsReportingThread(); }
@@ -90,6 +111,7 @@ ClientMetric::~ClientMetric() { StopMetricsReportingThread(); }
 std::unique_ptr<ClientMetric> ClientMetric::Create(
     const std::map<std::string, std::string>& labels,
     bool master_rpc_metrics_enabled) {
+    StartDfsBufferUsageLogging();
     if (!parseMetricsEnabled()) {
         LOG(INFO) << "Client metrics disabled (set MC_STORE_CLIENT_METRIC=0 to "
                      "disable)";
@@ -110,7 +132,13 @@ std::unique_ptr<ClientMetric> ClientMetric::Create(
                                           master_rpc_metrics_enabled);
 }
 
+void ClientMetric::RefreshDfsBufferUsage() {
+    ssd_metric.UpdateDfsBufferUsage(dfs_buffer_usage_tracker_->Snapshot());
+}
+
 void ClientMetric::serialize(std::string& str) {
+    std::lock_guard<std::mutex> lock(dfs_buffer_metrics_mutex_);
+    RefreshDfsBufferUsage();
     transfer_metric.serialize(str);
     if (master_rpc_metrics_enabled_) {
         master_client_metric.serialize(str);
@@ -121,6 +149,8 @@ void ClientMetric::serialize(std::string& str) {
 }
 
 std::string ClientMetric::summary_metrics() {
+    std::lock_guard<std::mutex> lock(dfs_buffer_metrics_mutex_);
+    RefreshDfsBufferUsage();
     std::stringstream ss;
     ss << "Client Metrics Summary\n";
     ss << transfer_metric.summary_metrics(bandwidth_reporting_enabled_);
@@ -182,28 +212,23 @@ void ClientMetric::StartMetricsReportingThread() {
             LOG(INFO) << "Client metrics reporting thread started (interval: "
                       << metrics_interval_seconds_ << "s)";
 
+            auto next_report = std::chrono::steady_clock::now() +
+                               std::chrono::seconds(metrics_interval_seconds_);
             while (!stop_token.stop_requested() &&
                    !should_stop_metrics_thread_) {
-                // Sleep for the interval, checking periodically for stop signal
-                for (uint64_t i = 0; i < metrics_interval_seconds_ &&
-                                     !stop_token.stop_requested() &&
-                                     !should_stop_metrics_thread_;
-                     ++i) {
-                    std::this_thread::sleep_for(std::chrono::seconds(1));
-                }
-
-                if (stop_token.stop_requested() ||
-                    should_stop_metrics_thread_) {
-                    break;  // Exit if stopped during sleep
-                }
-
-                // Print metrics summary
-                std::string summary = summary_metrics();
-                std::string bandwidth_report = BuildBandwidthReport();
-                std::string report = "Client Metrics Report:\n" + summary;
-                if (!bandwidth_report.empty()) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (stop_token.stop_requested() || should_stop_metrics_thread_)
+                    break;
+                if (metrics_interval_seconds_ == 0 ||
+                    std::chrono::steady_clock::now() < next_report)
+                    continue;
+                next_report = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(metrics_interval_seconds_);
+                std::string report =
+                    "Client Metrics Report:\n" + summary_metrics();
+                const auto bandwidth_report = BuildBandwidthReport();
+                if (!bandwidth_report.empty())
                     report += "\n" + bandwidth_report;
-                }
                 LOG(INFO) << report;
             }
             LOG(INFO) << "Client metrics reporting thread stopped";

@@ -14,7 +14,9 @@ class FileStorage {
    public:
     FileStorage(const FileStorageConfig& config, std::shared_ptr<Client> client,
                 const std::string& local_rpc_addr,
-                SsdMetric* ssd_metric = nullptr);
+                SsdMetric* ssd_metric = nullptr,
+                std::shared_ptr<DfsBufferUsageTracker> usage_tracker =
+                    DfsBufferUsageTracker::ProcessTracker());
     ~FileStorage();
 
     tl::expected<void, ErrorCode> Init();
@@ -243,6 +245,7 @@ class FileStorage {
 
     std::shared_ptr<Client> client_;
     SsdMetric* ssd_metric_{nullptr};
+    std::shared_ptr<DfsBufferUsageTracker> usage_tracker_;
     std::string local_rpc_addr_;
     // Pinned memory for GPU staging and SSD/DFS-to-GPU restores.
     std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;

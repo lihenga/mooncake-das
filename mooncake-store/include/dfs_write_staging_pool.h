@@ -5,9 +5,11 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 #include "pinned_buffer_pool.h"
+#include "dfs_buffer_usage.h"
 
 namespace mooncake {
 
@@ -17,9 +19,15 @@ class DfsWriteStagingPool {
     // asynchronous DFS task releases its context.
     struct Slot {
         PinnedBufferPool::Buffer backing;
+
+       private:
+        friend class DfsWriteStagingPool;
+        std::optional<DfsBufferAllocationUsage> usage;
     };
 
-    DfsWriteStagingPool(size_t arena_size, size_t arena_count);
+    DfsWriteStagingPool(size_t arena_size, size_t arena_count,
+                        std::shared_ptr<DfsBufferUsageTracker> usage_tracker =
+                            DfsBufferUsageTracker::ProcessTracker());
     ~DfsWriteStagingPool();
 
     DfsWriteStagingPool(const DfsWriteStagingPool&) = delete;
@@ -39,6 +47,7 @@ class DfsWriteStagingPool {
     const size_t arena_size_;
     std::vector<std::shared_ptr<Slot>> slots_;
     std::vector<std::shared_ptr<Slot>> free_slots_;
+    std::shared_ptr<DfsBufferUsageTracker> usage_tracker_;
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     bool shutting_down_{false};

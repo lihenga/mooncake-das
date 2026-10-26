@@ -9,6 +9,7 @@
 #include "offset_allocator/offset_allocator.h"
 #include "types.h"
 #include "replica.h"
+#include "dfs_buffer_usage.h"
 
 namespace mooncake {
 
@@ -31,7 +32,9 @@ class ClientBufferAllocator
     // Create for heap-allocated memory
     static std::shared_ptr<ClientBufferAllocator> create(
         size_t size, const std::string& protocol = "",
-        bool use_hugepage = false, bool use_spdk_dma = false);
+        bool use_hugepage = false, bool use_spdk_dma = false,
+        std::shared_ptr<DfsBufferUsageTracker> usage_tracker = nullptr,
+        DfsBufferUsageKind usage_kind = DfsBufferUsageKind::kRead);
 
     // Create for external memory. An optional owner keeps the backing
     // allocation alive until this allocator and every outstanding BufferHandle
@@ -39,7 +42,9 @@ class ClientBufferAllocator
     static std::shared_ptr<ClientBufferAllocator> create(
         void* addr, size_t size, const std::string& protocol = "",
         void* device_addr = nullptr,
-        std::shared_ptr<void> backing_owner = nullptr);
+        std::shared_ptr<void> backing_owner = nullptr,
+        std::shared_ptr<DfsBufferUsageTracker> usage_tracker = nullptr,
+        DfsBufferUsageKind usage_kind = DfsBufferUsageKind::kRead);
 
     ~ClientBufferAllocator();
 
@@ -73,8 +78,11 @@ class ClientBufferAllocator
 
    protected:
     // Constructors accessible to derived classes
-    ClientBufferAllocator(void* addr, size_t size, const std::string& protocol,
-                          void* device_addr = nullptr);
+    ClientBufferAllocator(
+        void* addr, size_t size, const std::string& protocol,
+        void* device_addr = nullptr,
+        std::shared_ptr<DfsBufferUsageTracker> usage_tracker = nullptr,
+        DfsBufferUsageKind usage_kind = DfsBufferUsageKind::kRead);
 
     void* buffer_;
     size_t buffer_size_;
@@ -83,7 +91,9 @@ class ClientBufferAllocator
 
    private:
     ClientBufferAllocator(size_t size, const std::string& protocol,
-                          bool use_hugepage, bool use_spdk_dma);
+                          bool use_hugepage, bool use_spdk_dma,
+                          std::shared_ptr<DfsBufferUsageTracker> usage_tracker,
+                          DfsBufferUsageKind usage_kind);
 
     // Declared before allocator_ so the backing outlives allocator teardown.
     std::shared_ptr<void> backing_owner_;

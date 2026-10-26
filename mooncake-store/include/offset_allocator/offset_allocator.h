@@ -11,6 +11,7 @@
 
 #include "mutex.h"
 #include "serialize/serializer.h"
+#include "dfs_buffer_usage.h"
 
 namespace mooncake::offset_allocator {
 typedef unsigned char uint8;
@@ -155,6 +156,14 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     // Destructor
     ~OffsetAllocator() = default;
 
+    // Attach only before the allocator is published or used for allocations.
+    void SetUsageTracker(
+        std::shared_ptr<mooncake::DfsBufferUsageTracker> tracker,
+        mooncake::DfsBufferUsageKind kind) {
+        usage_tracker_ = std::move(tracker);
+        usage_kind_ = kind;
+    }
+
     // Allocate memory and return a Handle (thread-safe)
     [[nodiscard]]
     std::optional<OffsetAllocationHandle> allocate(size_t size);
@@ -222,6 +231,9 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     // Lightweight metrics maintained during allocation/deallocation
     uint64_t m_allocated_size GUARDED_BY(m_mutex) = 0;
     uint64_t m_allocated_num GUARDED_BY(m_mutex) = 0;
+    std::shared_ptr<mooncake::DfsBufferUsageTracker> usage_tracker_;
+    mooncake::DfsBufferUsageKind usage_kind_{
+        mooncake::DfsBufferUsageKind::kRead};
     std::atomic<uint64_t> m_largest_free_region{0};
     bool m_largest_free_region_tightened GUARDED_BY(m_mutex) = false;
 

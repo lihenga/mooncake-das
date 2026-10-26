@@ -20,24 +20,29 @@ namespace mooncake {
 
 std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
     size_t size, const std::string& protocol, bool use_hugepage,
-    bool use_spdk_dma) {
+    bool use_spdk_dma, std::shared_ptr<DfsBufferUsageTracker> usage_tracker,
+    DfsBufferUsageKind usage_kind) {
     return std::shared_ptr<ClientBufferAllocator>(
-        new ClientBufferAllocator(size, protocol, use_hugepage, use_spdk_dma));
+        new ClientBufferAllocator(size, protocol, use_hugepage, use_spdk_dma,
+                                  std::move(usage_tracker), usage_kind));
 }
 
 std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
     void* addr, size_t size, const std::string& protocol, void* device_addr,
-    std::shared_ptr<void> backing_owner) {
+    std::shared_ptr<void> backing_owner,
+    std::shared_ptr<DfsBufferUsageTracker> usage_tracker,
+    DfsBufferUsageKind usage_kind) {
     auto allocator = std::shared_ptr<ClientBufferAllocator>(
-        new ClientBufferAllocator(addr, size, protocol, device_addr));
+        new ClientBufferAllocator(addr, size, protocol, device_addr,
+                                  std::move(usage_tracker), usage_kind));
     allocator->backing_owner_ = std::move(backing_owner);
     return allocator;
 }
 
-ClientBufferAllocator::ClientBufferAllocator(size_t size,
-                                             const std::string& protocol,
-                                             bool use_hugepage,
-                                             bool use_spdk_dma)
+ClientBufferAllocator::ClientBufferAllocator(
+    size_t size, const std::string& protocol, bool use_hugepage,
+    bool use_spdk_dma, std::shared_ptr<DfsBufferUsageTracker> usage_tracker,
+    DfsBufferUsageKind usage_kind)
     : buffer_size_(size),
       use_hugepage_(use_hugepage),
       protocol(protocol),
@@ -68,11 +73,13 @@ ClientBufferAllocator::ClientBufferAllocator(size_t size,
 
     allocator_ = mooncake::offset_allocator::OffsetAllocator::create(
         reinterpret_cast<uint64_t>(buffer_), size);
+    allocator_->SetUsageTracker(std::move(usage_tracker), usage_kind);
 }
 
-ClientBufferAllocator::ClientBufferAllocator(void* addr, size_t size,
-                                             const std::string& protocol,
-                                             void* device_addr)
+ClientBufferAllocator::ClientBufferAllocator(
+    void* addr, size_t size, const std::string& protocol, void* device_addr,
+    std::shared_ptr<DfsBufferUsageTracker> usage_tracker,
+    DfsBufferUsageKind usage_kind)
     : buffer_(addr),
       buffer_size_(size),
       device_buffer_(device_addr),
@@ -80,6 +87,7 @@ ClientBufferAllocator::ClientBufferAllocator(void* addr, size_t size,
       is_external_memory_(true) {
     allocator_ = mooncake::offset_allocator::OffsetAllocator::create(
         reinterpret_cast<uint64_t>(buffer_), size);
+    allocator_->SetUsageTracker(std::move(usage_tracker), usage_kind);
 }
 
 ClientBufferAllocator::~ClientBufferAllocator() {

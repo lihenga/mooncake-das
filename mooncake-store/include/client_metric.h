@@ -12,11 +12,13 @@
 #include <unordered_set>
 #include <vector>
 #include <ylt/metric/counter.hpp>
+#include <ylt/metric/gauge.hpp>
 #include <ylt/metric/histogram.hpp>
 #include <ylt/metric/summary.hpp>
 #include "environ.h"
 #include "hybrid_metric.h"
 #include "utils.h"
+#include "dfs_buffer_usage.h"
 
 namespace mooncake {
 
@@ -632,6 +634,21 @@ struct SsdMetric {
           ssd_total_latency_summary("mooncake_ssd_total_latency_summary_us",
                                     "SSD total latency quantiles (us)",
                                     {0.5, 0.9, 0.99}, labels),
+          dfs_read_buffer_allocated_bytes(
+              "mooncake_dfs_read_buffer_allocated_bytes",
+              "Current DFS read buffer allocation in bytes", labels),
+          dfs_prefetch_buffer_allocated_bytes(
+              "mooncake_dfs_prefetch_buffer_allocated_bytes",
+              "Current DFS prefetch buffer allocation in bytes", labels),
+          dfs_write_buffer_allocated_bytes(
+              "mooncake_dfs_write_buffer_allocated_bytes",
+              "Current DFS write buffer allocation in bytes", labels),
+          dfs_buffer_allocated_bytes(
+              "mooncake_dfs_buffer_allocated_bytes",
+              "Current total DFS buffer allocation in bytes", labels),
+          dfs_buffer_peak_allocated_bytes(
+              "mooncake_dfs_buffer_peak_allocated_bytes",
+              "Peak total DFS buffer allocation in bytes", labels),
           start_time_(std::chrono::steady_clock::now()) {}
 
     ylt::metric::counter_t ssd_read_bytes;
@@ -646,7 +663,20 @@ struct SsdMetric {
     ylt::metric::summary_t ssd_read_latency_summary;
     ylt::metric::summary_t ssd_write_latency_summary;
     ylt::metric::summary_t ssd_total_latency_summary;
+    ylt::metric::gauge_t dfs_read_buffer_allocated_bytes;
+    ylt::metric::gauge_t dfs_prefetch_buffer_allocated_bytes;
+    ylt::metric::gauge_t dfs_write_buffer_allocated_bytes;
+    ylt::metric::gauge_t dfs_buffer_allocated_bytes;
+    ylt::metric::gauge_t dfs_buffer_peak_allocated_bytes;
     std::chrono::steady_clock::time_point start_time_;
+
+    void UpdateDfsBufferUsage(const DfsBufferUsageSnapshot& snapshot) {
+        dfs_read_buffer_allocated_bytes.update(snapshot.read_bytes);
+        dfs_prefetch_buffer_allocated_bytes.update(snapshot.prefetch_bytes);
+        dfs_write_buffer_allocated_bytes.update(snapshot.write_bytes);
+        dfs_buffer_allocated_bytes.update(snapshot.total_bytes);
+        dfs_buffer_peak_allocated_bytes.update(snapshot.peak_total_bytes);
+    }
 
     void serialize(std::string& str) {
         ssd_read_bytes.serialize(str);
@@ -661,6 +691,11 @@ struct SsdMetric {
         ssd_read_latency_summary.serialize(str);
         ssd_write_latency_summary.serialize(str);
         ssd_total_latency_summary.serialize(str);
+        dfs_read_buffer_allocated_bytes.serialize(str);
+        dfs_prefetch_buffer_allocated_bytes.serialize(str);
+        dfs_write_buffer_allocated_bytes.serialize(str);
+        dfs_buffer_allocated_bytes.serialize(str);
+        dfs_buffer_peak_allocated_bytes.serialize(str);
     }
 
     std::string summary_metrics() {
@@ -720,6 +755,13 @@ struct SsdMetric {
         ss << "Write: " << format_summary_percentiles(ssd_write_latency_summary)
            << "\n";
         ss << "Total: " << format_summary_percentiles(ssd_total_latency_summary)
+           << "\n";
+        ss << "DFS buffer usage (process): read_bytes="
+           << dfs_read_buffer_allocated_bytes.value()
+           << ", prefetch_bytes=" << dfs_prefetch_buffer_allocated_bytes.value()
+           << ", write_bytes=" << dfs_write_buffer_allocated_bytes.value()
+           << ", total_bytes=" << dfs_buffer_allocated_bytes.value()
+           << ", peak_total_bytes=" << dfs_buffer_peak_allocated_bytes.value()
            << "\n";
 
         return ss.str();
@@ -826,7 +868,11 @@ struct ClientMetric {
     bool master_rpc_metrics_enabled_{true};
     std::mutex snapshot_mutex_;
     std::optional<TransferSnapshot> last_report_snapshot_;
+    std::shared_ptr<DfsBufferUsageTracker> dfs_buffer_usage_tracker_ =
+        DfsBufferUsageTracker::ProcessTracker();
 
+    std::mutex dfs_buffer_metrics_mutex_;
+    void RefreshDfsBufferUsage();
     void StartMetricsReportingThread();
     void StopMetricsReportingThread();
     std::string BuildBandwidthReport();

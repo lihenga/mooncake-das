@@ -96,8 +96,10 @@ void* AllocateAlignedBuffer(size_t aligned_size, const std::string& protocol,
 }  // namespace
 
 std::shared_ptr<AlignedClientBufferAllocator>
-AlignedClientBufferAllocator::create(size_t size, const std::string& protocol,
-                                     bool use_hugepage) {
+AlignedClientBufferAllocator::create(
+    size_t size, const std::string& protocol, bool use_hugepage,
+    std::shared_ptr<DfsBufferUsageTracker> usage_tracker,
+    DfsBufferUsageKind usage_kind) {
     if (size == 0) {
         LOG(ERROR)
             << "AlignedClientBufferAllocator: size must be greater than 0";
@@ -131,13 +133,16 @@ AlignedClientBufferAllocator::create(size_t size, const std::string& protocol,
     // Use custom deleter to properly free the aligned memory
     return std::shared_ptr<AlignedClientBufferAllocator>(
         new AlignedClientBufferAllocator(aligned_buffer, aligned_size, protocol,
-                                         use_mmap_hugepage));
+                                         use_mmap_hugepage,
+                                         std::move(usage_tracker), usage_kind));
 }
 
 AlignedClientBufferAllocator::AlignedClientBufferAllocator(
     void* aligned_buffer, size_t size, const std::string& protocol,
-    bool use_hugepage)
-    : ClientBufferAllocator(aligned_buffer, size, protocol),
+    bool use_hugepage, std::shared_ptr<DfsBufferUsageTracker> usage_tracker,
+    DfsBufferUsageKind usage_kind)
+    : ClientBufferAllocator(aligned_buffer, size, protocol, nullptr,
+                            std::move(usage_tracker), usage_kind),
       owns_memory_(true),
       allocated_size_(size),
       protocol_(protocol) {
