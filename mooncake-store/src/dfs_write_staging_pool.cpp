@@ -43,14 +43,37 @@ std::shared_ptr<DfsWriteStagingPool::Slot> DfsWriteStagingPool::Acquire(
     if (timed_out) *timed_out = false;
     std::unique_lock<std::mutex> lock(mutex_);
     const auto ready = [this] { return shutting_down_ || !free_slots_.empty(); };
+    const bool needs_wait = free_slots_.empty();
+    const auto wait_started = std::chrono::steady_clock::now();
+    if (needs_wait && usage_tracker_) usage_tracker_->RecordWriteWaitStart();
     const bool acquired = timeout == std::chrono::milliseconds::max()
                               ? (cv_.wait(lock, ready), true)
                               : cv_.wait_for(lock, timeout, ready);
     if (!acquired) {
         if (timed_out) *timed_out = true;
+        if (needs_wait && usage_tracker_) {
+            const auto wait_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - wait_started);
+            usage_tracker_->RecordWriteWaitEnd(true, wait_ms.count());
+        }
         return nullptr;
     }
-    if (shutting_down_) return nullptr;
+    if (shutting_down_) {
+        if (needs_wait && usage_tracker_) {
+            const auto wait_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - wait_started);
+            usage_tracker_->RecordWriteWaitEnd(false, wait_ms.count());
+        }
+        return nullptr;
+    }
+    if (needs_wait && usage_tracker_) {
+        const auto wait_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - wait_started);
+        usage_tracker_->RecordWriteWaitEnd(false, wait_ms.count());
+    }
     auto slot = std::move(free_slots_.back());
     free_slots_.pop_back();
     slot->usage.emplace(usage_tracker_, DfsBufferUsageKind::kWrite, 0);

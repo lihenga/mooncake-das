@@ -45,7 +45,17 @@ void StartDfsBufferUsageLogging() {
                       << " prefetch_peak_utilization="
                       << usage.prefetch_peak_utilization_tenths / 10.0 << "%"
                       << " write_peak_utilization="
-                      << usage.write_peak_utilization_tenths / 10.0 << "%";
+                      << usage.write_peak_utilization_tenths / 10.0 << "%"
+                      << " write_waiting_requests="
+                      << usage.write_waiting_requests
+                      << " write_waiting_peak_requests="
+                      << usage.write_waiting_peak_requests
+                      << " write_wait_total_requests="
+                      << usage.write_wait_total_requests
+                      << " write_wait_timeout_total="
+                      << usage.write_wait_timeout_total
+                      << " write_wait_time_ms_total="
+                      << usage.write_wait_time_ms_total;
         }
     });
 }

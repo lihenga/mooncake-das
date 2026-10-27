@@ -36,6 +36,11 @@ struct DfsBufferUsageSnapshot {
     uint64_t local_peak_utilization_tenths;
     uint64_t prefetch_peak_utilization_tenths;
     uint64_t write_peak_utilization_tenths;
+    uint64_t write_waiting_requests;
+    uint64_t write_waiting_peak_requests;
+    uint64_t write_wait_total_requests;
+    uint64_t write_wait_timeout_total;
+    uint64_t write_wait_time_ms_total;
 };
 
 class DfsBufferUsageTracker {
@@ -48,6 +53,20 @@ class DfsBufferUsageTracker {
     void AddCapacity(DfsBufferUsageKind kind, size_t capacity) {
         std::lock_guard<std::mutex> lock(mutex_);
         capacities_[static_cast<size_t>(kind)] += capacity;
+    }
+
+    void RecordWriteWaitStart() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++write_waiting_requests_;
+        ++write_waiting_peak_requests_;
+        ++write_wait_total_requests_;
+    }
+
+    void RecordWriteWaitEnd(bool timed_out, uint64_t wait_time_ms) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (write_waiting_requests_ > 0) --write_waiting_requests_;
+        if (timed_out) ++write_wait_timeout_total_;
+        write_wait_time_ms_total_ += wait_time_ms;
     }
 
     void Add(DfsBufferUsageKind kind, size_t bytes) {
@@ -107,7 +126,12 @@ class DfsBufferUsageTracker {
                 peak_utilization_tenths_[0],
                 peak_utilization_tenths_[1],
                 peak_utilization_tenths_[2],
-                peak_utilization_tenths_[3]};
+                peak_utilization_tenths_[3],
+                write_waiting_requests_,
+                write_waiting_peak_requests_,
+                write_wait_total_requests_,
+                write_wait_timeout_total_,
+                write_wait_time_ms_total_};
     }
 
    private:
@@ -122,6 +146,11 @@ class DfsBufferUsageTracker {
     std::array<uint64_t, 4> peak_utilization_tenths_{};
     uint64_t total_bytes_{0};
     uint64_t peak_total_bytes_{0};
+    uint64_t write_waiting_requests_{0};
+    uint64_t write_waiting_peak_requests_{0};
+    uint64_t write_wait_total_requests_{0};
+    uint64_t write_wait_timeout_total_{0};
+    uint64_t write_wait_time_ms_total_{0};
 };
 
 class DfsBufferAllocationUsage {
