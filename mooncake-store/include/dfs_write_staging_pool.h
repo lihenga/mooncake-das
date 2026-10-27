@@ -37,6 +37,7 @@ class DfsWriteStagingPool {
         std::chrono::milliseconds timeout = std::chrono::seconds(10),
         bool* timed_out = nullptr);
     void Release(std::shared_ptr<Slot> slot);
+    void UpdateUsedBytes(const std::shared_ptr<Slot>& slot, size_t bytes);
     void Shutdown();
 
     size_t arena_size() const { return arena_size_; }

@@ -59,7 +59,7 @@ FileStorage::FileStorage(const FileStorageConfig& config,
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       client_buffer_allocator_(AlignedClientBufferAllocator::create(
           config.local_buffer_size, client ? client->GetProtocol() : "", false,
-          usage_tracker_, DfsBufferUsageKind::kRead)) {
+          usage_tracker_, DfsBufferUsageKind::kLocal)) {
     if (config_.storage_backend_type == StorageBackendType::kDistributed) {
         config_.enable_dfs = true;
     }

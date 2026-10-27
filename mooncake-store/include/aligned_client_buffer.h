@@ -30,7 +30,7 @@ class AlignedClientBufferAllocator : public ClientBufferAllocator {
         size_t size, const std::string& protocol = "",
         bool use_hugepage = false,
         std::shared_ptr<DfsBufferUsageTracker> usage_tracker = nullptr,
-        DfsBufferUsageKind usage_kind = DfsBufferUsageKind::kRead);
+        DfsBufferUsageKind usage_kind = DfsBufferUsageKind::kLocal);
 
     /**
      * Get the base pointer of the aligned buffer

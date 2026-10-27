@@ -54,7 +54,7 @@ TEST(DfsWriteStagingPoolTest, ReturnedSlotCanBeReusedByNextChunk) {
     EXPECT_EQ(second->backing.data, first_address);
 }
 
-TEST(DfsWriteStagingPoolTest, TracksOccupiedChunksAndShutdownRelease) {
+TEST(DfsWriteStagingPoolTest, TracksUsedBytesAndShutdownRelease) {
     auto tracker = std::make_shared<DfsBufferUsageTracker>();
     DfsWriteStagingPool pool(1024, 2, tracker);
     EXPECT_EQ(tracker->Snapshot().write_bytes, 0);
@@ -62,19 +62,21 @@ TEST(DfsWriteStagingPoolTest, TracksOccupiedChunksAndShutdownRelease) {
     auto second = pool.Acquire(std::chrono::milliseconds(1));
     ASSERT_NE(first, nullptr);
     ASSERT_NE(second, nullptr);
-    EXPECT_EQ(tracker->Snapshot().write_bytes, 2048);
-    EXPECT_EQ(tracker->Snapshot().peak_total_bytes, 2048);
+    EXPECT_EQ(tracker->Snapshot().write_bytes, 0);
+    pool.UpdateUsedBytes(first, 100);
+    pool.UpdateUsedBytes(second, 200);
+    EXPECT_EQ(tracker->Snapshot().write_bytes, 300);
+    EXPECT_EQ(tracker->Snapshot().peak_total_bytes, 300);
     EXPECT_EQ(pool.Acquire(std::chrono::milliseconds(1)), nullptr);
-    EXPECT_EQ(tracker->Snapshot().total_bytes, 2048);
     pool.Release(first);
-    EXPECT_EQ(tracker->Snapshot().write_bytes, 1024);
+    EXPECT_EQ(tracker->Snapshot().write_bytes, 200);
     pool.Release(first);
-    EXPECT_EQ(tracker->Snapshot().write_bytes, 1024);
+    EXPECT_EQ(tracker->Snapshot().write_bytes, 200);
     pool.Shutdown();
-    EXPECT_EQ(tracker->Snapshot().write_bytes, 1024);
+    EXPECT_EQ(tracker->Snapshot().write_bytes, 200);
     pool.Release(std::move(second));
     EXPECT_EQ(tracker->Snapshot().total_bytes, 0);
-    EXPECT_EQ(tracker->Snapshot().peak_total_bytes, 2048);
+    EXPECT_EQ(tracker->Snapshot().peak_total_bytes, 300);
 }
 
 TEST(DfsWriteStagingPoolTest, OutstandingSlotRetainsUsageAfterPoolDestruction) {
@@ -84,11 +86,12 @@ TEST(DfsWriteStagingPoolTest, OutstandingSlotRetainsUsageAfterPoolDestruction) {
         DfsWriteStagingPool pool(1024, 1, tracker);
         slot = pool.Acquire(std::chrono::milliseconds(1));
         ASSERT_NE(slot, nullptr);
+        pool.UpdateUsedBytes(slot, 128);
     }
-    EXPECT_EQ(tracker->Snapshot().write_bytes, 1024);
+    EXPECT_EQ(tracker->Snapshot().write_bytes, 128);
     slot.reset();
     EXPECT_EQ(tracker->Snapshot().write_bytes, 0);
-    EXPECT_EQ(tracker->Snapshot().peak_total_bytes, 1024);
+    EXPECT_EQ(tracker->Snapshot().peak_total_bytes, 128);
 }
 
 }  // namespace mooncake::test

@@ -34,7 +34,7 @@ class ClientBufferAllocator
         size_t size, const std::string& protocol = "",
         bool use_hugepage = false, bool use_spdk_dma = false,
         std::shared_ptr<DfsBufferUsageTracker> usage_tracker = nullptr,
-        DfsBufferUsageKind usage_kind = DfsBufferUsageKind::kRead);
+        DfsBufferUsageKind usage_kind = DfsBufferUsageKind::kLocal);
 
     // Create for external memory. An optional owner keeps the backing
     // allocation alive until this allocator and every outstanding BufferHandle
@@ -44,7 +44,7 @@ class ClientBufferAllocator
         void* device_addr = nullptr,
         std::shared_ptr<void> backing_owner = nullptr,
         std::shared_ptr<DfsBufferUsageTracker> usage_tracker = nullptr,
-        DfsBufferUsageKind usage_kind = DfsBufferUsageKind::kRead);
+        DfsBufferUsageKind usage_kind = DfsBufferUsageKind::kLocal);
 
     ~ClientBufferAllocator();
 
@@ -82,7 +82,7 @@ class ClientBufferAllocator
         void* addr, size_t size, const std::string& protocol,
         void* device_addr = nullptr,
         std::shared_ptr<DfsBufferUsageTracker> usage_tracker = nullptr,
-        DfsBufferUsageKind usage_kind = DfsBufferUsageKind::kRead);
+        DfsBufferUsageKind usage_kind = DfsBufferUsageKind::kLocal);
 
     void* buffer_;
     size_t buffer_size_;

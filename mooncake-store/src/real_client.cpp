@@ -1721,7 +1721,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     client_buffer_allocator_ = ClientBufferAllocator::create(
         local_buffer_size, this->protocol, should_use_hugepage,
         use_spdk_dma_for_client_buffer, client_->GetDfsBufferUsageTracker(),
-        DfsBufferUsageKind::kRead);
+        DfsBufferUsageKind::kLocal);
 
     if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
@@ -3427,8 +3427,9 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
             munmap(shm_buffer, shm_size);
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
-        context.client_buffer_allocator =
-            ClientBufferAllocator::create(shm_buffer, shm_size, this->protocol);
+        context.client_buffer_allocator = ClientBufferAllocator::create(
+            shm_buffer, shm_size, this->protocol, nullptr, nullptr,
+            client_->GetDfsBufferUsageTracker(), DfsBufferUsageKind::kLocal);
     }
 
     context.mapped_shms.push_back(std::move(shm));
@@ -3541,8 +3542,9 @@ tl::expected<void, ErrorCode> RealClient::ascend_shm_internal(
             (void)aclrtFreePhysical(imported_handle);
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
-        context.client_buffer_allocator =
-            ClientBufferAllocator::create(mapped_va, vmm_size, this->protocol);
+        context.client_buffer_allocator = ClientBufferAllocator::create(
+            mapped_va, vmm_size, this->protocol, nullptr, nullptr,
+            client_->GetDfsBufferUsageTracker(), DfsBufferUsageKind::kLocal);
     }
     context.mapped_shms.push_back(std::move(region));
 #endif
@@ -3617,8 +3619,9 @@ tl::expected<void, ErrorCode> RealClient::ascend_ipc_shm_internal(
             (void)aclrtIpcMemClose(ipc_key_bytes.data());
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
-        context.client_buffer_allocator =
-            ClientBufferAllocator::create(mapped_va, mem_size, this->protocol);
+        context.client_buffer_allocator = ClientBufferAllocator::create(
+            mapped_va, mem_size, this->protocol, nullptr, nullptr,
+            client_->GetDfsBufferUsageTracker(), DfsBufferUsageKind::kLocal);
     }
 
     context.mapped_shms.push_back(std::move(region));

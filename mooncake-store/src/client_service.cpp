@@ -3634,6 +3634,8 @@ bool Client::StageDfsWriteData(
             } else {
                 std::memcpy(destination, slice.ptr, slice.size);
             }
+            context.staging_pool->UpdateUsedBytes(context.staging_slot,
+                                                  staging_offset);
             context.slices[i].push_back(Slice{destination, slice.size});
         }
     }

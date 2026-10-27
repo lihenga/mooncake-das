@@ -162,6 +162,7 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
         mooncake::DfsBufferUsageKind kind) {
         usage_tracker_ = std::move(tracker);
         usage_kind_ = kind;
+        if (usage_tracker_) usage_tracker_->AddCapacity(kind, m_capacity);
     }
 
     // Allocate memory and return a Handle (thread-safe)
@@ -233,7 +234,7 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     uint64_t m_allocated_num GUARDED_BY(m_mutex) = 0;
     std::shared_ptr<mooncake::DfsBufferUsageTracker> usage_tracker_;
     mooncake::DfsBufferUsageKind usage_kind_{
-        mooncake::DfsBufferUsageKind::kRead};
+        mooncake::DfsBufferUsageKind::kLocal};
     std::atomic<uint64_t> m_largest_free_region{0};
     bool m_largest_free_region_tightened GUARDED_BY(m_mutex) = false;
 

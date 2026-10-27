@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <thread>
 
+#include "dfs_buffer_usage.h"
 #include "bool_parser.h"
 #include "integer_parser.h"
 
@@ -19,17 +20,32 @@ void StartDfsBufferUsageLogging() {
         std::mutex mutex;
         std::condition_variable_any cv;
         std::unique_lock<std::mutex> lock(mutex);
+        constexpr auto kDfsBufferLogInterval = std::chrono::seconds(10);
         while (!stop.stop_requested()) {
-            cv.wait_for(lock, stop, std::chrono::seconds(1),
+            cv.wait_for(lock, stop, kDfsBufferLogInterval,
                         [] { return false; });
             if (stop.stop_requested()) break;
             const auto usage = tracker->Snapshot();
             LOG(INFO) << "action=dfs_buffer_usage scope=process"
                       << " read_bytes=" << usage.read_bytes
+                      << " local_bytes=" << usage.local_bytes
                       << " prefetch_bytes=" << usage.prefetch_bytes
                       << " write_bytes=" << usage.write_bytes
                       << " total_bytes=" << usage.total_bytes
-                      << " peak_total_bytes=" << usage.peak_total_bytes;
+                      << " read_peak_bytes=" << usage.read_peak_bytes
+                      << " local_peak_bytes=" << usage.local_peak_bytes
+                      << " prefetch_peak_bytes=" << usage.prefetch_peak_bytes
+                      << " write_peak_bytes=" << usage.write_peak_bytes
+                      << " peak_total_bytes=" << usage.peak_total_bytes
+                      << std::fixed << std::setprecision(1)
+                      << " read_peak_utilization="
+                      << usage.read_peak_utilization_tenths / 10.0 << "%"
+                      << " local_peak_utilization="
+                      << usage.local_peak_utilization_tenths / 10.0 << "%"
+                      << " prefetch_peak_utilization="
+                      << usage.prefetch_peak_utilization_tenths / 10.0 << "%"
+                      << " write_peak_utilization="
+                      << usage.write_peak_utilization_tenths / 10.0 << "%";
         }
     });
 }
@@ -132,13 +148,7 @@ std::unique_ptr<ClientMetric> ClientMetric::Create(
                                           master_rpc_metrics_enabled);
 }
 
-void ClientMetric::RefreshDfsBufferUsage() {
-    ssd_metric.UpdateDfsBufferUsage(dfs_buffer_usage_tracker_->Snapshot());
-}
-
 void ClientMetric::serialize(std::string& str) {
-    std::lock_guard<std::mutex> lock(dfs_buffer_metrics_mutex_);
-    RefreshDfsBufferUsage();
     transfer_metric.serialize(str);
     if (master_rpc_metrics_enabled_) {
         master_client_metric.serialize(str);
@@ -149,8 +159,6 @@ void ClientMetric::serialize(std::string& str) {
 }
 
 std::string ClientMetric::summary_metrics() {
-    std::lock_guard<std::mutex> lock(dfs_buffer_metrics_mutex_);
-    RefreshDfsBufferUsage();
     std::stringstream ss;
     ss << "Client Metrics Summary\n";
     ss << transfer_metric.summary_metrics(bandwidth_reporting_enabled_);
