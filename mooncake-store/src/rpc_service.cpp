@@ -1926,6 +1926,17 @@ WrappedMasterService::PromotionObjectHeartbeat(const UUID& client_id) {
     return master_service_.PromotionObjectHeartbeat(client_id);
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::RegisterDfsPrefetchTask(
+    const UUID& client_id, const std::string& key,
+    const std::string& tenant_id, ReplicaID source_id) {
+    return WithWriteTenant(
+        tenant_id, master_service_.IsTenantQuotaEnabled(),
+        [&](const TenantId& resolved_tenant_id) {
+            return master_service_.RegisterDfsPrefetchTask(
+                client_id, key, resolved_tenant_id, source_id);
+        });
+}
+
 tl::expected<PromotionAllocStartResponse, ErrorCode>
 WrappedMasterService::PromotionAllocStart(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
@@ -2122,6 +2133,9 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::PromotionObjectHeartbeat>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::RegisterDfsPrefetchTask>(
         &wrapped_master_service);
     server
         .register_handler<&mooncake::WrappedMasterService::PromotionAllocStart>(

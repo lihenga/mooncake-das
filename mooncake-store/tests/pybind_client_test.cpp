@@ -514,6 +514,147 @@ class RealClientDfsPrefetchTest : public RealClientTest {
     std::vector<std::string> sources_;
 };
 
+TEST_F(RealClientDfsPrefetchTest, PromotionWithoutArenaOrQueueTimeSessions) {
+    DfsPrefetchTestEnv dfs_env;
+    // Even an old arena environment setting must allocate nothing when the
+    // direct linker explicitly disables buffered prefetch at setup.
+    ScopedEnvVar arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES", "1048576");
+    const std::vector<std::string> keys{"promotion_no_buffer"};
+    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects(
+        "localhost:17850", keys, /*enable_dfs_prefetch=*/false));
+    ASSERT_TRUE(py_client_->dfs_prefetch_to_memory_available());
+    ASSERT_EQ(py_client_->file_storage_->PinnedPrefetchArenaCapacity(), 0u);
+    ASSERT_EQ(py_client_->batch_prefetch_to_memory(keys), std::vector<int>{0});
+    EXPECT_TRUE(py_client_->get_sessions_.empty());
+    EXPECT_TRUE(py_client_->get_session_prefetch_cache_.empty());
+    EXPECT_EQ(py_client_->file_storage_->PinnedPrefetchArenaCapacity(), 0u);
+    const auto replicas = py_client_->get_replica_desc(keys[0]);
+    EXPECT_EQ(std::count_if(replicas.begin(), replicas.end(), [](const auto& r) {
+                  return r.is_memory_replica() && r.status == ReplicaStatus::COMPLETE;
+              }), 1);
+    EXPECT_EQ(std::count_if(replicas.begin(), replicas.end(), [](const auto& r) {
+                  return r.is_dfs_replica();
+              }), 1);
+    // A fresh admission session selects MEMORY. Removing the staging
+    // allocator during the range read proves no DFS fallback supplied bytes.
+    ASSERT_EQ(py_client_->batch_get_session_start(keys), std::vector<int>{0});
+    EXPECT_TRUE(py_client_->all_get_sessions_memory(keys));
+    ExpectRead(keys[0], 0, 512, /*cache_only=*/true);
+    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+    EXPECT_EQ(py_client_->batch_prefetch_to_memory(keys), std::vector<int>{0});
+}
+
+TEST_F(RealClientDfsPrefetchTest, PromotionReadFailureRollsBackAndCanRetry) {
+    DfsPrefetchTestEnv dfs_env;
+    ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+    const std::vector<std::string> keys{"promotion_read_failure"};
+    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects(
+        "localhost:17851", keys, /*enable_dfs_prefetch=*/false));
+    InstallBucketReadHook([] { throw std::runtime_error("injected read failure"); });
+    auto failed = py_client_->batch_prefetch_to_memory(keys);
+    ASSERT_EQ(failed.size(), 1u);
+    EXPECT_NE(failed[0], 0);
+    auto replicas = py_client_->get_replica_desc(keys[0]);
+    ASSERT_EQ(replicas.size(), 1u);
+    EXPECT_TRUE(replicas[0].is_dfs_replica());
+    EXPECT_TRUE(py_client_->get_sessions_.empty());
+    InstallBucketReadHook([] {});
+    // Failure released both staged MEMORY and the dedup task.
+    EXPECT_EQ(py_client_->batch_prefetch_to_memory(keys), std::vector<int>{0});
+}
+
+TEST_F(RealClientDfsPrefetchTest, PromotionRegistrationFencesSourceAndDeduplicates) {
+    DfsPrefetchTestEnv dfs_env;
+    const std::vector<std::string> keys{"promotion_registration"};
+    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects(
+        "localhost:17852", keys, /*enable_dfs_prefetch=*/false));
+    const auto replicas = py_client_->get_replica_desc(keys[0]);
+    ASSERT_EQ(replicas.size(), 1u);
+    auto& client = py_client_->client_;
+    auto wrong = client->RegisterDfsPrefetchTask(keys[0], replicas[0].id + 1);
+    ASSERT_FALSE(wrong);
+    EXPECT_EQ(wrong.error(), ErrorCode::INVALID_REPLICA);
+    ASSERT_TRUE(client->RegisterDfsPrefetchTask(keys[0], replicas[0].id));
+    auto duplicate = client->RegisterDfsPrefetchTask(keys[0], replicas[0].id);
+    ASSERT_FALSE(duplicate);
+    EXPECT_EQ(duplicate.error(), ErrorCode::REPLICA_IS_NOT_READY);
+    auto wrong_size = client->PromotionAllocStart(keys[0], 1, {});
+    ASSERT_FALSE(wrong_size);
+    EXPECT_EQ(wrong_size.error(), ErrorCode::INVALID_PARAMS);
+    ASSERT_TRUE(client->NotifyPromotionFailure(keys[0]));
+    EXPECT_EQ(py_client_->batch_prefetch_to_memory(keys), std::vector<int>{0});
+}
+
+TEST_F(RealClientDfsPrefetchTest, PromotionTimeoutDoesNotPublishPartialMemory) {
+    DfsPrefetchTestEnv dfs_env;
+    ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+    const std::vector<std::string> keys{"promotion_timeout"};
+    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects(
+        "localhost:17853", keys, /*enable_dfs_prefetch=*/false));
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    auto completed = std::make_shared<std::promise<void>>();
+    auto complete = completed->get_future();
+    InstallBucketReadHook([released, completed] {
+        released.wait();
+        completed->set_value();
+    }, 10);
+    auto result = py_client_->batch_prefetch_to_memory(keys);
+    release.set_value();
+    ASSERT_EQ(complete.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    ASSERT_EQ(result.size(), 1u);
+    EXPECT_EQ(result[0], toInt(ErrorCode::DFS_BATCH_GET_TIMEOUT));
+    const auto replicas = py_client_->get_replica_desc(keys[0]);
+    ASSERT_EQ(replicas.size(), 1u);
+    EXPECT_TRUE(replicas[0].is_dfs_replica());
+    EXPECT_TRUE(py_client_->get_sessions_.empty());
+    InstallBucketReadHook([] {});
+    ASSERT_EQ(py_client_->batch_get_session_start(keys), std::vector<int>{0});
+    EXPECT_FALSE(py_client_->all_get_sessions_memory(keys));
+    ExpectRead(keys[0], 0, 512, /*cache_only=*/false);
+    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+}
+
+TEST_F(RealClientDfsPrefetchTest, PromotionRejectsInvalidatedDfsSource) {
+    DfsPrefetchTestEnv dfs_env;
+    ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+    const std::vector<std::string> keys{"promotion_invalidated_source"};
+    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects(
+        "localhost:17854", keys, /*enable_dfs_prefetch=*/false));
+    const auto replicas = py_client_->get_replica_desc(keys[0]);
+    ASSERT_EQ(replicas.size(), 1u);
+    const auto bucket = replicas[0].get_dfs_descriptor().shard_idx;
+    const auto data_path = replicas[0].get_dfs_descriptor().file_path;
+    MasterClient reporter(generate_uuid());
+    ASSERT_EQ(reporter.Connect(master_address_), ErrorCode::OK);
+    InstallBucketReadHook([&reporter, bucket, data_path, key = keys[0]] {
+        // A report alone is ignored while the master's bucket file exists.
+        // Remove this test-owned file only after its bytes have been read.
+        EXPECT_TRUE(std::filesystem::remove(data_path));
+        const auto result = reporter.BatchInvalidateDfsBuckets({{bucket}});
+        EXPECT_EQ(result.size(), 1u);
+        if (!result.empty()) EXPECT_TRUE(result[0]);
+        // Reporting schedules eviction asynchronously. Hold the read's
+        // completion until the source's read barrier is actually installed.
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(2);
+        bool retired = false;
+        do {
+            const auto exists = reporter.BatchExistKeyByReplicaType(
+                {key}, ReplicaType::DFS);
+            retired = exists.size() == 1 && exists[0] && !*exists[0];
+            if (!retired) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        } while (!retired && std::chrono::steady_clock::now() < deadline);
+        EXPECT_TRUE(retired);
+    });
+    const auto result = py_client_->batch_prefetch_to_memory(keys);
+    ASSERT_EQ(result.size(), 1u);
+    EXPECT_NE(result[0], 0);
+    for (const auto& replica : py_client_->get_replica_desc(keys[0])) {
+        EXPECT_FALSE(replica.is_memory_replica());
+    }
+}
+
 // CPU tests exercise ownership and host copies; this does not simulate DMA.
 class CpuPrefetchDevice : public device::AcceleratorDevice {
    public:

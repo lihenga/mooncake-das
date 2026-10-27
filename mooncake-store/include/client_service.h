@@ -543,6 +543,9 @@ class Client {
      * replicas via PromotionAllocStart + NotifyPromotionSuccess.
      */
     // Virtual to enable subclassing in unit tests.
+    virtual tl::expected<void, ErrorCode> RegisterDfsPrefetchTask(
+        const std::string& key, ReplicaID source_id);
+
     virtual tl::expected<void, ErrorCode> PromotionObjectHeartbeat(
         std::vector<PromotionTaskItem>& promotion_objects);
 

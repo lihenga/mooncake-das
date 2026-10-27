@@ -535,6 +535,9 @@ class MasterClient {
      * SSD and stage as MEMORY replicas via PromotionAllocStart +
      * NotifyPromotionSuccess.
      */
+    [[nodiscard]] tl::expected<void, ErrorCode> RegisterDfsPrefetchTask(
+        const UUID& client_id, const std::string& key, ReplicaID source_id);
+
     [[nodiscard]] tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
     PromotionObjectHeartbeat(const UUID& client_id);
 

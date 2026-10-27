@@ -5422,6 +5422,11 @@ tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(
     return {};
 }
 
+tl::expected<void, ErrorCode> Client::RegisterDfsPrefetchTask(
+    const std::string& key, ReplicaID source_id) {
+    return master_client_.RegisterDfsPrefetchTask(client_id_, key, source_id);
+}
+
 tl::expected<PromotionAllocStartResponse, ErrorCode>
 Client::PromotionAllocStart(
     const std::string& key, uint64_t size,

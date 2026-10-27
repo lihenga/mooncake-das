@@ -6979,6 +6979,106 @@ std::vector<int> RealClient::batch_get_session_prefetch(
     return results;
 }
 
+bool RealClient::dfs_prefetch_to_memory_available() const {
+    return client_ && client_buffer_allocator_ && file_storage_ &&
+           file_storage_->IsDfsBackendReady() && client_->DfsReadAllowed();
+}
+
+std::vector<int> RealClient::batch_prefetch_to_memory(
+    const std::vector<std::string>& keys) {
+    std::vector<int> results(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+    std::shared_lock<std::shared_mutex> lifecycle_lock(dfs_read_lifecycle_mutex_);
+    if (closed_.load(std::memory_order_acquire) || dfs_read_shutting_down_ ||
+        !dfs_prefetch_to_memory_available()) {
+        return results;
+    }
+    const auto queries = client_->BatchQuery(keys);
+    if (queries.size() != keys.size()) return results;
+    const auto local_endpoints = client_->GetLocalEndpoints();
+    const size_t alignment = GetEnvOr<size_t>("MOONCAKE_DFS_ALIGNMENT", 4096);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!queries[i]) {
+            results[i] = toInt(queries[i].error());
+            continue;
+        }
+        const auto& query = queries[i].value();
+        const auto* source = SelectSessionReplica(query.replicas, local_endpoints,
+                                                  client_->DfsReadAllowed());
+        if (!source) continue;
+        if (source->is_memory_replica()) {
+            results[i] = 0;
+            continue;
+        }
+        if (query.IsLeaseExpired()) {
+            results[i] = toInt(ErrorCode::LEASE_EXPIRED);
+            continue;
+        }
+        const auto& desc = source->get_dfs_descriptor();
+        const uint64_t bytes = desc.aligned_size;
+        if (bytes < desc.object_size || bytes > SIZE_MAX || alignment == 0) {
+            continue;
+        }
+        // One object per worker at a time, borrowed from the existing client
+        // pool. Nothing is retained for waiting requests or registered anew.
+        auto allocation = client_buffer_allocator_->allocate_aligned(
+            static_cast<size_t>(bytes), alignment);
+        if (!allocation) {
+            results[i] = toInt(ErrorCode::NO_AVAILABLE_HANDLE);
+            continue;
+        }
+        auto staging = std::make_shared<BufferHandle>(std::move(*allocation));
+        auto registered = client_->RegisterDfsPrefetchTask(keys[i], source->id);
+        if (!registered) {
+            results[i] = toInt(registered.error());
+            continue;
+        }
+        // Match upstream's alloc -> read -> write -> commit sequence and
+        // eagerly release master task/quota on every failed stage, including
+        // exceptions. Timed DFS reads keep staging alive through buffer_owner.
+        bool committed = false;
+        auto cleanup = [this, &key = keys[i], &committed](int*) {
+            if (!committed) client_->NotifyPromotionFailure(key);
+        };
+        int cleanup_token = 0;
+        std::unique_ptr<int, decltype(cleanup)> guard(&cleanup_token, cleanup);
+        auto target = client_->PromotionAllocStart(keys[i], desc.object_size, {});
+        if (!target) {
+            results[i] = toInt(target.error());
+            continue;
+        }
+        std::vector<std::string> read_keys{keys[i]};
+        std::vector<QueryResult> read_queries{
+            FilterQueryResult(query, *source)};
+        std::vector<std::vector<Slice>> read_slices{
+            {Slice{staging->ptr(), static_cast<size_t>(bytes)}}};
+        std::vector<std::shared_ptr<void>> owners{staging};
+        auto read = client_->BatchGet(read_keys, read_queries, read_slices,
+                                      false, &owners);
+        if (read.size() != 1 || !read.front()) {
+            results[i] = read.size() == 1 ? toInt(read.front().error())
+                                         : toInt(ErrorCode::INTERNAL_ERROR);
+            continue;
+        }
+        // DFS alignment padding is staging-only; MEMORY stores logical bytes.
+        std::vector<Slice> write_slices{
+            Slice{staging->ptr(), static_cast<size_t>(desc.object_size)}};
+        auto write = client_->PromotionWrite(target->memory_descriptor,
+                                              write_slices);
+        if (write != ErrorCode::OK) {
+            results[i] = toInt(write);
+            continue;
+        }
+        auto notify = client_->NotifyPromotionSuccess(keys[i]);
+        if (!notify) {
+            results[i] = toInt(notify.error());
+            continue;
+        }
+        committed = true;
+        results[i] = 0;
+    }
+    return results;
+}
+
 void RealClient::record_prefetched_tokens(uint64_t tokens) {
     if (client_ != nullptr) {
         client_->ObservePrefetchedTokens(tokens);

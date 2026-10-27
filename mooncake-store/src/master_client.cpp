@@ -253,6 +253,11 @@ struct RpcNameTraits<&WrappedMasterService::PromotionObjectHeartbeat> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::RegisterDfsPrefetchTask> {
+    static constexpr const char* value = "RegisterDfsPrefetchTask";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::PromotionAllocStart> {
     static constexpr const char* value = "PromotionAllocStart";
 };
@@ -1216,6 +1221,12 @@ tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
         client_id, tasks, metadatas);
     timer.LogResponseExpected(result);
     return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::RegisterDfsPrefetchTask(
+    const UUID& client_id, const std::string& key, ReplicaID source_id) {
+    return invoke_rpc<&WrappedMasterService::RegisterDfsPrefetchTask, void>(
+        client_id, key, tenant_id_.value(), source_id);
 }
 
 tl::expected<std::vector<PromotionTaskItem>, ErrorCode>

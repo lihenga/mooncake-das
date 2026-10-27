@@ -311,6 +311,10 @@ class RealClient : public PyClient {
     std::vector<int> batch_get_session_prefetch(
         const std::vector<std::string> &keys) override;
 
+    std::vector<int> batch_prefetch_to_memory(
+        const std::vector<std::string>& keys) override;
+    bool dfs_prefetch_to_memory_available() const override;
+
     // Whether waiting-queue DFS prefetch has a staging arena. Callers should
     // not submit prefetches when this is false: every DFS staging allocation
     // would fail.

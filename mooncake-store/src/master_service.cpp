@@ -10569,6 +10569,48 @@ auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
                                              promotion_max_per_heartbeat_);
 }
 
+auto MasterService::RegisterDfsPrefetchTask(
+    const UUID& client_id, const std::string& key, const TenantId& tenant_id,
+    ReplicaID source_id) -> tl::expected<void, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    MetadataAccessorRW accessor(this, object_id);
+    if (!accessor.Exists()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    auto& metadata = accessor.Get();
+    auto& tenant_state = accessor.GetTenantState();
+    if (accessor.InProcessing() ||
+        metadata.HasReplica(&Replica::fn_is_memory_replica) ||
+        tenant_state.promotion_tasks.count(object_id.user_key)) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+    auto* source = metadata.GetReplicaByID(source_id);
+    if (!source || !source->is_dfs_replica() || !source->is_completed() ||
+        !IsReplicaReadable(*source)) {
+        return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
+    }
+    if (promotion_in_flight_.load(std::memory_order_relaxed) >=
+        promotion_queue_limit_) {
+        return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+    }
+    // Shared source pin, dedup and cap with promotion-on-hit. DFS has no
+    // holder mailbox: only this registering executor may allocate/commit.
+    source->inc_refcnt();
+    EraseCandidate(tenant_state, object_id.user_key);
+    tenant_state.promotion_tasks.emplace(
+        object_id.user_key,
+        PromotionTask{.source_id = source_id,
+                      .object_size = source->get_dfs_descriptor().object_size,
+                      .start_time = std::chrono::system_clock::now(),
+                      .holder_id = client_id,
+                      .from_prefetch = true});
+    promotion_in_flight_.fetch_add(1, std::memory_order_relaxed);
+    MasterMetricManager::instance().inc_promotion_in_flight();
+    MasterMetricManager::instance().inc_promotion_admitted();
+    return {};
+}
+
 auto MasterService::PromotionAllocStart(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
     uint64_t size, const std::vector<std::string>& preferred_segments)
@@ -10717,6 +10759,16 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    const bool from_prefetch = task_it->second.from_prefetch;
+    if (from_prefetch) {
+        // DFS bucket invalidation can remove the source independently of a
+        // client's read lease. Never publish bytes from a retired generation.
+        const auto* prefetch_source =
+            metadata.GetReplicaByID(task_it->second.source_id);
+        if (!prefetch_source || !IsReplicaReadable(*prefetch_source)) {
+            return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
+        }
+    }
     bool committed = false;
     Replica* staged = metadata.GetReplicaByID(task_it->second.alloc_id);
     if (staged != nullptr && staged->is_memory_replica() &&
@@ -10791,6 +10843,9 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
     MasterMetricManager::instance().dec_promotion_in_flight();
     if (committed) {
         SyncCacheTotalAccounting(metadata);
+        if (from_prefetch) {
+            GrantLeaseForGroup(tenant_state, key, metadata);
+        }
         MasterMetricManager::instance().inc_promotion_completed();
         MasterMetricManager::instance().inc_promotion_completed_bytes(
             static_cast<int64_t>(completed_bytes));
@@ -10855,6 +10910,7 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     // Capture the chain's execution-failure count BEFORE erasing the task
     // (the iterator is invalidated by the erase).
     const uint32_t prior_failures = task_it->second.execution_failures;
+    const bool from_prefetch = task_it->second.from_prefetch;
     tenant_state.promotion_tasks.erase(task_it);
     promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
     MasterMetricManager::instance().dec_promotion_in_flight();
@@ -10877,7 +10933,8 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     // re-record -> re-admit -> fail -> re-record forever, monopolizing
     // delivery slots with no read demand. Once the bound is hit we stop
     // re-recording — a genuine read can still re-admit the key (fresh chain).
-    if (!metadata.HasReplica(&Replica::fn_is_memory_replica) &&
+    if (!from_prefetch &&
+        !metadata.HasReplica(&Replica::fn_is_memory_replica) &&
         metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
         if (prior_failures >= kMaxPromotionExecutionFailures) {
             LOG(WARNING) << "promotion_execution_gave_up key="

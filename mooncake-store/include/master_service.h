@@ -885,6 +885,12 @@ class MasterService {
      * map remains populated as the source of truth until NotifyPromotionSuccess
      * commits the new MEMORY replica.
      */
+    // Explicit DFS prefetch, adapted from upstream RegisterPrefetchTask.
+    // The caller executes the read; source_id fences the queried DFS replica.
+    auto RegisterDfsPrefetchTask(const UUID& client_id, const std::string& key,
+                                 const TenantId& tenant_id, ReplicaID source_id)
+        -> tl::expected<void, ErrorCode>;
+
     auto PromotionObjectHeartbeat(const UUID& client_id)
         -> tl::expected<std::vector<PromotionTaskItem>, ErrorCode>;
 
@@ -1741,6 +1747,7 @@ class MasterService {
         // copies candidate -> task verbatim, failure re-record writes
         // task+1 -> candidate.
         uint32_t execution_failures{0};
+        bool from_prefetch{false};
     };
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
