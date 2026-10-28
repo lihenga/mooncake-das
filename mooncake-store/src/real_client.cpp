@@ -7027,25 +7027,8 @@ std::vector<int> RealClient::batch_prefetch_to_memory(
             continue;
         }
         auto staging = std::make_shared<BufferHandle>(std::move(*allocation));
-        auto registered = client_->RegisterDfsPrefetchTask(keys[i], source->id);
-        if (!registered) {
-            results[i] = toInt(registered.error());
-            continue;
-        }
-        // Match upstream's alloc -> read -> write -> commit sequence and
-        // eagerly release master task/quota on every failed stage, including
-        // exceptions. Timed DFS reads keep staging alive through buffer_owner.
-        bool committed = false;
-        auto cleanup = [this, &key = keys[i], &committed](int*) {
-            if (!committed) client_->NotifyPromotionFailure(key);
-        };
-        int cleanup_token = 0;
-        std::unique_ptr<int, decltype(cleanup)> guard(&cleanup_token, cleanup);
-        auto target = client_->PromotionAllocStart(keys[i], desc.object_size, {});
-        if (!target) {
-            results[i] = toInt(target.error());
-            continue;
-        }
+        // Read before registering/allocating a target: DFS I/O must not hold a
+        // remote write address. Timed reads retain staging via buffer_owner.
         std::vector<std::string> read_keys{keys[i]};
         std::vector<QueryResult> read_queries{
             FilterQueryResult(query, *source)};
@@ -7062,19 +7045,8 @@ std::vector<int> RealClient::batch_prefetch_to_memory(
         // DFS alignment padding is staging-only; MEMORY stores logical bytes.
         std::vector<Slice> write_slices{
             Slice{staging->ptr(), static_cast<size_t>(desc.object_size)}};
-        auto write = client_->PromotionWrite(target->memory_descriptor,
-                                              write_slices);
-        if (write != ErrorCode::OK) {
-            results[i] = toInt(write);
-            continue;
-        }
-        auto notify = client_->NotifyPromotionSuccess(keys[i]);
-        if (!notify) {
-            results[i] = toInt(notify.error());
-            continue;
-        }
-        committed = true;
-        results[i] = 0;
+        results[i] = toInt(client_->PromoteDfsToMemory(keys[i], source->id,
+                                                     write_slices));
     }
     return results;
 }

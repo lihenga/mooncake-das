@@ -1747,6 +1747,8 @@ class MasterService {
         // copies candidate -> task verbatim, failure re-record writes
         // task+1 -> candidate.
         uint32_t execution_failures{0};
+        // Allocated DFS-prefetch tasks require an explicit terminal ack; the
+        // TTL reaper can only reclaim them before a write address is issued.
         bool from_prefetch{false};
     };
 

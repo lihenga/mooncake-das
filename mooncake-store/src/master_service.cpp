@@ -11414,6 +11414,15 @@ void MasterService::DiscardExpiredProcessingReplicas(
 
         for (auto task_it = tenant_state.promotion_tasks.begin();
              task_it != tenant_state.promotion_tasks.end();) {
+            // Once an executor has a DFS-prefetch write address, elapsed time
+            // cannot prove that it has stopped writing. Only its terminal
+            // success/failure notification can safely release this allocation.
+            // A lost executor/notification retains capacity rather than making
+            // the address available to an unrelated object under a late write.
+            if (task_it->second.from_prefetch && task_it->second.alloc_id != 0) {
+                ++task_it;
+                continue;
+            }
             const auto ttl =
                 task_it->second.start_time + put_start_release_timeout_sec_;
             if (ttl > now) {
