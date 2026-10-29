@@ -6,11 +6,16 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <deque>
 #include <filesystem>
+#include <future>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <system_error>
+#include <thread>
 #include <tuple>
 #include <unordered_set>
 #include <utility>
@@ -38,6 +43,41 @@ int64_t CurrentTimeNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
+}
+
+// Milliseconds between two steady-clock readings, for recovery timing logs.
+// Rounded up, so a pass that took a fraction of a millisecond reports 1 rather
+// than 0: a reported 0 has to mean "this never ran", which is exactly the
+// distinction the master draws on when deciding how much of the shared startup
+// budget is left for re-registering the replicas.
+int64_t DurationMsBetween(std::chrono::steady_clock::time_point from,
+                          std::chrono::steady_clock::time_point to) {
+    const auto elapsed_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(to - from)
+            .count();
+    return (elapsed_ns + 999999) / 1000000;
+}
+
+// Measured cost of re-registering one recovered replica in the master:
+// 1.5-2.0us on the test hardware, rounded up. Recovery reserves this for every
+// replica it restores so that the registration sharing the same budget is not
+// starved by a recovery that spent the whole window parsing.
+constexpr int64_t kRegistrationMicrosPerReplica = 3;
+
+// A deferred bucket delete that fails keeps its files on disk, and nothing
+// else would ever look at them again, so the tail retries it. Enough attempts
+// to ride out a transient read-only window, few enough that a permanently
+// failing id cannot keep the queue alive forever.
+constexpr int kMaxDeleteAttempts = 6;
+constexpr int64_t kDeleteBackoffBaseMs = 200;
+constexpr int64_t kDeleteBackoffMaxMs = 4000;
+
+std::chrono::milliseconds DeleteBackoffMs(int attempt) {
+    int64_t backoff_ms = kDeleteBackoffBaseMs;
+    for (int i = 0; i < attempt && backoff_ms < kDeleteBackoffMaxMs; ++i) {
+        backoff_ms *= 2;
+    }
+    return std::chrono::milliseconds(std::min(backoff_ms, kDeleteBackoffMaxMs));
 }
 
 bool IsLive(BucketEntryState state) {
@@ -186,6 +226,17 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     bucket_capacity_ = config.bucket_capacity;
     alignment_ = config.alignment;
     max_bucket_count_ = config.max_bucket_count;
+    // An unset bucket cap means "at most the number of buckets this process may
+    // hold anyway": a restored bucket beyond max_bucket_count would be evicted
+    // right after startup, so recovering it only costs memory and time. An
+    // explicit "no cap" is the exception, and snapshot mode is the reason for
+    // it: there the metadata is not rebuilt from these buckets, so a bucket
+    // left behind would dangle in the snapshot instead of being evicted.
+    recovery_max_buckets_ = config.recovery_max_buckets != 0
+                                ? config.recovery_max_buckets
+                                : max_bucket_count_;
+    recovery_max_duration_ = std::chrono::seconds(
+        std::max<int64_t>(0, config.recovery_max_duration_seconds));
     ready_bucket_target_ = static_cast<size_t>(config.ready_bucket_target);
     bucket_create_concurrency_ =
         static_cast<size_t>(config.bucket_create_concurrency);
@@ -236,8 +287,18 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
         return marker_result;
     }
 
+    // Re-arm the deferred tail: an earlier attempt on this instance may have
+    // stopped the workers, and recovery is about to queue work on it again.
+    {
+        std::lock_guard<std::mutex> tail_lock(tail_mutex_);
+        tail_stop_ = false;
+    }
+
     auto recovered = RecoverFromDisk(config.bucket_recovery_enabled);
     if (!recovered) {
+        // Nothing is queued on this path today, but the adapter must never
+        // outlive the tail thread, so stop it before tearing the adapter down.
+        StopRecoveryTailWorker();
         fs_adapter_->Shutdown();
         fs_adapter_.reset();
         return recovered;
@@ -274,7 +335,7 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
                 UpdateBucketPoolMetricsLocked();
             }
             for (const int64_t bucket_id : ready_bucket_ids) {
-                DeleteBucketFiles(bucket_id);
+                DeleteBucketFilesOrDefer(bucket_id);
             }
             fs_adapter_->Shutdown();
             fs_adapter_.reset();
@@ -341,9 +402,13 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     initialized_.store(true, std::memory_order_release);
 
     // Recovery may have rewritten in-memory state (legacy format upgrade,
-    // PENDING entries demoted to tombstones). Persist that immediately so the
-    // next start reads exactly what this process believes.
-    const size_t rewritten = FlushDirtyMetadata();
+    // PENDING entries demoted to tombstones). The rewrite is deferred instead
+    // of running here: startup has to finish inside the master's
+    // leader-election window, and the rewrite is idempotent, so a crash before
+    // it lands only makes the next start redo the same demotion. The
+    // maintenance tick and the destructor both flush too, so nothing is lost by
+    // waiting.
+    EnqueueRecoveryTail({RecoveryTailTask::Kind::kFlushDirtyMetadata, {}});
 
     size_t ready_bucket_count = 0;
     {
@@ -356,10 +421,14 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
               << ", max_bucket_count=" << max_bucket_count_
               << ", ready_bucket_target=" << ready_bucket_target_
               << ", bucket_create_concurrency=" << bucket_create_concurrency_
+              << ", recovery_max_buckets=" << recovery_max_buckets_
+              << ", recovery_max_duration_seconds="
+              << recovery_max_duration_.count()
               << ", recovered_buckets=" << recovered_bucket_count
+              << ", recovery_skipped_buckets=" << recovery_skipped_buckets_
               << ", ready_buckets=" << ready_bucket_count
               << ", recovered_replicas=" << recovered_replicas_.size()
-              << ", rewritten_buckets=" << rewritten;
+              << ", metadata_flush=deferred";
     return {};
 }
 
@@ -493,8 +562,9 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::PersistMetadata(
     return {};
 }
 
-void ImmutableBucketAllocator::DeleteBucketFiles(int64_t bucket_id) {
-    if (!fs_adapter_) return;
+bool ImmutableBucketAllocator::DeleteBucketFiles(int64_t bucket_id) {
+    if (!fs_adapter_) return false;
+    bool removed = true;
     auto meta_result = fs_adapter_->DeleteFile(BucketMetaPath(bucket_id));
     if (!meta_result && meta_result.error() != ErrorCode::FILE_NOT_FOUND) {
         static DfsLogLimiter log_limiter;
@@ -503,6 +573,7 @@ void ImmutableBucketAllocator::DeleteBucketFiles(int64_t bucket_id) {
                        << bucket_id << ", error=" << meta_result.error()
                        << ", suppressed=" << *suppressed;
         }
+        removed = false;
     }
     auto data_result = fs_adapter_->DeleteFile(BucketDataPath(bucket_id));
     if (!data_result && data_result.error() != ErrorCode::FILE_NOT_FOUND) {
@@ -512,7 +583,17 @@ void ImmutableBucketAllocator::DeleteBucketFiles(int64_t bucket_id) {
                        << bucket_id << ", error=" << data_result.error()
                        << ", suppressed=" << *suppressed;
         }
+        removed = false;
     }
+    return removed;
+}
+
+void ImmutableBucketAllocator::DeleteBucketFilesOrDefer(int64_t bucket_id) {
+    if (DeleteBucketFiles(bucket_id)) return;
+    // The id never reaches `buckets_` from here, so no capacity accounting or
+    // eviction pass can find these files again. Hand it to the tail, which
+    // retries with a backoff, instead of leaking them until the next restart.
+    EnqueueRecoveryTail({RecoveryTailTask::Kind::kDeleteBuckets, {bucket_id}});
 }
 
 // === bucket lifecycle ===
@@ -655,26 +736,184 @@ void ImmutableBucketAllocator::StopBucketWorkers() {
         if (worker.joinable()) worker.join();
     }
     bucket_create_workers_.clear();
-    // The legacy sweep deletes files through the fs adapter, so it must finish
+    // The deferred tail deletes files through the fs adapter, so it must finish
     // before the adapter is shut down.
-    if (legacy_cleanup_worker_.joinable()) {
-        legacy_cleanup_worker_.join();
+    StopRecoveryTailWorker();
+}
+
+void ImmutableBucketAllocator::EnqueueRecoveryTail(RecoveryTailTask task) {
+    {
+        std::lock_guard<std::mutex> lock(tail_mutex_);
+        if (tail_stop_) {
+            // Nothing will pick this up any more, and blocking the caller is
+            // exactly what this queue exists to avoid. Leave the files for the
+            // next start: it rescans the directory and reclaims them again.
+            LOG(WARNING) << "Dropping deferred DFS recovery tail work: the "
+                            "allocator is already shutting down";
+            return;
+        }
+        tail_queue_.push_back(std::move(task));
+        ++tail_pending_;
+        if (!recovery_tail_worker_.joinable()) {
+            try {
+                recovery_tail_worker_ = std::thread(
+                    &ImmutableBucketAllocator::RecoveryTailWorker, this);
+            } catch (const std::system_error& e) {
+                // Never fall back to doing the work inline: a caller on the
+                // startup path must not pay for a slow or unavailable DFS. The
+                // task stays queued, and DrainRecoveryTailAtShutdown() reclaims
+                // it if no later enqueue manages to start the thread either.
+                LOG(WARNING) << "Failed to start DFS recovery tail worker: "
+                             << e.what()
+                             << "; queued work will be retried or reclaimed at "
+                                "shutdown";
+            }
+        }
+    }
+    tail_cv_.notify_one();
+}
+
+void ImmutableBucketAllocator::RunRecoveryTailTask(
+    const RecoveryTailTask& task) {
+    switch (task.kind) {
+        case RecoveryTailTask::Kind::kDeleteBuckets: {
+            // Deleting these files needs no allocator lock: every id is below
+            // next_bucket_id_, so no bucket this process creates or evicts
+            // reuses a name in this list, and DeleteBucketFiles() touches only
+            // the fs adapter. DeleteBucketFiles() tolerates an already-absent
+            // `.meta` or `.data`, so an id that was recorded from only one of
+            // the two files - or whose file was removed before the sweep
+            // reached it - is not a failure.
+            std::vector<int64_t> failed;
+            for (const int64_t bucket_id : task.bucket_ids) {
+                if (!DeleteBucketFiles(bucket_id)) failed.push_back(bucket_id);
+            }
+            if (failed.empty()) {
+                LOG(INFO) << "DFS deferred bucket cleanup finished, buckets="
+                          << task.bucket_ids.size();
+                break;
+            }
+
+            // A delete that failed leaves files that nothing will look at
+            // again: the ids are not in `buckets_`, so they are charged to no
+            // capacity and eviction cannot reach them. Reporting success here
+            // would strand them until the next restart, so keep the task alive
+            // instead - unless the allocator is going down, where blocking the
+            // shutdown on a failing filesystem is worse than leaving files for
+            // the next start to reclaim.
+            bool stopping = false;
+            {
+                std::lock_guard<std::mutex> lock(tail_mutex_);
+                stopping = tail_stop_;
+            }
+            if (stopping || task.attempt >= kMaxDeleteAttempts) {
+                LOG(ERROR) << "DFS deferred bucket cleanup incomplete: "
+                           << failed.size() << " of " << task.bucket_ids.size()
+                           << " bucket(s) still on disk after "
+                           << task.attempt + 1 << " attempt(s)"
+                           << (stopping ? ", giving up: shutting down"
+                                        : ", giving up")
+                           << "; they are reclaimed on the next start";
+                break;
+            }
+            const auto backoff = DeleteBackoffMs(task.attempt);
+            LOG(WARNING) << "DFS deferred bucket cleanup incomplete: "
+                         << failed.size() << " of " << task.bucket_ids.size()
+                         << " bucket(s) still on disk, retrying in "
+                         << backoff.count() << "ms";
+            std::this_thread::sleep_for(backoff);
+            EnqueueRecoveryTail({RecoveryTailTask::Kind::kDeleteBuckets,
+                                 std::move(failed), task.attempt + 1});
+            break;
+        }
+        case RecoveryTailTask::Kind::kFlushDirtyMetadata:
+            // FlushDirtyMetadata() is safe to call from any thread: it
+            // snapshots under `mutex_`, serializes writes on
+            // `metadata_io_mutex_` and revalidates bucket identity before each
+            // one, so it cannot resurrect a bucket that has since been removed.
+            // A failed write puts `meta_dirty` back, so the maintenance tick
+            // retries it - no retry bookkeeping is needed here.
+            FlushDirtyMetadata();
+            break;
     }
 }
 
-void ImmutableBucketAllocator::LegacyCleanupWorker(
-    std::vector<int64_t> bucket_ids) {
-    // Deleting these files needs no allocator lock: every id is below
-    // next_bucket_id_, so no bucket this process creates or evicts reuses a
-    // name in this list, and DeleteBucketFiles() touches only the fs adapter.
-    // DeleteBucketFiles() tolerates an already-absent `.meta` or `.data`, so an
-    // id that was recorded from only one of the two files - or whose file was
-    // removed before the sweep reached it - is not a failure.
-    for (const int64_t bucket_id : bucket_ids) {
-        DeleteBucketFiles(bucket_id);
+void ImmutableBucketAllocator::FinishRecoveryTailTask() {
+    {
+        std::lock_guard<std::mutex> lock(tail_mutex_);
+        if (tail_pending_ > 0) --tail_pending_;
     }
-    LOG(INFO) << "DFS legacy bucket cleanup finished, buckets="
-              << bucket_ids.size();
+    tail_idle_cv_.notify_all();
+}
+
+bool ImmutableBucketAllocator::WaitForRecoveryTailIdle(
+    std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(tail_mutex_);
+    return tail_idle_cv_.wait_for(
+        lock, timeout, [this] { return tail_pending_ == 0; });
+}
+
+void ImmutableBucketAllocator::RecoveryTailWorker() {
+    for (;;) {
+        RecoveryTailTask task;
+        bool stopping = false;
+        {
+            std::unique_lock<std::mutex> lock(tail_mutex_);
+            tail_cv_.wait(lock, [this] {
+                return tail_stop_ || !tail_queue_.empty();
+            });
+            if (tail_queue_.empty()) return;
+            task = std::move(tail_queue_.front());
+            tail_queue_.pop_front();
+            // Read under the lock: stopping is signalled by another thread.
+            stopping = tail_stop_;
+        }
+        // A flush that is still pending at shutdown is dropped: the destructor
+        // runs one final flush, so rewriting files now would only delay it.
+        // Deletes are kept so a stopped allocator does not leak bucket files.
+        if (!stopping ||
+            task.kind != RecoveryTailTask::Kind::kFlushDirtyMetadata) {
+            RunRecoveryTailTask(task);
+        }
+        FinishRecoveryTailTask();
+    }
+}
+
+void ImmutableBucketAllocator::StopRecoveryTailWorker() {
+    {
+        std::lock_guard<std::mutex> lock(tail_mutex_);
+        tail_stop_ = true;
+    }
+    tail_cv_.notify_all();
+    // The worker drains what is already queued before it returns.
+    if (recovery_tail_worker_.joinable()) {
+        recovery_tail_worker_.join();
+    }
+    DrainRecoveryTailAtShutdown();
+}
+
+void ImmutableBucketAllocator::DrainRecoveryTailAtShutdown() {
+    size_t drained = 0;
+    for (;;) {
+        RecoveryTailTask task;
+        {
+            std::lock_guard<std::mutex> lock(tail_mutex_);
+            if (tail_queue_.empty()) break;
+            task = std::move(tail_queue_.front());
+            tail_queue_.pop_front();
+        }
+        ++drained;
+        // Same rule as the worker: a pending flush is dropped because the
+        // shutdown path flushes once more after this drain.
+        if (task.kind != RecoveryTailTask::Kind::kFlushDirtyMetadata) {
+            RunRecoveryTailTask(task);
+        }
+        FinishRecoveryTailTask();
+    }
+    if (drained > 0) {
+        LOG(INFO) << "Drained " << drained
+                  << " deferred DFS recovery tail task(s) on the shutdown path";
+    }
 }
 
 void ImmutableBucketAllocator::BucketCreateWorker() {
@@ -1690,6 +1929,46 @@ ImmutableBucketAllocator::TakeRecoveredReplicas() {
     return std::move(recovered_replicas_);
 }
 
+void ImmutableBucketAllocator::DropRecoveredBuckets(
+    const std::vector<int64_t>& bucket_ids) {
+    if (bucket_ids.empty()) return;
+
+    std::vector<int64_t> dropped;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const int64_t bucket_id : bucket_ids) {
+            auto it = buckets_.find(bucket_id);
+            if (it == buckets_.end()) continue;
+            // A bucket is dropped whole, so its own keys are the only index
+            // entries that can point at it. A key won by a newer bucket keeps
+            // its entry, which is why the bucket id is compared.
+            for (const auto& [key, entry] : it->second->entries) {
+                (void)entry;
+                auto index_it = key_index_.find(key);
+                if (index_it != key_index_.end() &&
+                    index_it->second == bucket_id) {
+                    key_index_.erase(index_it);
+                }
+            }
+            buckets_.erase(it);
+            RemoveFromLruLocked(bucket_id);
+            if (active_bucket_id_ == bucket_id) active_bucket_id_ = -1;
+            dropped.push_back(bucket_id);
+        }
+        if (dropped.empty()) return;
+        PublishBucketIdSnapshotLocked();
+    }
+
+    // The buckets released their capacity slots, so a blocked allocation or a
+    // refill worker may be able to make progress.
+    bucket_pool_cv_.notify_all();
+    LOG(WARNING) << "Dropping " << dropped.size()
+                 << " recovered DFS bucket(s) that the registration budget did "
+                    "not cover (oldest first)";
+    EnqueueRecoveryTail({RecoveryTailTask::Kind::kDeleteBuckets,
+                         std::move(dropped)});
+}
+
 // === eviction ===
 
 ImmutableBucketAllocator::PendingEviction
@@ -1932,8 +2211,10 @@ bool ImmutableBucketAllocator::CommitEviction(PendingEviction&& pending) {
 
     // shortcut: interrupted deletion may restore cached entries, add a durable
     // eviction intent if recovery must remember logical evictions.
-    // The master has already dropped all replicas before file deletion.
-    DeleteBucketFiles(bucket_id);
+    // The master has already dropped all replicas before file deletion. A
+    // delete that fails here would leave files no eviction pass can reach -
+    // the bucket is already out of `buckets_` - so the tail retries it.
+    DeleteBucketFilesOrDefer(bucket_id);
     // The deleted bucket's quota slot is reusable only after its files are no
     // longer present. Wake both refill workers and allocation waiters now.
     bucket_pool_cv_.notify_all();
@@ -1981,8 +2262,197 @@ void ImmutableBucketAllocator::AbortEviction(PendingEviction&& pending,
 
 // === recovery ===
 
+ImmutableBucketAllocator::ParsedBucket
+ImmutableBucketAllocator::ParseBucketForRecovery(int64_t bucket_id) {
+    ParsedBucket parsed;
+    parsed.bucket_id = bucket_id;
+
+    const std::string meta_path = BucketMetaPath(bucket_id);
+    PersistedBucketMetadata snapshot;
+    bool valid = false;
+    const auto file_size = fs_adapter_->GetFileSize(meta_path);
+    if (file_size) {
+        std::string payload(*file_size, '\0');
+        bool read_ok = true;
+        if (*file_size > 0) {
+            const auto read = fs_adapter_->ReadFile(meta_path, payload.data(),
+                                                    payload.size());
+            read_ok = read && *read == payload.size();
+        }
+        if (read_ok) {
+            try {
+                struct_pb::from_pb(snapshot, payload);
+                valid =
+                    snapshot.version == kBucketMetadataVersion &&
+                    ComputeMetadataChecksum(snapshot) == snapshot.checksum;
+            } catch (...) {
+                valid = false;
+            }
+        }
+    }
+    if (!valid || snapshot.bucket_id != bucket_id) {
+        parsed.failure_reason =
+            "no valid metadata snapshot, so none of its data can be proven "
+            "correct";
+        return parsed;
+    }
+    if (snapshot.alignment != alignment_) {
+        parsed.failure_reason = "metadata alignment " +
+                                std::to_string(snapshot.alignment) +
+                                " does not match configured " +
+                                std::to_string(alignment_) +
+                                ", so entry offsets cannot be recomputed";
+        return parsed;
+    }
+    if (snapshot.capacity == 0 || snapshot.capacity > bucket_capacity_) {
+        parsed.failure_reason = "metadata capacity " +
+                                std::to_string(snapshot.capacity) +
+                                " is incompatible with configured " +
+                                std::to_string(bucket_capacity_);
+        return parsed;
+    }
+    if (snapshot.append_offset > snapshot.capacity) {
+        parsed.failure_reason = "append_offset " +
+                                std::to_string(snapshot.append_offset) +
+                                " exceeds capacity " +
+                                std::to_string(snapshot.capacity);
+        return parsed;
+    }
+    if (snapshot.evicting) {
+        // The marker says the data file was being deleted; finish the job
+        // rather than exposing entries whose data may already be gone.
+        parsed.interrupted_eviction = true;
+        return parsed;
+    }
+
+    const auto data_size = fs_adapter_->GetFileSize(BucketDataPath(bucket_id));
+    if (!data_size) {
+        // Either the data file is gone or it cannot even be sized. Both leave
+        // the metadata describing bytes nobody can verify, so the whole bucket
+        // goes away instead of being reported every restart.
+        std::ostringstream reason;
+        reason << "data file is missing or unreadable, error="
+               << data_size.error();
+        parsed.failure_reason = reason.str();
+        return parsed;
+    }
+    parsed.data_size = *data_size;
+
+    auto bucket = std::make_shared<BucketState>();
+    bucket->bucket_id = bucket_id;
+    bucket->capacity = snapshot.capacity;
+    bucket->append_offset = 0;
+    bucket->live_bytes = 0;
+    bucket->last_access_ns = CurrentTimeNs();
+    // Everything on disk was written at seal time, so a recovered bucket is
+    // sealed by definition and its `.meta` already matches this state.
+    bucket->sealed = true;
+    bucket->meta_dirty = false;
+
+    bool bucket_ok = true;
+    // Not const: the key is moved into the bucket's entry map rather than
+    // copied, which is one allocation per replica out of the millions this
+    // pass walks through.
+    for (auto& persisted : snapshot.entries) {
+        parsed.max_generation =
+            std::max(parsed.max_generation, persisted.generation + 1);
+        if (!IsKnownEntryState(persisted.state)) {
+            parsed.failure_reason = "entry for key " + persisted.key +
+                                    " has unknown state " +
+                                    std::to_string(persisted.state);
+            bucket_ok = false;
+            break;
+        }
+        if (persisted.key.empty() ||
+            persisted.key_size != persisted.key.size()) {
+            parsed.failure_reason = "entry key size mismatch";
+            bucket_ok = false;
+            break;
+        }
+        const auto layout = RebuildBucketEntryLayout(
+            persisted.entry_offset, persisted.value_size, alignment_);
+        if (!layout || layout->aligned_size != persisted.reserved_size ||
+            layout->end() > snapshot.capacity) {
+            parsed.failure_reason = "entry for key " + persisted.key +
+                                    " has an out-of-range or inconsistent "
+                                    "layout";
+            bucket_ok = false;
+            break;
+        }
+
+        BucketEntry entry;
+        entry.entry_offset = persisted.entry_offset;
+        entry.key_size = persisted.key_size;
+        entry.value_size = persisted.value_size;
+        entry.reserved_size = persisted.reserved_size;
+        entry.generation = persisted.generation;
+        entry.state = static_cast<BucketEntryState>(persisted.state);
+
+        // Keep the space reserved even for dead entries: the offsets of
+        // later entries depend on it.
+        bucket->append_offset =
+            std::max(bucket->append_offset, layout->end());
+        bucket->entries.emplace(std::move(persisted.key), entry);
+        if (entry.state == BucketEntryState::PENDING) {
+            ++bucket->pending_entries;
+        }
+    }
+    if (!bucket_ok) return parsed;
+
+    // The persisted append_offset is authoritative when it is at least as
+    // large as what the entries imply (it also covers rolled-back space).
+    bucket->append_offset =
+        std::max(bucket->append_offset, snapshot.append_offset);
+    if (bucket->append_offset > bucket->capacity) {
+        parsed.failure_reason = "persisted append_offset " +
+                                std::to_string(bucket->append_offset) +
+                                " exceeds capacity " +
+                                std::to_string(bucket->capacity);
+        return parsed;
+    }
+
+    // Settle the final state of every entry. A PENDING entry's data was never
+    // confirmed durable, so it must not come back as readable; only COMMITTED
+    // entries survive.
+    for (auto& [key, entry] : bucket->entries) {
+        if (entry.state == BucketEntryState::COMMITTED) {
+            const auto layout = RebuildBucketEntryLayout(
+                entry.entry_offset, entry.value_size, alignment_);
+            if (!layout || layout->end() > parsed.data_size) {
+                LOG(ERROR) << "Dropping committed DFS entry for key " << key
+                           << " in bucket " << bucket_id
+                           << ": it extends past the data file end";
+                entry.state = BucketEntryState::TOMBSTONE;
+                ++bucket->tombstones;
+                bucket->meta_dirty = true;
+                continue;
+            }
+            bucket->live_bytes += entry.reserved_size;
+            continue;
+        }
+        if (entry.state == BucketEntryState::PENDING) {
+            --bucket->pending_entries;
+        }
+        entry.state = BucketEntryState::TOMBSTONE;
+        ++bucket->tombstones;
+        bucket->meta_dirty = true;
+    }
+
+    parsed.usable = true;
+    parsed.bucket = std::move(bucket);
+    return parsed;
+}
+
 tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
     bool recover_metadata) {
+    // Start the clock before the directory scan. The budget has to cover every
+    // cost of recovery, and the scan is the part that grows with the number of
+    // files a previous run left behind, so it must not sit outside the window.
+    const auto recovery_started = std::chrono::steady_clock::now();
+    // `key_index_` settles duplicate keys below, so it has to start empty: a
+    // leftover entry would make a freshly restored bucket look superseded.
+    key_index_.clear();
+    recovered_replicas_.clear();
     auto files = fs_adapter_->ListFiles(fsdir_);
     if (!files) {
         if (recover_metadata && files.error() == ErrorCode::FILE_NOT_FOUND) {
@@ -2028,263 +2498,207 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
         LOG(INFO) << "DFS bucket recovery disabled; deleting " << sweep.size()
                   << " legacy bucket(s) in the background, next_bucket_id="
                   << next_bucket_id_;
-        try {
-            // `sweep` is passed by value so the catch block below can still
-            // reclaim the files if the worker thread cannot be started.
-            legacy_cleanup_worker_ = std::thread(
-                &ImmutableBucketAllocator::LegacyCleanupWorker, this, sweep);
-        } catch (const std::system_error& e) {
-            LOG(WARNING) << "Failed to start DFS legacy bucket cleanup worker: "
-                         << e.what() << ", deleting synchronously";
-            for (const int64_t bucket_id : sweep) {
-                DeleteBucketFiles(bucket_id);
-            }
-        }
+        // Never fall back to deleting inline when the worker cannot start: this
+        // is the startup path, and one DFS round trip per file would stall it.
+        // The tail keeps the task queued and the shutdown drain reclaims it.
+        EnqueueRecoveryTail(
+            {RecoveryTailTask::Kind::kDeleteBuckets, std::move(sweep)});
         return {};
     }
-    std::sort(meta_ids.begin(), meta_ids.end());
+    // Newest bucket id first. Writes are recency-ordered, so the newest buckets
+    // are the ones most likely to be read again, and processing in this order
+    // makes anything the budget cuts off the oldest data. That is also what the
+    // LRU would drop first: it is seeded in ascending id order below, so the
+    // smallest ids sit at the cold end.
+    const auto scan_finished = std::chrono::steady_clock::now();
+    std::sort(meta_ids.begin(), meta_ids.end(),
+              [](int64_t lhs, int64_t rhs) { return lhs > rhs; });
+
+    // The budget window starts at the scan, so a slow directory listing eats
+    // into the time left for parsing instead of hiding outside the budget.
+    const bool budgeted_by_time =
+        recovery_max_duration_ > std::chrono::seconds(0);
+    const auto recovery_deadline = recovery_started + recovery_max_duration_;
+    // Buckets that did not fit the budget. They are never parsed and never
+    // published, so nothing can reference them, and they are deleted off the
+    // startup path.
+    std::vector<int64_t> skipped_ids;
+    size_t restored_buckets = 0;
+    recovery_skipped_buckets_ = 0;
 
     uint64_t max_generation = 0;
-    // Buckets already reclaimed by this pass: their metadata could not be
-    // trusted, so both files were deleted. A cache entry that cannot be proven
-    // correct is worse than a miss - the reader would recompute it anyway,
-    // while serving unverifiable bytes would silently corrupt the result.
-    // Tracked only so the orphan sweep below does not report them a second
-    // time.
+    // Buckets already handled by this pass: either their metadata could not be
+    // trusted, so both files were deleted, or they lost the budget and are
+    // queued for deletion. A cache entry that cannot be proven correct is worse
+    // than a miss - the reader would recompute it anyway, while serving
+    // unverifiable bytes would silently corrupt the result. Tracked only so the
+    // orphan sweep below does not report them a second time.
     std::unordered_set<int64_t> discarded_ids;
-    struct RecoveryWinner {
-        uint64_t generation = 0;
-        int64_t bucket_id = -1;
-        uint64_t entry_offset = 0;
-    };
-    // Resolve duplicates by the lexicographically greatest
-    // (generation, bucket_id, entry_offset). The location tie-breaker makes the
-    // result independent of unordered_map and filesystem traversal order.
-    std::unordered_map<std::string, RecoveryWinner> winners;
 
-    for (const int64_t bucket_id : meta_ids) {
-        const std::string meta_path = BucketMetaPath(bucket_id);
-        PersistedBucketMetadata snapshot;
-        bool valid = false;
-        auto file_size = fs_adapter_->GetFileSize(meta_path);
-        if (file_size) {
-            std::string payload(*file_size, '\0');
-            bool read_ok = true;
-            if (*file_size > 0) {
-                auto read = fs_adapter_->ReadFile(meta_path, payload.data(),
-                                                  payload.size());
-                read_ok = read && *read == payload.size();
-            }
-            if (read_ok) {
-                try {
-                    struct_pb::from_pb(snapshot, payload);
-                    valid =
-                        snapshot.version == kBucketMetadataVersion &&
-                        ComputeMetadataChecksum(snapshot) == snapshot.checksum;
-                } catch (...) {
-                    valid = false;
-                }
-            }
-        }
-        if (!valid || snapshot.bucket_id != bucket_id) {
-            LOG(ERROR)
-                << "Discarding DFS bucket " << bucket_id
-                << ": no valid metadata snapshot, so none of its data can"
-                   " be proven correct";
-            DeleteBucketFiles(bucket_id);
-            discarded_ids.insert(bucket_id);
-            continue;
-        }
-
-        if (snapshot.alignment != alignment_) {
-            LOG(ERROR) << "Discarding DFS bucket " << bucket_id
-                       << ": metadata alignment " << snapshot.alignment
-                       << " does not match configured " << alignment_
-                       << ", so entry offsets cannot be recomputed";
-            DeleteBucketFiles(bucket_id);
-            discarded_ids.insert(bucket_id);
-            continue;
-        }
-        if (snapshot.capacity == 0 || snapshot.capacity > bucket_capacity_) {
-            LOG(ERROR) << "Discarding DFS bucket " << bucket_id
-                       << ": metadata capacity " << snapshot.capacity
-                       << " is incompatible with configured "
-                       << bucket_capacity_;
-            DeleteBucketFiles(bucket_id);
-            discarded_ids.insert(bucket_id);
-            continue;
-        }
-        if (snapshot.append_offset > snapshot.capacity) {
-            LOG(ERROR) << "Discarding DFS bucket " << bucket_id
-                       << ": append_offset " << snapshot.append_offset
-                       << " exceeds capacity " << snapshot.capacity;
-            DeleteBucketFiles(bucket_id);
-            discarded_ids.insert(bucket_id);
-            continue;
-        }
-        if (snapshot.evicting) {
-            // The marker says the data file was being deleted; finish the job
-            // rather than exposing entries whose data may already be gone.
-            LOG(INFO) << "Completing interrupted eviction of DFS bucket "
-                      << bucket_id;
-            DeleteBucketFiles(bucket_id);
-            discarded_ids.insert(bucket_id);
-            continue;
-        }
-
-        auto data_size = fs_adapter_->GetFileSize(BucketDataPath(bucket_id));
-        if (!data_size) {
-            // Either the data file is gone or it cannot even be sized. Both
-            // leave the metadata describing bytes nobody can verify, so the
-            // whole bucket goes away instead of being reported every restart.
-            LOG(WARNING) << "Discarding DFS bucket " << bucket_id
-                         << ": data file is missing or unreadable, error="
-                         << data_size.error();
-            DeleteBucketFiles(bucket_id);
-            discarded_ids.insert(bucket_id);
-            continue;
-        }
-
-        auto bucket = std::make_shared<BucketState>();
-        bucket->bucket_id = bucket_id;
-        bucket->capacity = snapshot.capacity;
-        bucket->append_offset = 0;
-        bucket->live_bytes = 0;
-        bucket->last_access_ns = CurrentTimeNs();
-        // Everything on disk was written at seal time, so a recovered bucket is
-        // sealed by definition and its `.meta` already matches this state.
-        bucket->sealed = true;
-        bucket->meta_dirty = false;
-
-        bool bucket_ok = true;
-        for (const auto& persisted : snapshot.entries) {
-            max_generation = std::max(max_generation, persisted.generation + 1);
-            if (!IsKnownEntryState(persisted.state)) {
-                LOG(ERROR) << "Discarding DFS bucket " << bucket_id
-                           << ": entry for key " << persisted.key
-                           << " has unknown state " << persisted.state;
-                bucket_ok = false;
-                break;
-            }
-            if (persisted.key.empty() ||
-                persisted.key_size != persisted.key.size()) {
-                LOG(ERROR) << "Discarding DFS bucket " << bucket_id
-                           << ": entry key size mismatch";
-                bucket_ok = false;
-                break;
-            }
-            auto layout = RebuildBucketEntryLayout(
-                persisted.entry_offset, persisted.value_size, alignment_);
-            if (!layout || layout->aligned_size != persisted.reserved_size ||
-                layout->end() > snapshot.capacity) {
-                LOG(ERROR) << "Discarding DFS bucket " << bucket_id
-                           << ": entry for key " << persisted.key
-                           << " has an out-of-range or inconsistent layout";
-                bucket_ok = false;
-                break;
-            }
-
-            BucketEntry entry;
-            entry.entry_offset = persisted.entry_offset;
-            entry.key_size = persisted.key_size;
-            entry.value_size = persisted.value_size;
-            entry.reserved_size = persisted.reserved_size;
-            entry.generation = persisted.generation;
-            entry.state = static_cast<BucketEntryState>(persisted.state);
-
-            // Keep the space reserved even for dead entries: the offsets of
-            // later entries depend on it.
-            bucket->append_offset =
-                std::max(bucket->append_offset, layout->end());
-            bucket->entries[persisted.key] = entry;
-            if (entry.state == BucketEntryState::PENDING) {
-                ++bucket->pending_entries;
-            }
-        }
-        if (!bucket_ok) {
-            DeleteBucketFiles(bucket_id);
-            discarded_ids.insert(bucket_id);
-            continue;
-        }
-
-        // The persisted append_offset is authoritative when it is at least as
-        // large as what the entries imply (it also covers rolled-back space).
-        bucket->append_offset =
-            std::max(bucket->append_offset, snapshot.append_offset);
-
-        if (bucket->append_offset > bucket->capacity) {
-            LOG(ERROR) << "Discarding DFS bucket " << bucket_id
-                       << ": persisted append_offset " << bucket->append_offset
-                       << " exceeds capacity " << bucket->capacity;
-            DeleteBucketFiles(bucket_id);
-            discarded_ids.insert(bucket_id);
-            continue;
-        }
-
-        // Settle the final state of every entry. A PENDING entry's data was
-        // never confirmed durable, so it must not come back as readable; only
-        // COMMITTED entries survive.
-        for (auto& [key, entry] : bucket->entries) {
-            if (entry.state == BucketEntryState::COMMITTED) {
-                auto layout = RebuildBucketEntryLayout(
-                    entry.entry_offset, entry.value_size, alignment_);
-                if (!layout ||
-                    layout->end() > static_cast<uint64_t>(*data_size)) {
-                    LOG(ERROR) << "Dropping committed DFS entry for key " << key
-                               << " in bucket " << bucket_id
-                               << ": it extends past the data file end";
-                    entry.state = BucketEntryState::TOMBSTONE;
-                    ++bucket->tombstones;
-                    bucket->meta_dirty = true;
-                    continue;
-                }
-                bucket->live_bytes += entry.reserved_size;
-                continue;
-            }
-            if (entry.state == BucketEntryState::PENDING) {
-                --bucket->pending_entries;
-            }
-            entry.state = BucketEntryState::TOMBSTONE;
-            ++bucket->tombstones;
-            bucket->meta_dirty = true;
-        }
-
-        for (const auto& [key, entry] : bucket->entries) {
-            if (entry.state != BucketEntryState::COMMITTED) continue;
-            auto winner_it = winners.find(key);
-            const auto candidate =
-                std::tie(entry.generation, bucket_id, entry.entry_offset);
-            if (winner_it == winners.end()) {
-                winners[key] = {entry.generation, bucket_id,
-                                entry.entry_offset};
-            } else if (candidate > std::tie(winner_it->second.generation,
-                                            winner_it->second.bucket_id,
-                                            winner_it->second.entry_offset)) {
-                LOG(WARNING)
-                    << "DFS key " << key << " found in buckets "
-                    << winner_it->second.bucket_id << " and " << bucket_id
-                    << "; keeping the greater generation/location "
-                       "tuple";
-                winner_it->second = {entry.generation, bucket_id,
-                                     entry.entry_offset};
+    // Reading and decoding a bucket is the whole cost of recovery. Measured on
+    // the shared storage this runs on: one reader sustains ~165 MB/s while
+    // eight concurrent readers reach ~960 MB/s, because the client multiplexes
+    // streams and the per-file round trip stops being exposed. Parses are
+    // therefore issued ahead of the loop and consumed in bucket order, which is
+    // exactly the order arbitration needs.
+    //
+    // Deliberately a small window rather than parse-everything-then-arbitrate:
+    // a parsed bucket holds all of its entries in memory, so holding every
+    // bucket at once would mean millions of entries resident instead of a
+    // handful of buckets' worth.
+    //
+    // How many parses to keep in flight. Eight by default, and deliberately
+    // not derived from hardware_concurrency(): a parse is nearly all network
+    // wait, so the concurrency worth using is set by the storage client, not
+    // by the core count the scheduler reports - which under a cpu quota can be
+    // far below what the client would keep busy.
+    constexpr size_t kDefaultParseConcurrency = 8;
+    // Bounded so that a mistyped value cannot trade the whole startup for
+    // memory: every parse in flight holds its bucket's entries.
+    constexpr long long kMaxParseConcurrency = 64;
+    size_t parse_concurrency = kDefaultParseConcurrency;
+    if (const char* env = std::getenv("MOONCAKE_DFS_RECOVERY_CONCURRENCY")) {
+        try {
+            const long long configured = std::stoll(env);
+            if (configured >= 1) {
+                parse_concurrency = static_cast<size_t>(
+                    std::min(configured, kMaxParseConcurrency));
             } else {
-                LOG(WARNING) << "DFS key " << key << " in bucket " << bucket_id
-                             << " is superseded by bucket "
-                             << winner_it->second.bucket_id;
+                LOG(WARNING)
+                    << "Ignoring MOONCAKE_DFS_RECOVERY_CONCURRENCY=\"" << env
+                    << "\", using default " << kDefaultParseConcurrency;
             }
+        } catch (const std::exception&) {
+            LOG(WARNING)
+                << "Invalid MOONCAKE_DFS_RECOVERY_CONCURRENCY=\"" << env
+                << "\", using default " << kDefaultParseConcurrency;
         }
-
-        buckets_.emplace(bucket_id, std::move(bucket));
     }
+    std::deque<std::future<ParsedBucket>> pending_parses;
+    size_t issued_parses = 0;
+    // Parsed buckets that turned out to be unusable. They do not count against
+    // the cap, so they have to widen how many parses may be issued: otherwise a
+    // directory whose newest buckets are all unusable would restore fewer
+    // buckets than the cap allows.
+    size_t unusable_parses = 0;
+    const auto issue_parse = [&]() {
+        if (issued_parses >= meta_ids.size()) return;
+        // Never issue a parse the cap can never accept. It would be read and
+        // then dropped, which is exactly the I/O this window exists to overlap
+        // rather than to duplicate.
+        if (recovery_max_buckets_ > 0 &&
+            issued_parses >= static_cast<size_t>(recovery_max_buckets_) +
+                                 unusable_parses) {
+            return;
+        }
+        const int64_t id = meta_ids[issued_parses++];
+        pending_parses.push_back(std::async(std::launch::async, [this, id]() {
+            // One bucket that cannot be parsed must not take the whole
+            // recovery down: report it unusable and let the caller discard it
+            // exactly like any other metadata it cannot trust.
+            try {
+                return ParseBucketForRecovery(id);
+            } catch (const std::exception& e) {
+                ParsedBucket failed;
+                failed.bucket_id = id;
+                failed.failure_reason =
+                    std::string("metadata could not be parsed: ") + e.what();
+                return failed;
+            }
+        }));
+    };
+    for (size_t i = 0; i < parse_concurrency; ++i) issue_parse();
 
-    // Drop entries that lost the duplicate-key race, then index the winners.
-    for (auto& [bucket_id, bucket] : buckets_) {
+    for (size_t next_index = 0; next_index < meta_ids.size(); ++next_index) {
+        const int64_t bucket_id = meta_ids[next_index];
+        const bool out_of_buckets =
+            recovery_max_buckets_ > 0 &&
+            restored_buckets >= static_cast<size_t>(recovery_max_buckets_);
+        // Recovery and the master's re-registration share one budget, so every
+        // replica restored so far is charged the registration it will cost.
+        // Reserving it here keeps registration from being left with nothing
+        // after a recovery that used the whole window parsing.
+        //
+        // The window's parses are not charged: how many replicas they hold is
+        // only known once decoded. The wall-clock budget can therefore be
+        // overshot by up to one window's worth of registration. That is
+        // accepted - the bucket cap above is exact, and this budget exists to
+        // bound a startup that would otherwise be unbounded, not to land on a
+        // precise number of milliseconds.
+        const auto reserved_for_registration = std::chrono::microseconds(
+            static_cast<int64_t>(recovered_replicas_.size()) *
+            kRegistrationMicrosPerReplica);
+        const bool out_of_time =
+            budgeted_by_time &&
+            std::chrono::steady_clock::now() + reserved_for_registration >=
+                recovery_deadline;
+        if (out_of_buckets || out_of_time) {
+            // Truncate as a block, at a bucket boundary: a bucket is either
+            // published as a whole or not touched at all, so an interruption
+            // here can never leave a half-applied bucket behind. The one bucket
+            // already in progress always runs to completion, which is why the
+            // wall-clock budget can overshoot by a single bucket.
+            //
+            // No generation accounting is needed for the skipped ids: a
+            // generation is allocated when an entry is reserved, and only the
+            // active bucket reserves, so generation grows with bucket id. Every
+            // skipped id is smaller than every restored one, hence its
+            // generation is smaller too and next_generation_ cannot go
+            // backwards.
+            skipped_ids.assign(
+                meta_ids.begin() + static_cast<std::ptrdiff_t>(next_index),
+                meta_ids.end());
+            // Parses already issued are still reading. Their results are
+            // dropped, but wait for them here: a future's destructor would wait
+            // anyway, and waiting now keeps that wait out of the deletion work
+            // that follows, where it would look like the deletes are slow.
+            pending_parses.clear();
+            break;
+        }
+        // This bucket's parse was issued when the window opened, so its read
+        // and decode have been running while the buckets ahead of it were
+        // arbitrated. Parses are issued in the order they are consumed, so the
+        // front of the window is this bucket.
+        ParsedBucket parsed = pending_parses.front().get();
+        pending_parses.pop_front();
+        if (!parsed.usable) ++unusable_parses;
+        // Refill the window before doing anything with the result: the count
+        // above has to be visible to the next issue, and neither the deletion
+        // nor the arbitration below should delay the next read.
+        issue_parse();
+        if (!parsed.usable) {
+            if (parsed.interrupted_eviction) {
+                LOG(INFO) << "Completing interrupted eviction of DFS bucket "
+                          << bucket_id;
+            } else {
+                LOG(ERROR) << "Discarding DFS bucket " << bucket_id << ": "
+                           << parsed.failure_reason;
+            }
+            DeleteBucketFilesOrDefer(bucket_id);
+            discarded_ids.insert(bucket_id);
+            continue;
+        }
+        max_generation = std::max(max_generation, parsed.max_generation);
+        auto bucket = std::move(parsed.bucket);
+
+        // Settle cross-bucket duplicates and publish the survivors in the same
+        // pass. Buckets are processed newest first, and a generation is only
+        // ever allocated by the active bucket, so generation grows with bucket
+        // id: the first bucket to claim a key is by construction the one with
+        // the greatest (generation, bucket_id). That makes the arbitration a
+        // single insert instead of a second pass over every entry of every
+        // bucket, which is what used to put most of the recovery time outside
+        // the budget.
+        //
+        // `key_index_` doubles as the claim table, so no separate structure has
+        // to hold another copy of every key.
         for (auto& [key, entry] : bucket->entries) {
             if (entry.state != BucketEntryState::COMMITTED) continue;
-            auto winner_it = winners.find(key);
-            if (winner_it == winners.end() ||
-                winner_it->second.bucket_id != bucket_id ||
-                winner_it->second.entry_offset != entry.entry_offset) {
+            auto [claim, claimed] = key_index_.emplace(key, bucket_id);
+            if (!claimed) {
+                LOG(WARNING) << "DFS key " << key << " in bucket " << bucket_id
+                             << " is superseded by bucket " << claim->second
+                             << ", which was recovered first";
                 entry.state = BucketEntryState::TOMBSTONE;
                 ++bucket->tombstones;
                 bucket->meta_dirty = true;
@@ -2295,7 +2709,6 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
                 }
                 continue;
             }
-            key_index_[key] = bucket_id;
 
             auto layout = RebuildBucketEntryLayout(
                 entry.entry_offset, entry.value_size, alignment_);
@@ -2304,22 +2717,65 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
                 key, MakeBucketDescriptor(BucketDataPath(bucket_id), *layout,
                                           bucket_id)});
         }
+
+        buckets_.emplace(bucket_id, std::move(bucket));
+        ++restored_buckets;
+    }
+
+    // Everything still to do is O(bucket files) instead of O(entries), so the
+    // recovery budget is effectively spent once the loop ends. The two phases
+    // are still reported separately: if this one ever grows, it stops being
+    // covered by the budget and has to move inside the loop.
+    const auto loop_finished = std::chrono::steady_clock::now();
+
+    // Counted before the skipped ids join the set below, so the two reasons a
+    // bucket was not restored stay separable in the timing log.
+    const size_t rejected_buckets = discarded_ids.size();
+
+    // Advance both counters before anything is handed to the deferred tail:
+    // every id it may delete is then strictly below `next_bucket_id_`, so no
+    // bucket this process creates later can take one of those names.
+    next_bucket_id_ = max_seen_id + 1;
+    next_generation_ = std::max<uint64_t>(1, max_generation);
+
+    if (!skipped_ids.empty()) {
+        recovery_skipped_buckets_ = skipped_ids.size();
+        LOG(WARNING) << "DFS bucket recovery budget exhausted: restored="
+                     << restored_buckets << ", max_buckets="
+                     << recovery_max_buckets_ << ", max_duration_seconds="
+                     << recovery_max_duration_.count() << ", elapsed_ms="
+                     << DurationMsBetween(recovery_started,
+                                          std::chrono::steady_clock::now())
+                     << "; deleting " << skipped_ids.size()
+                     << " skipped (oldest) bucket(s) in the background";
+        // Marked as handled by this pass so the orphan sweep below does not
+        // queue the same ids a second time.
+        discarded_ids.insert(skipped_ids.begin(), skipped_ids.end());
+        EnqueueRecoveryTail({RecoveryTailTask::Kind::kDeleteBuckets,
+                             std::move(skipped_ids)});
     }
 
     // A data file with no `.meta` at all is the signature of a crash while the
     // bucket was still active: its metadata only lived in memory, so nothing
-    // can ever address the data again. Reclaim it. Buckets rejected above were
-    // already deleted, so they are skipped here to avoid a duplicate log line.
+    // can ever address the data again. Reclaim it. Buckets rejected or skipped
+    // above are already accounted for, so they are skipped here to avoid a
+    // duplicate log line.
+    //
+    // The deletes are queued instead of run here: each one costs a DFS round
+    // trip, and startup cannot afford a directory-sized pile of them.
+    std::vector<int64_t> orphan_data_ids;
     for (const int64_t data_id : data_ids) {
         if (buckets_.count(data_id) > 0) continue;
         if (discarded_ids.count(data_id) > 0) continue;
-        LOG(WARNING) << "Removing orphaned DFS bucket data file for bucket_id="
+        LOG(WARNING) << "Queueing removal of orphaned DFS bucket data file for "
+                        "bucket_id="
                      << data_id << " (no metadata, lost on an unclean restart)";
-        DeleteBucketFiles(data_id);
+        orphan_data_ids.push_back(data_id);
     }
-
-    next_bucket_id_ = max_seen_id + 1;
-    next_generation_ = std::max<uint64_t>(1, max_generation);
+    if (!orphan_data_ids.empty()) {
+        EnqueueRecoveryTail({RecoveryTailTask::Kind::kDeleteBuckets,
+                             std::move(orphan_data_ids)});
+    }
 
     // Every recovered bucket is sealed, so none of them is resumed: the next
     // allocation opens a fresh bucket. This is what keeps a sealed bucket's
@@ -2339,6 +2795,29 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
         lru_list_.push_front(bucket_id);
         lru_index_[bucket_id] = lru_list_.begin();
     }
+
+    // One line per restart that says where the startup time actually went: the
+    // directory scan, the per-bucket loop that the budget bounds, and the
+    // wrap-up after it. Together with the initializer log below it is what
+    // makes a missed budget diagnosable without re-deriving it from timestamps.
+    const auto recovery_finished = std::chrono::steady_clock::now();
+    recovery_elapsed_ms_ =
+        DurationMsBetween(recovery_started, recovery_finished);
+    LOG(INFO) << "DFS bucket recovery finished: elapsed_ms="
+              << DurationMsBetween(recovery_started, recovery_finished)
+              << ", scan_ms="
+              << DurationMsBetween(recovery_started, scan_finished)
+              << ", loop_ms="
+              << DurationMsBetween(scan_finished, loop_finished)
+              << ", finalize_ms="
+              << DurationMsBetween(loop_finished, recovery_finished)
+              << ", buckets=" << buckets_.size()
+              << ", rejected=" << rejected_buckets
+              << ", skipped=" << recovery_skipped_buckets_
+              << ", replicas=" << recovered_replicas_.size()
+              << ", budget_buckets=" << recovery_max_buckets_
+              << ", budget_seconds=" << recovery_max_duration_.count()
+              << ", parse_concurrency=" << parse_concurrency;
 
     PublishBucketIdSnapshotLocked();
     return {};
