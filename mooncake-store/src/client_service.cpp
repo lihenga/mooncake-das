@@ -5441,6 +5441,49 @@ tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(
     return {};
 }
 
+tl::expected<void, ErrorCode> Client::RegisterDfsPrefetchTask(
+    const std::string& key, ReplicaID source_id) {
+    return master_client_.RegisterDfsPrefetchTask(client_id_, key, source_id);
+}
+
+ErrorCode Client::PromoteDfsToMemory(const std::string& key, ReplicaID source_id,
+                                    std::vector<Slice>& slices) {
+    // A client can run several promotions of the same key over its lifetime.
+    // A unique executor prevents a delayed allocation/cleanup RPC from acting
+    // on a replacement task after the queue-wait timeout has expired.
+    const UUID executor = generate_uuid();
+    auto registered =
+        master_client_.RegisterDfsPrefetchTask(executor, key, source_id);
+    if (!registered) return registered.error();
+
+    bool committed = false;
+    auto cleanup = [this, &key, &executor, &committed](int*) {
+        if (!committed) master_client_.NotifyPromotionFailure(executor, key);
+    };
+    int cleanup_token = 0;
+    std::unique_ptr<int, decltype(cleanup)> guard(&cleanup_token, cleanup);
+    uint64_t size = 0;
+    for (const auto& slice : slices) size += slice.size;
+    auto target = master_client_.PromotionAllocStart(executor, key, size, {});
+    if (!target) return target.error();
+
+    // The master does not expire allocated DFS-prefetch targets. Keep staging
+    // and target ownership until all writes terminate, including failures.
+    // Calling get() while pending would apply the generic 60s wait timeout,
+    // which is not proof that the transport has stopped touching either buffer.
+    auto write = SubmitRangeWrite(target->memory_descriptor, slices, 0);
+    if (!write) return ErrorCode::TRANSFER_FAIL;
+    while (!write->isReady()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const auto result = write->get();
+    if (result != ErrorCode::OK) return result;
+    auto notify = master_client_.NotifyPromotionSuccess(executor, key);
+    if (!notify) return notify.error();
+    committed = true;
+    return ErrorCode::OK;
+}
+
 tl::expected<PromotionAllocStartResponse, ErrorCode>
 Client::PromotionAllocStart(
     const std::string& key, uint64_t size,
