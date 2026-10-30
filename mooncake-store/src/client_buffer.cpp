@@ -27,10 +27,13 @@ std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
 
 std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
     void* addr, size_t size, const std::string& protocol, void* device_addr,
-    std::shared_ptr<void> backing_owner) {
+    std::shared_ptr<void> backing_owner,
+    std::shared_ptr<DfsBufferUsageTracker> usage_tracker,
+    DfsBufferUsageKind usage_kind) {
     auto allocator = std::shared_ptr<ClientBufferAllocator>(
         new ClientBufferAllocator(addr, size, protocol, device_addr));
     allocator->backing_owner_ = std::move(backing_owner);
+    allocator->SetUsageTracker(std::move(usage_tracker), usage_kind);
     return allocator;
 }
 
@@ -101,6 +104,26 @@ ClientBufferAllocator::storageReport() const {
     return allocator_->storageReport();
 }
 
+void ClientBufferAllocator::SetUsageTracker(
+    std::shared_ptr<DfsBufferUsageTracker> tracker,
+    DfsBufferUsageKind kind) {
+    usage_tracker_ = std::move(tracker);
+    usage_kind_ = kind;
+}
+
+void ClientBufferAllocator::NotifyAllocationReleased() {
+    {
+        std::lock_guard<std::mutex> lock(allocation_wait_mutex_);
+        ++allocation_generation_;
+    }
+    allocation_wait_cv_.notify_all();
+}
+
+size_t ClientBufferAllocator::allocation_size_for_request(size_t size) const {
+    if (!allocator_) return 0;
+    return allocator_->normalizedAllocationSize(size);
+}
+
 std::optional<BufferHandle> ClientBufferAllocator::allocate(size_t size) {
     if (allocator_ == nullptr) {
         return std::nullopt;
@@ -110,30 +133,81 @@ std::optional<BufferHandle> ClientBufferAllocator::allocate(size_t size) {
         return std::nullopt;
     }
 
-    return std::make_optional<BufferHandle>(shared_from_this(),
-                                            std::move(*handle));
+    return std::make_optional<BufferHandle>(
+        shared_from_this(), std::move(*handle), usage_tracker_, usage_kind_);
+}
+
+std::optional<BufferHandle> ClientBufferAllocator::allocate_aligned_wait(
+    size_t size, size_t alignment, DfsBufferUsageKind kind,
+    std::chrono::milliseconds timeout, bool* timed_out) {
+    if (timed_out) *timed_out = false;
+    const bool finite_timeout = timeout != std::chrono::milliseconds::max();
+    const auto deadline = finite_timeout
+                              ? std::chrono::steady_clock::now() + timeout
+                              : std::chrono::steady_clock::time_point::max();
+    for (;;) {
+        std::unique_lock<std::mutex> lock(allocation_wait_mutex_);
+        const auto generation = allocation_generation_;
+        lock.unlock();
+        if (auto allocation = allocate_aligned(size, alignment, kind)) {
+            return allocation;
+        }
+        lock.lock();
+        if (timeout == std::chrono::milliseconds::zero()) {
+            if (timed_out) *timed_out = true;
+            break;
+        }
+        const auto ready = [this, generation] {
+            return allocation_generation_ != generation;
+        };
+        if (timeout == std::chrono::milliseconds::max()) {
+            allocation_wait_cv_.wait(lock, ready);
+        } else if (allocation_wait_cv_.wait_until(lock, deadline, ready) ==
+                   false) {
+            if (timed_out) *timed_out = true;
+            break;
+        }
+    }
+    return std::nullopt;
 }
 
 std::optional<BufferHandle> ClientBufferAllocator::allocate_aligned(
     size_t size, size_t alignment) {
+    return allocate_aligned(size, alignment, usage_kind_);
+}
+
+std::optional<BufferHandle> ClientBufferAllocator::allocate_aligned(
+    size_t size, size_t alignment, DfsBufferUsageKind kind) {
     if (size == 0 || alignment == 0) {
         return std::nullopt;
     }
 
-    auto allocation = allocate(size);
+    const auto allocate_for_kind = [this, kind](size_t allocation_size)
+        -> std::optional<BufferHandle> {
+        if (allocator_ == nullptr) return std::nullopt;
+        auto handle = allocator_->allocate(allocation_size);
+        if (!handle) return std::nullopt;
+        return BufferHandle(shared_from_this(), std::move(*handle),
+                            usage_tracker_, kind);
+    };
+
+    auto allocation = allocate_for_kind(size);
     if (!allocation) return std::nullopt;
 
     const auto address = reinterpret_cast<uintptr_t>(allocation->ptr());
-    if (address % alignment == 0) return allocation;
+    if (address % alignment == 0) {
+        return allocation;
+    }
 
     allocation.reset();
     if (size > std::numeric_limits<size_t>::max() - (alignment - 1)) {
         return std::nullopt;
     }
-    allocation = allocate(size + alignment - 1);
+    allocation = allocate_for_kind(size + alignment - 1);
     if (!allocation) return std::nullopt;
 
     auto owner = std::make_shared<BufferHandle>(std::move(allocation.value()));
+    const auto owner_allocation_size = owner->allocation_size();
     auto* host_base = static_cast<char*>(owner->ptr());
     const size_t remainder = reinterpret_cast<uintptr_t>(host_base) % alignment;
     const size_t offset = remainder == 0 ? 0 : alignment - remainder;
@@ -141,26 +215,86 @@ std::optional<BufferHandle> ClientBufferAllocator::allocate_aligned(
     if (device_ptr) {
         device_ptr = static_cast<char*>(device_ptr) + offset;
     }
+    auto allocator = shared_from_this();
     return BufferHandle(
-        host_base + offset, size, [owner]() { (void)owner; }, device_ptr);
+        host_base + offset, size,
+        [owner = std::move(owner), allocator]() mutable {
+            owner.reset();
+            allocator->NotifyAllocationReleased();
+        },
+        device_ptr, owner_allocation_size);
 }
 
 BufferHandle::BufferHandle(
     std::shared_ptr<ClientBufferAllocator> allocator,
-    mooncake::offset_allocator::OffsetAllocationHandle handle)
-    : allocator_(std::move(allocator)), handle_(std::move(handle)) {}
+    mooncake::offset_allocator::OffsetAllocationHandle handle,
+    std::shared_ptr<DfsBufferUsageTracker> usage_tracker,
+    DfsBufferUsageKind usage_kind)
+    : allocator_(std::move(allocator)),
+      handle_(std::move(handle)),
+      usage_(usage_tracker
+                 ? std::make_unique<DfsBufferAllocationUsage>(
+                       std::move(usage_tracker), usage_kind,
+                       handle_.allocationSize())
+                 : nullptr) {}
+
+BufferHandle::BufferHandle(BufferHandle&& other) noexcept
+    : allocator_(std::move(other.allocator_)),
+      handle_(std::move(other.handle_)),
+      usage_(std::move(other.usage_)),
+      view_ptr_(other.view_ptr_),
+      view_size_(other.view_size_),
+      view_allocation_size_(other.view_allocation_size_),
+      release_fn_(std::move(other.release_fn_)),
+      view_device_ptr_(other.view_device_ptr_) {
+    other.view_ptr_ = nullptr;
+    other.view_size_ = 0;
+    other.view_allocation_size_ = 0;
+    other.view_device_ptr_ = nullptr;
+}
+
+BufferHandle& BufferHandle::operator=(BufferHandle&& other) noexcept {
+    if (this == &other) return *this;
+    auto old_allocator = allocator_;
+    if (release_fn_) {
+        release_fn_();
+        release_fn_ = nullptr;
+    }
+    usage_.reset();
+    handle_ = std::move(other.handle_);
+    usage_ = std::move(other.usage_);
+    if (old_allocator) old_allocator->NotifyAllocationReleased();
+    allocator_ = std::move(other.allocator_);
+    view_ptr_ = other.view_ptr_;
+    view_size_ = other.view_size_;
+    view_allocation_size_ = other.view_allocation_size_;
+    release_fn_ = std::move(other.release_fn_);
+    view_device_ptr_ = other.view_device_ptr_;
+    other.view_ptr_ = nullptr;
+    other.view_size_ = 0;
+    other.view_allocation_size_ = 0;
+    other.view_device_ptr_ = nullptr;
+    return *this;
+}
 
 BufferHandle::BufferHandle(void* ptr, size_t size,
                            std::function<void()> release_fn,
-                           void* device_ptr)
+                           void* device_ptr, size_t allocation_size)
     : view_ptr_(ptr),
       view_size_(size),
+      view_allocation_size_(allocation_size == 0 ? size : allocation_size),
       release_fn_(std::move(release_fn)),
       view_device_ptr_(device_ptr) {}
 
 BufferHandle::~BufferHandle() {
     if (release_fn_) {
         release_fn_();
+        release_fn_ = nullptr;
+    }
+    if (allocator_) {
+        usage_.reset();
+        handle_ = offset_allocator::OffsetAllocationHandle();
+        allocator_->NotifyAllocationReleased();
     }
     // Otherwise OffsetAllocationHandle destructor handles deallocation
 }
@@ -171,6 +305,10 @@ void* BufferHandle::ptr() const {
 
 size_t BufferHandle::size() const {
     return view_ptr_ ? view_size_ : handle_.size();
+}
+
+size_t BufferHandle::allocation_size() const {
+    return view_ptr_ ? view_allocation_size_ : handle_.allocationSize();
 }
 
 void* BufferHandle::device_ptr() const {

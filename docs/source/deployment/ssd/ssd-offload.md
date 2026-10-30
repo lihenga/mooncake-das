@@ -133,7 +133,11 @@ Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_
 | `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `/data/file_storage` | Absolute path to the SSD storage directory |
 | `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR` | `bucket_storage_backend` | Storage backend type (see below) |
 | `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` | `1342177280` (1.25 GB) | Client-side staging buffer size |
-| `MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES` | `0` | Size of the additional preallocated pinned-host arena for same-process SSD-to-GPU restores. See the constraints below |
+| `MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES` | `8589934592` (8 GiB) | Shared pinned unified buffer for DFS read, prefetch, and write staging |
+| `MC_STORE_DFS_READ_CHUNK_SIZE_BYTES` | `1073741824` (1 GiB) | DFS read chunk size; values `<= 0` use the default |
+| `MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES` | `1073741824` (1 GiB) | DFS write chunk size; values `<= 0` use the default |
+| `MC_STORE_DFS_PREFETCH_CAPACITY_RATIO` | `0.5` | Maximum fraction of the unified buffer retained by prefetch allocations |
+| `MC_STORE_DFS_WRITE_ARENA_WAIT_MS` | `10000` | Maximum time DFS write staging waits for unified-buffer space |
 | `MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT` | `20000` | Max keys processed per iteration when scanning existing SSD metadata on startup |
 | `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` | `2199023255552` (2 TB) | Maximum disk usage |
 | `MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT` | `10000000` | Maximum number of objects on disk |
@@ -147,7 +151,7 @@ Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_
 
 The `MOONCAKE_OFFLOAD_*` watermark names are preferred. Short aliases `MOONCAKE_DISK_EVICTION_HIGH_WATERMARK_RATIO` and `MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO` are also accepted. The high watermark must be greater than the low watermark.
 
-The pinned restore quota is separate from `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES`; it does not convert the normal FileStorage arena to pinned memory. It is allocated only when `MC_STORE_MEMCPY=1`, and selected only when the current process owns the SSD replica and the restore destination is GPU memory. Tensor payload ranges are copied from their source offset without an additional FileStorage staging allocation. Remote, CPU-destination, and io_uring reads continue to use the existing path. If the pinned quota is exhausted, the request uses the normal restore arena; if the quota cannot be pinned at startup, the optimization remains disabled. The file-per-key backend may still use its own temporary pageable buffer internally; the bucket and offset-allocator backends can read into the supplied restore buffer directly.
+The unified DFS buffer is created when DFS is enabled and its configured size is positive. It is shared by DFS reads, prefetch, and writes; io_uring and local memcpy settings do not disable its creation. On HYGON, a mapped pinned allocation is preferred and falls back to ordinary pinned host memory if the device-visible alias cannot be created. If the unified buffer cannot be allocated, operations that require it return an allocation error.
 
 ### Bucket backend settings
 

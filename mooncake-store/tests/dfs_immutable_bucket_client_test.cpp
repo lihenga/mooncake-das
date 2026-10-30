@@ -1214,7 +1214,6 @@ class DfsBucketClientChunkLimitTest : public DfsBucketClientTest {
    protected:
     void ConfigureClientEnvironment() override {
         SetEnv("MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES", "16384");
-        SetEnv("MC_STORE_DFS_WRITE_ARENA_COUNT", "1");
     }
 };
 
@@ -1237,8 +1236,14 @@ class DfsBucketClientSlotTimeoutTest : public DfsBucketClientTest {
    protected:
     void ConfigureClientEnvironment() override {
         SetEnv("MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES", "4096");
-        SetEnv("MC_STORE_DFS_WRITE_ARENA_COUNT", "1");
+        SetEnv("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES", "8192");
         SetEnv("MC_STORE_DFS_WRITE_ARENA_WAIT_MS", "1");
+    }
+
+    void SetUp() override {
+        DfsBucketClientTest::SetUp();
+        writer_->SetUnifiedDfsBuffer(ClientBufferAllocator::create(8192),
+                                      8192);
     }
 };
 
@@ -1273,7 +1278,6 @@ class DfsBucketClientMultiChunkTest : public DfsBucketClientTest {
    protected:
     void ConfigureClientEnvironment() override {
         SetEnv("MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES", "4096");
-        SetEnv("MC_STORE_DFS_WRITE_ARENA_COUNT", "1");
     }
 };
 
