@@ -299,12 +299,10 @@ TEST_F(RealClientTest, SessionRangesReadDfs) {
 }
 
 // DFS-only objects for the waiting-queue prefetch tests. The variables stay
-// set for the lifetime of the test body. uring and the restore arena are
-// pinned off so a successful cached read can only come from the dedicated
-// prefetch arena.
+// set so cached reads use the unified DFS buffer.
 struct DfsPrefetchTestEnv {
     ScopedEnvVar local_memcpy{"MC_STORE_MEMCPY", "1"};
-    ScopedEnvVar restore_arena{"MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES", "0"};
+    ScopedEnvVar prefetch_ratio{"MC_STORE_DFS_PREFETCH_CAPACITY_RATIO", "1.0"};
     ScopedEnvVar use_uring{"MOONCAKE_OFFLOAD_USE_URING", "0"};
     ScopedEnvVar legacy_use_uring{"MOONCAKE_USE_URING", "0"};
     ScopedEnvVar enable_dfs{"MOONCAKE_ENABLE_DFS", "1"};
@@ -500,13 +498,13 @@ class RealClientDfsPrefetchTest : public RealClientTest {
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::seconds(1);
         const auto capacity =
-            py_client_->file_storage_->PinnedPrefetchArenaCapacity();
-        while (py_client_->file_storage_->PinnedPrefetchArenaReport()
+            py_client_->file_storage_->UnifiedBufferCapacity();
+        while (py_client_->file_storage_->UnifiedBufferReport()
                        .totalFreeSpace != capacity &&
                std::chrono::steady_clock::now() < deadline) {
             std::this_thread::yield();
         }
-        EXPECT_EQ(py_client_->file_storage_->PinnedPrefetchArenaReport()
+        EXPECT_EQ(py_client_->file_storage_->UnifiedBufferReport()
                       .totalFreeSpace,
                   capacity);
     }
@@ -574,7 +572,7 @@ TEST_F(RealClientLeasePrefetchTest,
        BucketPrefetchKeepsCacheAcrossLeaseDeadline) {
     DfsPrefetchTestEnv dfs_env;
     ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
-    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES",
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES",
                                 "4096");
     const std::vector<std::string> keys{"prefetch_crosses_lease"};
     ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17835", keys));
@@ -614,7 +612,7 @@ TEST_F(RealClientLeasePrefetchTest,
        BucketPrefetchRejectsRetiredOrChangedSession) {
     DfsPrefetchTestEnv dfs_env;
     ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
-    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES",
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES",
                                 "4096");
     const std::vector<std::string> keys{"prefetch_invalid_session"};
     ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17836", keys));
@@ -651,7 +649,7 @@ TEST_F(RealClientLeasePrefetchTest,
 TEST_F(RealClientLeasePrefetchTest,
        PrefetchEntryRejectsExpiredLeaseAndInvalidBuffer) {
     DfsPrefetchTestEnv dfs_env;
-    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES",
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES",
                                 "4096");
     const std::vector<std::string> keys{"prefetch_expired_entry"};
     ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17837", keys));
@@ -682,7 +680,7 @@ TEST_F(RealClientLeasePrefetchTest,
 TEST_F(RealClientDfsPrefetchTest, DfsBatchGetIntoPreservesDuplicateTargets) {
     DfsPrefetchTestEnv dfs_env;
     ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
-    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES", "0");
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES", "0");
     const std::vector<std::string> keys{"dfs_into_duplicates"};
     ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17838", keys));
     std::vector<std::string> outputs(2, std::string(sources_[0].size(), '?'));
@@ -703,7 +701,7 @@ TEST_F(RealClientDfsPrefetchTest, DfsBatchGetIntoPreservesDuplicateTargets) {
 TEST_F(RealClientDfsPrefetchTest, DfsSessionRangesPreserveDuplicateRequests) {
     DfsPrefetchTestEnv dfs_env;
     ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
-    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES", "0");
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES", "0");
     const std::vector<std::string> keys{"dfs_range_duplicates"};
     ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17839", keys));
     ASSERT_EQ(py_client_->batch_get_session_start(keys), std::vector<int>{0});
@@ -734,7 +732,7 @@ TEST_F(RealClientDfsPrefetchTest, DfsSessionRangesPreserveDuplicateRequests) {
 TEST_F(RealClientDfsPrefetchTest, DuplicateDfsTimeoutKeepsTemporaryBuffersAlive) {
     DfsPrefetchTestEnv dfs_env;
     ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
-    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES", "0");
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES", "0");
     ScopedEnvVar timeout("MOONCAKE_DFS_BATCH_GET_TIMEOUT_MS", "100");
     ScopedEnvVar fixed_timeout("MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS", "0");
     const std::vector<std::string> keys{"dfs_duplicate_timeout"};
@@ -744,7 +742,7 @@ TEST_F(RealClientDfsPrefetchTest, DuplicateDfsTimeoutKeepsTemporaryBuffersAlive)
         SCOPED_TRACE(chunk_size);
         const auto chunk_bytes =
             std::to_string(chunk_size == 0 ? 8192 : chunk_size);
-        ScopedEnvVar restore_chunk("MC_STORE_DFS_RESTORE_CHUNK_SIZE_BYTES",
+        ScopedEnvVar restore_chunk("MC_STORE_DFS_READ_CHUNK_SIZE_BYTES",
                                    chunk_bytes.c_str());
         std::vector<std::string> outputs(2, std::string(sources_[0].size(), '?'));
         for (auto& output : outputs) {
@@ -811,12 +809,13 @@ TEST_F(RealClientDfsPrefetchTest, DuplicateDfsTimeoutKeepsTemporaryBuffersAlive)
 
 TEST_F(RealClientDfsPrefetchTest, FailsWithoutArenaAndOrdinaryReadWorks) {
     DfsPrefetchTestEnv dfs_env;
-    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES", "0");
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES", "0");
     const std::vector<std::string> keys = {"dfs_prefetch_no_arena"};
     ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17826", keys));
 
     EXPECT_FALSE(py_client_->dfs_prefetch_arena_available());
-    EXPECT_EQ(py_client_->dfs_prefetch_arena_status(), "not configured");
+    EXPECT_EQ(py_client_->dfs_prefetch_arena_status(),
+              "unavailable: unified DFS buffer is not initialized");
     ASSERT_EQ(py_client_->batch_get_session_start(keys), std::vector<int>{0});
 
     // No dedicated arena: the prefetch fails instead of allocating pinned
@@ -829,15 +828,14 @@ TEST_F(RealClientDfsPrefetchTest, FailsWithoutArenaAndOrdinaryReadWorks) {
 
 TEST_F(RealClientDfsPrefetchTest, DisabledPrefetchKeepsOrdinaryReadWorking) {
     DfsPrefetchTestEnv dfs_env;
-    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES",
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES",
                                 "4096");
     const std::vector<std::string> keys = {"dfs_prefetch_disabled_read"};
     ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects(
         "localhost:17830", keys, /*enable_dfs_prefetch=*/false));
 
     EXPECT_FALSE(py_client_->dfs_prefetch_arena_available());
-    EXPECT_EQ(py_client_->prefetch_arena_stats_, nullptr);
-    EXPECT_EQ(py_client_->dfs_prefetch_arena_status(), "not configured");
+    EXPECT_EQ(py_client_->dfs_prefetch_arena_status(), "disabled");
     ASSERT_EQ(py_client_->batch_get_session_start(keys), std::vector<int>{0});
     EXPECT_EQ(py_client_->batch_get_session_prefetch(keys),
               std::vector<int>{NoAvailableHandle()});
@@ -847,9 +845,9 @@ TEST_F(RealClientDfsPrefetchTest, DisabledPrefetchKeepsOrdinaryReadWorking) {
     EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
 }
 
-TEST_F(RealClientDfsPrefetchTest, StartupDisableReleasesUnusedArena) {
+TEST_F(RealClientDfsPrefetchTest, StartupDisableKeepsUnifiedArenaForOtherUsers) {
     DfsPrefetchTestEnv dfs_env;
-    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES",
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES",
                                 "4096");
     const std::vector<std::string> keys = {"dfs_prefetch_startup_disable"};
     ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17831", keys));
@@ -857,42 +855,26 @@ TEST_F(RealClientDfsPrefetchTest, StartupDisableReleasesUnusedArena) {
 
     ASSERT_NE(py_client_->file_storage_, nullptr);
     const size_t capacity =
-        py_client_->file_storage_->PinnedPrefetchArenaCapacity();
+        py_client_->file_storage_->UnifiedBufferCapacity();
     ASSERT_EQ(capacity, 4096);
     EXPECT_EQ(
-        py_client_->file_storage_->PinnedPrefetchArenaReport().totalFreeSpace,
+        py_client_->file_storage_->UnifiedBufferReport().totalFreeSpace,
         capacity);
 
     auto borrowed = py_client_->file_storage_->AllocatePinnedPrefetchBuffer(
         512, 64);
     ASSERT_TRUE(borrowed.has_value());
-    EXPECT_FALSE(py_client_->disable_dfs_prefetch());
-    EXPECT_TRUE(py_client_->dfs_prefetch_arena_available());
-    EXPECT_EQ(py_client_->file_storage_->PinnedPrefetchArenaCapacity(),
-              capacity);
-    borrowed.reset();
-
     EXPECT_TRUE(py_client_->disable_dfs_prefetch());
     EXPECT_FALSE(py_client_->dfs_prefetch_arena_available());
     EXPECT_EQ(py_client_->dfs_prefetch_arena_status(), "disabled");
-    EXPECT_EQ(py_client_->file_storage_->PinnedPrefetchArenaCapacity(), 0);
-    EXPECT_EQ(
-        py_client_->file_storage_->PinnedPrefetchArenaReport().totalFreeSpace,
-        0);
-
-    EXPECT_EQ(py_client_->prefetch_arena_stats_, nullptr);
-    ASSERT_EQ(py_client_->batch_get_session_start(keys), std::vector<int>{0});
-    EXPECT_EQ(py_client_->batch_get_session_prefetch(keys),
-              std::vector<int>{NoAvailableHandle()});
-    ExpectRead(keys[0], 0, 512, /*cache_only=*/false);
-    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
-
-    EXPECT_TRUE(py_client_->disable_dfs_prefetch());
+    EXPECT_EQ(py_client_->file_storage_->UnifiedBufferCapacity(), capacity);
+    EXPECT_LT(py_client_->file_storage_->UnifiedBufferReport().totalFreeSpace,
+              capacity);
 }
 
 TEST_F(RealClientDfsPrefetchTest, StartupDisableRefusesActiveSession) {
     DfsPrefetchTestEnv dfs_env;
-    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES",
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES",
                                 "4096");
     const std::vector<std::string> keys = {"dfs_prefetch_disable_active"};
     ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17832", keys));
@@ -901,17 +883,16 @@ TEST_F(RealClientDfsPrefetchTest, StartupDisableRefusesActiveSession) {
     ASSERT_EQ(py_client_->batch_get_session_start(keys), std::vector<int>{0});
     EXPECT_FALSE(py_client_->disable_dfs_prefetch());
     EXPECT_TRUE(py_client_->dfs_prefetch_arena_available());
-    EXPECT_EQ(py_client_->file_storage_->PinnedPrefetchArenaCapacity(), 4096);
+    EXPECT_EQ(py_client_->file_storage_->UnifiedBufferCapacity(), 4096);
     EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
 }
 
 TEST_F(RealClientDfsPrefetchTest,
        RestoreReadsAreChunkedAndOversizedEntryFailsIndividually) {
     DfsPrefetchTestEnv dfs_env;
-    ScopedEnvVar restore_arena("MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES",
-                               "8192");
-    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES", "0");
-    ScopedEnvVar restore_chunk("MC_STORE_DFS_RESTORE_CHUNK_SIZE_BYTES",
+    ScopedEnvVar unified_buffer("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES",
+                                "8192");
+    ScopedEnvVar restore_chunk("MC_STORE_DFS_READ_CHUNK_SIZE_BYTES",
                                "4096");
     if (!PinnedPrefetchMemorySupported()) {
         GTEST_SKIP() << "pinned host memory is unavailable on this machine";
@@ -1000,7 +981,7 @@ TEST_F(RealClientTest, DfsPrefetchArenaUnavailableWithoutFileStorage) {
 TEST_F(RealClientDfsPrefetchTest, UsesDedicatedArenaAndFailsPerKeyWhenFull) {
     DfsPrefetchTestEnv dfs_env;
     // Room for exactly one object.
-    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES",
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES",
                                 "4096");
     const std::vector<std::string> keys = {"dfs_prefetch_cached",
                                            "dfs_prefetch_overflow"};
@@ -1033,7 +1014,7 @@ TEST_F(RealClientDfsPrefetchTest, UsesDedicatedArenaAndFailsPerKeyWhenFull) {
 TEST_F(RealClientDfsPrefetchTest, SharedRootRegionIsReleasedAfterLastKey) {
     DfsPrefetchTestEnv dfs_env;
     // Room for exactly the two objects read by one prefetch call.
-    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES",
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES",
                                 "8192");
     const std::vector<std::string> keys = {
         "dfs_prefetch_root_a", "dfs_prefetch_root_b", "dfs_prefetch_root_c"};
@@ -1065,7 +1046,7 @@ TEST_F(RealClientDfsPrefetchTest, SharedRootRegionIsReleasedAfterLastKey) {
 
 TEST_F(RealClientDfsPrefetchTest, TearDownWithLivePrefetchedBuffers) {
     DfsPrefetchTestEnv dfs_env;
-    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES",
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES",
                                 "8192");
     const std::vector<std::string> keys = {"dfs_prefetch_teardown_a",
                                            "dfs_prefetch_teardown_b"};
@@ -1093,7 +1074,7 @@ TEST_F(RealClientTest, SessionRangesReadDfsIntoGpuUsesPinnedArena) {
 
     ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
     ScopedEnvVar pinned_restore_arena(
-        "MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES", "1048576");
+        "MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES", "1048576");
     ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
     ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
                                  "distributed_storage_backend");
@@ -1179,7 +1160,7 @@ TEST_F(RealClientTest, PinnedSsdRestoreReadsNonTailRangeIntoGpu) {
     ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
     ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
     ScopedEnvVar pinned_restore_arena(
-        "MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES", "1048576");
+        "MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES", "1048576");
     ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
                                  "bucket_storage_backend");
     ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");

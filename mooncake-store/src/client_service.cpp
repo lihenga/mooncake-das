@@ -113,30 +113,23 @@ std::vector<tl::expected<void, ErrorCode>> FinalizeSessionsByEpoch(
 }
 
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
-constexpr size_t kDefaultDfsWriteChunkSize = 512ULL * 1024 * 1024;
-constexpr size_t kDefaultDfsWriteArenaCount = 16;
+constexpr size_t kDefaultDfsWriteChunkSize = 1ULL * 1024 * 1024 * 1024;
 
 size_t ReadDfsWriteChunkSize() {
-    using Variables = FileStorageEnvironmentVariables;
     const auto configured = Environ::Read(
-        Variables::MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES);
-    if (!configured.has_value()) return kDefaultDfsWriteChunkSize;
-    return *configured > 0 ? static_cast<size_t>(*configured) : 0;
-}
-
-size_t ReadDfsWriteArenaCount() {
-    const auto configured = Environ::Read(
-        FileStorageEnvironmentVariables::MC_STORE_DFS_WRITE_ARENA_COUNT);
-    if (!configured.has_value()) return kDefaultDfsWriteArenaCount;
-    return *configured > 0 ? static_cast<size_t>(*configured) : 0;
+        FileStorageEnvironmentVariables::MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES);
+    if (!configured.has_value() || *configured <= 0) {
+        return kDefaultDfsWriteChunkSize;
+    }
+    return static_cast<size_t>(*configured);
 }
 
 std::chrono::milliseconds ReadDfsWriteArenaWait() {
     constexpr int64_t kDefaultWaitMs = 10000;
     const auto configured = Environ::Read(
         FileStorageEnvironmentVariables::MC_STORE_DFS_WRITE_ARENA_WAIT_MS);
-    const int64_t wait_ms = configured.value_or(kDefaultWaitMs);
-    return std::chrono::milliseconds(std::max<int64_t>(wait_ms, 0));
+    return std::chrono::milliseconds(std::max<int64_t>(
+        configured.value_or(kDefaultWaitMs), 0));
 }
 
 bool IsValidServiceEndpoint(const std::string& endpoint) {
@@ -635,9 +628,8 @@ Client::Client(const std::string& local_hostname,
       dfs_batch_timeout_fixed_ms_(Environ::GetUInt64(
           "MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS",
           kDefaultDfsBatchTimeoutFixedMs)),
-      dfs_write_arena_count_(ReadDfsWriteArenaCount()),
-      dfs_write_chunk_size_(ReadDfsWriteChunkSize()),
       dfs_write_arena_wait_(ReadDfsWriteArenaWait()),
+      dfs_write_chunk_size_(ReadDfsWriteChunkSize()),
       pinned_buffer_pool_(
           std::make_shared<PinnedBufferPool>(Environ::GetSizeT(
               "MC_STORE_DFS_PINNED_POOL_BYTES",
@@ -657,8 +649,7 @@ Client::Client(const std::string& local_hostname,
               << dfs_batch_timeout_fixed_ms_.load(std::memory_order_relaxed)
               << " ms (0 baseline disables)";
 
-    LOG(INFO) << "DFS write buffer, chunk_size=" << dfs_write_chunk_size_
-              << ", chunk_count=" << dfs_write_arena_count_;
+    LOG(INFO) << "DFS write buffer, chunk_size=" << dfs_write_chunk_size_;
 
     if (metrics_) {
         if (metrics_->GetReportingInterval() > 0) {
@@ -846,9 +837,13 @@ void Client::StopServiceMetricsReporter() {
 }
 
 Client::~Client() {
-    // Stop accepting new asynchronous DFS writes and wake callers waiting for
-    // a fixed staging slot before draining tasks already submitted.
-    if (dfs_write_staging_pool_) dfs_write_staging_pool_->Shutdown();
+    // Stop accepting new asynchronous DFS writes before draining tasks already
+    // submitted. Their BufferHandles retain the unified allocator.
+    unified_buffer_log_running_.store(false, std::memory_order_release);
+    unified_buffer_log_cv_.notify_all();
+    if (unified_buffer_log_thread_.joinable()) {
+        unified_buffer_log_thread_.join();
+    }
     // They report their result through master_client_ and write through
     // dfs_storage_backend_, so they must not outlive this object.
     DrainAsyncDfsWrites();
@@ -3475,7 +3470,8 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
     const std::vector<std::string>& keys,
     const std::vector<const std::vector<Slice>*>& slice_lists,
     const std::vector<DistributedFSDescriptor>& descriptors,
-    std::shared_ptr<DistributedStorageBackend> backend) {
+    std::shared_ptr<DistributedStorageBackend> backend,
+    std::chrono::milliseconds staging_wait) {
     if (keys.size() != slice_lists.size() ||
         keys.size() != descriptors.size()) {
         return std::vector<ErrorCode>(keys.size(), ErrorCode::INVALID_PARAMS);
@@ -3493,12 +3489,16 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
     std::vector<ErrorCode> results(keys.size(), ErrorCode::OK);
     std::vector<DfsWriteRequest> requests;
     std::vector<size_t> request_indices;
-    std::vector<PinnedBufferPool::Buffer> staging_buffers;
+    std::vector<std::unique_ptr<BufferHandle>> staging_buffers;
     requests.reserve(keys.size());
     request_indices.reserve(keys.size());
 
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
+    const auto staging_deadline =
+        staging_wait == std::chrono::milliseconds::max()
+            ? std::chrono::steady_clock::time_point::max()
+            : std::chrono::steady_clock::now() + staging_wait;
     for (size_t i = 0; i < keys.size(); ++i) {
         if (slice_lists[i] == nullptr) {
             results[i] = ErrorCode::INVALID_PARAMS;
@@ -3520,17 +3520,39 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
             }
 
             device->SetContext(info.device_id);
-            auto buffer = pinned_buffer_pool_->Acquire(slice.size);
-            if (!device->Copy(buffer.data, slice.ptr, slice.size,
+            const auto remaining =
+                staging_wait == std::chrono::milliseconds::max()
+                    ? staging_wait
+                    : std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::max(staging_deadline -
+                                       std::chrono::steady_clock::now(),
+                                   std::chrono::steady_clock::duration::zero()));
+            auto buffer = unified_buffer_allocator_
+                              ? unified_buffer_allocator_->allocate_aligned_wait(
+                                    slice.size, 4096,
+                                    DfsBufferUsageKind::kWrite, remaining,
+                                    nullptr)
+                              : std::nullopt;
+            if (!buffer) {
+                LOG(ERROR) << "DFS_UNIFIED_BUFFER_ALLOCATION_FAILED kind=write "
+                              "mode=synchronous size="
+                           << slice.size;
+                ObserveUnifiedDfsBufferAllocationFailure(
+                    DfsBufferUsageKind::kWrite);
+                results[i] = ErrorCode::NO_AVAILABLE_HANDLE;
+                staging_succeeded = false;
+                break;
+            }
+            if (!device->Copy(buffer->ptr(), slice.ptr, slice.size,
                               device::CopyDirection::kDeviceToHost)) {
                 LOG(ERROR) << "DFS D2H staging failed for key " << keys[i];
-                pinned_buffer_pool_->Release(std::move(buffer));
                 results[i] = ErrorCode::TRANSFER_FAIL;
                 staging_succeeded = false;
                 break;
             }
-            host_slices.emplace_back(Slice{buffer.data, slice.size});
-            staging_buffers.push_back(std::move(buffer));
+            host_slices.emplace_back(Slice{buffer->ptr(), slice.size});
+            staging_buffers.push_back(
+                std::make_unique<BufferHandle>(std::move(*buffer)));
         }
         if (!staging_succeeded) {
             continue;
@@ -3574,26 +3596,23 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
                     all_succeeded, successful_bytes,
                     write_duration_seconds);
 
-    for (auto& buffer : staging_buffers) {
-        pinned_buffer_pool_->Release(std::move(buffer));
-    }
+    staging_buffers.clear();
     return results;
 }
 
-void Client::AsyncDfsWriteContext::ReleaseStagingSlot() {
-    if (!staging_pool || !staging_slot) return;
-    staging_pool->Release(std::move(staging_slot));
+void Client::AsyncDfsWriteContext::ReleaseStagingBuffer() {
+    staging_buffer.reset();
 }
 
 Client::AsyncDfsWriteContext::~AsyncDfsWriteContext() {
     slices.clear();
-    ReleaseStagingSlot();
+    ReleaseStagingBuffer();
 }
 
 bool Client::StageDfsWriteData(
     AsyncDfsWriteContext& context,
     const std::vector<const std::vector<Slice>*>& slice_lists) {
-    if (!context.staging_slot || !context.staging_slot->backing.data) return false;
+    if (!context.staging_buffer || !context.staging_buffer->ptr()) return false;
 
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
@@ -3614,15 +3633,15 @@ bool Client::StageDfsWriteData(
                 return false;
             }
 
-            if (staging_offset > context.staging_slot->backing.capacity ||
-                slice.size > context.staging_slot->backing.capacity -
-                                 staging_offset) {
+            if (staging_offset > context.staging_buffer->size() ||
+                slice.size > context.staging_buffer->size() - staging_offset) {
                 LOG(ERROR) << "DFS write staging arena exhausted for key "
                            << context.keys[i];
                 return false;
             }
             char* destination =
-                context.staging_slot->backing.data + staging_offset;
+                static_cast<char*>(context.staging_buffer->ptr()) +
+                staging_offset;
             staging_offset += slice.size;
 
             device::PointerInfo info{};
@@ -3720,7 +3739,7 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
     // completion RPCs so another chunk can stage while PutEnd/PutRevoke runs.
     requests.clear();
     context->slices.clear();
-    context->ReleaseStagingSlot();
+    context->ReleaseStagingBuffer();
 
     // Report each key individually so one failure cannot revoke its neighbours.
     // The RPCs are idempotent on the master side, so a bounded retry is safe.
@@ -3784,8 +3803,10 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
 
 void Client::SubmitDfsWriteChunk(
     std::vector<PutOperation>& ops, const std::vector<size_t>& chunk_indices,
-    bool is_upsert, bool allow_async, bool* slot_timed_out,
-    std::chrono::steady_clock::time_point deadline) {
+    bool is_upsert, bool allow_async,
+    std::chrono::steady_clock::time_point deadline,
+    bool* staging_timed_out_out) {
+    if (staging_timed_out_out) *staging_timed_out_out = false;
     std::vector<std::string> keys;
     std::vector<const std::vector<Slice>*> slice_lists;
     std::vector<DistributedFSDescriptor> descriptors;
@@ -3850,7 +3871,8 @@ void Client::SubmitDfsWriteChunk(
     const bool async_write =
         allow_async && backend->GetAllocatorType() == DfsAllocatorType::BUCKET;
     if (!async_write) {
-        auto results = WriteDfsReplicas(keys, slice_lists, descriptors);
+        auto results = WriteDfsReplicas(
+            keys, slice_lists, descriptors, nullptr, dfs_write_arena_wait_);
         for (size_t i = 0; i < results.size(); ++i) {
             auto& op = ops[op_indices[i]];
             if (results[i] == ErrorCode::OK) {
@@ -3866,26 +3888,57 @@ void Client::SubmitDfsWriteChunk(
 
     std::shared_ptr<AsyncDfsWriteContext> context;
     bool staged = false;
+    bool staging_allocation_timed_out = false;
     try {
         context = std::make_shared<AsyncDfsWriteContext>();
         context->deadline = deadline;
         context->keys = keys;
         context->descriptors = descriptors;
         context->backend = std::move(backend);
-        context->staging_pool = dfs_write_staging_pool_;
-        auto staging_wait = dfs_write_arena_wait_;
-        const auto now = std::chrono::steady_clock::now();
-        if (deadline != std::chrono::steady_clock::time_point::max()) {
-            const auto remaining =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    deadline > now ? deadline - now
-                                   : std::chrono::steady_clock::duration::zero());
-            staging_wait = std::min(staging_wait, remaining);
+        context->unified_buffer_allocator = unified_buffer_allocator_;
+        if (!context->unified_buffer_allocator) {
+            LOG(ERROR) << "DFS_UNIFIED_BUFFER_ALLOCATION_FAILED kind=write "
+                          "mode=asynchronous reason=allocator_unavailable";
+            ObserveUnifiedDfsBufferAllocationFailure(
+                DfsBufferUsageKind::kWrite);
+            throw std::runtime_error("Unified DFS buffer is unavailable");
         }
-        context->staging_slot =
-            context->staging_pool->Acquire(staging_wait, slot_timed_out);
-        if (!context->staging_slot) {
-            throw std::runtime_error("DFS write staging slot unavailable");
+        size_t payload_size = 0;
+        for (const auto* slices : slice_lists) {
+            if (!slices) {
+                throw std::runtime_error("DFS write staging size overflow");
+            }
+            const size_t slice_size = CalculateSliceSize(*slices);
+            if (payload_size >
+                std::numeric_limits<size_t>::max() - slice_size) {
+                throw std::runtime_error("DFS write staging size overflow");
+            }
+            payload_size += slice_size;
+        }
+        const bool deadline_expired =
+            deadline != std::chrono::steady_clock::time_point::max() &&
+            deadline <= std::chrono::steady_clock::now();
+        const auto staging_wait =
+            deadline_expired
+                ? std::chrono::milliseconds::zero()
+                : deadline == std::chrono::steady_clock::time_point::max()
+                      ? dfs_write_arena_wait_
+                      : std::min(
+                            dfs_write_arena_wait_,
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                deadline - std::chrono::steady_clock::now()));
+        if (deadline_expired) staging_allocation_timed_out = true;
+        context->staging_buffer =
+            context->unified_buffer_allocator->allocate_aligned_wait(
+                payload_size, 4096, DfsBufferUsageKind::kWrite, staging_wait,
+                &staging_allocation_timed_out);
+        if (!context->staging_buffer) {
+            LOG(ERROR) << "DFS_UNIFIED_BUFFER_ALLOCATION_FAILED kind=write "
+                          "mode=asynchronous size="
+                       << payload_size;
+            ObserveUnifiedDfsBufferAllocationFailure(
+                DfsBufferUsageKind::kWrite);
+            throw std::runtime_error("Unified DFS write buffer unavailable");
         }
         context->is_upsert = is_upsert;
         context->object_checksums.resize(keys.size());
@@ -3904,16 +3957,17 @@ void Client::SubmitDfsWriteChunk(
         LOG(ERROR) << "Failed to stage async DFS write: " << e.what();
     }
     if (!staged) {
-        const bool staging_timed_out = slot_timed_out && *slot_timed_out;
         for (const size_t index : op_indices) {
             auto& op = ops[index];
             op.transfer_summary.RecordFailure(
-                ReplicaType::DFS,
-                staging_timed_out ? ErrorCode::DFS_BATCH_PUT_TIMEOUT
-                                  : ErrorCode::TRANSFER_FAIL);
-            op.AppendFailureContext(staging_timed_out
-                                        ? "DFS BatchPut staging timed out"
-                                        : "Failed to stage DFS write data");
+                ReplicaType::DFS, ErrorCode::TRANSFER_FAIL);
+            op.AppendFailureContext(
+                staging_allocation_timed_out
+                    ? "DFS staging allocation wait timed out"
+                    : "Failed to stage DFS write data");
+        }
+        if (staging_timed_out_out) {
+            *staging_timed_out_out = staging_allocation_timed_out;
         }
         return;
     }
@@ -4048,34 +4102,12 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
     if (!async_write) {
         std::vector<size_t> all_indices(ops.size());
         std::iota(all_indices.begin(), all_indices.end(), 0);
-        SubmitDfsWriteChunk(ops, all_indices, is_upsert, allow_async, nullptr,
-                            deadline);
-        return;
-    }
-
-    if (dfs_write_chunk_size_ == 0 || dfs_write_arena_count_ == 0) {
-        std::vector<size_t> all_indices(ops.size());
-        std::iota(all_indices.begin(), all_indices.end(), 0);
-        SubmitDfsWriteChunk(ops, all_indices, is_upsert, false);
+        SubmitDfsWriteChunk(ops, all_indices, is_upsert, allow_async, deadline,
+                            nullptr);
         return;
     }
 
     const size_t chunk_limit = dfs_write_chunk_size_;
-
-    if (!dfs_write_staging_pool_) {
-        LOG(ERROR) << "DFS write staging arena is unavailable";
-        for (auto& op : ops) {
-            if (!op.IsResolved() &&
-                op.transfer_summary.allocated_dfs_replicas > 0 &&
-                NonDfsTransfersSucceeded(op.transfer_summary)) {
-                op.transfer_summary.RecordFailure(
-                    ReplicaType::DFS, ErrorCode::TRANSFER_FAIL);
-                op.AppendFailureContext("DFS write staging arena unavailable");
-            }
-        }
-        return;
-    }
-
     std::vector<std::vector<size_t>> chunks;
     std::vector<size_t> chunk;
     size_t chunk_bytes = 0;
@@ -4127,18 +4159,17 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
         LOG(INFO) << "Async DFS write batch: total_payload_bytes="
                   << total_payload_bytes << ", chunks=" << chunks.size()
                   << ", chunk_limit_bytes=" << chunk_limit
-                  << ", arena_count=" << dfs_write_arena_count_
                   << ", timeout_ms=" << timeout_ms;
     }
 
     for (size_t chunk_index = 0; chunk_index < chunks.size(); ++chunk_index) {
-        bool slot_timed_out = false;
+        bool staging_timed_out = false;
         SubmitDfsWriteChunk(ops, chunks[chunk_index], is_upsert, allow_async,
-                            &slot_timed_out, deadline);
-        if (slot_timed_out) {
-            LOG(WARNING) << "DFS write staging slot wait timed out; refusing "
-                         << "remaining " << chunks.size() - chunk_index - 1
-                         << " chunks";
+                            deadline, &staging_timed_out);
+        if (staging_timed_out) {
+            LOG(WARNING) << "DFS write staging allocation wait timed out; "
+                         << "refusing remaining "
+                         << chunks.size() - chunk_index - 1 << " chunks";
             for (size_t remaining = chunk_index + 1;
                  remaining < chunks.size(); ++remaining) {
                 for (const size_t op_index : chunks[remaining]) {
@@ -4146,10 +4177,9 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
                     if (!op.IsResolved() &&
                         op.transfer_summary.allocated_dfs_replicas > 0) {
                         op.transfer_summary.RecordFailure(
-                            ReplicaType::DFS,
-                            ErrorCode::DFS_BATCH_PUT_TIMEOUT);
+                            ReplicaType::DFS, ErrorCode::TRANSFER_FAIL);
                         op.AppendFailureContext(
-                            "DFS write staging slot wait timed out");
+                            "DFS staging allocation wait timed out");
                     }
                 }
             }
@@ -5386,20 +5416,81 @@ tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
     return master_client_.NotifyOffloadSuccess(client_id_, tasks, metadatas);
 }
 
+void Client::SetDfsWriteChunkSize(size_t chunk_size) {
+    dfs_write_chunk_size_ = chunk_size;
+}
+
+void Client::SetUnifiedDfsBuffer(
+    std::shared_ptr<ClientBufferAllocator> allocator, size_t capacity) {
+    unified_buffer_allocator_ = std::move(allocator);
+    unified_buffer_capacity_ = capacity;
+    if (!unified_buffer_allocator_ || unified_buffer_capacity_ == 0) return;
+    if (!unified_buffer_log_running_.exchange(true)) {
+        unified_buffer_log_thread_ =
+            std::thread(&Client::LogUnifiedDfsBufferUsage, this);
+    }
+}
+
+void Client::LogUnifiedDfsBufferUsage() {
+    std::unique_lock<std::mutex> lock(unified_buffer_log_mutex_);
+    while (unified_buffer_log_running_.load(std::memory_order_acquire)) {
+        unified_buffer_log_cv_.wait_for(lock, std::chrono::seconds(5));
+        if (!unified_buffer_log_running_.load(std::memory_order_acquire)) {
+            break;
+        }
+        const auto allocator = unified_buffer_allocator_;
+        const auto tracker = allocator ? allocator->usage_tracker() : nullptr;
+        const auto snapshot = tracker ? tracker->Snapshot()
+                                      : DfsBufferUsageSnapshot{};
+        const double capacity = static_cast<double>(unified_buffer_capacity_);
+        const auto utilization = [capacity](uint64_t bytes) {
+            return capacity == 0.0 ? 0.0 : bytes * 100.0 / capacity;
+        };
+        size_t write_backlog = 0;
+        {
+            std::lock_guard<std::mutex> inflight_lock(dfs_inflight_mutex_);
+            write_backlog = dfs_inflight_writes_;
+        }
+        if (metrics_) {
+            metrics_->unified_buffer_metric.capacity_bytes.update(
+                static_cast<int64_t>(unified_buffer_capacity_));
+            metrics_->unified_buffer_metric.read_bytes.update(
+                static_cast<int64_t>(snapshot.read_bytes));
+            metrics_->unified_buffer_metric.prefetch_bytes.update(
+                static_cast<int64_t>(snapshot.prefetch_bytes));
+            metrics_->unified_buffer_metric.write_bytes.update(
+                static_cast<int64_t>(snapshot.write_bytes));
+            metrics_->unified_buffer_metric.total_bytes.update(
+                static_cast<int64_t>(snapshot.total_bytes));
+            metrics_->unified_buffer_metric.peak_total_bytes.update(
+                static_cast<int64_t>(snapshot.peak_total_bytes));
+            metrics_->unified_buffer_metric.write_backlog.update(
+                static_cast<int64_t>(write_backlog));
+        }
+        if (!dfs_read_trace_enabled()) continue;
+        LOG(INFO) << "action=dfs_unified_buffer_usage scope=process"
+                  << " unified_capacity_bytes=" << unified_buffer_capacity_
+                  << " read_bytes=" << snapshot.read_bytes
+                  << " prefetch_bytes=" << snapshot.prefetch_bytes
+                  << " write_bytes=" << snapshot.write_bytes
+                  << " total_bytes=" << snapshot.total_bytes
+                  << " read_utilization=" << std::fixed << std::setprecision(1)
+                  << utilization(snapshot.read_bytes) << "%"
+                  << " prefetch_utilization="
+                  << utilization(snapshot.prefetch_bytes) << "%"
+                  << " write_utilization=" << utilization(snapshot.write_bytes)
+                  << "% total_utilization=" << utilization(snapshot.total_bytes)
+                  << "% peak_total_bytes=" << snapshot.peak_total_bytes
+                  << " peak_total_utilization="
+                  << utilization(snapshot.peak_total_bytes) << "%"
+                  << " write_backlog=" << write_backlog;
+    }
+}
+
 void Client::SetDfsStorageBackend(
     std::shared_ptr<DistributedStorageBackend> backend) {
     if (backend && !master_dfs_root_dir_.empty()) {
         backend->SetDescriptorRootDir(master_dfs_root_dir_);
-    }
-    const bool bucket_backend =
-        backend && backend->GetAllocatorType() == DfsAllocatorType::BUCKET;
-    if (bucket_backend && dfs_write_chunk_size_ > 0 &&
-        dfs_write_arena_count_ > 0 && !dfs_write_staging_pool_) {
-        dfs_write_staging_pool_ = std::make_shared<DfsWriteStagingPool>(
-            dfs_write_chunk_size_, dfs_write_arena_count_);
-        LOG(INFO) << "Initialized DFS write staging arenas: count="
-                  << dfs_write_arena_count_ << ", size="
-                  << dfs_write_chunk_size_;
     }
     if (backend) {
         backend->SetBatchTimeoutFixedMs(GetDfsBatchTimeoutFixedMs());

@@ -60,6 +60,37 @@ TEST_F(ClientBufferTest, ZeroSizeAllocator) {
     EXPECT_FALSE(handle_opt.has_value());
 }
 
+TEST_F(ClientBufferTest, AllocationWaitIsWokenByRelease) {
+    auto allocator = ClientBufferAllocator::create(4096);
+    auto held = allocator->allocate_aligned(4096, 4096);
+    ASSERT_TRUE(held.has_value());
+
+    std::atomic<bool> allocated{false};
+    std::thread waiter([&] {
+        auto result = allocator->allocate_aligned_wait(
+            4096, 4096, DfsBufferUsageKind::kWrite,
+            std::chrono::seconds(2));
+        allocated.store(result.has_value());
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    held.reset();
+    waiter.join();
+    EXPECT_TRUE(allocated.load());
+}
+
+TEST_F(ClientBufferTest, AllocationWaitReportsTimeout) {
+    auto allocator = ClientBufferAllocator::create(4096);
+    auto held = allocator->allocate_aligned(4096, 4096);
+    ASSERT_TRUE(held.has_value());
+
+    bool timed_out = false;
+    auto result = allocator->allocate_aligned_wait(
+        4096, 4096, DfsBufferUsageKind::kWrite,
+        std::chrono::milliseconds::zero(), &timed_out);
+    EXPECT_FALSE(result.has_value());
+    EXPECT_TRUE(timed_out);
+}
+
 TEST_F(ClientBufferTest, ExternalBackingOutlivesAllocatorReference) {
     auto backing = std::make_shared<std::vector<char>>(16384);
     std::weak_ptr<std::vector<char>> backing_lifetime = backing;
