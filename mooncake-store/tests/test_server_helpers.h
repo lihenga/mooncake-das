@@ -34,7 +34,8 @@ class InProcMaster {
     InProcMaster() = default;
     ~InProcMaster() { Stop(); }
 
-    bool Start(InProcMasterConfig config) {
+    bool Start(InProcMasterConfig config,
+               std::optional<int64_t> processing_timeout_sec = std::nullopt) {
         try {
             // Choose ports if not provided.
             // Allocate all needed ports atomically to avoid collisions
@@ -134,6 +135,10 @@ class InProcMaster {
             wms_cfg.view_version = 0;
             // Use default client_live_ttl_sec to align with production defaults
             wms_cfg.enable_ha = false;
+            if (processing_timeout_sec) {
+                wms_cfg.put_start_release_timeout_sec = *processing_timeout_sec;
+                wms_cfg.put_start_discard_timeout_sec = 0;
+            }
             wms_cfg.http_port = static_cast<uint16_t>(http_metrics_port_);
             wms_cfg.cluster_id = DEFAULT_CLUSTER_ID;
             wms_cfg.root_fs_dir = config.root_fs_dir.has_value()

@@ -342,6 +342,14 @@ class PyClient {
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }
 
+    // Explicit DFS -> MEMORY promotion, independent of get sessions. Uses
+    // transient registered staging; never retains a prefetch object buffer.
+    virtual std::vector<int> batch_prefetch_to_memory(
+        const std::vector<std::string>& keys) {
+        return std::vector<int>(keys.size(), toInt(ErrorCode::INVALID_PARAMS));
+    }
+    virtual bool dfs_prefetch_to_memory_available() const { return false; }
+
     // Whether batch_get_session_prefetch() has a staging arena for DFS reads.
     virtual bool dfs_prefetch_arena_available() const { return false; }
 

@@ -3237,6 +3237,23 @@ PYBIND11_MODULE(store, m) {
             "Start get sessions and return each result with its selected "
             "source; expired queries return SESSION_START_LEASE_EXPIRED (-716).")
         .def(
+            "batch_prefetch_to_memory",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string>& keys) {
+                if (!self.is_client_initialized()) return std::vector<int>{};
+                py::gil_scoped_release release;
+                return self.store_->batch_prefetch_to_memory(keys);
+            },
+            py::arg("keys"),
+            "Promote DFS objects to shared MEMORY replicas without retaining "
+            "get sessions or a dedicated prefetch buffer. Returns per-key status.")
+        .def(
+            "dfs_prefetch_to_memory_available",
+            [](MooncakeStorePyWrapper &self) {
+                return self.is_client_initialized() &&
+                       self.store_->dfs_prefetch_to_memory_available();
+            })
+        .def(
             "batch_get_session_prefetch",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys) {

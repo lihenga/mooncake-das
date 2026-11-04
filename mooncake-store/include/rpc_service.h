@@ -257,6 +257,10 @@ class WrappedMasterService {
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
 
+    tl::expected<void, ErrorCode> RegisterDfsPrefetchTask(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, ReplicaID source_id);
+
     // Promotion-on-hit RPCs.
     tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
     PromotionObjectHeartbeat(const UUID& client_id);
