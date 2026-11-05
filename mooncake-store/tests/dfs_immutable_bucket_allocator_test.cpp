@@ -1387,7 +1387,10 @@ TEST(ImmutableBucketAllocatorTest,
     std::ofstream(tmp.file("bucket_000042.data")) << "orphan data";
     std::vector<std::string> old_files;
     for (const auto& entry : std::filesystem::directory_iterator(tmp.path())) {
-        old_files.push_back(entry.path().string());
+        if (entry.path().extension() == ".meta" ||
+            entry.path().extension() == ".data") {
+            old_files.push_back(entry.path().string());
+        }
     }
 
     config.bucket_recovery_enabled = false;
@@ -1425,6 +1428,7 @@ TEST(ImmutableBucketAllocatorTest,
     for (const auto& path : old_files) {
         EXPECT_FALSE(std::filesystem::exists(path)) << path;
     }
+    EXPECT_TRUE(std::filesystem::exists(tmp.file(kDfsRootMarkerFileName)));
 
     // A metadata-only ID also reserves its name without loading its payload.
     std::ofstream(tmp.file("bucket_000050.meta")) << "still not metadata";
