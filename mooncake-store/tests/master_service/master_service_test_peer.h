@@ -67,6 +67,8 @@ class MasterServiceTestPeer {
 
     void RunDfsEvictionForTesting();
 
+    void ProcessInvalidatedDfsBucketsForTesting();
+
     void ConfigureKvcsCapacityForTesting(
         std::unique_ptr<KvcsCapacityProvider> provider, bool eviction_enabled,
         double high_watermark, double low_watermark);

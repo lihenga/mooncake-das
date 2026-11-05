@@ -7861,7 +7861,7 @@ TEST_F(MasterServiceTest, DfsBucketMissingFileInvalidationIsNotEviction) {
             context.client_id, {{descriptor.shard_idx}}, TenantId::Default());
         ASSERT_EQ(present_report.size(), 1u);
         ASSERT_TRUE(present_report.front().has_value());
-        service.ProcessInvalidatedDfsBucketsForTesting();
+        MasterServiceTestPeer(service).ProcessInvalidatedDfsBucketsForTesting();
         const auto still_present =
             service.GetReplicaList("missing_file_key", TenantId::Default());
         ASSERT_TRUE(still_present.has_value());
@@ -7875,7 +7875,7 @@ TEST_F(MasterServiceTest, DfsBucketMissingFileInvalidationIsNotEviction) {
         ASSERT_EQ(queued.size(), 1u);
         ASSERT_TRUE(queued.front().has_value());
 
-        service.ProcessInvalidatedDfsBucketsForTesting();
+        MasterServiceTestPeer(service).ProcessInvalidatedDfsBucketsForTesting();
         const auto metrics_after = CaptureDfsBucketEvictionMetrics();
 
         for (size_t i = 0; i < 6; ++i) {

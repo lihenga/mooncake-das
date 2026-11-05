@@ -1,8 +1,10 @@
 # DAS extension boundaries
 
-The community comparison point is `b01664ce699fbd432e6721b4514ff6afac848451`,
-the PR #3732 backport inherited by this branch. Do not substitute the PR's
-original merge tree: it belongs to a different community history.
+The current community comparison point is official v0.3.14,
+`e1ea5d31bb5e46ff2df9f90e7c2fbaf52fcdee8c` (PR #4880). The merge also
+includes `v0.3.14_dev` through `b6fb061b`. The earlier split comparison point
+was the PR #3732 backport `b01664ce699fbd432e6721b4514ff6afac848451`; use
+that point only when comparing the pre-upgrade split.
 
 This branch keeps existing classes and public APIs. Independent DAS definitions
 live in separate translation units or support headers. Existing community
@@ -112,3 +114,24 @@ isolated target directory.
 
 A successful SHCA build does not validate CUDA, 3FS, other wheel variants,
 cross-node RDMA, real DFS deployment or model-serving performance.
+
+## v0.3.14 integration boundaries
+
+- Keep upstream namespace accessors and ObjectState as the only metadata owner.
+  DAS backfill state belongs to ObjectState; never restore the old shard tables.
+- ReadLayout types/methods are registered only in `store/das/read_bindings.cpp`
+  and `store/das/store_bindings.h`. L3's inline registrations must not be added
+  again in `store_py.cpp`. Python variant checking similarly has one owner in
+  `_variant_compat.py`, called from the canonical `python/mooncake/__init__.py`.
+- RPC registrations remain upstream's pooled registrations plus the seven DAS
+  endpoints; adding a second registration crashes Master startup.
+- `storage_backend_interface.cpp` owns backend-independent shared definitions;
+  master-only targets must not link a client/GPU implementation for these.
+- Synchronous eviction/invalidation test entry points belong to
+  `tests/master_service/master_service_test_peer.*`, outside the public Master API.
+- The variant script incorporates L3's multi-protocol/HyLink support while
+  retaining `USE_HYGON` for DAS scatter kernels and fake legacy HIP RPC for
+  DTK 26.04. New HyLink uses its separate community transport.
+- After updating packaging, parse TOML and check source/target membership:
+  conflict-free merges can duplicate `[tool.mooncake]`, ReadLayout sources,
+  test targets or Python registrations.

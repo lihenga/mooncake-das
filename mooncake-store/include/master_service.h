@@ -163,7 +163,6 @@ class MasterService {
         return bucket_allocator_.get() != nullptr;
     }
 
-    void ProcessInvalidatedDfsBucketsForTesting();
     WeightMetadataStore::Result<WeightResidencyOperation>
     StartWeightResidencyOperation(
         const StartWeightResidencyOperationRequest& request);

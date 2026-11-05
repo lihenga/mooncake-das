@@ -823,10 +823,6 @@ void MasterService::RefreshDfsMetrics() const {
                                                           false);
 }
 
-void MasterService::ProcessInvalidatedDfsBucketsForTesting() {
-    ProcessInvalidatedDfsBuckets();
-}
-
 tl::expected<int64_t, ErrorCode> MasterService::SetDfsMaxBucketCount(
     int64_t new_max_bucket_count) {
     if (!bucket_allocator_) {
