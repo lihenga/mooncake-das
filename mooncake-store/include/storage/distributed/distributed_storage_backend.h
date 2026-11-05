@@ -220,7 +220,8 @@ class DistributedStorageBackend
     // shard.mutex, which serializes all I/O on the shard, so no other thread
     // can be using the old descriptor concurrently. On failure the descriptor
     // is reset to -1 so a later GetOrOpenShard reinitializes it.
-    tl::expected<void, ErrorCode> ReopenShardLocked(ShardFile& shard);
+    tl::expected<void, ErrorCode> ReopenShardLocked(ShardFile& shard,
+                                                    bool read_only = false);
     tl::expected<int, ErrorCode> OpenBucket(
         const DistributedFSDescriptor& descriptor);
     bool UsesBucketAllocator() const;

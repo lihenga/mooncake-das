@@ -14,6 +14,7 @@
 #include "config/distributed_storage_config.h"
 #include "storage/distributed/fs_adapter.h"
 #include "storage/distributed/posix_fs_adapter.h"
+#include "storage/distributed/dfs_root_identity.h"
 #ifdef USE_3FS
 #include "storage/distributed/hf3fs_adapter.h"
 #endif
@@ -58,12 +59,11 @@ tl::expected<void, ErrorCode> ShardAllocator::Init(
     eviction_check_interval_ = config.eviction_check_interval;
 
     std::error_code ec;
-    std::filesystem::create_directories(mount_path_, ec);
-    if (ec) {
-        LOG(ERROR) << "Failed to create DFS mount path " << mount_path_ << ": "
-                   << ec.message();
+    const bool exists = std::filesystem::exists(mount_path_, ec);
+    if (ec) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    if (!exists) return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    if (!std::filesystem::is_directory(mount_path_, ec) || ec)
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-    }
 
     if (fs_adapter_) fs_adapter_->Shutdown();
     if (config.fs_adapter_type == "posix") {
@@ -87,6 +87,10 @@ tl::expected<void, ErrorCode> ShardAllocator::Init(
                    << ", error=" << adapter_init.error();
         return tl::make_unexpected(adapter_init.error());
     }
+
+    auto marker = EnsureDfsRootMarker(
+        *fs_adapter_, mount_path_ + "/" + kDfsRootMarkerFileName);
+    if (!marker) return marker;
 
     // Recover the capacity layout only. Allocation handles and key metadata
     // remain empty; snapshot/oplog recovery is deliberately still unsupported.

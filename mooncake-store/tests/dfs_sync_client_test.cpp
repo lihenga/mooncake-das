@@ -62,6 +62,7 @@ class DfsSyncClientTest : public ::testing::Test {
 
         SetEnv("MOONCAKE_ENABLE_DFS", "1");
         SetEnv("MOONCAKE_DFS_FS_ADAPTER", "posix");
+        SetEnv("MOONCAKE_DFS_ALLOCATOR_TYPE", "shard");
         SetEnv("MOONCAKE_DFS_ROOT_DIR", root_);
         SetEnv("MOONCAKE_DFS_SHARD_COUNT", "2");
         SetEnv("MOONCAKE_DFS_SHARD_CAPACITY",

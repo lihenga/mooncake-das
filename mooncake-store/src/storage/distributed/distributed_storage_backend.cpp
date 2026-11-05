@@ -402,19 +402,28 @@ DistributedStorageBackend::ValidateAndOpenShardFile(
 }
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::ReopenShardLocked(
-    ShardFile& shard) {
+    ShardFile& shard, bool read_only) {
     if (shard.path.empty()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     // Drop the stale descriptor first. The caller holds shard.mutex, which
     // serializes all I/O on this shard, so no other thread can be reading or
     // writing through the old fd while we close it.
+    if (shard.read_fd >= 0 && shard.read_fd != shard.fd) {
+        (void)fs_adapter_->CloseFile(shard.read_fd);
+    }
+    shard.read_fd = -1;
     if (shard.fd >= 0) {
-        if (shard.read_fd == shard.fd) shard.read_fd = -1;
         (void)fs_adapter_->CloseFile(shard.fd);
         shard.fd = -1;
     }
     auto fd = ValidateAndOpenShardFile(shard.path);
+    if (!fd && read_only) {
+        fd = fs_adapter_->OpenFileReadOnly(shard.path);
+        if (!fd) return tl::make_unexpected(fd.error());
+        shard.read_fd = *fd;
+        return {};
+    }
     if (!fd) return tl::make_unexpected(fd.error());
     shard.fd = *fd;
     if (shard.read_fd < 0) shard.read_fd = *fd;

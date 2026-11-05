@@ -1375,7 +1375,9 @@ DistributedStorageBackend::BatchWriteShard(
         requests.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     for (size_t i = 0; i < requests.size(); ++i) {
         const auto& request = requests[i];
-        auto target = ResolveTarget(request.descriptor, request.key);
+        if (!IsDfsDescriptorRangeValid(request.descriptor, distributed_config_))
+            continue;
+        auto target = GetOrOpenShard(request.descriptor);
         if (!target) {
             results[i] = tl::make_unexpected(target.error());
             continue;
@@ -1395,10 +1397,23 @@ DistributedStorageBackend::BatchWriteShard(
         }
         if (total == 0 || value_size != request.descriptor.object_size)
             continue;
-        std::lock_guard<std::mutex> lock(*target->mutex);
-        auto result = fs_adapter_->WriteAt(
-            target->fd, iovs.data(), static_cast<int>(iovs.size()),
-            static_cast<int64_t>(request.descriptor.offset));
+        auto& shard = **target;
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        auto perform = [&] {
+            return fs_adapter_->WriteAt(
+                shard.fd, iovs.data(), static_cast<int>(iovs.size()),
+                static_cast<int64_t>(request.descriptor.offset));
+        };
+        auto result = perform();
+        if ((!result || *result != total) && fs_adapter_->SupportsFdReopen() &&
+            (result || result.error() == ErrorCode::FILE_WRITE_FAIL)) {
+            auto reopened = ReopenShardLocked(shard);
+            if (!reopened) {
+                results[i] = tl::make_unexpected(reopened.error());
+                continue;
+            }
+            result = perform();
+        }
         if (!result)
             results[i] = tl::make_unexpected(result.error());
         else if (*result == total)
@@ -1416,7 +1431,9 @@ DistributedStorageBackend::BatchReadShard(
         requests.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     for (size_t i = 0; i < requests.size(); ++i) {
         const auto& request = requests[i];
-        auto target = ResolveTarget(request.descriptor, request.key, true);
+        if (!IsDfsDescriptorRangeValid(request.descriptor, distributed_config_))
+            continue;
+        auto target = GetOrOpenShard(request.descriptor, true);
         if (!target) {
             results[i] = tl::make_unexpected(target.error());
             continue;
@@ -1458,12 +1475,34 @@ DistributedStorageBackend::BatchReadShard(
             remaining -= size;
         }
 
-        std::lock_guard<std::mutex> lock(*target->mutex);
-        auto result = fs_adapter_->ReadAt(
-            target->fd, iovs.data(), static_cast<int>(iovs.size()),
-            static_cast<int64_t>(
-                request.descriptor.offset +
-                (request.range_read ? request.value_offset : 0)));
+        auto& shard = **target;
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        auto file_size = fs_adapter_->GetFileSize(shard.path);
+        if (!file_size ||
+            request.descriptor.offset > static_cast<uint64_t>(*file_size) ||
+            request.descriptor.object_size >
+                static_cast<uint64_t>(*file_size) - request.descriptor.offset) {
+            results[i] = tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            continue;
+        }
+        auto perform = [&] {
+            return fs_adapter_->ReadAt(
+                shard.read_fd, iovs.data(), static_cast<int>(iovs.size()),
+                static_cast<int64_t>(
+                    request.descriptor.offset +
+                    (request.range_read ? request.value_offset : 0)));
+        };
+        auto result = perform();
+        if ((!result || *result != requested_size) &&
+            fs_adapter_->SupportsFdReopen() &&
+            (result || result.error() == ErrorCode::FILE_READ_FAIL)) {
+            auto reopened = ReopenShardLocked(shard, true);
+            if (!reopened) {
+                results[i] = tl::make_unexpected(reopened.error());
+                continue;
+            }
+            result = perform();
+        }
         if (!result)
             results[i] = tl::make_unexpected(result.error());
         else if (*result == requested_size)

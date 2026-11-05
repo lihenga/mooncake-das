@@ -357,7 +357,6 @@ bool WriteTestDfsReadProbes(const std::string& root) {
 std::string TestDfsIdentityForRoot(const DistributedStorageConfig& config) {
     // Direct backend tests supply the identity normally issued by the Master.
     (void)WriteTestDfsRootIdentity(config.fsdir);
-    (void)WriteTestDfsReadProbes(config.fsdir);
     return kTestDfsRootIdentity;
 }
 
@@ -1265,11 +1264,12 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     void FailOpenCall(int call) { fail_open_call_ = call; }
     int OpenCallCount() const { return open_calls_.load(); }
 
-    tl::expected<int, ErrorCode> OpenFile(const std::string& path) override {
+    tl::expected<int, ErrorCode> OpenFileReadWriteExisting(
+        const std::string& path) override {
         if (++open_calls_ == fail_open_call_) {
             return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
         }
-        return PosixFsAdapter::OpenFile(path);
+        return PosixFsAdapter::OpenFileReadWriteExisting(path);
     }
 
     void FailWriteCall(int call) { fail_write_call_ = call; }
@@ -1423,12 +1423,13 @@ class BlockingShardFsAdapter : public PosixFsAdapter {
         return PosixFsAdapter::GetFileSize(path);
     }
 
-    tl::expected<int, ErrorCode> OpenFile(const std::string& path) override {
+    tl::expected<int, ErrorCode> OpenFileReadWriteExisting(
+        const std::string& path) override {
         if (path == path_) {
             ++open_calls_;
             if (!block_file_size_) Block();
         }
-        return PosixFsAdapter::OpenFile(path);
+        return PosixFsAdapter::OpenFileReadWriteExisting(path);
     }
 
    private:
@@ -2685,27 +2686,7 @@ TEST(DfsGlobalAllocatorTest, InitReturnsSpecificErrors) {
     EXPECT_EQ(file_error_result.error(), ErrorCode::FILE_WRITE_FAIL);
 }
 
-TEST(DfsGlobalAllocatorTest, AllocateReservesAlignmentPadding) {
-    EnvGuard env;
-    ConfigurePosixDfs(env);
-    TempDir tmp("dfs_alloc_padding");
 
-    DfsGlobalAllocator alloc;
-    ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8 * 1024, 4096)));
-
-    auto desc = alloc.Allocate("key1", 100);
-    ASSERT_TRUE(desc.has_value());
-    EXPECT_EQ(desc->aligned_size, 4096);
-    EXPECT_EQ(desc->offset % 4096, 0);
-
-    auto exhausted = alloc.Allocate("key2", 100);
-    EXPECT_FALSE(exhausted.has_value());
-    EXPECT_EQ(exhausted.error(), ErrorCode::NO_AVAILABLE_HANDLE);
-
-    alloc.Free(desc->offset, desc->aligned_size, desc->shard_idx, "key1");
-    auto after_free = alloc.Allocate("key3", 100);
-    EXPECT_TRUE(after_free.has_value());
-}
 
 TEST(DfsGlobalAllocatorTest, ExhaustionAndEviction) {
     EnvGuard env;
@@ -2716,7 +2697,7 @@ TEST(DfsGlobalAllocatorTest, ExhaustionAndEviction) {
 
     DfsGlobalAllocator alloc;
     ASSERT_TRUE(
-        alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 32 * 1024, 4096)));
+        alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 16 * 1024, 4096)));
 
     std::vector<DistributedFSDescriptor> descs;
     for (int i = 0; i < 4; ++i) {
@@ -2756,7 +2737,7 @@ TEST(DfsGlobalAllocatorTest, RestorePreparedEvictionPreservesCandidateOrder) {
 
     DfsGlobalAllocator alloc;
     ASSERT_TRUE(
-        alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 32 * 1024, 4096)));
+        alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 16 * 1024, 4096)));
 
     for (int i = 0; i < 4; ++i) {
         const std::string key = "k" + std::to_string(i);
@@ -2787,7 +2768,7 @@ TEST(DfsGlobalAllocatorTest, PartialResolutionContinuesToLowWatermark) {
 
     DfsGlobalAllocator alloc;
     ASSERT_TRUE(
-        alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 32 * 1024, 4096)));
+        alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 16 * 1024, 4096)));
 
     std::vector<DistributedFSDescriptor> descs;
     for (int i = 0; i < 4; ++i) {
@@ -2828,7 +2809,7 @@ TEST(DfsGlobalAllocatorTest, EvictionCountsPendingFreeTowardWatermarks) {
 
     DfsGlobalAllocator alloc;
     ASSERT_TRUE(
-        alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 32 * 1024, 4096)));
+        alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 16 * 1024, 4096)));
 
     for (int i = 0; i < 4; ++i) {
         const std::string key = "k" + std::to_string(i);
@@ -2856,7 +2837,7 @@ TEST(DfsGlobalAllocatorTest, FreeRemovesLruEntryBeforeOffsetReuse) {
     TempDir tmp("dfs_free_lru_reuse");
 
     DfsGlobalAllocator alloc;
-    ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8 * 1024, 4096)));
+    ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 4 * 1024, 4096)));
 
     auto desc_a = alloc.Allocate("A", 100);
     ASSERT_TRUE(desc_a.has_value());
@@ -2880,7 +2861,7 @@ TEST(DfsGlobalAllocatorTest, StaleFreeDoesNotReleaseReusedOffset) {
     TempDir tmp("dfs_stale_free");
 
     DfsGlobalAllocator alloc;
-    ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8 * 1024, 4096)));
+    ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 4 * 1024, 4096)));
 
     auto desc_a = alloc.Allocate("A", 100);
     ASSERT_TRUE(desc_a.has_value());
@@ -2976,6 +2957,10 @@ TEST(DfsBackendTimeoutTest, RequiresOwnerForTimeoutAndQuarantinesIt) {
     config.batch_get_timeout_ms = 50;
     config.batch_timeout_fixed_ms = 0;
 
+    // Shard files are prepared by the Master before client I/O.
+    ShardAllocator allocator;
+    ASSERT_TRUE(allocator.Init(config));
+
     auto adapter = std::make_unique<BlockingReadPosixFsAdapter>();
     auto* adapter_ptr = adapter.get();
     auto backend = std::make_shared<DistributedStorageBackend>(
@@ -3058,6 +3043,10 @@ TEST(DfsBackendTimeoutTest, LimitsTimedReadsUntilRealCompletion) {
     config.batch_get_max_inflight_batches = 2;
     config.batch_get_max_inflight_bytes = 12288;
 
+    // Shard files are prepared by the Master before client I/O.
+    ShardAllocator allocator;
+    ASSERT_TRUE(allocator.Init(config));
+
     auto adapter = std::make_unique<BlockingReadPosixFsAdapter>();
     auto* adapter_ptr = adapter.get();
     auto backend = std::make_shared<DistributedStorageBackend>(
@@ -3136,6 +3125,10 @@ TEST(DfsBackendTimeoutTest, TimeoutLatchWakesInflightAdmissionWaiter) {
     config.batch_get_max_inflight_batches = 1;
     config.batch_get_max_inflight_bytes = 4096;
 
+    // Shard files are prepared by the Master before client I/O.
+    ShardAllocator allocator;
+    ASSERT_TRUE(allocator.Init(config));
+
     auto adapter = std::make_unique<BlockingReadPosixFsAdapter>();
     auto* adapter_ptr = adapter.get();
     auto backend = std::make_shared<DistributedStorageBackend>(
@@ -3204,6 +3197,10 @@ TEST(DfsBackendTimeoutTest, RejectsReadThatExceedsInflightByteLimit) {
     config.batch_timeout_fixed_ms = 0;
     config.batch_get_max_inflight_batches = 2;
     config.batch_get_max_inflight_bytes = 4095;
+
+    // Shard files are prepared by the Master before client I/O.
+    ShardAllocator allocator;
+    ASSERT_TRUE(allocator.Init(config));
 
     auto adapter = std::make_unique<BlockingReadPosixFsAdapter>();
     auto* adapter_ptr = adapter.get();

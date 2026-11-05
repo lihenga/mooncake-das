@@ -230,6 +230,7 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", eviction_check_interval_seconds="
         << eviction_check_interval.count()
         << ", object_storage_config_path=" << object_storage_config_path;
+    oss << ", batch_timeout_fixed_ms=" << batch_timeout_fixed_ms;
     return oss.str();
 }
 
