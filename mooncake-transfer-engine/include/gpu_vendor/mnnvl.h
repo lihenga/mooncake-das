@@ -16,26 +16,34 @@
 
 #if defined(USE_HIP)
 #include <transport/hip_transport/hip_transport.h>
-#define allocateFabricMemory(size) \
-    mooncake::HipTransport::allocatePinnedLocalMemory(size)
-#define freeFabricMemory(addr) \
-    mooncake::HipTransport::freePinnedLocalMemory(addr)
+inline void* allocateFabricMemory(size_t size) {
+    return mooncake::HipTransport::allocatePinnedLocalMemory(size);
+}
+inline void freeFabricMemory(void* addr) {
+    mooncake::HipTransport::freePinnedLocalMemory(addr);
+}
 #elif defined(USE_UBSHMEM)
 #include <transport/ascend_transport/ubshmem_transport/ubshmem_transport.h>
-#define allocateFabricMemory(size) \
-    mooncake::UBShmemTransport::allocatePinnedLocalMemory(size)
-#define freeFabricMemory(addr) \
-    mooncake::UBShmemTransport::freePinnedLocalMemory(addr)
+inline void* allocateFabricMemory(size_t size) {
+    return mooncake::UBShmemTransport::allocatePinnedLocalMemory(size);
+}
+inline void freeFabricMemory(void* addr) {
+    mooncake::UBShmemTransport::freePinnedLocalMemory(addr);
+}
 #elif defined(USE_MUSA)
 #include <transport/musa_transport/musa_transport.h>
-#define allocateFabricMemory(size) \
-    mooncake::MusaTransport::allocatePinnedLocalMemory(size)
-#define freeFabricMemory(addr) \
-    mooncake::MusaTransport::freePinnedLocalMemory(addr)
+inline void* allocateFabricMemory(size_t size) {
+    return mooncake::MusaTransport::allocatePinnedLocalMemory(size);
+}
+inline void freeFabricMemory(void* addr) {
+    mooncake::MusaTransport::freePinnedLocalMemory(addr);
+}
 #else
 #include <transport/nvlink_transport/nvlink_transport.h>
-#define allocateFabricMemory(size) \
-    mooncake::NvlinkTransport::allocatePinnedLocalMemory(size)
-#define freeFabricMemory(addr) \
-    mooncake::NvlinkTransport::freePinnedLocalMemory(addr)
+inline void* allocateFabricMemory(size_t size) {
+    return mooncake::NvlinkTransport::allocatePinnedLocalMemory(size);
+}
+inline void freeFabricMemory(void* addr) {
+    mooncake::NvlinkTransport::freePinnedLocalMemory(addr);
+}
 #endif
