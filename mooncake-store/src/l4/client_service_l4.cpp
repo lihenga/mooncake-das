@@ -64,7 +64,6 @@
 #include "storage/distributed/dfs_io_timeout.h"
 #include "storage/distributed/distributed_storage_backend.h"
 
-
 namespace mooncake {
 
 using l4::AllAllocatedTransfersSucceeded;
@@ -292,8 +291,7 @@ bool IsValidServiceEndpoint(const std::string& endpoint) {
         }
     } else {
         const auto separator = endpoint.rfind(':');
-        if (separator == std::string::npos ||
-            endpoint.find(':') != separator) {
+        if (separator == std::string::npos || endpoint.find(':') != separator) {
             return false;
         }
         host = endpoint.substr(0, separator);
@@ -317,8 +315,6 @@ bool IsValidServiceEndpoint(const std::string& endpoint) {
 }
 
 }  // namespace
-
-
 
 void Client::ObserveL4Read(bool prefetch, bool success, uint64_t bytes,
                            double duration_seconds) {
@@ -387,8 +383,7 @@ void Client::RecordServiceReadFailure(ReplicaType replica_type) {
     }
 }
 
-void Client::RecordServiceDualWrite(bool memory_succeeded,
-                                    bool dfs_succeeded) {
+void Client::RecordServiceDualWrite(bool memory_succeeded, bool dfs_succeeded) {
     std::lock_guard<std::mutex> lock(service_metrics_mutex_);
     if (service_metrics_snapshot_.service_endpoint.empty()) return;
     if (memory_succeeded && dfs_succeeded) {
@@ -475,9 +470,8 @@ void Client::ExpireAsyncDfsWriteMetrics() {
 
 void Client::ServiceMetricsReporterLoop() {
     while (service_metrics_report_running_.load(std::memory_order_acquire)) {
-        for (int i = 0; i < 50 &&
-                        service_metrics_report_running_.load(
-                            std::memory_order_acquire);
+        for (int i = 0; i < 50 && service_metrics_report_running_.load(
+                                      std::memory_order_acquire);
              ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
@@ -600,8 +594,8 @@ bool Client::StageDfsWriteData(
                 device->SetContext(info.device_id);
                 if (!device->Copy(destination, slice.ptr, slice.size,
                                   device::CopyDirection::kDeviceToHost)) {
-                    LOG(ERROR) << "DFS D2H staging failed for key "
-                               << context.keys[i];
+                    LOG(ERROR)
+                        << "DFS D2H staging failed for key " << context.keys[i];
                     return false;
                 }
             } else {
@@ -621,10 +615,9 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
             context->keys[i], context->descriptors[i], context->slices[i]});
     }
 
-    // Every request gets a definite outcome: a missing or short result vector is
-    // treated as failure for the affected keys rather than silently ignored.
-    std::vector<ErrorCode> outcomes(requests.size(),
-                                    ErrorCode::INTERNAL_ERROR);
+    // Every request gets a definite outcome: a missing or short result vector
+    // is treated as failure for the affected keys rather than silently ignored.
+    std::vector<ErrorCode> outcomes(requests.size(), ErrorCode::INTERNAL_ERROR);
     const auto write_started = std::chrono::steady_clock::now();
     std::vector<tl::expected<void, ErrorCode>> results;
     try {
@@ -680,8 +673,7 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
     CompleteAsyncDfsWriteMetrics(context, outcomes);
 
     ObserveDirectIo("write", DirectStorageMetricSource(ReplicaType::DFS),
-                    all_succeeded, successful_bytes,
-                    write_duration_seconds);
+                    all_succeeded, successful_bytes, write_duration_seconds);
 
     // BatchWrite is synchronous: once it returns, neither the backend nor the
     // local request views use the staging bytes. Release the slot before the
@@ -731,8 +723,8 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
             }
             if (completion) break;
             // OBJECT_NOT_FOUND / INVALID_WRITE mean the object already moved on
-            // (removed, or replaced by a newer generation). Retrying cannot help
-            // and must not disturb the new state.
+            // (removed, or replaced by a newer generation). Retrying cannot
+            // help and must not disturb the new state.
             const auto error = completion.error();
             if (error == ErrorCode::OBJECT_NOT_FOUND ||
                 error == ErrorCode::INVALID_WRITE ||
@@ -741,11 +733,12 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
             }
         }
         if (!completion) {
-            LOG(ERROR) << "Failed to finalize async DFS write for key " << key
-                       << " (" << (succeeded ? "PutEnd" : "PutRevoke")
-                       << "), error=" << toString(completion.error())
-                       << "; the master will reclaim the PROCESSING replica via "
-                          "its put-start timeout";
+            LOG(ERROR)
+                << "Failed to finalize async DFS write for key " << key << " ("
+                << (succeeded ? "PutEnd" : "PutRevoke")
+                << "), error=" << toString(completion.error())
+                << "; the master will reclaim the PROCESSING replica via "
+                   "its put-start timeout";
         }
     }
 }
@@ -758,10 +751,10 @@ void Client::DrainAsyncDfsWrites() {
     dfs_inflight_cv_.wait(lock, [this] { return dfs_inflight_writes_ == 0; });
 }
 
-tl::expected<DfsBucketSnapshotResponse, ErrorCode>
-Client::GetDfsBucketSnapshot(const UUID& last_epoch, uint64_t last_version) {
+tl::expected<DfsBucketSnapshotResponse, ErrorCode> Client::GetDfsBucketSnapshot(
+    const UUID& last_epoch, uint64_t last_version) {
     return master_client_.GetDfsBucketSnapshot(client_id_, last_epoch,
-                                                last_version);
+                                               last_version);
 }
 
 void Client::SetDfsWriteChunkSize(size_t chunk_size) {
@@ -788,18 +781,16 @@ void Client::SetUnifiedDfsBuffer(
 void Client::LogUnifiedDfsBufferUsage() {
     std::unique_lock<std::mutex> lock(unified_buffer_log_mutex_);
     while (unified_buffer_log_running_.load(std::memory_order_acquire)) {
-        unified_buffer_log_cv_.wait_for(
-            lock, std::chrono::seconds(5), [this] {
-                return !unified_buffer_log_running_.load(
-                    std::memory_order_acquire);
-            });
+        unified_buffer_log_cv_.wait_for(lock, std::chrono::seconds(5), [this] {
+            return !unified_buffer_log_running_.load(std::memory_order_acquire);
+        });
         if (!unified_buffer_log_running_.load(std::memory_order_acquire)) {
             break;
         }
         const auto allocator = unified_buffer_allocator_;
         const auto tracker = allocator ? allocator->usage_tracker() : nullptr;
-        const auto snapshot = tracker ? tracker->Snapshot()
-                                      : DfsBufferUsageSnapshot{};
+        const auto snapshot =
+            tracker ? tracker->Snapshot() : DfsBufferUsageSnapshot{};
         const double capacity = static_cast<double>(unified_buffer_capacity_);
         const auto utilization = [capacity](uint64_t bytes) {
             return capacity == 0.0 ? 0.0 : bytes * 100.0 / capacity;

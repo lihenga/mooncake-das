@@ -14,16 +14,60 @@
 #include "mutex.h"
 #include "rpc_service.h"
 #include "types.h"
-#include "utils/scoped_vlog_timer.h"
+#include "common/scoped_vlog_timer.h"
 #include "master_metric_manager.h"
 #include "version.h"
 
 namespace mooncake {
 
 MasterClient::~MasterClient() {
+    // Never release the pool under a suspended request coroutine (#3909).
+    // 30s is generous: every request carries its own RPC timeout.
     if (!rpc_drain_.drain_for(std::chrono::seconds(30))) {
-        LOG(ERROR) << "MasterClient teardown: RPCs still in flight after 30s";
+        LOG(ERROR) << "MasterClient teardown: RPCs still in flight after "
+                      "30s drain; releasing the pool regardless";
     }
+}
+
+#define DEFINE_WEIGHT_CLIENT_METHOD(method, request_type, result_type)       \
+    WeightRpcResult<result_type> MasterClient::method(                       \
+        const request_type& request) {                                       \
+        return invoke_rpc<&WrappedMasterService::method,                     \
+                          tl::expected<result_type, WeightManagementError>>( \
+            request, tenant_id_.value());                                    \
+    }
+
+DEFINE_WEIGHT_CLIENT_METHOD(BeginWeightImport, BeginWeightImportRequest,
+                            WeightRevisionMetadata)
+DEFINE_WEIGHT_CLIENT_METHOD(CommitWeightImport, CommitWeightImportRequest,
+                            WeightRevisionMetadata)
+DEFINE_WEIGHT_CLIENT_METHOD(AbortWeightImport, AbortWeightImportRequest,
+                            WeightRevisionMetadata)
+DEFINE_WEIGHT_CLIENT_METHOD(GetWeightRevision, GetWeightRevisionRequest,
+                            WeightRevisionView)
+DEFINE_WEIGHT_CLIENT_METHOD(ListWeightRevisions, ListWeightRevisionsRequest,
+                            ListWeightRevisionsResponse)
+DEFINE_WEIGHT_CLIENT_METHOD(AcquireWeightRevisionLease,
+                            AcquireWeightRevisionLeaseRequest,
+                            WeightRevisionLease)
+DEFINE_WEIGHT_CLIENT_METHOD(RenewWeightRevisionLease,
+                            RenewWeightRevisionLeaseRequest,
+                            WeightRevisionLease)
+DEFINE_WEIGHT_CLIENT_METHOD(StartWeightResidencyOperation,
+                            StartWeightResidencyOperationRequest,
+                            WeightResidencyOperation)
+DEFINE_WEIGHT_CLIENT_METHOD(QueryWeightOperation, QueryWeightOperationRequest,
+                            WeightResidencyOperation)
+DEFINE_WEIGHT_CLIENT_METHOD(DeleteWeightRevision, DeleteWeightRevisionRequest,
+                            WeightRevisionMetadata)
+
+#undef DEFINE_WEIGHT_CLIENT_METHOD
+
+WeightRpcResult<void> MasterClient::ReleaseWeightRevisionLease(
+    const ReleaseWeightRevisionLeaseRequest& request) {
+    return invoke_rpc<&WrappedMasterService::ReleaseWeightRevisionLease,
+                      tl::expected<void, WeightManagementError>>(
+        request, tenant_id_.value());
 }
 
 ErrorCode MasterClient::Connect(const std::string& master_addr) {
@@ -91,6 +135,29 @@ std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
     return result;
 }
 
+tl::expected<bool, ErrorCode> MasterClient::ProbeKey(
+    const std::string& object_key) {
+    ScopedVLogTimer timer(1, "MasterClient::ProbeKey");
+    timer.LogRequest("object_key=", object_key);
+
+    auto result = invoke_rpc<&WrappedMasterService::ProbeKey, bool>(
+        object_key, tenant_id_.value());
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchProbeKey(
+    const std::vector<std::string>& object_keys,
+    const GrantLeasePolicy& policy) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchProbeKey");
+    timer.LogRequest("keys_count=", object_keys.size());
+
+    auto result = invoke_batch_rpc<&WrappedMasterService::BatchProbeKey, bool>(
+        object_keys.size(), policy, object_keys, tenant_id_.value());
+    timer.LogResponse("result=", result.size(), " keys");
+    return result;
+}
+
 tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
 MasterClient::CalcCacheStats() {
     return invoke_rpc<&WrappedMasterService::CalcCacheStats,
@@ -122,8 +189,8 @@ MasterClient::BatchReplicaClear(const std::vector<std::string>& object_keys,
                      ", client_id=", client_id,
                      ", segment_name=", segment_name);
     auto result = invoke_rpc<&WrappedMasterService::BatchReplicaClear,
-                             std::vector<std::string>>(object_keys, client_id,
-                                                       segment_name);
+                             std::vector<std::string>>(
+        object_keys, client_id, segment_name, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }
@@ -174,6 +241,44 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys,
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaList,
                                    GetReplicaListResponse>(
         object_keys.size(), object_keys, tenant_id);
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
+tl::expected<GetReplicaListResponse, ErrorCode>
+MasterClient::GetReplicaListReadOnly(const std::string& object_key) {
+    return GetReplicaListReadOnly(object_key, tenant_id_.value());
+}
+
+tl::expected<GetReplicaListResponse, ErrorCode>
+MasterClient::GetReplicaListReadOnly(const std::string& object_key,
+                                     const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "MasterClient::GetReplicaListReadOnly");
+    timer.LogRequest("object_key=", object_key, ", tenant_id=", tenant_id);
+
+    auto result = invoke_rpc<&WrappedMasterService::GetReplicaListForAdmin,
+                             GetReplicaListResponse>(object_key, tenant_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterClient::BatchGetReplicaListReadOnly(
+    const std::vector<std::string>& object_keys) {
+    return BatchGetReplicaListReadOnly(object_keys, tenant_id_.value());
+}
+
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterClient::BatchGetReplicaListReadOnly(
+    const std::vector<std::string>& object_keys, const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchGetReplicaListReadOnly");
+    timer.LogRequest("keys_count=", object_keys.size(),
+                     ", tenant_id=", tenant_id);
+
+    auto result =
+        invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaListForAdmin,
+                         GetReplicaListResponse>(object_keys.size(),
+                                                 object_keys, tenant_id);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -722,6 +827,17 @@ tl::expected<void, ErrorCode> MasterClient::NotifyPromotionSuccess(
     return NotifyPromotionSuccess(client_id, key, tenant_id_.value());
 }
 
+tl::expected<void, ErrorCode> MasterClient::RegisterPrefetchTask(
+    const UUID& client_id, const std::string& key,
+    const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "MasterClient::RegisterPrefetchTask");
+    timer.LogRequest("client_id=", client_id, ", key=", key);
+    auto result = invoke_rpc<&WrappedMasterService::RegisterPrefetchTask, void>(
+        client_id, key, tenant_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<void, ErrorCode> MasterClient::NotifyPromotionSuccess(
     const UUID& client_id, const std::string& key,
     const std::string& tenant_id) {
@@ -953,6 +1069,21 @@ tl::expected<void, ErrorCode> MasterClient::EvictDiskReplica(
 
     auto result = invoke_rpc<&WrappedMasterService::EvictDiskReplica, void>(
         client_id_, key, tenant_id, replica_type);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<bool, ErrorCode> MasterClient::EvictDiskReplicaIfCurrent(
+    const std::string& key, const std::string& tenant_id,
+    ReplicaType replica_type, ReplicaID expected_replica_id) {
+    ScopedVLogTimer timer(1, "MasterClient::EvictDiskReplicaIfCurrent");
+    timer.LogRequest("key=", key, ", tenant_id=", tenant_id,
+                     ", replica_type=", replica_type,
+                     ", expected_replica_id=", expected_replica_id);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::EvictDiskReplicaIfCurrent, bool>(
+            client_id_, key, tenant_id, replica_type, expected_replica_id);
     timer.LogResponseExpected(result);
     return result;
 }

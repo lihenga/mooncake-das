@@ -43,34 +43,27 @@
 #ifdef USE_HTTP
 #include "transfer_metadata_plugin.h"
 #endif
-#ifdef USE_NOF
-#include "spdk/spdk_wrapper.h"
-#endif
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
 #include "ha/kv/etcd_ha_kv_backend.h"
 #endif
 #include "ha/oplog/oplog_batch_storage.h"
 #include "ha/oplog/ordered_oplog_writer.h"
-#include "ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.h"
-#include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
-#include "ha/snapshot/snapshot_constants.h"
 #include "types.h"
-#include "serialize/serializer.h"
 #include "ha/snapshot/snapshot_logger.h"
-#include "utils/zstd_util.h"
-#include "utils/file_util.h"
+#include "common/zstd_util.h"
+#include "common/file_util.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
-#include "storage/distributed/dfs_global_allocator.h"
+#include "storage/distributed/shard_allocator.h"
+#include "storage/distributed/kvcs/kvcs_capacity_provider.h"
+#include "storage/distributed/kvcs/kvcs_efc_target.h"
 #include "storage/distributed/dfs_root_identity.h"
 #include "storage/distributed/dfs_read_probe.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "random.h"
 #include "utils.h"
 #include "kv_event/kv_event_config.h"
-#include "master_snapshot_manager.h"
-#include "master_snapshot_repository.h"
 #include "ha_metric_manager.h"
 #include "metadata_store.h"
 
@@ -92,10 +85,10 @@ DfsRootFileStatus ReadExpectedDfsRootFile(const std::string& path,
     const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) {
         return errno == ENOENT ? DfsRootFileStatus::kMissing
-                              : DfsRootFileStatus::kIoError;
+                               : DfsRootFileStatus::kIoError;
     }
 
-    struct stat st {};
+    struct stat st{};
     bool valid = ::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
                  static_cast<uint64_t>(st.st_size) == expected.size();
     std::string contents;
@@ -122,17 +115,19 @@ DfsRootFileStatus ReadExpectedDfsRootFile(const std::string& path,
 }
 
 bool ReadDfsRootIdentity(const std::string& marker_path,
-                         const std::string& cluster_id,
-                         std::string& identity, bool& missing) {
+                         const std::string& cluster_id, std::string& identity,
+                         bool& missing) {
     missing = false;
-    const int fd = ::open(marker_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    const int fd =
+        ::open(marker_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) {
         missing = errno == ENOENT;
         return false;
     }
 
-    struct stat st {};
-    bool valid = ::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0 &&
+    struct stat st{};
+    bool valid = ::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+                 st.st_size > 0 &&
                  static_cast<uint64_t>(st.st_size) <= kMaxDfsRootIdentitySize;
     std::string contents;
     if (valid) {
@@ -166,14 +161,13 @@ bool SyncDfsRootDirectory(const std::string& root) {
     const int result = ::fsync(fd);
     const int saved_errno = errno;
     ::close(fd);
-    return result == 0 || saved_errno == EINVAL ||
-           saved_errno == EOPNOTSUPP;
+    return result == 0 || saved_errno == EINVAL || saved_errno == EOPNOTSUPP;
 }
 
 bool EnsureDfsReadProbeDirectory(const std::string& root,
                                  std::string_view directory_name) {
     const std::string path = root + "/" + std::string(directory_name);
-    struct stat st {};
+    struct stat st{};
     if (::lstat(path.c_str(), &st) == 0) return S_ISDIR(st.st_mode);
     if (errno != ENOENT) return false;
 
@@ -202,13 +196,11 @@ bool PublishExpectedDfsRootFile(const std::string& root,
                                 const std::string& path,
                                 const std::string& contents) {
     const UUID suffix = generate_uuid();
-    const std::string temp_path =
-        path + "." + std::to_string(::getpid()) + "." +
-        UuidToString(suffix) + ".tmp";
-    const int temp_fd = ::open(temp_path.c_str(),
-                               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC |
-                                   O_NOFOLLOW,
-                               0644);
+    const std::string temp_path = path + "." + std::to_string(::getpid()) +
+                                  "." + UuidToString(suffix) + ".tmp";
+    const int temp_fd =
+        ::open(temp_path.c_str(),
+               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0644);
     if (temp_fd < 0) {
         static DfsLogLimiter log_limiter;
         if (auto suppressed = log_limiter.ShouldLog()) {
@@ -249,8 +241,7 @@ bool PublishExpectedDfsRootFile(const std::string& root,
 
     // EEXIST means another writer won the race, not that it published the
     // expected bytes. Re-read in both cases before declaring success.
-    if (ReadExpectedDfsRootFile(path, contents) !=
-        DfsRootFileStatus::kMatch) {
+    if (ReadExpectedDfsRootFile(path, contents) != DfsRootFileStatus::kMatch) {
         return false;
     }
     if (!SyncDfsRootDirectory(root)) {
@@ -278,12 +269,12 @@ bool EnsureDfsRootIdentity(const std::string& root,
         return false;
     }
     if (!IsValidClusterIdComponent(cluster_id)) {
-        LOG(ERROR) << "Invalid cluster id for DFS root identity: " << cluster_id;
+        LOG(ERROR) << "Invalid cluster id for DFS root identity: "
+                   << cluster_id;
         return false;
     }
 
-    const std::string marker_path =
-        root + "/" + kDfsRootIdentityFileName;
+    const std::string marker_path = root + "/" + kDfsRootIdentityFileName;
     bool missing = false;
     if (ReadDfsRootIdentity(marker_path, cluster_id, identity, missing)) {
         return true;
@@ -339,12 +330,12 @@ bool EnsureDfsRootIdentity(const std::string& root,
 
 bool ProbeDfsRootWritable(const std::string& root, std::string& error) {
     constexpr size_t kProbeSize = 4096;
-    const std::string path =
-        root + "/.mooncake_dfs_init_probe." + std::to_string(::getpid()) +
-        "." + UuidToString(generate_uuid());
-    const int fd = ::open(
-        path.c_str(),
-        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    const std::string path = root + "/.mooncake_dfs_init_probe." +
+                             std::to_string(::getpid()) + "." +
+                             UuidToString(generate_uuid());
+    const int fd =
+        ::open(path.c_str(),
+               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0) {
         error = "create " + path + ": " + std::strerror(errno);
         return false;
@@ -377,8 +368,8 @@ bool ProbeDfsRootWritable(const std::string& root, std::string& error) {
     if (failure_errno != 0) {
         // Best-effort cleanup also covers write/fsync failures.
         ::unlink(path.c_str());
-        error = "write/sync/remove " + path + ": " +
-                std::strerror(failure_errno);
+        error =
+            "write/sync/remove " + path + ": " + std::strerror(failure_errno);
         return false;
     }
     return true;
@@ -410,8 +401,6 @@ void MasterService::DfsAllocatorRetryThreadFunc() {
             MasterServiceConfig retry_config;
             // The runtime snapshot policy is fixed at construction. Retry the
             // same configured allocator against the current DFS environment.
-            retry_config.enable_snapshot = !dfs_restore_from_bucket_metadata_;
-            retry_config.enable_snapshot_restore = false;
             const DfsInitResult result =
                 InitDfsAllocatorFromEnvironment(retry_config);
             if (result != DfsInitResult::kRetryableFailure) break;
@@ -429,7 +418,7 @@ void MasterService::DfsAllocatorRetryThreadFunc() {
 
 bool MasterService::InitializeDfsRootGuard(const std::string& root,
                                            const std::string& identity) {
-    struct stat st {};
+    struct stat st{};
     if (::stat(root.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
         return false;
     }
@@ -441,8 +430,7 @@ bool MasterService::InitializeDfsRootGuard(const std::string& root,
     }
     for (size_t probe_index = 0;
          probe_index < kDfsReadProbeDirectoryNames.size(); ++probe_index) {
-        const auto directory_name =
-            kDfsReadProbeDirectoryNames[probe_index];
+        const auto directory_name = kDfsReadProbeDirectoryNames[probe_index];
         if (!EnsureDfsReadProbeDirectory(root, directory_name)) return false;
         const std::string probe_directory =
             root + "/" + std::string(directory_name);
@@ -475,39 +463,31 @@ bool MasterService::InitializeDfsRootGuard(const std::string& root,
 
 size_t MasterService::DropDfsReplicasAfterRootReplacement() {
     size_t removed_replicas = 0;
-    for (size_t shard_index = 0; shard_index < kNumShards; ++shard_index) {
-        MetadataShardAccessorRW shard(this, shard_index);
-        for (auto& [tenant_id, tenant_state] : shard->tenants) {
-            for (auto it = tenant_state.metadata.begin();
-                 it != tenant_state.metadata.end();) {
-                auto& metadata = it->second;
-                const size_t removed = EraseReplicasWithCacheTotalAccounting(
-                    metadata, [](const Replica& replica) {
-                        return replica.is_dfs_replica();
-                    });
-                if (removed == 0) {
-                    ++it;
-                    continue;
-                }
-                removed_replicas += removed;
-                const std::string key = it->first;
-                if (!metadata.IsValid()) {
-                    PublishKvRemoved(key, metadata, tenant_id);
-                    it = EraseMetadata(tenant_state, it, tenant_id,
-                                       QuotaEraseMode::kFull, &shard);
-                    continue;
-                }
-                if (metadata.HasReplica([](const Replica& replica) {
-                        return replica.is_memory_replica() &&
-                               replica.is_completed() &&
-                               !replica.has_invalid_mem_handle();
-                    })) {
-                    tenant_state.dfs_backfill[key] = {};
-                }
-                ++it;
+    VisitNamespaces([&](const TenantId& tenant_id, metadata::Namespace& ns) {
+        std::vector<route::ObjectRef> refs;
+        for (auto object : ns.objects.ReadCursor())
+            refs.push_back(object.ref());
+        for (const auto& ref : refs) {
+            MetadataAccessorRW accessor(this, tenant_id, ref);
+            if (!accessor.IsPublished()) continue;
+            auto& metadata = accessor.Get();
+            const auto removed = EraseReplicasWithCacheTotalAccounting(
+                metadata, &Replica::fn_is_dfs_replica);
+            if (removed == 0) continue;
+            removed_replicas += removed;
+            PublishKvRemovedAfterEvict(ref.key, removed, "disk", metadata,
+                                       tenant_id);
+            if (!metadata.IsValid()) {
+                accessor.Erase();
+            } else if (metadata.HasReplica([](const Replica& replica) {
+                           return replica.is_memory_replica() &&
+                                  replica.is_completed() &&
+                                  !replica.has_invalid_mem_handle();
+                       })) {
+                accessor.GetState().dfs_backfill.emplace();
             }
         }
-    }
+    });
     return removed_replicas;
 }
 
@@ -525,7 +505,7 @@ bool MasterService::RecoverDfsRootAfterReplacement(
     } recovery_flag_reset{dfs_root_recovery_in_progress_};
 
     // Everything through allocator construction and guard publication is
-    // deliberately outside snapshot_mutex_. DFS publication is gated by
+    // deliberately outside master_state_mutex_. DFS publication is gated by
     // dfs_root_recovery_in_progress_, while L3-only metadata requests remain
     // available throughout slow DFS inspection and bucket creation.
     const std::string identity_path = root + "/" + kDfsRootIdentityFileName;
@@ -597,19 +577,18 @@ bool MasterService::RecoverDfsRootAfterReplacement(
                     continue;
                 }
                 root_lost_data = true;
-                LOG(WARNING) << "Replacement DFS root is missing bucket "
-                             << bucket_id
-                             << "; treating the old storage generation as "
-                                "lost, root="
-                             << root;
+                LOG(WARNING)
+                    << "Replacement DFS root is missing bucket " << bucket_id
+                    << "; treating the old storage generation as "
+                       "lost, root="
+                    << root;
                 break;
             }
         }
     }
     {
         std::lock_guard lock(dfs_root_guard_mutex_);
-        root_lost_data =
-            root_lost_data || dfs_root_replacement_lost_data_;
+        root_lost_data = root_lost_data || dfs_root_replacement_lost_data_;
         dfs_root_replacement_lost_data_ = root_lost_data;
     }
     if (identity_status == DfsRootFileStatus::kMissing &&
@@ -628,8 +607,7 @@ bool MasterService::RecoverDfsRootAfterReplacement(
             return false;
         }
         auto config = DistributedStorageConfig::FromEnvironment();
-        if (config.allocator_type != DfsAllocatorType::BUCKET ||
-            config.fsdir != root) {
+        if (config.allocator_type != "bucket" || config.fsdir != root) {
             LOG(ERROR) << "DFS configuration changed during root recovery, "
                           "root="
                        << root << ", config={" << config.FormatStr() << "}";
@@ -669,7 +647,7 @@ bool MasterService::RecoverDfsRootAfterReplacement(
         // The commit barrier excludes metadata requests only while DFS replicas
         // are removed and the fully initialized allocator generation is
         // published. No DFS filesystem I/O or bucket creation occurs here.
-        std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+        std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
         if (root_lost_data) {
             removed_replicas = DropDfsReplicasAfterRootReplacement();
 
@@ -712,7 +690,7 @@ void MasterService::ReconcileDfsRootFiles() {
         recovery_needed = dfs_root_recovery_needed_;
     }
 
-    struct stat st {};
+    struct stat st{};
     const int injected_stat_error =
         dfs_root_stat_error_for_testing_.load(std::memory_order_acquire);
     int stat_result = 0;
@@ -749,8 +727,7 @@ void MasterService::ReconcileDfsRootFiles() {
         if (auto suppressed = mount_log_limiter.ShouldLog()) {
             LOG(ERROR) << "DFS root is unavailable; waiting for recovery, "
                           "root="
-                       << root
-                       << ", suppressed=" << *suppressed;
+                       << root << ", suppressed=" << *suppressed;
         }
         return;
     }
@@ -814,16 +791,15 @@ void MasterService::ReconcileDfsRootFiles() {
     if (!reconcile(root, kDfsRootIdentityFileName, identity)) {
         return;
     }
-    reconcile(root, kDfsRootMarkerFileName,
-              std::string(kDfsRootMarkerPayload,
-                          sizeof(kDfsRootMarkerPayload) - 1));
+    reconcile(
+        root, kDfsRootMarkerFileName,
+        std::string(kDfsRootMarkerPayload, sizeof(kDfsRootMarkerPayload) - 1));
     for (size_t probe_index = 0;
          probe_index < kDfsReadProbeDirectoryNames.size(); ++probe_index) {
-        const auto directory_name =
-            kDfsReadProbeDirectoryNames[probe_index];
+        const auto directory_name = kDfsReadProbeDirectoryNames[probe_index];
         if (!EnsureDfsReadProbeDirectory(root, directory_name)) {
-            LOG(ERROR) << "Failed to create DFS read-probe directory "
-                       << root << "/" << directory_name;
+            LOG(ERROR) << "Failed to create DFS read-probe directory " << root
+                       << "/" << directory_name;
             continue;
         }
         const std::string probe_directory =
@@ -844,7 +820,7 @@ void MasterService::RefreshDfsMetrics() const {
     // shard_count * shard_capacity and BUCKET uses max_bucket_count *
     // bucket_capacity.  Do not reuse the legacy root-fs/global-file flag.
     MasterMetricManager::instance().set_dfs_storage_usage(capacity, used,
-                                                           false);
+                                                          false);
 }
 
 void MasterService::ProcessInvalidatedDfsBucketsForTesting() {
@@ -864,8 +840,8 @@ tl::expected<uint32_t, ErrorCode> MasterService::SetDfsHeartbeatInterval(
     if (new_interval_seconds == 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return dfs_heartbeat_interval_seconds_.exchange(
-        new_interval_seconds, std::memory_order_acq_rel);
+    return dfs_heartbeat_interval_seconds_.exchange(new_interval_seconds,
+                                                    std::memory_order_acq_rel);
 }
 
 uint64_t MasterService::SetDfsBatchTimeoutFixedMs(uint64_t new_timeout_ms) {
@@ -885,14 +861,14 @@ tl::expected<uint8_t, ErrorCode> MasterService::SetDfsFilterMode(
         dfs_filter_mode_.exchange(new_filter_mode, std::memory_order_acq_rel);
     LOG(INFO) << "action=set_dfs_filter_mode, old_value="
               << static_cast<unsigned int>(old_value)
-              << ", new_value="
-              << static_cast<unsigned int>(new_filter_mode);
+              << ", new_value=" << static_cast<unsigned int>(new_filter_mode);
     return old_value;
 }
 
 bool MasterService::IsReplicaReadableForGet(const Replica& replica) const {
-    if (!replica.is_completed() || replica.is_eviction_pending() ||
-        replica.has_invalid_mem_handle() || replica.has_invalid_nof_handle()) {
+    if (!replica.is_completed() || !replica.is_available() ||
+        replica.is_eviction_pending() || replica.has_invalid_mem_handle() ||
+        replica.has_invalid_nof_handle()) {
         return false;
     }
     // Get may read DFS replicas while the existence filter is enabled, but a
@@ -964,9 +940,9 @@ MasterService::ReserveDfsSpaceForBatch(
 
     for (auto& result : results) {
         if (!result.success) continue;
-        reservations.emplace(
-            result.key,
-            DfsBatchReservation{std::move(result.descriptor), source_allocator});
+        reservations.emplace(result.key,
+                             DfsBatchReservation{std::move(result.descriptor),
+                                                 source_allocator});
     }
     return reservations;
 }
@@ -997,7 +973,8 @@ MasterService::BatchInvalidateDfsBuckets(
     for (const auto& report : reports) {
         if (report.bucket_id < 0 ||
             !bucket_allocator_->HasBucket(report.bucket_id)) {
-            results.emplace_back(tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
             continue;
         }
         const auto file_present = IsDfsBucketDataFilePresent(report.bucket_id);
@@ -1009,8 +986,7 @@ MasterService::BatchInvalidateDfsBuckets(
         }
         if (*file_present) {
             LOG(INFO) << "Ignoring DFS bucket invalidation report for bucket "
-                      << report.bucket_id
-                      << ": master data file is present";
+                      << report.bucket_id << ": master data file is present";
             results.emplace_back();
             continue;
         }
@@ -1059,17 +1035,21 @@ void MasterService::ProcessInvalidatedDfsBuckets() {
 tl::expected<CopyStartResponse, ErrorCode> MasterService::DfsBackfillStart(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
     const std::string& src_segment, const UUID& task_id) {
+    const auto record = FindClientRecord(client_id);
+    auto retaining_guard =
+        record ? record->TryAcquireRetainingGuard() : std::nullopt;
+    if (!retaining_guard)
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     auto tenant = ResolveTenantIdForWrite(tenant_id);
     if (!tenant) return tl::make_unexpected(tenant.error());
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     MetadataAccessorRW accessor(this, ObjectIdentity{*tenant, key});
     if (!accessor.Exists()) {
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
-    auto& state = accessor.GetTenantState();
-    auto candidate = state.dfs_backfill.find(key);
-    if (candidate == state.dfs_backfill.end() || task_id == UUID{} ||
-        candidate->second.task_id != task_id) {
+    auto& state = accessor.GetState();
+    auto& candidate = state.dfs_backfill;
+    if (!candidate || task_id == UUID{} || candidate->task_id != task_id) {
         return tl::make_unexpected(ErrorCode::INVALID_VERSION);
     }
     auto assignment = task_manager_.get_read_access().find_task_by_id(task_id);
@@ -1080,7 +1060,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::DfsBackfillStart(
     }
     auto& metadata = accessor.Get();
     if (accessor.InProcessing() || accessor.HasReplicationTask() ||
-        state.dynamic_replication_pending.contains(key)) {
+        bool(state.dynamic_replication_pending)) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     if (metadata.HasReplica(&Replica::is_dfs_replica)) {
@@ -1091,7 +1071,8 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::DfsBackfillStart(
     if (!source || !source->is_memory_replica() || !source->is_completed() ||
         source->has_invalid_mem_handle() ||
         segment_manager_.getSegmentAccess().GetClientIdBySegmentName(
-            src_segment, owner) != ErrorCode::OK || owner != client_id) {
+            src_segment, owner) != ErrorCode::OK ||
+        owner != client_id) {
         return tl::make_unexpected(ErrorCode::REPLICA_NOT_FOUND);
     }
     if ((dfs_filter_mode_.load(std::memory_order_acquire) & 1) != 0 ||
@@ -1101,106 +1082,64 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::DfsBackfillStart(
     if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
-    auto allocated = dfs_allocator_->Allocate(key, metadata.size);
+    auto allocated = dfs_allocator_->Allocate(key, metadata.TotalLength());
     if (!allocated) return tl::make_unexpected(allocated.error());
     std::vector<Replica> replicas;
     replicas.emplace_back(std::move(*allocated), ReplicaStatus::PROCESSING);
     CopyStartResponse response;
     response.source = source->get_descriptor();
     response.targets.push_back(replicas.front().get_descriptor());
-    state.replication_tasks.emplace(
-        key, ReplicationTask{client_id, std::chrono::system_clock::now(),
-                             ReplicationTask::Type::COPY, source->id(),
-                             {replicas.front().id()}, 0, task_id, 0});
+    state.replication_task = ReplicationTask{client_id,
+                                             std::chrono::system_clock::now(),
+                                             ReplicationTask::Type::COPY,
+                                             source->id(),
+                                             {replicas.front().id()},
+                                             task_id,
+                                             0};
     source->inc_refcnt();
     metadata.AddReplicas(std::move(replicas));
     return response;
 }
 
 void MasterService::RestoreRecoveredDfsReplicas(bool rebuild_metadata) {
-    if (bucket_allocator_ == nullptr) return;
-
+    if (!bucket_allocator_) return;
     auto recovered = bucket_allocator_->TakeRecoveredReplicas();
-    if (recovered.empty()) return;
-
-    const TenantId tenant_id = TenantId::Default();
+    if (!rebuild_metadata) return;
+    const auto tenant_id = TenantId::Default();
     size_t restored = 0;
-    size_t superseded = 0;
-    const size_t candidates = recovered.size();
-    size_t preserved_live = 0;
-
-    if (rebuild_metadata) {
-        std::vector<ImmutableBucketAllocator::RecoveredReplica>
-            stale_recovered;
-        std::unordered_map<size_t, std::vector<size_t>> indices_by_shard;
-        for (size_t i = 0; i < recovered.size(); ++i) {
-            indices_by_shard[getMetadataShardIndex(tenant_id,
-                                                   recovered[i].key)]
-                .push_back(i);
-        }
-
-        for (auto& [shard_idx, indices] : indices_by_shard) {
-            MetadataShardAccessorRW shard(this, shard_idx);
-            auto& tenant_state = shard->tenants[tenant_id];
-            for (const size_t i : indices) {
-                auto& entry = recovered[i];
-                auto existing = tenant_state.metadata.find(entry.key);
-                if (existing != tenant_state.metadata.end()) {
-                    const auto& metadata = existing->second;
-                    const bool installed_by_this_recovery =
-                        metadata.client_id == UUID{0, 0} &&
-                        metadata.CountReplicas() == 1 &&
-                        metadata.HasReplica(&Replica::fn_is_dfs_replica);
-                    if (installed_by_this_recovery) {
-                        tenant_state.metadata.erase(existing);
-                        ++superseded;
-                    } else {
-                        // A retry can race with a successful memory-only write.
-                        // Keep the live value and tombstone only the stale DFS
-                        // extent after releasing all metadata shard locks.
-                        ++preserved_live;
-                        static DfsLogLimiter log_limiter;
-                        if (auto suppressed = log_limiter.ShouldLog()) {
-                            LOG(WARNING)
-                                << "Skipping stale DFS recovery for key="
-                                << entry.key
-                                << ": live metadata already present, recovered "
-                                   "extent tombstoned, suppressed="
-                                << *suppressed;
-                        }
-                        stale_recovered.push_back(std::move(entry));
-                        continue;
-                    }
+    for (const auto& entry : recovered) {
+        bool stale = false;
+        {
+            MetadataAccessorRW accessor(
+                this, {tenant_id, entry.key},
+                MetadataAccessorRW::CreateKey{.cleanup_invalid = false});
+            if (accessor.IsPublished()) {
+                const auto& metadata = accessor.Get();
+                if (metadata.client_id != UUID{} ||
+                    metadata.CountReplicas() != 1 ||
+                    !metadata.HasReplica(&Replica::fn_is_dfs_replica)) {
+                    stale = true;
+                } else {
+                    accessor.Erase();
                 }
-
-                const uint64_t object_size = entry.descriptor.object_size;
+            }
+            if (!stale) {
                 std::vector<Replica> replicas;
                 replicas.emplace_back(entry.descriptor,
                                       ReplicaStatus::COMPLETE);
-                tenant_state.metadata.emplace(
-                    std::piecewise_construct,
-                    std::forward_as_tuple(entry.key),
-                    std::forward_as_tuple(
-                        UUID{0, 0}, std::chrono::system_clock::now(),
-                        object_size, std::move(replicas), std::nullopt,
-                        /*enable_hard_pin=*/false, ObjectDataType::UNKNOWN,
-                        std::string(), tenant_id, entry.key));
+                accessor.Publish(UUID{}, std::chrono::system_clock::now(),
+                                 entry.descriptor.object_size,
+                                 std::move(replicas), std::nullopt, false,
+                                 ObjectDataType::UNKNOWN, std::string(),
+                                 tenant_id, entry.key);
                 ++restored;
             }
         }
-
-        // Never nest allocator and metadata-shard locks.
-        for (const auto& entry : stale_recovered) {
-            bucket_allocator_->Free(entry.key, entry.descriptor);
-        }
+        // Allocator maintenance must not run while a namespace key is held.
+        if (stale) bucket_allocator_->Free(entry.key, entry.descriptor);
     }
-
     LOG(INFO) << "Restored " << restored
-              << " DFS replicas from bucket metadata (" << candidates
-              << " candidates, " << superseded
-              << " superseded, " << preserved_live
-              << " live entries preserved, metadata_rebuilt="
-              << (rebuild_metadata ? "true" : "false") << ")";
+              << " DFS replicas from bucket metadata";
 }
 
 UUID MasterService::GetDfsMasterEpoch() const {
@@ -1212,11 +1151,12 @@ UUID MasterService::GetDfsMasterEpoch() const {
     return dfs_snapshot_epoch_;
 }
 
-auto MasterService::GetDfsBucketSnapshot(
-    const UUID& client_id, const UUID& last_epoch, uint64_t last_version)
+auto MasterService::GetDfsBucketSnapshot(const UUID& client_id,
+                                         const UUID& last_epoch,
+                                         uint64_t last_version)
     -> tl::expected<DfsBucketSnapshotResponse, ErrorCode> {
     (void)client_id;
-    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+    std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
     const UUID current_epoch = GetDfsMasterEpoch();
     if (current_epoch == UUID{} || bucket_allocator_ == nullptr) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
@@ -1232,8 +1172,8 @@ auto MasterService::GetDfsBucketSnapshot(
         dfs_heartbeat_interval_seconds_.load(std::memory_order_acquire);
     response.batch_timeout_fixed_ms =
         dfs_batch_timeout_fixed_ms_.load(std::memory_order_acquire);
-    response.unchanged = last_epoch == current_epoch &&
-                         last_version == snapshot->version;
+    response.unchanged =
+        last_epoch == current_epoch && last_version == snapshot->version;
     if (!response.unchanged) response.bucket_ids = snapshot->bucket_ids;
     LOG(INFO) << "Returned DFS bucket snapshot, version=" << response.version
               << ", unchanged=" << response.unchanged
@@ -1242,74 +1182,72 @@ auto MasterService::GetDfsBucketSnapshot(
 }
 
 void MasterService::RunDfsBackfill() {
-    if ((dfs_filter_mode_.load(std::memory_order_acquire) & 1) != 0 ||
+    if ((dfs_filter_mode_.load(std::memory_order_acquire) & 1) ||
         dfs_root_recovery_in_progress_.load(std::memory_order_acquire) ||
-        !dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
+        !dfs_allocator_ || !dfs_allocator_->IsInitialized())
         return;
-    }
-    // Bound recovery traffic and rotate shards so a large degraded workload
-    // cannot monopolize scheduling. Failed attempts wait before reallocation.
     constexpr size_t kBatchSize = 256;
     size_t attempted = 0;
+    bool full = false;
     const auto now = std::chrono::steady_clock::now();
-    std::shared_lock<std::shared_mutex> lock(snapshot_mutex_);
-    for (size_t visited = 0; visited < kNumShards; ++visited) {
-        const size_t index = dfs_backfill_shard_;
-        dfs_backfill_shard_ = (dfs_backfill_shard_ + 1) % kNumShards;
-        MetadataShardAccessorRW shard(this, index);
-        for (auto& [tenant_id, state] : shard->tenants) {
-            for (auto it = state.dfs_backfill.begin();
-                 it != state.dfs_backfill.end();) {
-                auto object = state.metadata.find(it->first);
-                if (object == state.metadata.end() ||
-                    object->second.HasReplica([](const Replica& replica) {
-                        return replica.is_dfs_replica() &&
-                               replica.is_completed();
-                    })) {
-                    it = state.dfs_backfill.erase(it);
-                    continue;
-                }
-                auto& retry = it->second;
-                auto& metadata = object->second;
-                const auto& key = it->first;
-                ++it;
-                if (retry.retry_after > now ||
-                    state.processing_keys.contains(key) ||
-                    state.replication_tasks.contains(key) ||
-                    metadata.HasReplica(&Replica::is_dfs_replica)) continue;
-                if (retry.task_id != UUID{}) {
-                    auto task = task_manager_.get_read_access()
-                                    .find_task_by_id(retry.task_id);
-                    if (task && !task->is_finished()) continue;
-                }
-                retry.retry_after = now + std::chrono::seconds(5);
-                ++attempted;
-                const auto sources = metadata.GetReplicaSegmentNames();
-                for (const auto& source : sources) {
-                    auto replica = metadata.GetReplicaBySegmentName(source);
-                    if (!replica || !replica->is_memory_replica() ||
-                        !replica->is_completed() ||
-                        replica->has_invalid_mem_handle()) continue;
-                    UUID owner;
-                    if (segment_manager_.getSegmentAccess()
-                            .GetClientIdBySegmentName(source, owner) !=
-                        ErrorCode::OK) continue;
-                    auto task = task_manager_.get_write_access()
-                                    .submit_task_typed<TaskType::DFS_BACKFILL>(
-                                        owner, {tenant_id.value(), key, source});
-                    if (task) {
-                        retry.task_id = *task;
-                    } else if (task.error() ==
-                               ErrorCode::TASK_PENDING_LIMIT_EXCEEDED) {
-                        // Capacity is global: scanning more keys cannot help.
-                        return;
-                    }
-                    break;
-                }
-                if (attempted >= kBatchSize) return;
-            }
+    std::shared_lock lock(master_state_mutex_);
+    VisitNamespaces([&](const TenantId& tenant_id, metadata::Namespace& ns) {
+        if (full) return;
+        std::vector<route::ObjectRef> refs;
+        for (auto object : ns.objects.ReadCursor()) {
+            if (object.state().dfs_backfill) refs.push_back(object.ref());
         }
-    }
+        if (refs.empty()) return;
+        const size_t first = dfs_backfill_shard_ % refs.size();
+        for (size_t i = 0; i < refs.size() && !full; ++i) {
+            const auto& ref = refs[(first + i) % refs.size()];
+            MetadataAccessorRW accessor(this, tenant_id, ref);
+            if (!accessor.IsPublished()) continue;
+            auto& state = accessor.GetState();
+            auto& metadata = accessor.Get();
+            if (!state.dfs_backfill) continue;
+            if (metadata.HasReplica([](const Replica& replica) {
+                    return replica.is_dfs_replica() && replica.is_completed();
+                })) {
+                state.dfs_backfill.reset();
+                continue;
+            }
+            auto& retry = *state.dfs_backfill;
+            if (retry.retry_after > now || state.HasWorkInFlight() ||
+                metadata.HasReplica(&Replica::fn_is_dfs_replica))
+                continue;
+            if (retry.task_id != UUID{}) {
+                auto task = task_manager_.get_read_access().find_task_by_id(
+                    retry.task_id);
+                if (task && !task->is_finished()) continue;
+            }
+            retry.retry_after = now + std::chrono::seconds(5);
+            ++attempted;
+            for (const auto& source : metadata.GetReplicaSegmentNames()) {
+                auto replica = metadata.GetReplicaBySegmentName(source);
+                if (!replica || !replica->is_memory_replica() ||
+                    !replica->is_completed() ||
+                    replica->has_invalid_mem_handle())
+                    continue;
+                UUID owner;
+                if (segment_manager_.getSegmentAccess()
+                        .GetClientIdBySegmentName(source, owner) !=
+                    ErrorCode::OK)
+                    continue;
+                auto task =
+                    task_manager_.get_write_access()
+                        .submit_task_typed<TaskType::DFS_BACKFILL>(
+                            owner, {tenant_id.value(), ref.key, source});
+                if (task)
+                    retry.task_id = *task;
+                else if (task.error() == ErrorCode::TASK_PENDING_LIMIT_EXCEEDED)
+                    full = true;
+                break;
+            }
+            if (attempted >= kBatchSize) full = true;
+        }
+        dfs_backfill_shard_ = first + attempted;
+    });
 }
 
 bool MasterService::PrepareDfsRootForInitialization(
@@ -1352,23 +1290,63 @@ void MasterService::RunLowUtilizationDfsEviction() {
 
 MasterService::DfsInitResult MasterService::InitDfsAllocatorFromEnvironment(
     const MasterServiceConfig& config) {
-    dfs_restore_from_bucket_metadata_ =
-        !config.enable_snapshot && !config.enable_snapshot_restore;
+    (void)config;
+    const auto dfs_config = DistributedStorageConfig::FromEnvironment();
     const bool dfs_enabled = Environ::GetBool(
         "MOONCAKE_ENABLE_DFS", Environ::GetBool("MOONCAKE_DFS_ENABLED", false));
-    if (!dfs_enabled) {
+    if (!dfs_enabled && !dfs_config.UsesKvcs()) {
         enable_dfs_.store(false, std::memory_order_release);
         dfs_retry_needed_.store(false, std::memory_order_release);
         return DfsInitResult::kDisabled;
     }
 
+    enable_dfs_ = true;
+    if (dfs_config.UsesKvcs()) {
+        use_kvcs_ = true;
+        auto target = LoadKvcsEfcTarget(dfs_config.object_storage_config_path);
+        if (!target) {
+            LOG(ERROR) << "Failed to load KVCS target capacity source";
+            enable_dfs_ = false;
+            use_kvcs_ = false;
+            return enable_dfs_ ? DfsInitResult::kInitialized
+                               : DfsInitResult::kPermanentFailure;
+        }
+        auto provider = CreateKvcsCapacityProvider(*target);
+        if (!provider) {
+            if (provider.error() == ErrorCode::NOT_SUPPORTED) {
+                LOG(WARNING) << "KVCS SDK is unavailable; capacity refresh "
+                                "is disabled";
+                LOG(INFO) << "KVCS distributed object storage initialized "
+                             "without DFS extent allocator, config={"
+                          << dfs_config.FormatStr() << "}";
+                return enable_dfs_ ? DfsInitResult::kInitialized
+                                   : DfsInitResult::kPermanentFailure;
+            }
+            LOG(ERROR) << "Failed to create KVCS capacity provider: "
+                       << toString(provider.error());
+            enable_dfs_ = false;
+            use_kvcs_ = false;
+            return enable_dfs_ ? DfsInitResult::kInitialized
+                               : DfsInitResult::kPermanentFailure;
+        }
+        dfs_kvcs_capacity_provider_ = std::move(*provider);
+        dfs_kvcs_capacity_check_interval_ = dfs_config.eviction_check_interval;
+        dfs_kvcs_eviction_enabled_ = dfs_config.eviction_enabled;
+        dfs_kvcs_eviction_high_watermark_ = dfs_config.eviction_high_watermark;
+        dfs_kvcs_eviction_low_watermark_ = dfs_config.eviction_low_watermark;
+        InitKvcsDfsEviction();
+        LOG(INFO) << "KVCS distributed object storage initialized without "
+                     "DFS extent allocator, config={"
+                  << dfs_config.FormatStr() << "}";
+        return enable_dfs_ ? DfsInitResult::kInitialized
+                           : DfsInitResult::kPermanentFailure;
+    }
     if (enable_oplog_) {
         LOG(ERROR) << "DFS cannot be enabled with oplog recovery until DFS "
                       "allocator state restoration is supported";
         throw std::invalid_argument("DFS is incompatible with oplog recovery");
     }
 
-    const auto dfs_config = DistributedStorageConfig::FromEnvironment();
     dfs_bucket_low_utilization_threshold_ =
         dfs_config.low_utilization_threshold;
     dfs_bucket_low_utilization_evictions_per_tick_ =
@@ -1401,12 +1379,12 @@ MasterService::DfsInitResult MasterService::InitDfsAllocatorFromEnvironment(
 
     std::unique_ptr<DfsAllocatorInterface> allocator;
     ImmutableBucketAllocator* bucket_allocator = nullptr;
-    if (dfs_config.allocator_type == DfsAllocatorType::BUCKET) {
+    if (dfs_config.allocator_type == "bucket") {
         auto bucket_owner = std::make_unique<ImmutableBucketAllocator>();
         bucket_allocator = bucket_owner.get();
         allocator = std::move(bucket_owner);
     } else {
-        allocator = std::make_unique<DfsGlobalAllocator>();
+        allocator = std::make_unique<ShardAllocator>();
     }
 
     auto init_result = allocator->Init(dfs_config);
@@ -1443,6 +1421,8 @@ MasterService::DfsInitResult MasterService::InitDfsAllocatorFromEnvironment(
     dfs_allocator_owner_ = std::move(allocator);
     bucket_allocator_.store(bucket_allocator);
     dfs_allocator_.store(dfs_allocator_owner_.get());
+    shard_allocator_ =
+        dynamic_cast<ShardAllocator*>(dfs_allocator_owner_.get());
 
     // The allocator has already rebuilt its bucket state during Init(). When
     // snapshot recovery owns metadata, consume the recovered list without
@@ -1453,9 +1433,8 @@ MasterService::DfsInitResult MasterService::InitDfsAllocatorFromEnvironment(
     enable_dfs_.store(true, std::memory_order_release);
     dfs_retry_needed_.store(false, std::memory_order_release);
 
-    LOG(INFO) << "DFS allocator initialized, type="
-              << ToString(dfs_config.allocator_type) << ", config={"
-              << dfs_config.FormatStr() << "}";
+    LOG(INFO) << "DFS allocator initialized, type=" << dfs_config.allocator_type
+              << ", config={" << dfs_config.FormatStr() << "}";
     RefreshDfsMetrics();
     return DfsInitResult::kInitialized;
 }
@@ -1464,12 +1443,24 @@ std::vector<tl::expected<bool, ErrorCode>>
 MasterService::BatchExistKeyByReplicaType(const std::vector<std::string>& keys,
                                           const TenantId& tenant_id,
                                           ReplicaType replica_type) {
-    return BatchExistKeyInternal(keys, tenant_id, replica_type,
-                                 /*grant_lease=*/false);
+    std::vector<tl::expected<bool, ErrorCode>> results;
+    results.reserve(keys.size());
+    std::shared_lock lock(master_state_mutex_);
+    const auto& tenant = ResolveRequestTenantId(tenant_id);
+    for (const auto& key : keys) {
+        MetadataAccessorRO accessor(this, tenant, key);
+        results.emplace_back(accessor.Exists() &&
+                             accessor.Get().HasReplica([&](const Replica& r) {
+                                 return (replica_type == ReplicaType::ALL ||
+                                         r.type() == replica_type) &&
+                                        IsReplicaReadable(r);
+                             }));
+    }
+    return results;
 }
 
 void MasterService::FreeDfsReplicas(const std::string& key,
-                                    const std::vector<Replica>& replicas) {
+                                    std::span<const Replica> replicas) {
     if (!dfs_allocator_) return;
     for (const auto& replica : replicas) {
         if (!replica.is_dfs_replica()) continue;
@@ -1517,558 +1508,227 @@ bool MasterService::RunBucketDfsEvictionInternal(
     bool force_one, std::optional<int64_t> invalidated_bucket_id,
     double low_utilization_threshold, int low_utilization_eviction_limit,
     int low_utilization_attempt_limit) {
-    if (bucket_allocator_ == nullptr) return false;
-    const bool invalidating_missing_bucket = invalidated_bucket_id.has_value();
-    const bool low_utilization_eviction = low_utilization_threshold >= 0.0;
-    const int max_low_utilization_evictions =
-        low_utilization_eviction_limit >= 0
-            ? low_utilization_eviction_limit
-            : dfs_bucket_low_utilization_evictions_per_tick_;
-
-    // Free() defers its metadata write so it never fsyncs under a metadata
-    // shard lock. This tick holds no master lock, so it is the right place to
-    // make those tombstones durable.
-    bucket_allocator_->FlushDirtyMetadata();
-
-    const TenantId tenant_id = TenantId::Default();
-    // Buckets already inspected in this cycle. Bounds the scan when every
-    // remaining bucket keeps getting rejected.
-    std::set<int64_t> attempted;
-    bool evicted = false;
-    int low_utilization_evictions = 0;
-    int low_utilization_attempts = 0;
-    int low_utilization_rejections = 0;
-    static DfsLogLimiter low_utilization_rejection_log_limiter;
-    const auto log_low_utilization_rejection =
-        [&](int64_t bucket_id, const char* phase, const std::string& key,
-            const char* reason) {
-            if (!low_utilization_eviction) return;
-            if (auto suppressed =
-                    low_utilization_rejection_log_limiter.ShouldLog()) {
-                LOG(WARNING)
-                    << "[DFS_LOW_UTILIZATION_EVICTION_REJECTED] bucket_id="
-                    << bucket_id << ", phase=" << phase << ", key=" << key
-                    << ", reason=" << reason << ", suppressed=" << *suppressed;
-            }
-        };
-    const int max_low_utilization_attempts =
+    auto* allocator = bucket_allocator_.get();
+    if (!allocator) return false;
+    const UUID epoch = GetDfsMasterEpoch();
+    const bool invalidating = invalidated_bucket_id.has_value();
+    const bool low_utilization = low_utilization_threshold >= 0.0;
+    const int limit = low_utilization_eviction_limit >= 0
+                          ? low_utilization_eviction_limit
+                          : dfs_bucket_low_utilization_evictions_per_tick_;
+    const int attempt_limit =
         low_utilization_attempt_limit >= 0
             ? low_utilization_attempt_limit
             : dfs_bucket_low_utilization_attempts_per_tick_;
-
-    while (true) {
-        if (low_utilization_eviction && max_low_utilization_attempts >= 0 &&
-            low_utilization_attempts >= max_low_utilization_attempts) {
+    allocator->FlushDirtyMetadata();
+    const size_t retried = allocator->RetryFailedEvictions();
+    if (force_one && retried > 0) return true;
+    const auto tenant_id = TenantId::Default();
+    std::set<int64_t> attempted;
+    int evictions = static_cast<int>(retried);
+    for (;;) {
+        if (low_utilization && attempt_limit >= 0 &&
+            attempted.size() >= static_cast<size_t>(attempt_limit))
+            break;
+        auto pending =
+            invalidating
+                ? allocator->PrepareInvalidation(*invalidated_bucket_id)
+            : low_utilization ? allocator->PrepareEvictionForLowUtilization(
+                                    low_utilization_threshold)
+            : force_one ? allocator->PrepareEvictionForAllocationFailure()
+                        : allocator->PrepareEviction();
+        const int64_t bucket_id = pending.bucket_id();
+        if (bucket_id < 0) break;
+        if (!attempted.insert(bucket_id).second) {
+            allocator->AbortEviction(std::move(pending));
             break;
         }
-        ImmutableBucketAllocator::PendingEviction pending;
-        if (invalidated_bucket_id.has_value()) {
-            pending =
-                bucket_allocator_->PrepareInvalidation(*invalidated_bucket_id);
-        } else if (low_utilization_eviction) {
-            pending = bucket_allocator_->PrepareEvictionForLowUtilization(
-                low_utilization_threshold);
-        } else if (force_one) {
-            pending = bucket_allocator_->PrepareEvictionForAllocationFailure();
-        } else {
-            pending = bucket_allocator_->PrepareEviction();
-        }
-        // Nothing is evictable right now (below watermark, or every bucket is
-        // active/frozen).
-        if (pending.bucket_id() < 0) return evicted;
-        if (!attempted.insert(pending.bucket_id()).second) {
-            // The scan wrapped around without making progress.
-            bucket_allocator_->AbortEviction(std::move(pending));
-            return evicted;
-        }
-        const int64_t evicted_bucket_id = pending.bucket_id();
-        if (low_utilization_eviction) ++low_utilization_attempts;
-        if (!invalidating_missing_bucket) {
-            if (low_utilization_eviction) {
-                MasterMetricManager::instance()
-                    .inc_dfs_bucket_eviction_attempts();
-                MasterMetricManager::instance()
-                    .inc_dfs_bucket_low_utilization_eviction_attempts();
-            } else {
-                MasterMetricManager::instance()
-                    .inc_dfs_bucket_eviction_attempts();
-            }
-        }
-
+        auto& metrics = MasterMetricManager::instance();
+        if (!invalidating) metrics.inc_dfs_bucket_eviction_attempts();
+        if (low_utilization)
+            metrics.inc_dfs_bucket_low_utilization_eviction_attempts();
         const auto& candidates = pending.Candidates();
-        if (candidates.empty()) {
-            // A bucket whose entries are all tombstoned has no replicas for the
-            // master to validate, so it can be reclaimed immediately.
-            const bool committed =
-                bucket_allocator_->CommitEviction(std::move(pending));
-            if (committed && !invalidating_missing_bucket) {
-                MasterMetricManager::instance().inc_dfs_bucket_evictions();
+        auto matches = [](const Replica& replica, const auto& candidate) {
+            if (!replica.is_dfs_replica()) return false;
+            const auto& desc = replica.get_dfs_descriptor();
+            const auto& expected = candidate.descriptor;
+            return desc.shard_idx == expected.shard_idx &&
+                   desc.offset == expected.offset &&
+                   desc.object_size == expected.object_size &&
+                   desc.aligned_size == expected.aligned_size &&
+                   desc.file_path == expected.file_path;
+        };
+        auto clear_pending = [&] {
+            std::shared_lock lock(master_state_mutex_);
+            for (const auto& candidate : candidates) {
+                MetadataAccessorRW accessor(this, {tenant_id, candidate.key},
+                                            MetadataAccessorRW::AsIs{});
+                if (!accessor.IsPublished()) continue;
+                accessor.Get().VisitReplicas(
+                    [&](const Replica& r) { return matches(r, candidate); },
+                    [](Replica& r) { r.set_eviction_pending(false); });
             }
-            if (committed && low_utilization_eviction) {
-                MasterMetricManager::instance()
-                    .inc_dfs_bucket_low_utilization_evictions();
-                ++low_utilization_evictions;
-                LOG(INFO) << "[DFS_LOW_UTILIZATION_EVICTION] bucket_id="
-                          << evicted_bucket_id << ", committed=true";
-            }
-            if (committed) evicted = true;
-            if (committed && (invalidating_missing_bucket || force_one ||
-                              (low_utilization_eviction &&
-                               max_low_utilization_evictions >= 0 &&
-                               low_utilization_evictions >=
-                                   max_low_utilization_evictions))) {
+        };
+        auto acceptable = [&](MetadataAccessorRW& accessor,
+                              const auto& candidate, bool phase_two) {
+            if (!accessor.IsPublished()) return true;
+            auto& metadata = accessor.Get();
+            if (!metadata.HasReplica(
+                    [&](const Replica& r) { return matches(r, candidate); }))
                 return true;
+            if (accessor.GetState().HasWorkInFlight() ||
+                metadata.HasReplica([&](const Replica& r) {
+                    return matches(r, candidate) &&
+                           (r.is_processing() || r.is_busy());
+                }))
+                return false;
+            // Read admission is frozen in phase one. A lease subsequently
+            // granted through a surviving memory replica cannot read this
+            // bucket.
+            if (!invalidating && !phase_two) {
+                auto now = std::chrono::system_clock::now();
+                if (metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
+                    (IsSoftPinActive(metadata, now) &&
+                     !allow_evict_soft_pinned_objects_))
+                    return false;
             }
-            continue;
-        }
-
-        // Phase 1 (validate and freeze reads): mark accepted replicas before
-        // releasing their shard lock. Always take shard locks in
-        // ascending index order so concurrent evictions cannot deadlock.
-        std::map<size_t, std::vector<size_t>> indexes_by_shard;
-        for (size_t i = 0; i < candidates.size(); ++i) {
-            indexes_by_shard[getMetadataShardIndex(tenant_id,
-                                                   candidates[i].key)]
-                .push_back(i);
-        }
-
-        auto matches_candidate =
-            [](const Replica& replica,
-               const DfsAllocatorInterface::EvictionCandidate& candidate) {
-                if (!replica.is_dfs_replica()) return false;
-                const auto& desc = replica.get_dfs_descriptor();
-                // Field-by-field match against the descriptor the allocator
-                // handed out, so a superseded generation is never mistaken for
-                // the current one.
-                return desc.shard_idx == candidate.descriptor.shard_idx &&
-                       desc.offset == candidate.descriptor.offset &&
-                       desc.object_size == candidate.descriptor.object_size &&
-                       desc.aligned_size == candidate.descriptor.aligned_size &&
-                       desc.file_path == candidate.descriptor.file_path;
-            };
-
-        auto clear_eviction_pending = [&] {
-            for (const auto& [shard_idx, indexes] : indexes_by_shard) {
-                std::shared_lock<std::shared_mutex> snapshot_lock(
-                    snapshot_mutex_);
-                SharedMutexLocker shard_lock(
-                    &metadata_shards_[shard_idx].mutex);
-                auto tenant_it =
-                    metadata_shards_[shard_idx].tenants.find(tenant_id);
-                if (tenant_it == metadata_shards_[shard_idx].tenants.end()) {
-                    continue;
-                }
-                for (const size_t i : indexes) {
-                    const auto& candidate = candidates[i];
-                    auto metadata_it =
-                        tenant_it->second.metadata.find(candidate.key);
-                    if (metadata_it == tenant_it->second.metadata.end())
-                        continue;
-                    metadata_it->second.VisitReplicas(
-                        [&](const Replica& replica) {
-                            return matches_candidate(replica, candidate);
-                        },
-                        [](Replica& replica) {
-                            replica.set_eviction_pending(false);
-                        });
-                }
-            }
-        };
-
-        bool all_accepted = true;
-        std::string phase1_reject_key;
-        const char* phase1_reject_reason = nullptr;
-        auto record_phase1_rejection = [&](const std::string& key,
-                                           const char* reason) {
-            if (phase1_reject_reason != nullptr) return;
-            phase1_reject_key = key;
-            phase1_reject_reason = reason;
-        };
-        auto now = std::chrono::system_clock::now();
-        for (const auto& [shard_idx, indexes] : indexes_by_shard) {
-            if (!all_accepted) break;
-            std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
-            SharedMutexLocker shard_lock(&metadata_shards_[shard_idx].mutex);
-
-            for (const size_t i : indexes) {
-                const auto& candidate = candidates[i];
-                auto tenant_it =
-                    metadata_shards_[shard_idx].tenants.find(tenant_id);
-                if (tenant_it == metadata_shards_[shard_idx].tenants.end()) {
-                    continue;  // already gone from the master's view
-                }
-                auto& tenant_state = tenant_it->second;
-                auto metadata_it = tenant_state.metadata.find(candidate.key);
-                if (metadata_it == tenant_state.metadata.end()) continue;
-
-                auto& metadata = metadata_it->second;
-                const bool has_candidate =
-                    metadata.HasReplica([&](const Replica& replica) {
-                        return matches_candidate(replica, candidate);
-                    });
-                if (!has_candidate) continue;
-
-                const bool candidate_is_processing =
-                    metadata.HasReplica([&](const Replica& replica) {
-                        return matches_candidate(replica, candidate) &&
-                               replica.is_processing();
-                    });
-                const bool acceptable =
-                    !candidate_is_processing &&
-                    !tenant_state.processing_keys.contains(candidate.key) &&
-                    (invalidating_missing_bucket ||
-                     (!metadata.IsHardPinned() &&
-                      metadata.IsLeaseExpired(now)));
-                if (!acceptable) {
-                    // Whole-bucket eviction is all-or-nothing: one protected
-                    // entry vetoes the bucket; undo earlier read barriers.
-                    if (candidate_is_processing) {
-                        record_phase1_rejection(candidate.key,
-                                                "replica_processing");
-                    } else if (tenant_state.processing_keys.contains(
-                                   candidate.key)) {
-                        record_phase1_rejection(candidate.key,
-                                                "key_processing");
-                    } else if (!invalidating_missing_bucket &&
-                               metadata.IsHardPinned()) {
-                        record_phase1_rejection(candidate.key, "hard_pinned");
-                    } else if (!invalidating_missing_bucket &&
-                               !metadata.IsLeaseExpired(now)) {
-                        record_phase1_rejection(candidate.key,
-                                                "lease_not_expired");
-                    } else {
-                        record_phase1_rejection(candidate.key,
-                                                "validation_rejected");
-                    }
-                    all_accepted = false;
-                    break;
-                }
-                metadata.VisitReplicas(
-                    [&](const Replica& replica) {
-                        return matches_candidate(replica, candidate);
-                    },
-                    [](Replica& replica) {
-                        replica.set_eviction_pending(true);
-                    });
-            }
-        }
-
-        if (!all_accepted) {
-            if (low_utilization_eviction) {
-                ++low_utilization_rejections;
-                log_low_utilization_rejection(
-                    evicted_bucket_id, "phase1", phase1_reject_key,
-                    phase1_reject_reason != nullptr ? phase1_reject_reason
-                                                    : "validation_rejected");
-            }
-            clear_eviction_pending();
-            bucket_allocator_->AbortEviction(std::move(pending));
-            if (invalidating_missing_bucket) return false;
-            continue;
-        }
-
-        // Keep object operations out of the gap between revalidation and the
-        // storage commit. PutStart acquires this lock before it can publish a
-        // new PROCESSING replica, so the validation covers the metadata that
-        // will be removed below.
-        std::vector<std::pair<size_t, std::string>> operation_lock_requests;
-        operation_lock_requests.reserve(candidates.size());
-        for (const auto& candidate : candidates) {
-            operation_lock_requests.emplace_back(
-                std::hash<std::string>{}(
-                    tenant_id.MakeScopedKey(candidate.key)) %
-                    kObjectOperationLockStripes,
-                candidate.key);
-        }
-        std::sort(operation_lock_requests.begin(),
-                  operation_lock_requests.end());
-        std::vector<std::string> operation_lock_keys;
-        operation_lock_keys.reserve(operation_lock_requests.size());
-        size_t previous_stripe = 0;
-        bool have_previous_stripe = false;
-        for (const auto& [stripe, key] : operation_lock_requests) {
-            if (!have_previous_stripe || stripe != previous_stripe) {
-                operation_lock_keys.push_back(key);
-                previous_stripe = stripe;
-                have_previous_stripe = true;
-            }
-        }
-        std::vector<ObjectOperationLock> object_operation_locks;
-        object_operation_locks.reserve(operation_lock_keys.size());
-        for (const auto& key : operation_lock_keys) {
-            object_operation_locks.emplace_back(
-                AcquireObjectOperationLock(tenant_id, key));
-        }
-
-        // Phase 2 (revalidate): metadata may have changed since Phase 1. A
-        // candidate that became processing (e.g. a concurrent PutStart reused
-        // the key after Phase 1 saw it as evictable) must not be removed.
-        bool phase2_accepted = true;
-        std::string phase2_reject_key;
-        const char* phase2_reject_reason = nullptr;
-        for (const auto& [shard_idx, indexes] : indexes_by_shard) {
-            if (!phase2_accepted) break;
-            std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
-            SharedMutexLocker shard_lock(&metadata_shards_[shard_idx].mutex);
-            for (const size_t i : indexes) {
-                const auto& candidate = candidates[i];
-                auto tenant_it =
-                    metadata_shards_[shard_idx].tenants.find(tenant_id);
-                if (tenant_it == metadata_shards_[shard_idx].tenants.end()) {
-                    continue;
-                }
-                auto& tenant_state = tenant_it->second;
-                auto metadata_it = tenant_state.metadata.find(candidate.key);
-                if (metadata_it == tenant_state.metadata.end()) continue;
-
-                auto& metadata = metadata_it->second;
-                const bool candidate_is_processing =
-                    metadata.HasReplica([&](const Replica& replica) {
-                        return matches_candidate(replica, candidate) &&
-                               replica.is_processing();
-                    });
-                if (candidate_is_processing ||
-                    tenant_state.processing_keys.contains(candidate.key)) {
-                    phase2_reject_key = candidate.key;
-                    phase2_reject_reason = candidate_is_processing
-                                               ? "replica_processing"
-                                               : "key_processing";
-                    phase2_accepted = false;
-                    break;
-                }
-            }
-        }
-        if (!phase2_accepted) {
-            if (low_utilization_eviction) {
-                ++low_utilization_rejections;
-                log_low_utilization_rejection(
-                    evicted_bucket_id, "phase2", phase2_reject_key,
-                    phase2_reject_reason != nullptr ? phase2_reject_reason
-                                                    : "validation_rejected");
-            }
-            clear_eviction_pending();
-            bucket_allocator_->AbortEviction(std::move(pending));
-            if (invalidating_missing_bucket) return false;
-            continue;
-        }
-
-        // Phase 3 (commit metadata): remove every candidate replica. Same fixed
-        // shard order, and still no DFS I/O under the locks.
-        for (const auto& [shard_idx, indexes] : indexes_by_shard) {
-            std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
-            SharedMutexLocker shard_lock(&metadata_shards_[shard_idx].mutex);
-
-            for (const size_t i : indexes) {
-                const auto& candidate = candidates[i];
-                auto tenant_it =
-                    metadata_shards_[shard_idx].tenants.find(tenant_id);
-                if (tenant_it == metadata_shards_[shard_idx].tenants.end()) {
-                    continue;
-                }
-                auto& tenant_state = tenant_it->second;
-                auto metadata_it = tenant_state.metadata.find(candidate.key);
-                if (metadata_it == tenant_state.metadata.end()) continue;
-
-                auto& metadata = metadata_it->second;
-                const size_t erased =
-                    metadata.EraseReplicas([&](const Replica& replica) {
-                        return matches_candidate(replica, candidate) &&
-                               !replica.is_processing();
-                    });
-                if (erased > 0 && !invalidating_missing_bucket) {
-                    MasterMetricManager::instance()
-                        .inc_dfs_bucket_evicted_replicas(
-                            static_cast<int64_t>(erased));
-                    MasterMetricManager::instance()
-                        .inc_dfs_bucket_evicted_bytes(
-                            static_cast<int64_t>(metadata.size * erased));
-                }
-                if (erased > 0 && !metadata.IsValid()) {
-                    PublishKvRemovedAfterEvict(candidate.key,
-                                               metadata.size * erased, "disk",
-                                               metadata, tenant_id);
-                    EraseMetadata(tenant_state, metadata_it, tenant_id,
-                                  QuotaEraseMode::kFull);
-                }
-            }
-
-            auto tenant_it =
-                metadata_shards_[shard_idx].tenants.find(tenant_id);
-            if (tenant_it != metadata_shards_[shard_idx].tenants.end() &&
-                tenant_it->second.Empty()) {
-                metadata_shards_[shard_idx].tenants.erase(tenant_it);
-            }
-        }
-
-        // Phase 3 (commit storage): the master no longer returns any descriptor
-        // into this bucket, so it is now safe to drop the files.
-        const bool committed =
-            bucket_allocator_->CommitEviction(std::move(pending));
-        if (committed && !invalidating_missing_bucket) {
-            MasterMetricManager::instance().inc_dfs_bucket_evictions();
-        }
-        if (committed && low_utilization_eviction) {
-            MasterMetricManager::instance()
-                .inc_dfs_bucket_low_utilization_evictions();
-            ++low_utilization_evictions;
-            LOG(INFO) << "[DFS_LOW_UTILIZATION_EVICTION] bucket_id="
-                      << evicted_bucket_id << ", committed=true";
-        }
-        if (committed) evicted = true;
-        if (committed &&
-            (invalidating_missing_bucket || force_one ||
-             (low_utilization_eviction && max_low_utilization_evictions >= 0 &&
-              low_utilization_evictions >= max_low_utilization_evictions))) {
             return true;
+        };
+        bool accepted = true;
+        {
+            std::shared_lock lock(master_state_mutex_);
+            if (GetDfsMasterEpoch() != epoch) accepted = false;
+            for (const auto& candidate : candidates) {
+                if (!accepted) break;
+                MetadataAccessorRW accessor(this, {tenant_id, candidate.key},
+                                            MetadataAccessorRW::AsIs{});
+                if (!acceptable(accessor, candidate, false)) {
+                    accepted = false;
+                    break;
+                }
+                if (accessor.IsPublished())
+                    accessor.Get().VisitReplicas(
+                        [&](const Replica& r) { return matches(r, candidate); },
+                        [](Replica& r) { r.set_eviction_pending(true); });
+            }
+        }
+        if (accepted && dfs_eviction_after_validation_hook_)
+            dfs_eviction_after_validation_hook_();
+        if (accepted) {
+            // Namespace routes forbid holding two key guards. The existing
+            // master-state barrier makes revalidation/removal atomic without
+            // nesting key locks; filesystem work stays outside this barrier.
+            std::unique_lock lock(master_state_mutex_);
+            accepted = GetDfsMasterEpoch() == epoch;
+            for (const auto& candidate : candidates) {
+                if (!accepted) break;
+                MetadataAccessorRW accessor(this, {tenant_id, candidate.key},
+                                            MetadataAccessorRW::AsIs{});
+                accepted = acceptable(accessor, candidate, true);
+            }
+            if (accepted) {
+                for (const auto& candidate : candidates) {
+                    MetadataAccessorRW accessor(this,
+                                                {tenant_id, candidate.key},
+                                                MetadataAccessorRW::AsIs{});
+                    if (!accessor.IsPublished()) continue;
+                    auto& metadata = accessor.Get();
+                    const size_t erased =
+                        metadata.EraseReplicas([&](const Replica& r) {
+                            return matches(r, candidate);
+                        });
+                    if (erased && !invalidating) {
+                        metrics.inc_dfs_bucket_evicted_replicas(erased);
+                        metrics.inc_dfs_bucket_evicted_bytes(
+                            metadata.TotalLength() * erased);
+                    }
+                    PublishKvRemovedAfterEvict(candidate.key, erased, "disk",
+                                               metadata, tenant_id);
+                    if (!metadata.IsValid()) accessor.Erase();
+                }
+            }
+        }
+        if (!accepted) {
+            clear_pending();
+            allocator->AbortEviction(std::move(pending));
+            if (invalidating || GetDfsMasterEpoch() != epoch)
+                return evictions > 0;
+            continue;
+        }
+        if (allocator->CommitEviction(std::move(pending))) {
+            ++evictions;
+            if (!invalidating) metrics.inc_dfs_bucket_evictions();
+            if (low_utilization)
+                metrics.inc_dfs_bucket_low_utilization_evictions();
+            if (force_one || invalidating ||
+                (low_utilization && limit >= 0 && evictions >= limit))
+                break;
         }
     }
-    if (low_utilization_eviction) {
-        LOG(INFO) << "[DFS_LOW_UTILIZATION_EVICTION_SUMMARY] attempted="
-                  << low_utilization_attempts
-                  << ", committed=" << low_utilization_evictions
-                  << ", rejected=" << low_utilization_rejections;
-    }
-    return evicted;
+    return evictions > 0;
 }
 
 void MasterService::RunShardDfsEviction() {
-    if (!dfs_allocator_) return;
-    // Shard eviction uses the per-key prepare/resolve protocol, which is
-    // specific to DfsGlobalAllocator and not part of the common interface.
-    auto* shard_allocator =
-        dynamic_cast<DfsGlobalAllocator*>(dfs_allocator_.get());
-    if (shard_allocator == nullptr) return;
-
-    const TenantId tenant_id = TenantId::Default();
-    using CandidateIdentity = std::tuple<std::string, int, uint64_t>;
-    std::set<CandidateIdentity> attempted;
-
-    while (true) {
-        auto pending = shard_allocator->PrepareEviction();
+    auto* allocator = dynamic_cast<ShardAllocator*>(dfs_allocator_.get());
+    if (!allocator) return;
+    const auto tenant_id = TenantId::Default();
+    std::set<std::tuple<std::string, int, uint64_t>> attempted;
+    for (;;) {
+        auto pending = allocator->PrepareEviction();
         if (pending.Empty()) return;
-
         const auto candidates = pending.Candidates();
         std::vector<bool> accepted(candidates.size(), false);
-        std::vector<bool> considered(candidates.size(), false);
-        bool saw_repeated_candidate = false;
-
-        // Group prepared candidates by metadata shard, then validate and
-        // remove each group while holding only that shard. Prepared allocator
-        // extents remain unavailable until ResolvePreparedEviction(), so
-        // different metadata shards do not need one cross-shard transaction.
-        std::array<std::vector<size_t>, kNumShards> indexes_by_shard;
+        bool repeated = false;
         for (size_t i = 0; i < candidates.size(); ++i) {
             const auto& candidate = candidates[i];
             if (!attempted
                      .emplace(candidate.key, candidate.shard_idx,
                               candidate.offset)
                      .second) {
-                saw_repeated_candidate = true;
+                repeated = true;
                 continue;
             }
-            considered[i] = true;
-            indexes_by_shard[getMetadataShardIndex(tenant_id, candidate.key)]
-                .push_back(i);
-        }
-
-        auto matches_candidate = [](const Replica& replica,
-                                    const auto& candidate) {
-            return replica.is_dfs_replica() &&
-                   replica.get_dfs_descriptor().shard_idx ==
-                       candidate.shard_idx &&
-                   replica.get_dfs_descriptor().offset == candidate.offset;
-        };
-
-        auto now = std::chrono::system_clock::now();
-        for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
-            if (indexes_by_shard[shard_idx].empty()) continue;
-
-            std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
-            SharedMutexLocker shard_lock(&metadata_shards_[shard_idx].mutex);
-
-            // Validate and remove candidates under the same shard lock. Once a
-            // candidate has been seen in this cycle, it is excluded above;
-            // encountering it again means the LRU scan has wrapped.
-            for (const size_t i : indexes_by_shard[shard_idx]) {
-                const auto& candidate = candidates[i];
-                auto tenant_it =
-                    metadata_shards_[shard_idx].tenants.find(tenant_id);
-                if (tenant_it == metadata_shards_[shard_idx].tenants.end()) {
-                    accepted[i] = true;
-                    continue;
-                }
-                auto& tenant_state = tenant_it->second;
-                auto metadata_it = tenant_state.metadata.find(candidate.key);
-                if (metadata_it == tenant_state.metadata.end()) {
-                    accepted[i] = true;
-                    continue;
-                }
-
-                auto& metadata = metadata_it->second;
-                const bool has_candidate =
-                    metadata.HasReplica([&](const Replica& replica) {
-                        return matches_candidate(replica, candidate);
-                    });
-                if (!has_candidate) {
-                    accepted[i] = true;
-                    continue;
-                }
-
-                const bool candidate_is_processing =
-                    metadata.HasReplica([&](const Replica& replica) {
-                        return matches_candidate(replica, candidate) &&
-                               replica.is_processing();
-                    });
-                accepted[i] =
-                    !candidate_is_processing &&
-                    !tenant_state.processing_keys.contains(candidate.key) &&
-                    !metadata.IsHardPinned() && metadata.IsLeaseExpired(now) &&
-                    (!IsSoftPinActive(metadata, now) ||
-                     allow_evict_soft_pinned_objects_);
-                if (!accepted[i]) continue;
-
-                // A missing descriptor was accepted above and is already
-                // evicted from the master's point of view. Otherwise remove
-                // the accepted descriptor before its allocator extent can be
-                // committed and reused.
-                const size_t erased =
-                    metadata.EraseReplicas([&](const Replica& replica) {
-                        return matches_candidate(replica, candidate) &&
-                               !replica.is_processing();
-                    });
-                if (erased > 0 && !metadata.IsValid()) {
-                    PublishKvRemovedAfterEvict(candidate.key,
-                                               metadata.size * erased, "disk",
-                                               metadata, tenant_id);
-                    EraseMetadata(tenant_state, metadata_it, tenant_id,
-                                  QuotaEraseMode::kFull);
-                }
+            std::shared_lock lock(master_state_mutex_);
+            MetadataAccessorRW accessor(this, {tenant_id, candidate.key},
+                                        MetadataAccessorRW::AsIs{});
+            if (!accessor.IsPublished()) {
+                accepted[i] = true;
+                continue;
             }
-
-            auto tenant_it =
-                metadata_shards_[shard_idx].tenants.find(tenant_id);
-            if (tenant_it != metadata_shards_[shard_idx].tenants.end() &&
-                tenant_it->second.Empty()) {
-                metadata_shards_[shard_idx].tenants.erase(tenant_it);
+            auto& metadata = accessor.Get();
+            auto matches = [&](const Replica& replica) {
+                return replica.is_dfs_replica() &&
+                       replica.get_dfs_descriptor().shard_idx ==
+                           candidate.shard_idx &&
+                       replica.get_dfs_descriptor().offset == candidate.offset;
+            };
+            if (!metadata.HasReplica(matches)) {
+                accepted[i] = true;
+                continue;
             }
+            auto now = std::chrono::system_clock::now();
+            accepted[i] = !accessor.GetState().HasWorkInFlight() &&
+                          !metadata.HasReplica([&](const Replica& r) {
+                              return matches(r) && r.is_processing();
+                          }) &&
+                          !metadata.IsHardPinned() &&
+                          metadata.IsLeaseExpired(now) &&
+                          (!IsSoftPinActive(metadata, now) ||
+                           allow_evict_soft_pinned_objects_);
+            if (!accepted[i]) continue;
+            const size_t erased = metadata.EraseReplicas(matches);
+            PublishKvRemovedAfterEvict(candidate.key, erased, "disk", metadata,
+                                       tenant_id);
+            if (!metadata.IsValid()) accessor.Erase();
         }
-
-        shard_allocator->ResolvePreparedEviction(std::move(pending), accepted);
-
-        // A protected allocation stays live, but moving it to the MRU side
-        // lets this cycle inspect colder candidates behind it. The attempted
-        // set bounds the scan when every remaining allocation is protected.
+        allocator->ResolvePreparedEviction(std::move(pending), accepted);
         for (size_t i = 0; i < candidates.size(); ++i) {
-            if (considered[i] && !accepted[i]) {
-                shard_allocator->UpdateAccess(candidates[i].key,
-                                              candidates[i].shard_idx,
-                                              candidates[i].offset);
-            }
+            if (!accepted[i])
+                allocator->UpdateAccess(candidates[i].key,
+                                        candidates[i].shard_idx,
+                                        candidates[i].offset);
         }
-
-        if (saw_repeated_candidate) {
-            return;
-        }
+        if (repeated) return;
     }
 }
 
@@ -2079,6 +1739,11 @@ void MasterService::DfsEvictionThreadFunc() {
     auto next_dfs_backfill_time = std::chrono::steady_clock::now();
     auto next_dfs_root_guard_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
+        if (!AdmitsBusinessWorkers()) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kEvictionThreadSleepMs));
+            continue;
+        }
         if (dfs_allocator_ && dfs_allocator_->IsEvictionEnabled()) {
             ProcessInvalidatedDfsBuckets();
             const auto steady_now = std::chrono::steady_clock::now();
@@ -2095,6 +1760,7 @@ void MasterService::DfsEvictionThreadFunc() {
             const auto steady_now = std::chrono::steady_clock::now();
             if (steady_now >= next_dfs_eviction_time) {
                 bucket_allocator_->FlushDirtyMetadata();
+                bucket_allocator_->RetryFailedEvictions();
                 next_dfs_eviction_time =
                     std::chrono::steady_clock::now() +
                     dfs_allocator_->GetEvictionCheckInterval();
@@ -2129,7 +1795,9 @@ MasterService::BatchPutStart(const UUID& client_id,
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
         results;
     results.reserve(keys.size());
-    if (keys.size() != slice_lengths.size()) {
+    if (keys.size() != slice_lengths.size() ||
+        !config.ValidSessionIds(keys.size()) ||
+        !config.HasValidKeyHints(keys.size())) {
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
         return results;

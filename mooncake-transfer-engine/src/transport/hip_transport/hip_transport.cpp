@@ -142,10 +142,12 @@ static int openIPCHandle(const std::vector<unsigned char>& buffer,
 
 #ifdef USE_HYGON
 static std::string ShareableHandleToHex(const hipFabricHandle_t& handle) {
-    const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&handle);
+    const unsigned char* bytes =
+        reinterpret_cast<const unsigned char*>(&handle);
     std::ostringstream oss;
     for (size_t i = 0; i < sizeof(hipFabricHandle_t); ++i) {
-        oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(bytes[i]);
+        oss << std::hex << std::setw(2) << std::setfill('0')
+            << static_cast<int>(bytes[i]);
     }
     return oss.str();
 }
@@ -155,10 +157,11 @@ static int openShareableHandle(const std::vector<unsigned char>& buffer,
     /**
      * 1. Collect ALL local GPU devices.
      * 2. Perform a single batch attachment of the remote fabric handle.
-     * This registers the remote physical memory into the current process's page tables
-     * and authorizes access for all selected hardware agents.
+     * This registers the remote physical memory into the current process's page
+     * tables and authorizes access for all selected hardware agents.
      *
-     * Benefit: Returns a single Virtual Address (shm_addr) consistent across all local GPUs.
+     * Benefit: Returns a single Virtual Address (shm_addr) consistent across
+     * all local GPUs.
      */
     (void)length;
     hipFabricHandle_t handle;
@@ -175,14 +178,17 @@ static int openShareableHandle(const std::vector<unsigned char>& buffer,
         devices[i] = i;
     }
 
-    if (!checkHip(hipHsaExtRpcMemoryAttachDevice(&handle, devices.size(), devices.data(), shm_addr),
+    if (!checkHip(hipHsaExtRpcMemoryAttachDevice(&handle, devices.size(),
+                                                 devices.data(), shm_addr),
                   "HipTransport: hipHsaExtRpcMemoryAttachDevice failed")) {
         return -1;
     }
 
     if (globalConfig().trace) {
-        LOG(INFO) << "HipTransport: Attaching fabric handle: " << ShareableHandleToHex(handle);
-        LOG(INFO) << "HipTransport: " << num_devices  << " device(s)" << " attached shared memory at address " << *shm_addr;
+        LOG(INFO) << "HipTransport: Attaching fabric handle: "
+                  << ShareableHandleToHex(handle);
+        LOG(INFO) << "HipTransport: " << num_devices << " device(s)"
+                  << " attached shared memory at address " << *shm_addr;
     }
     return 0;
 }
@@ -481,7 +487,7 @@ HipTransport::~HipTransport() {
         for (auto& entry : remap_entries_) {
 #ifdef USE_HYGON
             checkHip(hipHsaExtRpcMemoryDetach(entry.second.shm_addr),
-                          "HipTransport: hipHsaExtRpcMemoryDetach failed");
+                     "HipTransport: hipHsaExtRpcMemoryDetach failed");
 #else
             freePinnedLocalMemory(entry.second.shm_addr);
 #endif
@@ -494,8 +500,9 @@ HipTransport::~HipTransport() {
     remap_entries_.clear();
 #ifdef USE_HYGON
     if (module_loaded_) {
-        for (auto &entry : device_copy_modules_) {
-            checkHip(hipModuleUnload(entry.second), "HipTransport: Failed to unload copy module");
+        for (auto& entry : device_copy_modules_) {
+            checkHip(hipModuleUnload(entry.second),
+                     "HipTransport: Failed to unload copy module");
         }
     }
 #endif
@@ -585,11 +592,13 @@ Status HipTransport::startAsyncTransfer(const TransferRequest& request,
 #ifdef USE_HYGON
     if (!use_fabric_mem_) {
         if (slice->opcode == TransferRequest::READ) {
-            err = hipMemcpyAsync(slice->source_addr, (void*)slice->local.dest_addr,
-                                 slice->length, hipMemcpyDefault, stream);
+            err = hipMemcpyAsync(slice->source_addr,
+                                 (void*)slice->local.dest_addr, slice->length,
+                                 hipMemcpyDefault, stream);
         } else {
-            err = hipMemcpyAsync((void*)slice->local.dest_addr, slice->source_addr,
-                                 slice->length, hipMemcpyDefault, stream);
+            err = hipMemcpyAsync((void*)slice->local.dest_addr,
+                                 slice->source_addr, slice->length,
+                                 hipMemcpyDefault, stream);
         }
     } else {
         // HSA ptr not support in hip API now, use kernel copy
@@ -607,19 +616,24 @@ Status HipTransport::startAsyncTransfer(const TransferRequest& request,
         if (globalConfig().trace) {
             // check 16 bytes alignment for better performance
             if ((d_addr % 16 != 0) || (s_addr % 16 != 0)) {
-                LOG(WARNING) << "HipTransport: 16-bytes Unaligned copy detected (d_addr: " << std::hex << d_addr
-                             << ", s_addr: " << std::hex << s_addr << "). Performance may be degraded." << std::dec;
+                LOG(WARNING)
+                    << "HipTransport: 16-bytes Unaligned copy detected "
+                       "(d_addr: "
+                    << std::hex << d_addr << ", s_addr: " << std::hex << s_addr
+                    << "). Performance may be degraded." << std::dec;
             }
         }
 
-        void* args[] = { &d_addr, &s_addr, &length };
+        void* args[] = {&d_addr, &s_addr, &length};
         /**
-        * Grid Size Calculation Logic:
-        * Background Mode (Default): Limits the kernel to 20 blocks. Use MC_HIP_COPY_BLOCKS to adjust.
-        * Full Mode (MC_HIP_COPY_PERF=1): Scales grid size to data length for maximum.
-        */
+         * Grid Size Calculation Logic:
+         * Background Mode (Default): Limits the kernel to 20 blocks. Use
+         * MC_HIP_COPY_BLOCKS to adjust. Full Mode (MC_HIP_COPY_PERF=1): Scales
+         * grid size to data length for maximum.
+         */
         int threads_per_block = 1024;
-        uint32_t blocks_per_grid = (length + threads_per_block - 1) / threads_per_block;
+        uint32_t blocks_per_grid =
+            (length + threads_per_block - 1) / threads_per_block;
         const char* env_perf = getenv("MC_HIP_COPY_PERF");
         if (env_perf && strcmp(env_perf, "1") == 0) {
             if (blocks_per_grid > 4194302LL) {
@@ -636,26 +650,30 @@ Status HipTransport::startAsyncTransfer(const TransferRequest& request,
                     if (value > 0) {
                         blocks_per_grid = value;
                     } else {
-                        LOG(WARNING) << "HipTransport: MC_HIP_COPY_BLOCKS value " << value
-                                    << " must be positive, using default "
-                                    << blocks_per_grid;
+                        LOG(WARNING)
+                            << "HipTransport: MC_HIP_COPY_BLOCKS value "
+                            << value << " must be positive, using default "
+                            << blocks_per_grid;
                     }
                 } catch (...) {
-                    LOG(WARNING) << "HipTransport: Invalid MC_HIP_COPY_BLOCKS value, using default "
-                                << blocks_per_grid;
+                    LOG(WARNING) << "HipTransport: Invalid MC_HIP_COPY_BLOCKS "
+                                    "value, using default "
+                                 << blocks_per_grid;
                 }
             }
         }
 
         auto copy_func_it = device_copy_funcs_.find(device_id);
         if (copy_func_it == device_copy_funcs_.end()) {
-            LOG(ERROR) << "HipTransport: No copy function found for device " << device_id;
+            LOG(ERROR) << "HipTransport: No copy function found for device "
+                       << device_id;
             slice->markFailed();
             event_pool_.putEvent(event, device_id);
             return Status::Memory("No copy function available for device");
         }
         err = hipModuleLaunchKernel(copy_func_it->second, blocks_per_grid, 1, 1,
-                                    threads_per_block, 1, 1, 0, stream, args, nullptr);
+                                    threads_per_block, 1, 1, 0, stream, args,
+                                    nullptr);
     }
 #else
     if (slice->opcode == TransferRequest::READ) {
@@ -760,9 +778,13 @@ Status HipTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 
     // Get task and status info
     auto& task = batch_desc.task_list[task_id];
-    status.transferred_bytes = task.transferred_bytes;
-    uint64_t success_slice_count = task.success_slice_count;
-    uint64_t failed_slice_count = task.failed_slice_count;
+    uint64_t success_slice_count =
+        __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+    uint64_t failed_slice_count =
+        __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+    // Completion counters publish the preceding byte updates.
+    status.transferred_bytes =
+        __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
 
     // Determine completion status
     if (success_slice_count + failed_slice_count == task.slice_count) {
@@ -878,20 +900,22 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
 
         void* real_addr;
         size_t real_size;
-        if (!checkHip(hipMemGetAddressRange((hipDeviceptr_t*)&real_addr, &real_size, (hipDeviceptr_t)addr),
+        if (!checkHip(hipMemGetAddressRange((hipDeviceptr_t*)&real_addr,
+                                            &real_size, (hipDeviceptr_t)addr),
                       "HipTransport: hipMemGetAddressRange failed")) {
             real_addr = addr;
             real_size = length;
         }
         if (globalConfig().trace) {
-            LOG(INFO) << "HipTransport: Register memory at real address " << real_addr
-                      << " with real size " << real_size;
+            LOG(INFO) << "HipTransport: Register memory at real address "
+                      << real_addr << " with real size " << real_size;
         }
         auto local_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
-        for (auto &entry : local_desc->buffers) {
+        for (auto& entry : local_desc->buffers) {
             if (entry.addr == (uint64_t)real_addr) {
                 if (globalConfig().trace) {
-                    LOG(INFO) << "HipTransport: Memory region " << real_addr << " already registered, skipping.";
+                    LOG(INFO) << "HipTransport: Memory region " << real_addr
+                              << " already registered, skipping.";
                 }
                 return 0;
             }
@@ -903,7 +927,8 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
             return -1;
         }
         if (globalConfig().trace) {
-            LOG(INFO) << "HipTransport: Created fabric handle: " << ShareableHandleToHex(handle);
+            LOG(INFO) << "HipTransport: Created fabric handle: "
+                      << ShareableHandleToHex(handle);
         }
 
         (void)remote_accessible;
@@ -911,7 +936,8 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
         desc.addr = (uint64_t)real_addr;
         desc.length = real_size;
         desc.name = location;
-        desc.shm_name = serializeBinaryData((const void*)&handle, sizeof(hipFabricHandle_t));
+        desc.shm_name = serializeBinaryData((const void*)&handle,
+                                            sizeof(hipFabricHandle_t));
         return metadata_->addLocalMemoryBuffer(desc, true);
 #else
         // Retain allocation handle
@@ -1060,8 +1086,7 @@ void* HipTransport::allocatePinnedLocalMemory(size_t size) {
     if (supportFabricMem()) {
         size = (size + kAlignment - 1) & ~(kAlignment - 1);
     }
-    if (!checkHip(hipMalloc(&ptr, size),
-                  "HipTransport: hipMalloc failed")) {
+    if (!checkHip(hipMalloc(&ptr, size), "HipTransport: hipMalloc failed")) {
         return nullptr;
     }
     return ptr;

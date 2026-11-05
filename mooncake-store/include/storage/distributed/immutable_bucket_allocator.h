@@ -14,6 +14,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -144,7 +145,8 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     ~ImmutableBucketAllocator() override;
 
     ImmutableBucketAllocator(const ImmutableBucketAllocator&) = delete;
-    ImmutableBucketAllocator& operator=(const ImmutableBucketAllocator&) = delete;
+    ImmutableBucketAllocator& operator=(const ImmutableBucketAllocator&) =
+        delete;
 
     DfsAllocatorType Type() const override { return DfsAllocatorType::BUCKET; }
 
@@ -296,7 +298,8 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     PendingEviction PrepareEvictionForLowUtilization(double threshold);
 
     /**
-     * @brief Freeze one specific bucket after its data file is confirmed missing.
+     * @brief Freeze one specific bucket after its data file is confirmed
+     * missing.
      */
     PendingEviction PrepareInvalidation(int64_t bucket_id);
 
@@ -314,10 +317,11 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     /**
      * @brief Accept the eviction: drop the bucket and delete its files.
      * Must only be called once the master has removed every candidate replica.
-     * @return True when the allocator removed the logical bucket. Physical file
-     * deletion is still best-effort.
+     * @return True after data deletion; failed deletions retain quota and
+     * retry.
      */
     bool CommitEviction(PendingEviction&& pending);
+    size_t RetryFailedEvictions();
 
     /**
      * @brief Reject the eviction and return the bucket to service unchanged.
@@ -347,6 +351,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
      * @brief Number of buckets currently tracked (test/metrics helper).
      */
     size_t GetBucketCount() const;
+    uint64_t GetFileCount() const override { return GetBucketCount(); }
 
     struct BucketIdSnapshot {
         uint64_t version = 0;
@@ -417,6 +422,8 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
         // Set between PrepareEviction and Commit/Abort. A frozen bucket
         // accepts no new allocations and cannot be selected again.
         bool frozen = false;
+        bool evicting = false;
+        bool eviction_marker_persisted = false;
         // A ready bucket owns a fully preallocated data file but has never
         // accepted an allocation. Ready buckets are absent from the LRU.
         bool ready = false;
@@ -514,7 +521,8 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
 
     tl::expected<void, ErrorCode> RecoverFromDisk(bool recover_metadata);
 
-    void DeleteBucketFiles(int64_t bucket_id);
+    bool DeleteBucketFiles(int64_t bucket_id);
+    bool TryDeleteEvictedBucket(int64_t bucket_id, const BucketPtr& bucket);
 
     uint64_t UsedBytesLocked() const;
 
@@ -528,6 +536,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     size_t ready_bucket_target_ = 4;
     size_t bucket_create_concurrency_ = 2;
 
+    bool recovery_enabled_ = false;
     bool eviction_enabled_ = true;
     double eviction_high_watermark_ = 0.9;
     double eviction_low_watermark_ = 0.7;
@@ -556,6 +565,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     std::thread legacy_cleanup_worker_;
     std::function<void()> before_bucket_preallocate_hook_for_testing_;
     std::unordered_map<int64_t, BucketPtr> buckets_;
+    std::unordered_set<int64_t> waiting_deletions_;
     std::unordered_map<std::string, int64_t> key_index_;
     int64_t next_bucket_id_ = 0;
     int64_t active_bucket_id_ = -1;

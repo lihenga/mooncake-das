@@ -10,7 +10,7 @@
 #include <fcntl.h>     // For O_CREAT, O_RDWR
 #include <unistd.h>    // For ftruncate, close, shm_unlink
 
-#include "utils.h"
+#include "common/client_buffer_allocation.h"
 
 #if defined(USE_SUNRISE)
 #include "sunrise_allocator.h"
@@ -20,9 +20,9 @@ namespace mooncake {
 
 std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
     size_t size, const std::string& protocol, bool use_hugepage,
-    bool use_spdk_dma) {
-    return std::shared_ptr<ClientBufferAllocator>(
-        new ClientBufferAllocator(size, protocol, use_hugepage, use_spdk_dma));
+    std::shared_ptr<DmaBufferAllocator> dma_allocator) {
+    return std::shared_ptr<ClientBufferAllocator>(new ClientBufferAllocator(
+        size, protocol, use_hugepage, std::move(dma_allocator)));
 }
 
 std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
@@ -37,14 +37,13 @@ std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
     return allocator;
 }
 
-ClientBufferAllocator::ClientBufferAllocator(size_t size,
-                                             const std::string& protocol,
-                                             bool use_hugepage,
-                                             bool use_spdk_dma)
+ClientBufferAllocator::ClientBufferAllocator(
+    size_t size, const std::string& protocol, bool use_hugepage,
+    std::shared_ptr<DmaBufferAllocator> dma_allocator)
     : buffer_size_(size),
       use_hugepage_(use_hugepage),
       protocol(protocol),
-      use_spdk_dma_(use_spdk_dma) {
+      dma_allocator_(std::move(dma_allocator)) {
     if (size == 0) {
         buffer_ = nullptr;
         allocator_ = nullptr;
@@ -62,7 +61,7 @@ ClientBufferAllocator::ClientBufferAllocator(size_t size,
 #endif
         {
             buffer_ = allocate_buffer_allocator_memory(
-                size, protocol, alignment, use_spdk_dma_);
+                size, protocol, alignment, dma_allocator_.get());
         }
     }
     if (!buffer_) {
@@ -91,7 +90,7 @@ ClientBufferAllocator::~ClientBufferAllocator() {
         if (use_hugepage_) {
             free_buffer_mmap_memory(buffer_, buffer_size_);
         } else {
-            free_memory(protocol, buffer_, use_spdk_dma_);
+            free_memory(protocol, buffer_, dma_allocator_.get());
         }
     }
 }
@@ -118,9 +117,9 @@ std::optional<BufferHandle> ClientBufferAllocator::allocate(size_t size) {
     }
     DCHECK_EQ(estimated_size, handle->allocationSize());
 
-    return std::make_optional<BufferHandle>(
-        shared_from_this(), std::move(*handle), usage_tracker_, usage_kind_,
-        estimated_size);
+    return std::make_optional<BufferHandle>(shared_from_this(),
+                                            std::move(*handle), usage_tracker_,
+                                            usage_kind_, estimated_size);
 }
 
 BufferHandle::BufferHandle(
@@ -130,11 +129,10 @@ BufferHandle::BufferHandle(
     DfsBufferUsageKind usage_kind, size_t reserved_size)
     : allocator_(std::move(allocator)),
       handle_(std::move(handle)),
-      usage_(usage_tracker
-                 ? std::make_unique<DfsBufferAllocationUsage>(
-                       std::move(usage_tracker), usage_kind,
-                       handle_.allocationSize(), reserved_size)
-                 : nullptr) {}
+      usage_(usage_tracker ? std::make_unique<DfsBufferAllocationUsage>(
+                                 std::move(usage_tracker), usage_kind,
+                                 handle_.allocationSize(), reserved_size)
+                           : nullptr) {}
 
 BufferHandle::BufferHandle(BufferHandle&& other) noexcept
     : allocator_(std::move(other.allocator_)),
@@ -176,8 +174,8 @@ BufferHandle& BufferHandle::operator=(BufferHandle&& other) noexcept {
 }
 
 BufferHandle::BufferHandle(void* ptr, size_t size,
-                           std::function<void()> release_fn,
-                           void* device_ptr, size_t allocation_size)
+                           std::function<void()> release_fn, void* device_ptr,
+                           size_t allocation_size)
     : view_ptr_(ptr),
       view_size_(size),
       view_allocation_size_(allocation_size == 0 ? size : allocation_size),
@@ -259,8 +257,9 @@ int allocateSlices(std::vector<Slice>& slices,
             Slice{buffer_ptr, replica.get_local_disk_descriptor().object_size});
     } else if (replica.is_dfs_replica()) {
         // Use aligned_size (value + padding) so the slice length is a multiple
-        // of the DFS block alignment, letting O_DIRECT go through the zero-bounce
-        // preadv path. The trailing padding is read but not scattered.
+        // of the DFS block alignment, letting O_DIRECT go through the
+        // zero-bounce preadv path. The trailing padding is read but not
+        // scattered.
         const auto& desc = replica.get_dfs_descriptor();
         const uint64_t slice_size =
             desc.aligned_size > 0 ? desc.aligned_size : desc.object_size;

@@ -14,8 +14,7 @@ inline constexpr uint64_t kDefaultDfsBatchTimeoutFixedMs = 70000;
 inline uint64_t SaturatingScaleTimeoutMs(uint64_t base_timeout_ms,
                                          uint64_t multiplier) {
     if (base_timeout_ms == 0) return 0;
-    if (base_timeout_ms >
-        std::numeric_limits<uint64_t>::max() / multiplier) {
+    if (base_timeout_ms > std::numeric_limits<uint64_t>::max() / multiplier) {
         return std::numeric_limits<uint64_t>::max();
     }
     return base_timeout_ms * multiplier;
@@ -23,8 +22,7 @@ inline uint64_t SaturatingScaleTimeoutMs(uint64_t base_timeout_ms,
 
 inline uint64_t SaturatingAddTimeoutMs(uint64_t timeout_ms,
                                        uint64_t fixed_timeout_ms) {
-    if (fixed_timeout_ms >
-        std::numeric_limits<uint64_t>::max() - timeout_ms) {
+    if (fixed_timeout_ms > std::numeric_limits<uint64_t>::max() - timeout_ms) {
         return std::numeric_limits<uint64_t>::max();
     }
     return timeout_ms + fixed_timeout_ms;
@@ -71,10 +69,12 @@ inline void SaturatingAddBytes(uint64_t bytes, uint64_t* total) {
 inline std::chrono::steady_clock::time_point DfsIoDeadlineFromNow(
     uint64_t timeout_ms) {
     const auto now = std::chrono::steady_clock::now();
-    const auto available = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::time_point::max() - now);
+    const auto available =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::time_point::max() - now);
     const auto max_count = static_cast<uint64_t>(available.count());
-    const auto clamped = std::min(timeout_ms, max_count > 0 ? max_count - 1 : 0);
+    const auto clamped =
+        std::min(timeout_ms, max_count > 0 ? max_count - 1 : 0);
     return now + std::chrono::milliseconds(clamped);
 }
 

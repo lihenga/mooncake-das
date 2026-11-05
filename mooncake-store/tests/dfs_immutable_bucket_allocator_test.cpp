@@ -166,10 +166,11 @@ DistributedStorageConfig MakeBucketConfig(const std::string& fsdir,
     DistributedStorageConfig config;
     config.fsdir = fsdir;
     config.fs_adapter_type = "posix";
-    config.allocator_type = DfsAllocatorType::BUCKET;
+    config.allocator_type = "bucket";
     config.bucket_capacity = bucket_capacity;
     config.max_bucket_count = max_bucket_count;
     config.ready_bucket_target = 0;
+    config.bucket_recovery_enabled = true;
     config.alignment = kAlignment;
     config.single_tenant = true;
     config.eviction_enabled = false;
@@ -189,7 +190,7 @@ DistributedStorageConfig MakeShardConfig(const std::string& fsdir,
     DistributedStorageConfig config;
     config.fsdir = fsdir;
     config.fs_adapter_type = "posix";
-    config.allocator_type = DfsAllocatorType::SHARD;
+    config.allocator_type = "shard";
     config.shard_count = shard_count;
     config.shard_capacity = shard_capacity;
     config.alignment = kAlignment;
@@ -207,7 +208,8 @@ uint64_t EntryStartOf(const DistributedFSDescriptor& desc) {
 
 std::string BucketMetaFile(const TempDir& tmp, int64_t bucket_id) {
     return tmp.file("bucket_" +
-                    ImmutableBucketAllocator::FormatBucketId(bucket_id) + ".meta");
+                    ImmutableBucketAllocator::FormatBucketId(bucket_id) +
+                    ".meta");
 }
 
 // Seals the current active bucket, which is the only moment its `.meta` file is
@@ -232,9 +234,8 @@ std::optional<int64_t> ReadDfsBucketCreateFailureTotal() {
         if (serialized.compare(line_begin, line_prefix.size(), line_prefix) ==
             0) {
             const size_t value_begin = line_begin + line_prefix.size();
-            const size_t value_end = line_end == std::string::npos
-                                         ? serialized.size()
-                                         : line_end;
+            const size_t value_end =
+                line_end == std::string::npos ? serialized.size() : line_end;
             return std::stoll(
                 serialized.substr(value_begin, value_end - value_begin));
         }
@@ -366,8 +367,7 @@ TEST(ImmutableBucketAllocatorTest,
     EXPECT_TRUE(post_retire_rejected);
     ASSERT_EQ(retired_results.size(), 1u);
     EXPECT_FALSE(retired_results[0].success);
-    EXPECT_EQ(retired_results[0].error,
-              ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    EXPECT_EQ(retired_results[0].error, ErrorCode::DFS_SERVICE_UNAVAILABLE);
 
     auto replacement_allocation =
         replacement->Allocate("replacement_key", kAlignment);
@@ -378,7 +378,8 @@ TEST(ImmutableBucketAllocatorTest,
 
 std::string BucketDataFile(const TempDir& tmp, int64_t bucket_id) {
     return tmp.file("bucket_" +
-                    ImmutableBucketAllocator::FormatBucketId(bucket_id) + ".data");
+                    ImmutableBucketAllocator::FormatBucketId(bucket_id) +
+                    ".data");
 }
 
 bool WriteBucketMetadata(const TempDir& tmp, PersistedBucketMetadata snapshot) {
@@ -477,8 +478,8 @@ TEST(ImmutableBucketAllocatorTest,
     auto allocated = alloc.Allocate("precreate_retry", 100);
     ASSERT_TRUE(allocated.has_value());
 
-    const auto first_deadline = std::chrono::steady_clock::now() +
-                                std::chrono::seconds(3);
+    const auto first_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
     auto first_failures = ReadDfsBucketCreateFailureTotal();
     while ((!first_failures || *first_failures == *failures_before) &&
            std::chrono::steady_clock::now() < first_deadline) {
@@ -489,7 +490,8 @@ TEST(ImmutableBucketAllocatorTest,
     ASSERT_GT(*first_failures, *failures_before);
 
     // Exhaust the active bucket, then keep requesting space during backoff.
-    // Previously every allocation cleared the deadline and retried metadata I/O.
+    // Previously every allocation cleared the deadline and retried metadata
+    // I/O.
     for (int i = 0; i < 200; ++i) {
         (void)alloc.Allocate("backoff_" + std::to_string(i), kBucketCapacity);
     }
@@ -498,8 +500,8 @@ TEST(ImmutableBucketAllocatorTest,
     EXPECT_EQ(*immediate_failures, *first_failures);
     EXPECT_TRUE(log_capture.cleanup_messages().empty());
 
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::seconds(5);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
     auto failures_after = first_failures;
     while (std::chrono::steady_clock::now() < deadline) {
         failures_after = ReadDfsBucketCreateFailureTotal();
@@ -517,11 +519,12 @@ TEST(ImmutableBucketAllocatorTest,
     }
     EXPECT_TRUE(log_capture.cleanup_messages().empty());
 
-    // Recovery is driven by the worker's next timed retry, without resetting it.
+    // Recovery is driven by the worker's next timed retry, without resetting
+    // it.
     std::filesystem::remove(tmp.path());
     std::filesystem::create_directory(tmp.path());
-    const auto recovery_deadline = std::chrono::steady_clock::now() +
-                                   std::chrono::seconds(6);
+    const auto recovery_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(6);
     bool recovered = false;
     while (std::chrono::steady_clock::now() < recovery_deadline) {
         auto retry = alloc.Allocate("after_recovery", kBucketCapacity);
@@ -533,7 +536,6 @@ TEST(ImmutableBucketAllocatorTest,
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     EXPECT_TRUE(recovered);
-
 }
 
 TEST(ImmutableBucketAllocatorTest, InitRejectsInvalidConfiguration) {
@@ -580,7 +582,8 @@ TEST(ImmutableBucketAllocatorTest, InitRejectsInvalidConfiguration) {
     }
 }
 
-TEST(ImmutableBucketAllocatorTest, MultipleObjectsShareBucketWithDistinctOffsets) {
+TEST(ImmutableBucketAllocatorTest,
+     MultipleObjectsShareBucketWithDistinctOffsets) {
     TempDir tmp("bucket_multi");
     ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
@@ -914,7 +917,8 @@ TEST(ImmutableBucketAllocatorTest, MetadataIsPersistedWhenBucketIsSealed) {
     EXPECT_FALSE(std::filesystem::exists(meta_path + ".log"));
 }
 
-TEST(ImmutableBucketAllocatorTest, MetadataRoundTripKeepsEntryGenerationAndKey) {
+TEST(ImmutableBucketAllocatorTest,
+     MetadataRoundTripKeepsEntryGenerationAndKey) {
     TempDir tmp("bucket_metadata_schema");
     {
         ImmutableBucketAllocator alloc;
@@ -1224,7 +1228,8 @@ TEST(ImmutableBucketAllocatorTest, RecoveryRejectsCorruptAndTruncatedMetadata) {
     }
 }
 
-TEST(ImmutableBucketAllocatorTest, NarrowedCapacityDiscardsIncompatibleBuckets) {
+TEST(ImmutableBucketAllocatorTest,
+     NarrowedCapacityDiscardsIncompatibleBuckets) {
     TempDir tmp("bucket_recover_narrowed");
     std::string data_path;
     {
@@ -1364,7 +1369,8 @@ TEST(ImmutableBucketAllocatorTest, RecoveryPreservesBucketIdSequence) {
     EXPECT_EQ(desc->shard_idx, 3);
 }
 
-TEST(ImmutableBucketAllocatorTest, RecoveryDisabledReclaimsFilesAndUsesFreshBudget) {
+TEST(ImmutableBucketAllocatorTest,
+     RecoveryDisabledReclaimsFilesAndUsesFreshBudget) {
     TempDir tmp("bucket_no_recovery");
     auto config = MakeBucketConfig(tmp.path(), kAlignment, 8);
     config.ready_bucket_target = 0;
@@ -1440,6 +1446,7 @@ DistributedStorageConfig MakeEvictionConfig(const std::string& fsdir,
                                             uint64_t bucket_capacity,
                                             int64_t max_bucket_count) {
     auto config = MakeBucketConfig(fsdir, bucket_capacity, max_bucket_count);
+    config.bucket_recovery_enabled = false;
     config.eviction_enabled = true;
     config.eviction_high_watermark = 0.5;
     config.eviction_low_watermark = 0.25;
@@ -1630,7 +1637,8 @@ TEST(ImmutableBucketAllocatorTest, CommitAndAbortEvictionAreIdempotent) {
     EXPECT_EQ(alloc.GetBucketCount(), 2u);
 }
 
-TEST(ImmutableBucketAllocatorTest, AllocationFailureEvictionBypassesLowWatermark) {
+TEST(ImmutableBucketAllocatorTest,
+     AllocationFailureEvictionBypassesLowWatermark) {
     TempDir tmp("bucket_evict_allocation_failure");
     constexpr uint64_t capacity = 10 * kAlignment;
     ImmutableBucketAllocator alloc;
@@ -1760,7 +1768,8 @@ TEST(ImmutableBucketAllocatorTest, FreePendingReservationMakesBucketEvictable) {
     EXPECT_TRUE(alloc.CommitEviction(std::move(pending)));
 }
 
-TEST(ImmutableBucketAllocatorTest, LowUtilizationEvictionIgnoresGlobalWatermark) {
+TEST(ImmutableBucketAllocatorTest,
+     LowUtilizationEvictionIgnoresGlobalWatermark) {
     TempDir tmp("bucket_evict_low_utilization");
     const uint64_t capacity = kAlignment;
     ImmutableBucketAllocator alloc;
@@ -1831,7 +1840,8 @@ TEST(ImmutableBucketAllocatorTest, EvictionDisabledYieldsNoCandidates) {
     EXPECT_FALSE(alloc.IsEvictionEnabled());
 }
 
-TEST(ImmutableBucketAllocatorTest, ReadableDescriptorSurvivesConcurrentEviction) {
+TEST(ImmutableBucketAllocatorTest,
+     ReadableDescriptorSurvivesConcurrentEviction) {
     TempDir tmp("bucket_evict_inflight");
     const uint64_t capacity = kAlignment;
     ImmutableBucketAllocator alloc;
@@ -2114,7 +2124,7 @@ TEST(DfsAllocatorConfigTest, ParsesAndRejectsAllocatorTypes) {
 TEST(DfsAllocatorConfigTest, DefaultsToShardAndValidatesBucketFields) {
     DistributedStorageConfig config;
     // SHARD remains the default so existing deployments do not change mode.
-    EXPECT_EQ(config.allocator_type, DfsAllocatorType::SHARD);
+    EXPECT_EQ(config.allocator_type, "shard");
     EXPECT_TRUE(config.allocator_type_valid);
 
     TempDir tmp("config_validate");
@@ -2185,8 +2195,7 @@ TEST(BucketEntryLayoutTest, RebuildMatchesComputeAndRejectsMisalignment) {
     auto computed = ComputeBucketEntryLayout(alignment, 200, alignment);
     ASSERT_TRUE(computed.has_value());
 
-    auto rebuilt =
-        RebuildBucketEntryLayout(computed->offset, 200, alignment);
+    auto rebuilt = RebuildBucketEntryLayout(computed->offset, 200, alignment);
     ASSERT_TRUE(rebuilt.has_value());
     EXPECT_EQ(rebuilt->offset, computed->offset);
     EXPECT_EQ(rebuilt->aligned_size, computed->aligned_size);
@@ -2200,8 +2209,7 @@ TEST(BucketEntryLayoutTest, DescriptorConstructionIsCentralized) {
     auto layout = ComputeBucketEntryLayout(0, 100, alignment);
     ASSERT_TRUE(layout.has_value());
 
-    auto desc =
-        MakeBucketDescriptor("/tmp/bucket_000001.data", *layout, 1);
+    auto desc = MakeBucketDescriptor("/tmp/bucket_000001.data", *layout, 1);
     EXPECT_EQ(desc.file_path, "/tmp/bucket_000001.data");
     EXPECT_EQ(desc.offset, layout->offset);
     EXPECT_EQ(desc.object_size, 100u);
@@ -2381,6 +2389,40 @@ TEST(BucketMetadataDurabilityTest, FlushRacesWithConcurrentAllocateAndCommit) {
     const size_t restored = recovered.TakeRecoveredReplicas().size();
     EXPECT_GE(restored, kTotal - kEntriesPerBucket);
     EXPECT_LE(restored, kTotal);
+}
+
+TEST(ImmutableBucketAllocatorTest,
+     FailedPhysicalDeletionRetainsQuotaAndRetries) {
+    TempDir tmp("bucket_delete_retry");
+    auto config = MakeEvictionConfig(tmp.path(), kAlignment, 2);
+    config.ready_bucket_target = 0;
+    config.bucket_recovery_enabled = true;
+    ImmutableBucketAllocator alloc;
+    ASSERT_TRUE(alloc.Init(config));
+    auto victim = alloc.Allocate("victim", 100);
+    ASSERT_TRUE(victim);
+    ASSERT_TRUE(alloc.MarkCommitted("victim", *victim));
+    auto active = alloc.Allocate("active", 100);
+    ASSERT_TRUE(active);
+    ASSERT_TRUE(alloc.MarkCommitted("active", *active));
+    const std::string saved = victim->file_path + ".saved";
+    std::filesystem::rename(victim->file_path, saved);
+    std::filesystem::create_directory(victim->file_path);
+    std::ofstream(victim->file_path + "/occupied") << "block unlink";
+    auto pending = alloc.PrepareEvictionForAllocationFailure();
+    ASSERT_EQ(pending.bucket_id(), victim->shard_idx);
+    EXPECT_FALSE(alloc.CommitEviction(std::move(pending)));
+    EXPECT_EQ(alloc.GetBucketCount(), 2u);
+    EXPECT_FALSE(alloc.GetBucketIdForKey("victim"));
+    auto extra = alloc.Allocate("extra", kAlignment);
+    EXPECT_FALSE(extra);
+    std::filesystem::remove(victim->file_path + "/occupied");
+    std::filesystem::remove(victim->file_path);
+    std::filesystem::rename(saved, victim->file_path);
+    EXPECT_EQ(alloc.RetryFailedEvictions(), 1u);
+    EXPECT_EQ(alloc.GetBucketCount(), 1u);
+    EXPECT_FALSE(std::filesystem::exists(victim->file_path));
+    EXPECT_TRUE(alloc.Allocate("extra", kAlignment));
 }
 
 }  // namespace mooncake::test

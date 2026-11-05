@@ -17,7 +17,7 @@
 #include "master_service.h"
 #include "rpc_helper.h"
 #include "types.h"
-#include "utils/scoped_vlog_timer.h"
+#include "common/scoped_vlog_timer.h"
 #include "version.h"
 
 namespace mooncake::rpc_detail {
@@ -110,6 +110,31 @@ inline auto WithWriteTenant(std::string_view raw, bool enable_multi_tenants,
         return Result(tl::make_unexpected(tenant_id.error()));
     }
     return std::invoke(std::forward<Fn>(fn), tenant_id.value());
+}
+
+template <typename Request>
+void BindWeightRequestTenant(Request& request, const TenantId& tenant_id) {
+    if constexpr (requires { request.identity.tenant_id; }) {
+        request.identity.tenant_id = tenant_id.value();
+    } else {
+        request.tenant_id = tenant_id.value();
+    }
+}
+
+template <typename Request, typename Fn>
+auto WithWeightRequestTenant(Request request, std::string_view raw,
+                             bool enable_multi_tenants, bool write, Fn&& fn) {
+    using Result = std::invoke_result_t<Fn, const Request&>;
+    auto tenant_id =
+        write ? ResolveTenantIdForWrite(raw, enable_multi_tenants)
+              : ResolveRequestTenantId(
+                    enable_multi_tenants ? raw : TenantId::kDefaultValue);
+    if (!tenant_id) {
+        return Result(
+            tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT));
+    }
+    BindWeightRequestTenant(request, *tenant_id);
+    return std::invoke(std::forward<Fn>(fn), request);
 }
 
 }  // namespace mooncake::rpc_detail

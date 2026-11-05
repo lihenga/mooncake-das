@@ -1,5 +1,6 @@
 // client_buffer_test.cpp
 #include "client_buffer.h"
+#include "nof/nof_runtime.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -59,7 +60,7 @@ TEST_F(ClientBufferTest, AdmissionProtectsOneReadChunkFromWrites) {
     tracker->ConfigureAdmission(kReadFreeReserve, 0, kCapacity);
 
     ASSERT_EQ(tracker->TryReserve(DfsBufferUsageKind::kWrite,
-                                   kCapacity - kReadFreeReserve),
+                                  kCapacity - kReadFreeReserve),
               DfsBufferAdmissionFailure::kNone);
     tracker->CommitReservation(DfsBufferUsageKind::kWrite,
                                kCapacity - kReadFreeReserve,
@@ -77,10 +78,10 @@ TEST_F(ClientBufferTest, AdmissionRejectsRequestLargerThanNonReadCapacity) {
     tracker->ConfigureAdmission(kReadFreeReserve, 0, kCapacity);
 
     EXPECT_EQ(tracker->TryReserve(DfsBufferUsageKind::kWrite,
-                                   kCapacity - kReadFreeReserve + 1),
+                                  kCapacity - kReadFreeReserve + 1),
               DfsBufferAdmissionFailure::kRequestExceedsLimit);
     EXPECT_EQ(tracker->TryReserve(DfsBufferUsageKind::kPrefetch,
-                                   kCapacity - kReadFreeReserve + 1),
+                                  kCapacity - kReadFreeReserve + 1),
               DfsBufferAdmissionFailure::kRequestExceedsLimit);
 }
 
@@ -108,8 +109,8 @@ TEST_F(ClientBufferTest, AdmissionCarvesWriteProtectionOutOfPrefetch) {
 
     EXPECT_EQ(limits.read_min_protection_bytes, kReadFreeReserve);
     EXPECT_EQ(limits.write_min_protection_bytes, kWriteReserve);
-    EXPECT_EQ(limits.prefetch_limit_bytes, kCapacity - kReadFreeReserve -
-                                               kWriteReserve);
+    EXPECT_EQ(limits.prefetch_limit_bytes,
+              kCapacity - kReadFreeReserve - kWriteReserve);
     // Prefetch fills its truncated budget and is then refused.
     ASSERT_EQ(tracker->TryReserve(DfsBufferUsageKind::kPrefetch,
                                   limits.prefetch_limit_bytes),
@@ -148,12 +149,12 @@ TEST_F(ClientBufferTest, AdmissionReservationIsAtomicAcrossWriters) {
 
     std::array<DfsBufferAdmissionFailure, 2> results;
     std::thread first([&] {
-        results[0] = tracker->TryReserve(
-            DfsBufferUsageKind::kWrite, kCapacity - kReadFreeReserve);
+        results[0] = tracker->TryReserve(DfsBufferUsageKind::kWrite,
+                                         kCapacity - kReadFreeReserve);
     });
     std::thread second([&] {
-        results[1] = tracker->TryReserve(
-            DfsBufferUsageKind::kWrite, kCapacity - kReadFreeReserve);
+        results[1] = tracker->TryReserve(DfsBufferUsageKind::kWrite,
+                                         kCapacity - kReadFreeReserve);
     });
     first.join();
     second.join();
@@ -220,8 +221,7 @@ TEST_F(ClientBufferTest, AllocationWaitIsWokenByRelease) {
     std::atomic<bool> allocated{false};
     std::thread waiter([&] {
         auto result = allocator->allocate_aligned_wait(
-            4096, 4096, DfsBufferUsageKind::kWrite,
-            std::chrono::seconds(2));
+            4096, 4096, DfsBufferUsageKind::kWrite, std::chrono::seconds(2));
         allocated.store(result.has_value());
     });
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -238,8 +238,8 @@ TEST_F(ClientBufferTest, AllocationWaitReportsTimeout) {
     bool timed_out = false;
     const auto start = std::chrono::steady_clock::now();
     auto result = allocator->allocate_aligned_wait(
-        4096, 4096, DfsBufferUsageKind::kWrite,
-        std::chrono::milliseconds(30), &timed_out);
+        4096, 4096, DfsBufferUsageKind::kWrite, std::chrono::milliseconds(30),
+        &timed_out);
     const auto elapsed = std::chrono::steady_clock::now() - start;
     EXPECT_FALSE(result.has_value());
     EXPECT_TRUE(timed_out);
@@ -288,11 +288,16 @@ TEST_F(ClientBufferTest, SpdkDmaAllocatorDestroysWithSpdkFree) {
     constexpr size_t buffer_size = 4096;
     constexpr size_t alloc_size = 64;
 
+    auto runtime = CreateNofRuntime();
+    if (!runtime.initiator) {
+        GTEST_SKIP() << "NoF unavailable";
+    }
+
     std::shared_ptr<ClientBufferAllocator> allocator;
     try {
         allocator = ClientBufferAllocator::create(buffer_size, "tcp",
                                                   /*use_hugepage=*/false,
-                                                  /*use_spdk_dma=*/true);
+                                                  runtime.dma_allocator);
     } catch (const std::bad_alloc&) {
         GTEST_SKIP()
             << "SPDK DMA allocation is unavailable in this environment";

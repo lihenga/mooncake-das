@@ -18,7 +18,7 @@
 #include "mutex.h"
 #include "rpc_service.h"
 #include "types.h"
-#include "utils/scoped_vlog_timer.h"
+#include "common/scoped_vlog_timer.h"
 #include "master_metric_manager.h"
 #include "version.h"
 
@@ -33,18 +33,33 @@ struct RpcNameTraits<&WrappedMasterService::ExistKey> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::ProbeKey> {
+    static constexpr const char* value = "ProbeKey";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::BatchExistKey> {
     static constexpr const char* value = "BatchExistKey";
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::BatchExistKeyByReplicaType> {
-    static constexpr const char* value = "BatchExistKeyByReplicaType";
+struct RpcNameTraits<&WrappedMasterService::BatchProbeKey> {
+    static constexpr const char* value = "BatchProbeKey";
 };
 
 template <>
 struct RpcNameTraits<&WrappedMasterService::GetReplicaList> {
     static constexpr const char* value = "GetReplicaList";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::GetReplicaListForAdmin> {
+    static constexpr const char* value = "GetReplicaListForAdmin";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaListForAdmin> {
+    static constexpr const char* value = "BatchGetReplicaListForAdmin";
 };
 
 template <>
@@ -203,11 +218,6 @@ struct RpcNameTraits<&WrappedMasterService::Ping> {
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::ReportServiceMetrics> {
-    static constexpr const char* value = "ReportServiceMetrics";
-};
-
-template <>
 struct RpcNameTraits<&WrappedMasterService::GetFsdir> {
     static constexpr const char* value = "GetFsdir";
 };
@@ -263,6 +273,11 @@ struct RpcNameTraits<&WrappedMasterService::PromotionAllocStart> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::RegisterPrefetchTask> {
+    static constexpr const char* value = "RegisterPrefetchTask";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::NotifyPromotionSuccess> {
     static constexpr const char* value = "NotifyPromotionSuccess";
 };
@@ -279,16 +294,6 @@ struct RpcNameTraits<&WrappedMasterService::CopyStart> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::DynamicReplicaCopyStart> {
     static constexpr const char* value = "DynamicReplicaCopyStart";
-};
-
-template <>
-struct RpcNameTraits<&WrappedMasterService::DfsBackfillStart> {
-    static constexpr const char* value = "DfsBackfillStart";
-};
-
-template <>
-struct RpcNameTraits<&WrappedMasterService::DfsBackfillFinish> {
-    static constexpr const char* value = "DfsBackfillFinish";
 };
 
 template <>
@@ -355,8 +360,58 @@ struct RpcNameTraits<&WrappedMasterService::EvictDiskReplica> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::EvictDiskReplicaIfCurrent> {
+    static constexpr const char* value = "EvictDiskReplicaIfCurrent";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::BatchEvictDiskReplica> {
     static constexpr const char* value = "BatchEvictDiskReplica";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::PollRemoveAll> {
+    static constexpr const char* value = "PollRemoveAll";
+};
+
+#define DEFINE_WEIGHT_RPC_NAME(method)                    \
+    template <>                                           \
+    struct RpcNameTraits<&WrappedMasterService::method> { \
+        static constexpr const char* value = #method;     \
+    }
+
+DEFINE_WEIGHT_RPC_NAME(BeginWeightImport);
+DEFINE_WEIGHT_RPC_NAME(CommitWeightImport);
+DEFINE_WEIGHT_RPC_NAME(AbortWeightImport);
+DEFINE_WEIGHT_RPC_NAME(GetWeightRevision);
+DEFINE_WEIGHT_RPC_NAME(ListWeightRevisions);
+DEFINE_WEIGHT_RPC_NAME(AcquireWeightRevisionLease);
+DEFINE_WEIGHT_RPC_NAME(RenewWeightRevisionLease);
+DEFINE_WEIGHT_RPC_NAME(ReleaseWeightRevisionLease);
+DEFINE_WEIGHT_RPC_NAME(StartWeightResidencyOperation);
+DEFINE_WEIGHT_RPC_NAME(QueryWeightOperation);
+DEFINE_WEIGHT_RPC_NAME(DeleteWeightRevision);
+
+#undef DEFINE_WEIGHT_RPC_NAME
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchExistKeyByReplicaType> {
+    static constexpr const char* value = "BatchExistKeyByReplicaType";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::ReportServiceMetrics> {
+    static constexpr const char* value = "ReportServiceMetrics";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::DfsBackfillStart> {
+    static constexpr const char* value = "DfsBackfillStart";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::DfsBackfillFinish> {
+    static constexpr const char* value = "DfsBackfillFinish";
 };
 
 template <>
@@ -368,12 +423,6 @@ template <>
 struct RpcNameTraits<&WrappedMasterService::GetDfsBucketSnapshot> {
     static constexpr const char* value = "GetDfsBucketSnapshot";
 };
-
-template <>
-struct RpcNameTraits<&WrappedMasterService::PollRemoveAll> {
-    static constexpr const char* value = "PollRemoveAll";
-};
-
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_client_pool(
     const std::shared_ptr<RpcClientPool::ClientPool>& client_pool,
@@ -443,6 +492,8 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
             input_size, tl::make_unexpected(ErrorCode::RPC_FAIL));
     }
     auto pool = client_accessor_->GetClientPool();
+
+    // Increment RPC counter
     if (metrics_) {
         metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
     }

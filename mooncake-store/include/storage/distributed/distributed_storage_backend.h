@@ -10,10 +10,12 @@
 #include <optional>
 #include <shared_mutex>
 #include <set>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#include "config/distributed_storage_config.h"
 #include "fs_adapter.h"
 #include "replica.h"
 #include "storage/distributed/dfs_io_timeout.h"
@@ -31,79 +33,6 @@ enum class DistributedStorageMode {
 };
 class ThreadPool;
 
-struct DistributedStorageConfig {
-    std::string fsdir = "/mnt/3fs/mooncake";
-    std::string fs_adapter_type = "hf3fs";
-    bool enable_health_check = false;
-    int shard_count = 64;
-    uint64_t shard_capacity = 4ULL * 1024 * 1024 * 1024;
-    uint64_t alignment = 4096;
-    bool single_tenant = true;
-    bool eviction_enabled = true;
-    double eviction_high_watermark = 0.9;
-    double eviction_low_watermark = 0.7;
-    // BUCKET mode only: reclaim sealed buckets whose live utilization is below
-    // this threshold. A value of 0 disables low-utilization cleanup.
-    double low_utilization_threshold = 0.05;
-    // Maximum number of low-utilization buckets reclaimed per maintenance tick.
-    int low_utilization_evictions_per_tick = 1;
-    // Maximum number of low-utilization candidates inspected per maintenance
-    // tick. This bounds work when candidates are rejected by the Master.
-    int low_utilization_eviction_attempts_per_tick = 8;
-    std::chrono::seconds deferred_free_duration{30};
-    std::chrono::seconds eviction_check_interval{5};
-
-    // Which space-management strategy the master uses. SHARD is the default so
-    // existing deployments are unaffected.
-    DfsAllocatorType allocator_type = DfsAllocatorType::SHARD;
-    // BUCKET mode only: size of each append-only bucket data file.
-    uint64_t bucket_capacity = 256ULL * 1024 * 1024;
-    // When false, retain old bucket files without recovering their replicas.
-    // max_bucket_count then budgets only buckets created by this process.
-    bool bucket_recovery_enabled = false;
-    // BUCKET mode only: upper bound on live buckets. Also the fixed
-    // denominator for eviction watermarks, so it must be > 0.
-    int64_t max_bucket_count = 256;
-    // BUCKET mode only: desired number of preallocated buckets kept ready for
-    // the next rollover, capped by the available bucket count. Zero disables
-    // background precreation.
-    int ready_bucket_target = 4;
-    // BUCKET mode only: maximum number of concurrent bucket preallocations.
-    int bucket_create_concurrency = 2;
-    // BUCKET mode only: number of threads for parallel batch reads across
-    // buckets. Set to 1 to disable parallelism. Must be in
-    // [1, kMaxBatchReadThreads].
-    int batch_read_threads = 128;
-    // When true, BatchRead keeps the legacy flow that groups reads by bucket
-    // and merges contiguous entries. When false (default), every key is read
-    // directly on its own with batch_read_threads concurrency.
-    bool batch_read_merge_enabled = false;
-    // When true (default), BatchRead reads through dedicated direct handles
-    // (page-cache-bypassing where the adapter supports it, e.g. O_DIRECT on
-    // POSIX). When false, reads go through the regular cached handles.
-    bool direct_read_enabled = true;
-    // Baseline for the size-scaled DFS BatchGet deadline. Zero disables it.
-    uint64_t batch_get_timeout_ms = 10000;
-    // Fixed budget added after size scaling. Shared with BatchPut through
-    // MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS.
-    uint64_t batch_timeout_fixed_ms = kDefaultDfsBatchTimeoutFixedMs;
-    // Bound DFS reads whose filesystem I/O has not actually completed. A
-    // timeout keeps both charges until the background read really returns.
-    uint64_t batch_get_max_inflight_batches = 8;
-    uint64_t batch_get_max_inflight_bytes = 8ULL * 1024 * 1024 * 1024;
-    // Cleared by FromEnvironment() when MOONCAKE_DFS_ALLOCATOR_TYPE names an
-    // unknown allocator, so the master can reject the configuration instead of
-    // silently defaulting to SHARD.
-    bool allocator_type_valid = true;
-
-    bool Validate() const;
-    bool ValidateForAllocator() const;
-    bool ValidateForBucketAllocator() const;
-    static bool IsReplicaEnabledFromEnvironment();
-    static DistributedStorageConfig FromEnvironment();
-    std::string FormatStr() const;
-};
-
 struct DfsWriteRequest {
     std::string key;
     DistributedFSDescriptor descriptor;
@@ -111,6 +40,21 @@ struct DfsWriteRequest {
 };
 
 struct DfsReadRequest {
+    DfsReadRequest(std::string key, DistributedFSDescriptor descriptor,
+                   std::vector<Slice> slices,
+                   std::shared_ptr<void> owner = nullptr)
+        : key(std::move(key)),
+          descriptor(std::move(descriptor)),
+          slices(std::move(slices)),
+          buffer_owner(std::move(owner)) {}
+    DfsReadRequest(std::string key, DistributedFSDescriptor descriptor,
+                   std::vector<Slice> slices, uint64_t value_offset,
+                   bool range_read)
+        : key(std::move(key)),
+          descriptor(std::move(descriptor)),
+          slices(std::move(slices)),
+          value_offset(value_offset),
+          range_read(range_read) {}
     std::string key;
     DistributedFSDescriptor descriptor;
     std::vector<Slice> slices;
@@ -118,6 +62,10 @@ struct DfsReadRequest {
     // into its background context so the allocator cannot reuse the memory
     // before the underlying preadv has really returned.
     std::shared_ptr<void> buffer_owner;
+    // When range_read is set, slices are a window of the value starting at
+    // value_offset. Otherwise slices must cover the whole object.
+    uint64_t value_offset = 0;
+    bool range_read = false;
 };
 
 /**
@@ -156,9 +104,11 @@ class DistributedStorageBackend
         return storage_mode_ == DistributedStorageMode::kObjectStorage;
     }
 
-    // Set the master's path namespace before publishing the backend for I/O.
     void SetDescriptorRootDir(const std::string& root_dir) {
         descriptor_root_dir_ = root_dir;
+    }
+    bool UsesKvcs() const {
+        return UsesObjectStorage() && distributed_config_.UsesKvcs();
     }
 
     tl::expected<void, ErrorCode> Init() override;
@@ -198,6 +148,9 @@ class DistributedStorageBackend
     std::vector<tl::expected<void, ErrorCode>> BatchRead(
         const std::vector<DfsReadRequest>& requests);
 
+    ObjectStorageIoResults BatchDeleteObjects(
+        std::span<const std::string> logical_keys);
+
     // Key-only storage backend operations cannot safely address DFS objects;
     // callers must use BatchRead/BatchWrite with request-scoped descriptors.
     tl::expected<void, ErrorCode> BatchLoad(
@@ -219,7 +172,8 @@ class DistributedStorageBackend
      * and the asynchronous BUCKET one.
      */
     DfsAllocatorType GetAllocatorType() const {
-        return distributed_config_.allocator_type;
+        return ParseDfsAllocatorType(distributed_config_.allocator_type)
+            .value_or(DfsAllocatorType::SHARD);
     }
 
     void SetBatchTimeoutFixedMs(uint64_t timeout_ms) {
@@ -244,14 +198,52 @@ class DistributedStorageBackend
     tl::expected<size_t, ErrorCode> CleanupStaleBucketFds(
         const std::vector<int64_t>& active_bucket_ids);
     tl::expected<bool, ErrorCode> CleanupBucketFd(int64_t bucket_id);
+    // Upper bound on bucket files one BatchWrite/BatchRead holds open at once.
+    static constexpr size_t kMaxOpenBucketsPerBatch = 64;
 
    private:
     struct ShardFile {
         std::string path;
+        int fd = -1;
         int read_fd = -1;
-        std::atomic<int> write_fd{-1};
         std::mutex mutex;
     };
+    struct DfsIoOp;
+
+    tl::expected<ShardFile*, ErrorCode> GetOrOpenShard(
+        const DistributedFSDescriptor& descriptor, bool read_only = false);
+    // Validates that file_path is a shard file of the expected capacity located
+    // directly under root_dir_, then opens it and returns the descriptor.
+    tl::expected<int, ErrorCode> ValidateAndOpenShardFile(
+        const std::string& file_path);
+    // Reopens a shard's descriptor after an I/O failure. The caller must hold
+    // shard.mutex, which serializes all I/O on the shard, so no other thread
+    // can be using the old descriptor concurrently. On failure the descriptor
+    // is reset to -1 so a later GetOrOpenShard reinitializes it.
+    tl::expected<void, ErrorCode> ReopenShardLocked(ShardFile& shard);
+    tl::expected<int, ErrorCode> OpenBucket(
+        const DistributedFSDescriptor& descriptor);
+    bool UsesBucketAllocator() const;
+    // Preserve per-request bucket handles and shard I/O locking for adapters
+    // that do not opt in to batching.
+    tl::expected<void, ErrorCode> ExecuteSingleIo(DfsIoOp& op, bool write);
+    // Resolve fds for validated ops and submit them through SubmitBatchIo.
+    // Both write failures into results[op.index]. Shard fds come from the
+    // shard cache; bucket fds are opened per batch, at most
+    // kMaxOpenBucketsPerBatch at a time, and closed after their submission.
+    void ExecuteShardBatchIo(
+        std::vector<DfsIoOp>& ops,
+        std::vector<tl::expected<void, ErrorCode>>& results, bool write);
+    void ExecuteBucketBatchIo(
+        std::vector<DfsIoOp>& ops,
+        std::vector<tl::expected<void, ErrorCode>>& results, bool write);
+    // Submits io_requests (io_requests[i] belongs to *io_ops[i]) to the
+    // adapter as one batch. Short transfers are completed when
+    // complete_short_io is set and reported as failures otherwise.
+    void SubmitBatchIo(const std::vector<FdIoRequest>& io_requests,
+                       const std::vector<DfsIoOp*>& io_ops,
+                       std::vector<tl::expected<void, ErrorCode>>& results,
+                       bool write, bool complete_short_io);
 
     // BUCKET mode opens bucket data files on demand and caches the handles.
     // Handles are shared_ptr so an in-flight read/write keeps the fd alive even
@@ -272,7 +264,7 @@ class DistributedStorageBackend
     };
 
     bool IsBucketMode() const {
-        return distributed_config_.allocator_type == DfsAllocatorType::BUCKET;
+        return distributed_config_.allocator_type == "bucket";
     }
 
     /**
@@ -360,10 +352,9 @@ class DistributedStorageBackend
         const ReadTask& task, const std::vector<DfsReadRequest>& requests,
         std::vector<tl::expected<void, ErrorCode>>& results);
 
-    void ExecuteReadTasks(
-        const std::vector<ReadTask>& tasks,
-        const std::vector<DfsReadRequest>& requests,
-        std::vector<tl::expected<void, ErrorCode>>& results);
+    void ExecuteReadTasks(const std::vector<ReadTask>& tasks,
+                          const std::vector<DfsReadRequest>& requests,
+                          std::vector<tl::expected<void, ErrorCode>>& results);
 
     ErrorCode AcquireInflightReadUntil(
         uint64_t bytes, std::chrono::steady_clock::time_point deadline);
@@ -375,7 +366,8 @@ class DistributedStorageBackend
     DistributedStorageConfig distributed_config_;
     std::atomic<uint64_t> batch_timeout_fixed_ms_;
     std::string expected_root_identity_;
-    std::function<tl::expected<std::string, ErrorCode>()> root_identity_provider_;
+    std::function<tl::expected<std::string, ErrorCode>()>
+        root_identity_provider_;
     std::string root_dir_;
     std::string descriptor_root_dir_;
     std::string health_probe_path_prefix_;
@@ -388,7 +380,8 @@ class DistributedStorageBackend
     uint64_t inflight_read_bytes_{0};
     std::mutex health_probe_write_mutex_;
     std::string canonical_root_dir_;
-    std::vector<std::unique_ptr<ShardFile>> shard_files_;
+    std::mutex shard_files_mutex_;
+    std::unordered_map<int, std::unique_ptr<ShardFile>> shard_files_;
     DistributedStorageMode storage_mode_ = DistributedStorageMode::kFileSystem;
 
     std::shared_mutex bucket_epoch_mutex_;

@@ -146,12 +146,13 @@ class DfsAllocatorInterface {
                               const DistributedFSDescriptor& descriptor) = 0;
 
     virtual bool IsEvictionEnabled() const = 0;
-
     virtual std::chrono::seconds GetEvictionCheckInterval() const = 0;
-
-    virtual uint64_t GetTotalCapacity() const = 0;
-
     virtual uint64_t GetUsedBytes() const = 0;
+    virtual uint64_t GetTotalCapacity() const = 0;
+    // Number of backing files that hold DFS data. In shard mode this is the
+    // pre-allocated shard file count; in bucket mode it is the current
+    // immutable bucket file count.
+    virtual uint64_t GetFileCount() const = 0;
 };
 
 }  // namespace mooncake

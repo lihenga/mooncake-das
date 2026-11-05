@@ -8,8 +8,8 @@
 
 namespace mooncake {
 
-inline constexpr std::array<std::string_view, 2>
-    kDfsReadProbeDirectoryNames = {".health1", ".health2"};
+inline constexpr std::array<std::string_view, 2> kDfsReadProbeDirectoryNames = {
+    ".health1", ".health2"};
 inline constexpr char kDfsReadProbeFileName[] = ".mooncake_dfs_read_probe";
 inline constexpr size_t kDfsReadProbeSize = 1U << 20;
 inline constexpr size_t kDfsReadProbeBlockSize = 4096;
@@ -33,17 +33,16 @@ inline uint64_t DfsReadProbeSeed(std::string_view identity, size_t probe_index,
     return hash == 0 ? 0x9e3779b97f4a7c15ULL : hash;
 }
 
-inline void FillDfsReadProbeBlock(std::string_view identity,
-                                  size_t probe_index, size_t block_index,
-                                  char* destination) {
+inline void FillDfsReadProbeBlock(std::string_view identity, size_t probe_index,
+                                  size_t block_index, char* destination) {
     uint64_t state = DfsReadProbeSeed(identity, probe_index, block_index);
     for (size_t offset = 0; offset < kDfsReadProbeBlockSize; ++offset) {
         // xorshift64*; deterministic generation, not cryptographic randomness.
         state ^= state >> 12;
         state ^= state << 25;
         state ^= state >> 27;
-        destination[offset] = static_cast<char>(
-            (state * 2685821657736338717ULL) >> 56);
+        destination[offset] =
+            static_cast<char>((state * 2685821657736338717ULL) >> 56);
     }
 }
 

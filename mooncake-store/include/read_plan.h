@@ -27,8 +27,8 @@ using ReadLayout = std::tuple<std::vector<std::string>, std::vector<size_t>,
 class ReadPlan {
    public:
     ReadPlan(std::shared_ptr<PyClient> client, std::vector<ReadLayout> layouts,
-             int num_groups, bool reuse_ranges = false,
-             bool page_wise = false, bool borrowed_sessions = false);
+             int num_groups, bool reuse_ranges = false, bool page_wise = false,
+             bool borrowed_sessions = false);
     ~ReadPlan();
     ReadPlan(const ReadPlan&) = delete;
     ReadPlan& operator=(const ReadPlan&) = delete;

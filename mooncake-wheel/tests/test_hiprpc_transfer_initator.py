@@ -8,20 +8,21 @@ import os
 from mooncake.allocator import NVLinkAllocator
 
 # use cross-node Hygon HCU fabric transport, need hardware support
-os.environ["MC_FORCE_MNNVL"] = "1" # or os.environ["MC_FORCE_HIP"] = "1"
+os.environ["MC_FORCE_MNNVL"] = "1"  # or os.environ["MC_FORCE_HIP"] = "1"
 os.environ["MC_USE_HIP_IPC"] = "0"
 
+
 def main():
-    torch.cuda.set_device(1) # Use GPU 1 for client
+    torch.cuda.set_device(1)  # Use GPU 1 for client
     allocator = NVLinkAllocator.get_allocator(1)
     custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
     # Initialize ZMQ context and socket
     context = zmq.Context()
     recv_socket = context.socket(zmq.PULL)
-    recv_socket.connect(f"tcp://172.17.113.140:5555")
+    recv_socket.connect("tcp://172.17.113.140:5555")
 
     send_socket = context.socket(zmq.PUSH)
-    send_socket.connect(f"tcp://172.17.113.140:5556")
+    send_socket.connect("tcp://172.17.113.140:5556")
 
     # Wait for buffer info from server
     print("Waiting for server buffer information...")
@@ -33,27 +34,26 @@ def main():
     print(f"Server buffer address: {server_ptr}, length: {server_len}")
 
     # Initialize client engine
-    HOSTNAME = "172.17.112.120" # localhost for simple demo, replace with actual IP if needed
-    METADATA_SERVER = "P2PHANDSHAKE" # [ETCD_SERVER_URL, P2PHANDSHAKE, ...]
-    PROTOCOL = "rdma" # [rdma, tcp, ...]
-    DEVICE_NAME = "" # auto discovery if empty
+    HOSTNAME = (
+        "172.17.112.120"  # localhost for simple demo, replace with actual IP if needed
+    )
+    METADATA_SERVER = "P2PHANDSHAKE"  # [ETCD_SERVER_URL, P2PHANDSHAKE, ...]
+    PROTOCOL = "rdma"  # [rdma, tcp, ...]
+    DEVICE_NAME = ""  # auto discovery if empty
 
     client_engine = TransferEngine()
-    client_engine.initialize(
-        HOSTNAME,
-        METADATA_SERVER,
-        PROTOCOL,
-        DEVICE_NAME
-    )
+    client_engine.initialize(HOSTNAME, METADATA_SERVER, PROTOCOL, DEVICE_NAME)
     session_id = f"{HOSTNAME}:{client_engine.get_rpc_port()}"
 
     with torch.cuda.use_mem_pool(custom_mem_pool):
         # Allocate and initialize client buffer (1MB)
-        client_buffer = torch.full((1024 * 1024,), 92, dtype=torch.uint8, device="cuda:1")
+        client_buffer = torch.full(
+            (1024 * 1024,), 92, dtype=torch.uint8, device="cuda:1"
+        )
         client_ptr = client_buffer.data_ptr()
         client_len = client_buffer.nbytes
 
-    torch.cuda.synchronize(1) # Ensure data is ready before transfer
+    torch.cuda.synchronize(1)  # Ensure data is ready before transfer
 
     # Register memory with Mooncake
     ret_value = client_engine.register_memory(client_ptr, client_len)
@@ -69,7 +69,7 @@ def main():
         server_session_id,
         client_ptr,
         server_ptr,
-        min(client_len, server_len)  # Transfer minimum of both lengths
+        min(client_len, server_len),  # Transfer minimum of both lengths
     )
 
     if ret >= 0:
@@ -88,6 +88,7 @@ def main():
     send_socket.close()
     recv_socket.close()
     context.term()
+
 
 if __name__ == "__main__":
     main()

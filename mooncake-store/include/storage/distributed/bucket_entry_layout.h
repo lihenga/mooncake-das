@@ -109,8 +109,7 @@ inline std::optional<BucketEntryLayout> RebuildBucketEntryLayout(
  * field.
  */
 inline DistributedFSDescriptor MakeBucketDescriptor(
-    std::string data_path, const BucketEntryLayout& layout,
-    int64_t bucket_id) {
+    std::string data_path, const BucketEntryLayout& layout, int64_t bucket_id) {
     DistributedFSDescriptor descriptor;
     descriptor.file_path = std::move(data_path);
     descriptor.offset = layout.offset;

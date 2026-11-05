@@ -202,7 +202,8 @@ struct ReadPlan::Impl {
                     std::vector<size_t> s, o;
                     for (const auto &items : layout)
                         for (const auto &i : items) {
-                            a.push_back(reinterpret_cast<void *>(address(i, row)));
+                            a.push_back(
+                                reinterpret_cast<void *>(address(i, row)));
                             s.push_back(i[2]);
                             o.push_back(i[3]);
                         }
@@ -212,7 +213,8 @@ struct ReadPlan::Impl {
                 } else {
                     // One key per (row, component); each key carries the ranges
                     // of that component across all groups. All non-empty groups
-                    // share the same component count (enforced at construction).
+                    // share the same component count (enforced at
+                    // construction).
                     size_t component_count = 0;
                     for (const auto &group_items : layout)
                         if (!group_items.empty()) {
@@ -225,7 +227,8 @@ struct ReadPlan::Impl {
                         for (const auto &group_items : layout) {
                             if (group_items.size() <= c) continue;
                             const auto &i = group_items[c];
-                            a.push_back(reinterpret_cast<void *>(address(i, row)));
+                            a.push_back(
+                                reinterpret_cast<void *>(address(i, row)));
                             s.push_back(i[2]);
                             o.push_back(i[3]);
                         }
@@ -310,7 +313,8 @@ struct ReadPlan::Impl {
                 for (const auto &item : layout[g]) {
                     if (!item[2]) continue;
                     spans.push_back({address(item, *lo),
-                                     checked_add(address(item, *hi), item[2]), g});
+                                     checked_add(address(item, *hi), item[2]),
+                                     g});
                 }
         }
         std::sort(spans.begin(), spans.end(), [](const Span &a, const Span &b) {
@@ -354,8 +358,9 @@ struct ReadPlan::Impl {
                     slot.built = true;
                     auto &r = slot.ranges;
                     if (!r.keys.empty())
-                        slot.result = client->batch_get_into_multi_buffer_ranges(
-                            r.keys, r.addresses, r.sizes, r.offsets);
+                        slot.result =
+                            client->batch_get_into_multi_buffer_ranges(
+                                r.keys, r.addresses, r.sizes, r.offsets);
                 } catch (...) {
                     slot.error = std::current_exception();
                 }
@@ -392,7 +397,8 @@ struct ReadPlan::Impl {
                     work_cv.wait(lock, [&] { return slot.done; });
                 }
                 if (slot.error) std::rethrow_exception(slot.error);
-                if (!slot.ranges.keys.empty()) check(slot.ranges, slot.result, g);
+                if (!slot.ranges.keys.empty())
+                    check(slot.ranges, slot.result, g);
                 if (g < groups - 1) mark(g);
                 slot.ranges = Ranges{};
                 slot.result.clear();
@@ -449,15 +455,14 @@ struct ReadPlan::Impl {
                         "Mooncake read plan session start failed");
             } else if (adaptive) {
                 // SGLang owns these sessions and any DFS prefetch buffers.
-                // Inspect their selected replicas without a second Master query.
-                effective_page_wise =
-                    !client->all_get_sessions_memory(session);
+                // Inspect their selected replicas without a second Master
+                // query.
+                effective_page_wise = !client->all_get_sessions_memory(session);
             }
             const char *enabled = std::getenv("MOONCAKE_READ_PLAN_PIPELINE");
             const bool requested = enabled && std::string(enabled) == "1";
-            const bool pipeline =
-                requested && !reuse && !effective_page_wise && groups > 1 &&
-                disjoint_groups();
+            const bool pipeline = requested && !reuse && !effective_page_wise &&
+                                  groups > 1 && disjoint_groups();
             if (requested) {
                 static std::atomic<bool> logged_yes{false}, logged_no{false};
                 auto &logged = pipeline ? logged_yes : logged_no;
@@ -503,12 +508,14 @@ struct ReadPlan::Impl {
                     }
                     auto &r = *selected;
                     if (!r.keys.empty()) {
-                        auto result = client->batch_get_into_multi_buffer_ranges(
-                            r.keys, r.addresses, r.sizes, r.offsets);
+                        auto result =
+                            client->batch_get_into_multi_buffer_ranges(
+                                r.keys, r.addresses, r.sizes, r.offsets);
                         check(r, result, group);
                     }
                     if (group < groups - 1)
-                        mark(group);  // Final readiness includes session cleanup.
+                        mark(group);  // Final readiness includes session
+                                      // cleanup.
                 }
             }
         } catch (...) {

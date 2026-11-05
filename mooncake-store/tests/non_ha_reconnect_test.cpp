@@ -16,7 +16,7 @@
 
 #include "client_service.h"
 #include "master_metric_manager.h"
-#include "utils.h"
+#include "common/client_buffer_allocation.h"
 #include "test_server_helpers.h"
 #include "default_config.h"
 
@@ -35,7 +35,7 @@ TEST(NonHAReconnectTest, ClientRecoversAfterEstablishedConnectionBlackhole) {
     // Firewall changes are permitted only in an explicitly isolated network
     // namespace. Ordinary CI runs skip this privileged fault-injection test.
     const char* iptables = std::getenv("MOONCAKE_TEST_IPTABLES");
-    struct stat current_net {}, init_net {};
+    struct stat current_net{}, init_net{};
     if (!iptables || stat("/proc/self/ns/net", &current_net) != 0 ||
         stat("/proc/1/ns/net", &init_net) != 0 ||
         current_net.st_ino == init_net.st_ino) {
@@ -87,9 +87,10 @@ TEST(NonHAReconnectTest, ClientRecoversAfterEstablishedConnectionBlackhole) {
         }
         std::string rule;
     } drop{iptables, false,
-           "-p tcp -d 127.0.0.1 --dport " +
-               std::to_string(master.rpc_port()) + " -j DROP"};
-    ASSERT_EQ(std::system((drop.command + " -I OUTPUT " + drop.rule).c_str()), 0);
+           "-p tcp -d 127.0.0.1 --dport " + std::to_string(master.rpc_port()) +
+               " -j DROP"};
+    ASSERT_EQ(std::system((drop.command + " -I OUTPUT " + drop.rule).c_str()),
+              0);
     drop.active = true;
     // No FIN/RST is sent: the connected socket must time out and recover.
     std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -100,7 +101,8 @@ TEST(NonHAReconnectTest, ClientRecoversAfterEstablishedConnectionBlackhole) {
               blocked_pings);
     EXPECT_EQ(MasterClientTestPeer::Pool(*client), pool);
     EXPECT_EQ(std::system((drop.command + " -L OUTPUT -nvx").c_str()), 0);
-    ASSERT_EQ(std::system((drop.command + " -D OUTPUT " + drop.rule).c_str()), 0);
+    ASSERT_EQ(std::system((drop.command + " -D OUTPUT " + drop.rule).c_str()),
+              0);
     drop.active = false;
     bool recovered = false;
     for (int i = 0; i < 30; ++i) {

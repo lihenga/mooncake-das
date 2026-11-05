@@ -121,12 +121,13 @@ TEST(DfsEpochSerializationTest, OldAndNewOplogPayloadsRemainReadable) {
     }
 }
 
-void WriteTestDfsRootIdentity(const std::filesystem::path& root,
-                              const std::string& identity =
-                                  kTestDfsRootIdentity) {
+void WriteTestDfsRootIdentity(
+    const std::filesystem::path& root,
+    const std::string& identity = kTestDfsRootIdentity) {
     std::ofstream marker(root / kDfsRootIdentityFileName,
                          std::ios::binary | std::ios::trunc);
-    marker.write(identity.data(), static_cast<std::streamsize>(identity.size()));
+    marker.write(identity.data(),
+                 static_cast<std::streamsize>(identity.size()));
 }
 
 class BucketTempDir {
@@ -282,7 +283,7 @@ DistributedStorageConfig MakeBucketConfig(const std::string& fsdir) {
     DistributedStorageConfig config;
     config.fsdir = fsdir;
     config.fs_adapter_type = "posix";
-    config.allocator_type = DfsAllocatorType::BUCKET;
+    config.allocator_type = "bucket";
     config.bucket_capacity = kBucketCapacity;
     config.max_bucket_count = 16;
     config.alignment = kAlignment;
@@ -372,7 +373,8 @@ TEST_F(DfsBucketBackendTest, WriteThenReadRoundTrip) {
     EXPECT_EQ(ReadObject(key, desc), value);
 }
 
-TEST_F(DfsBucketBackendTest, CleanupDropsMissingInactiveBucketWithoutRecreatingIt) {
+TEST_F(DfsBucketBackendTest,
+       CleanupDropsMissingInactiveBucketWithoutRecreatingIt) {
     const std::string value(4096, 'C');
     auto desc = WriteObject("cleanup_missing", value);
     auto cleanup = backend_->CleanupStaleBucketFds({});
@@ -388,7 +390,8 @@ TEST_F(DfsBucketBackendTest, CleanupDropsMissingInactiveBucketWithoutRecreatingI
     EXPECT_EQ(*cleanup, 1u);
 
     auto writes = backend_->BatchWrite(
-        {{"cleanup_missing", desc,
+        {{"cleanup_missing",
+          desc,
           {{const_cast<char*>(value.data()), value.size()}}}});
     ASSERT_EQ(writes.size(), 1u);
     EXPECT_FALSE(writes[0].has_value());
@@ -1128,8 +1131,7 @@ TEST(DistributedStorageBackendRootTest,
     EXPECT_EQ(std::distance(std::filesystem::directory_iterator(root.path()),
                             std::filesystem::directory_iterator{}),
               1);
-    std::ifstream marker(root.file(kDfsRootIdentityFileName),
-                         std::ios::binary);
+    std::ifstream marker(root.file(kDfsRootIdentityFileName), std::ios::binary);
     const std::string contents((std::istreambuf_iterator<char>(marker)),
                                std::istreambuf_iterator<char>());
     EXPECT_EQ(contents, wrong_identity);
@@ -1227,8 +1229,8 @@ TEST(DistributedStorageBackendRootTest,
     ASSERT_FALSE(write_probe.has_value());
     EXPECT_EQ(write_probe.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
 
-    DistributedFSDescriptor descriptor{
-        root + "/bucket_000000.data", 0, 4, kAlignment, 0};
+    DistributedFSDescriptor descriptor{root + "/bucket_000000.data", 0, 4,
+                                       kAlignment, 0};
     std::string value = "data";
     auto write_results = backend.BatchWrite(
         {{"marker_gate", descriptor, {{value.data(), value.size()}}}});
@@ -1385,6 +1387,7 @@ TEST_F(DfsBucketBackendTest, ReadAfterAllocatorRecoveryReturnsSameBytes) {
     // bookkeeping.
     BucketTempDir dir("dfs_bucket_recover_io");
     auto config = MakeBucketConfig(dir.path());
+    config.bucket_recovery_enabled = true;
 
     std::vector<std::string> keys{"rec_a", "rec_b"};
     std::vector<std::string> values{std::string(300, 'p'),

@@ -22,6 +22,7 @@ struct SessionRangeReadRequest {
     std::vector<size_t> sizes;
     std::vector<size_t> src_offsets;
     std::chrono::steady_clock::time_point lease_deadline;
+    size_t transferred_bytes{0};
 };
 
 using NonMemReadEntry = SessionRangeReadRequest;
@@ -35,6 +36,8 @@ struct PrefetchedSessionBuffer {
 struct SessionRangeReadPlan {
     std::vector<SessionRangeReadRequest> memory_requests;
     std::vector<SessionRangeReadRequest> dfs_requests;
+    std::vector<SessionRangeReadRequest> local_disk_requests;
+    std::vector<SessionRangeReadRequest> disk_requests;
 };
 
 struct SessionRangeReadContext {

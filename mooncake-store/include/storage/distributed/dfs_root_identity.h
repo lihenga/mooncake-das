@@ -51,10 +51,9 @@ inline bool ParseDfsRootIdentity(std::string_view contents,
         return false;
     }
     identity = SerializeDfsRootIdentity(expected_cluster_id, token);
-    return !identity.empty() && identity ==
-                                      std::string(magic_prefix) +
-                                          expected_cluster_id + "\n" +
-                                          std::string(contents) + "\n";
+    return !identity.empty() && identity == std::string(magic_prefix) +
+                                                expected_cluster_id + "\n" +
+                                                std::string(contents) + "\n";
 }
 
 }  // namespace mooncake

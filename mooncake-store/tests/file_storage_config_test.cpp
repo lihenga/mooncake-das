@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 
+#include "config.h"
 #include "storage_backend.h"
 
 namespace mooncake {
@@ -46,8 +47,7 @@ struct FileStorageEnvironment {
         "MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR"};
     ScopedEnvVar storage_path{"MOONCAKE_OFFLOAD_FILE_STORAGE_PATH"};
     ScopedEnvVar local_buffer_size{"MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES"};
-    ScopedEnvVar unified_buffer_size{
-        "MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES"};
+    ScopedEnvVar unified_buffer_size{"MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES"};
     ScopedEnvVar read_chunk_size{"MC_STORE_DFS_READ_CHUNK_SIZE_BYTES"};
     ScopedEnvVar write_chunk_size{"MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES"};
     ScopedEnvVar prefetch_capacity_ratio{
@@ -102,8 +102,6 @@ void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
 class FileStorageConfigTest : public ::testing::Test {
    protected:
     FileStorageEnvironment env;
-    ScopedEnvVar bucket_keys_limit{"MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT"};
-    ScopedEnvVar bucket_size_limit{"MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES"};
     std::filesystem::path data_path;
 
     void SetUp() override {
@@ -123,11 +121,42 @@ class FileStorageConfigTest : public ::testing::Test {
 
 TEST_F(FileStorageConfigTest, DefaultValuesWhenNoEnvSet) {
     const auto config = FileStorageConfig::FromEnvironment();
-    const auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
 
     ExpectDefaultFileStorageConfig(config);
-    EXPECT_EQ(bucket_backend_config.bucket_keys_limit, 500);
-    EXPECT_EQ(bucket_backend_config.bucket_size_limit, 256 * 1024 * 1024);
+}
+
+TEST_F(FileStorageConfigTest, FabricMemRoundsDefaultLocalBufferUpToOneGiB) {
+    auto& fabric = globalConfig().ascend_use_fabric_mem;
+    const bool previous = fabric;
+    fabric = true;
+    const auto config = FileStorageConfig::FromEnvironment();
+    fabric = previous;
+
+    // The ordinary default is 1280 MiB. The next 1GiB boundary is 2 GiB.
+    EXPECT_EQ(config.local_buffer_size, int64_t{2} * 1024 * 1024 * 1024);
+    EXPECT_EQ(config.local_buffer_size % (1024 * 1024 * 1024), 0);
+}
+
+TEST_F(FileStorageConfigTest, FabricMemKeepsAlignedLocalBuffer) {
+    auto& fabric = globalConfig().ascend_use_fabric_mem;
+    const bool previous = fabric;
+    fabric = true;
+    env.local_buffer_size.Set("1073741824");
+    const auto config = FileStorageConfig::FromEnvironment();
+    fabric = previous;
+
+    EXPECT_EQ(config.local_buffer_size, 1073741824);
+}
+
+TEST_F(FileStorageConfigTest, FabricMemRoundsUnalignedLocalBufferUp) {
+    auto& fabric = globalConfig().ascend_use_fabric_mem;
+    const bool previous = fabric;
+    fabric = true;
+    env.local_buffer_size.Set("1342177280");
+    const auto config = FileStorageConfig::FromEnvironment();
+    fabric = previous;
+
+    EXPECT_EQ(config.local_buffer_size, int64_t{2} * 1024 * 1024 * 1024);
 }
 
 TEST_F(FileStorageConfigTest, ReadsValidValues) {
@@ -151,7 +180,7 @@ TEST_F(FileStorageConfigTest, ReadsValidValues) {
 
     const auto config = FileStorageConfig::FromEnvironment();
     EXPECT_EQ(config.storage_backend_type, StorageBackendType::kDistributed);
-    EXPECT_TRUE(config.enable_dfs);
+    EXPECT_FALSE(config.enable_dfs);
     EXPECT_EQ(config.storage_filepath, "/tmp/storage");
     EXPECT_EQ(config.local_buffer_size, 2147483648);
     EXPECT_EQ(config.unified_buffer_size, 64 * 1024 * 1024);
@@ -168,15 +197,6 @@ TEST_F(FileStorageConfigTest, ReadsValidValues) {
     EXPECT_DOUBLE_EQ(config.disk_eviction_high_watermark_ratio, 0.75);
     EXPECT_DOUBLE_EQ(config.disk_eviction_low_watermark_ratio, 0.50);
     EXPECT_TRUE(config.use_uring);
-}
-
-TEST_F(FileStorageConfigTest, ReadsBucketBackendValues) {
-    bucket_keys_limit.Set("1000");
-    bucket_size_limit.Set("536870912");
-
-    const auto config = BucketBackendConfig::FromEnvironment();
-    EXPECT_EQ(config.bucket_keys_limit, 1000);
-    EXPECT_EQ(config.bucket_size_limit, 512 * 1024 * 1024);
 }
 
 TEST_F(FileStorageConfigTest, PreservesAliasPrecedence) {
@@ -284,14 +304,11 @@ TEST_F(FileStorageConfigTest, InvalidValuesUseDefaultsAndPreserveDiagnostics) {
 }
 
 TEST_F(FileStorageConfigTest, InvalidIntValueUsesDefault) {
-    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "abc");
     SetEnv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES", "sdfsdf");
     SetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "-1");
 
     const auto config = FileStorageConfig::FromEnvironment();
-    const auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
 
-    EXPECT_EQ(bucket_backend_config.bucket_keys_limit, 500);
     EXPECT_EQ(config.total_size_limit, 2ULL * 1024 * 1024 * 1024 * 1024);
     EXPECT_EQ(config.heartbeat_interval_seconds, 10u);
     EXPECT_DOUBLE_EQ(config.disk_eviction_high_watermark_ratio, 0.90);
@@ -306,13 +323,6 @@ TEST_F(FileStorageConfigTest, OutOfRangeValueUsesDefault) {
     SetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "-10");
     const auto negative = FileStorageConfig::FromEnvironment();
     EXPECT_EQ(negative.heartbeat_interval_seconds, 10u);
-}
-
-TEST_F(FileStorageConfigTest, EmptyEnvValueUsesDefault) {
-    bucket_keys_limit.Set("");
-
-    const auto config = BucketBackendConfig::FromEnvironment();
-    EXPECT_EQ(config.bucket_keys_limit, 500);
 }
 
 TEST_F(FileStorageConfigTest, ValidateSuccessWithValidConfig) {
@@ -361,8 +371,8 @@ TEST_F(FileStorageConfigTest,
 TEST_F(FileStorageConfigTest,
        DistributedDoesNotRejectNonWritableStoragePathAtStartup) {
     std::filesystem::permissions(
-        data_path, std::filesystem::perms::owner_read |
-                       std::filesystem::perms::owner_exec,
+        data_path,
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_exec,
         std::filesystem::perm_options::replace);
 
     FileStorageConfig config;

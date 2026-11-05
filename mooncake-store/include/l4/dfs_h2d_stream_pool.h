@@ -47,8 +47,7 @@ class RealClient::DfsH2dStreamPool {
                     worker->thread = std::thread([this, worker_ptr, stream] {
                         device->SetContext(device_id);
                         {
-                            std::lock_guard<std::mutex> lock(
-                                worker_ptr->mutex);
+                            std::lock_guard<std::mutex> lock(worker_ptr->mutex);
                             worker_ptr->ready = true;
                         }
                         worker_ptr->completion_cv.notify_one();
@@ -59,8 +58,7 @@ class RealClient::DfsH2dStreamPool {
                                 return worker_ptr->has_task ||
                                        worker_ptr->stopping;
                             });
-                            if (worker_ptr->stopping &&
-                                !worker_ptr->has_task) {
+                            if (worker_ptr->stopping && !worker_ptr->has_task) {
                                 break;
                             }
                             lock.unlock();
@@ -188,16 +186,15 @@ class RealClient::DfsH2dStreamPool {
         }
     }
 
-    std::unique_ptr<Lease> Acquire(
-        const device::AcceleratorDevice *accelerator, int32_t device_id) {
+    std::unique_ptr<Lease> Acquire(const device::AcceleratorDevice *accelerator,
+                                   int32_t device_id) {
         std::shared_ptr<DeviceState> state;
         std::unique_lock<std::mutex> lock(mutex_);
         if (shutting_down_) return nullptr;
         DeviceKey key{accelerator, device_id};
         auto [it, inserted] = states_.try_emplace(key);
         if (inserted) {
-            it->second =
-                std::make_shared<DeviceState>(accelerator, device_id);
+            it->second = std::make_shared<DeviceState>(accelerator, device_id);
         }
         state = it->second;
 
@@ -230,8 +227,7 @@ class RealClient::DfsH2dStreamPool {
         {
             std::unique_lock<std::mutex> lock(mutex_);
             if (shutting_down_) {
-                shutdown_cv_.wait(lock,
-                                  [this] { return shutdown_complete_; });
+                shutdown_cv_.wait(lock, [this] { return shutdown_complete_; });
                 return shutdown_succeeded_;
             }
             shutting_down_ = true;
