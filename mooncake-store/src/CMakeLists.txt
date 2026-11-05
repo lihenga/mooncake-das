@@ -10,13 +10,16 @@ add_subdirectory(local_ssd)
 set(MOONCAKE_STORE_SHARED_SOURCES
     types.cpp
     utils.cpp
+    l4/utils_l4.cpp
     mmap_arena.cpp
     thread_pool.cpp
     etcd_helper.cpp
+    l4/etcd_helper_das.cpp
     uds_transport.cpp
     storage/distributed/distributed_storage_backend.cpp
     l4/distributed_storage_backend_l4.cpp
     storage/distributed/posix_fs_adapter.cpp
+    l4/posix_fs_adapter_l4.cpp
     storage/distributed/immutable_bucket_allocator.cpp
     utils/file_util.cpp)
 
@@ -28,18 +31,24 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     master_snapshot_manager.cpp
     master_snapshot_repository.cpp
     master_metric_manager.cpp
+    l4/master_metric_manager_l4.cpp
     segment.cpp
+    l4/segment_metrics.cpp
     tenant_quota.cpp
     tenant_quota_ledger.cpp
     tenant_quota_policy_store.cpp
     rpc_service.cpp
+    l4/rpc_service_l4.cpp
     master_admin_service.cpp
+    l4/master_admin_service_l4.cpp
     offset_allocator.cpp
     http_metadata_server.cpp
     serialize/serializer.cpp
     storage/distributed/dfs_global_allocator.cpp
+    l4/dfs_global_allocator_l4.cpp
     ha/leadership/leader_coordinator_factory.cpp
     ha/leadership/backends/etcd/etcd_leader_coordinator.cpp
+    l4/etcd_service_ready.cpp
     ha/common/redis/redis_connection.cpp
     ha/leadership/backends/redis/redis_leader_coordinator.cpp
     ha/leadership/master_service_supervisor.cpp
@@ -77,6 +86,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     l4/client_service_l4.cpp
     client_metric.cpp
     master_client.cpp
+    l4/master_client_l4.cpp
     storage_backend.cpp
     nvme_kv_backend.cpp
     nvme_kv_connector.cpp
@@ -89,6 +99,8 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     transfer_task.cpp
     posix_file.cpp
     client_buffer.cpp
+    l4/client_buffer_l4.cpp
+    l4/pinned_buffer_pool_l4.cpp
     aligned_client_buffer.cpp
     real_client.cpp
     l4/real_client_l4.cpp
@@ -96,12 +108,16 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     read_plan.cpp
     registered_pinned_memory.cpp
     dummy_client.cpp
+    l4/dummy_client_l4.cpp
     shm_helper.cpp
     file_storage.cpp
+    l4/file_storage_l4.cpp
     config/file_storage_config.cpp
+    l4/file_storage_config.cpp
     device/accelerator_device.cpp
     device/accelerator_registry.cpp
     device/runtime_accelerator.cpp
+    l4/device_copy.cpp
     device/cuda_like_accelerator_device.cpp
     device/cuda_ipc_buffer.cpp
     device/hip_accelerator_device.cpp
@@ -152,7 +168,7 @@ if(USE_3FS)
   add_subdirectory(hf3fs)
   list(APPEND MOONCAKE_STORE_SHARED_SOURCES ${HF3FS_SOURCES})
   list(APPEND MOONCAKE_STORE_SHARED_SOURCES
-       storage/distributed/hf3fs_adapter.cpp)
+       storage/distributed/hf3fs_adapter.cpp l4/hf3fs_adapter_l4.cpp)
   find_library(
     HF3FS_API_LIB hf3fs_api_shared
     PATHS /usr/lib

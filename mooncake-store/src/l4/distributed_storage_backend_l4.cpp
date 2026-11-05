@@ -1,4 +1,5 @@
 #include "l4/distributed_storage_internal.h"
+#include "l4/dfs_descriptor_internal.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/dfs_log_limiter.h"
 
@@ -29,6 +30,88 @@
 #include "utils.h"
 
 namespace mooncake {
+
+namespace l4 {
+void ReadDfsLowUtilizationEnvironment(DistributedStorageConfig& config) {
+    config.low_utilization_threshold =
+        Environ::GetDouble("MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_THRESHOLD",
+                           config.low_utilization_threshold);
+    const bool valid_low_utilization_threshold =
+        std::isfinite(config.low_utilization_threshold) &&
+        config.low_utilization_threshold >= 0.0 &&
+        config.low_utilization_threshold < 1.0;
+    if (!valid_low_utilization_threshold) {
+        LOG(WARNING) << "Invalid MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_THRESHOLD="
+                     << config.low_utilization_threshold
+                     << "; using default 0.05";
+        config.low_utilization_threshold = 0.05;
+    }
+    config.low_utilization_evictions_per_tick = Environ::GetInt(
+        "MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_EVICTIONS_PER_TICK",
+        config.low_utilization_evictions_per_tick);
+    if (config.low_utilization_evictions_per_tick < 0) {
+        LOG(WARNING)
+            << "Invalid MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_EVICTIONS_PER_TICK="
+            << config.low_utilization_evictions_per_tick << "; using default 1";
+        config.low_utilization_evictions_per_tick = 1;
+    }
+    config.low_utilization_eviction_attempts_per_tick =
+        Environ::GetInt("MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_ATTEMPTS_PER_TICK",
+                        config.low_utilization_eviction_attempts_per_tick);
+    if (config.low_utilization_eviction_attempts_per_tick < 1) {
+        LOG(WARNING)
+            << "Invalid MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_ATTEMPTS_PER_TICK="
+            << config.low_utilization_eviction_attempts_per_tick
+            << "; using default 8";
+        config.low_utilization_eviction_attempts_per_tick = 8;
+    }
+}
+
+void ReadDfsBucketEnvironment(DistributedStorageConfig& config) {
+    // An unknown allocator type name is recorded rather than corrected, so the
+    // master surfaces a configuration error instead of silently using SHARD.
+    const std::string allocator_type_name = Environ::GetString(
+        "MOONCAKE_DFS_ALLOCATOR_TYPE", ToString(config.allocator_type));
+    if (auto parsed = ParseDfsAllocatorType(allocator_type_name)) {
+        config.allocator_type = *parsed;
+    } else {
+        LOG(ERROR) << "Unknown MOONCAKE_DFS_ALLOCATOR_TYPE '"
+                   << allocator_type_name << "', expected 'shard' or 'bucket'";
+        config.allocator_type_valid = false;
+    }
+    config.bucket_capacity = Environ::GetUInt64("MOONCAKE_DFS_BUCKET_CAPACITY",
+                                                config.bucket_capacity);
+    config.bucket_recovery_enabled = Environ::GetBool(
+        "MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED", config.bucket_recovery_enabled);
+    config.max_bucket_count = static_cast<int64_t>(
+        Environ::GetInt("MOONCAKE_DFS_MAX_BUCKET_COUNT",
+                        static_cast<int>(config.max_bucket_count)));
+    config.ready_bucket_target = Environ::GetInt(
+        "MOONCAKE_DFS_READY_BUCKET_COUNT", config.ready_bucket_target);
+    config.bucket_create_concurrency =
+        Environ::GetInt("MOONCAKE_DFS_BUCKET_CREATE_CONCURRENCY",
+                        config.bucket_create_concurrency);
+    config.batch_read_threads = Environ::GetInt(
+        "MOONCAKE_DFS_BATCH_READ_THREADS", config.batch_read_threads);
+    config.batch_read_merge_enabled =
+        Environ::GetBool("MOONCAKE_DFS_BATCH_READ_MERGE_ENABLED",
+                         config.batch_read_merge_enabled);
+    config.direct_read_enabled = Environ::GetBool(
+        "MOONCAKE_DFS_DIRECT_READ_ENABLED", config.direct_read_enabled);
+    config.batch_get_timeout_ms = Environ::GetUInt64(
+        "MOONCAKE_DFS_BATCH_GET_TIMEOUT_MS", config.batch_get_timeout_ms);
+    config.batch_timeout_fixed_ms = Environ::GetUInt64(
+        "MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS", config.batch_timeout_fixed_ms);
+    config.batch_get_max_inflight_batches =
+        Environ::GetUInt64("MOONCAKE_DFS_BATCH_GET_MAX_INFLIGHT_BATCHES",
+                           config.batch_get_max_inflight_batches);
+    config.batch_get_max_inflight_bytes =
+        Environ::GetUInt64("MOONCAKE_DFS_BATCH_GET_MAX_INFLIGHT_BYTES",
+                           config.batch_get_max_inflight_bytes);
+}
+}  // namespace l4
+
+using namespace dfs_descriptor_detail;
 
 namespace {
 
@@ -1163,6 +1246,338 @@ DistributedStorageBackend::InitBucketModeLocked() {
               << root_dir_ << ", bucket_capacity="
               << distributed_config_.bucket_capacity;
     return {};
+}
+
+std::optional<DfsAllocatorType> ParseDfsAllocatorType(std::string_view name) {
+    if (name == "shard" || name == "SHARD") return DfsAllocatorType::SHARD;
+    if (name == "bucket" || name == "BUCKET") return DfsAllocatorType::BUCKET;
+    return std::nullopt;
+}
+
+const char* ToString(DfsAllocatorType type) {
+    switch (type) {
+        case DfsAllocatorType::SHARD:
+            return "shard";
+        case DfsAllocatorType::BUCKET:
+            return "bucket";
+    }
+    return "unknown";
+}
+
+bool DistributedStorageConfig::IsReplicaEnabledFromEnvironment() {
+    const bool enabled =
+        Environ::GetBool("MOONCAKE_DFS_FORCE_ONE_REPLICA", false);
+    static std::once_flag log_once;
+    std::call_once(log_once, [enabled] {
+        LOG(INFO) << "MOONCAKE_DFS_FORCE_ONE_REPLICA is "
+                  << (enabled ? "true" : "false");
+    });
+    return enabled;
+}
+
+tl::expected<DistributedStorageBackend::ResolvedTarget, ErrorCode>
+DistributedStorageBackend::ResolveTarget(
+    const DistributedFSDescriptor& descriptor, const std::string& key,
+    bool read_only) {
+    if (!IsBucketMode()) {
+        if (descriptor.shard_idx < 0 ||
+            descriptor.shard_idx >= static_cast<int>(shard_files_.size())) {
+            LOG(ERROR) << "Invalid DFS shard_idx " << descriptor.shard_idx
+                       << " for key " << key;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        auto& shard = *shard_files_[descriptor.shard_idx];
+        if (descriptor.file_path != shard.path) {
+            LOG(ERROR) << "DFS path mismatch for key " << key
+                       << ", descriptor=" << descriptor.file_path
+                       << ", configured=" << shard.path;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (!IsDfsDescriptorRangeValid(descriptor, distributed_config_)) {
+            LOG(ERROR) << "Invalid DFS descriptor range for key " << key
+                       << ", offset=" << descriptor.offset
+                       << ", object_size=" << descriptor.object_size
+                       << ", aligned_size=" << descriptor.aligned_size
+                       << ", shard_capacity="
+                       << distributed_config_.shard_capacity;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        const int fd = read_only
+                           ? shard.read_fd
+                           : shard.write_fd.load(std::memory_order_acquire);
+        if (fd < 0) {
+            return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+        }
+        return ResolvedTarget{fd, &shard.mutex, false, nullptr};
+    }
+
+    // BUCKET mode: the descriptor carries an allocator-chosen path, so it must
+    // be validated before it is used to open anything.
+    if (descriptor.shard_idx < 0) {
+        LOG(ERROR) << "Invalid DFS bucket id " << descriptor.shard_idx
+                   << " for key " << key;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const std::string expected_path =
+        descriptor_root_dir_ + "/" + kBucketFilePrefix +
+        ImmutableBucketAllocator::FormatBucketId(descriptor.shard_idx) +
+        kBucketDataSuffix;
+    // The master's mount path may not exist on this client.
+    if (std::filesystem::path(descriptor.file_path).lexically_normal() !=
+        std::filesystem::path(expected_path).lexically_normal()) {
+        LOG(ERROR) << "DFS bucket path mismatch for key " << key
+                   << ", descriptor=" << descriptor.file_path
+                   << ", expected=" << expected_path;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!IsBucketDescriptorRangeValid(descriptor, key, distributed_config_)) {
+        LOG(ERROR) << "Invalid DFS bucket descriptor for key " << key
+                   << ", offset=" << descriptor.offset
+                   << ", object_size=" << descriptor.object_size
+                   << ", aligned_size=" << descriptor.aligned_size
+                   << ", bucket_capacity="
+                   << distributed_config_.bucket_capacity;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto handle = read_only ? GetOrOpenBucketDirect(descriptor.shard_idx,
+                                                    descriptor.MasterEpoch())
+                            : GetOrOpenBucket(descriptor.shard_idx,
+                                              descriptor.MasterEpoch());
+    if (!handle && read_only) {
+        if (handle.error() != ErrorCode::NOT_SUPPORTED) {
+            return tl::make_unexpected(handle.error());
+        }
+        handle =
+            GetOrOpenBucket(descriptor.shard_idx, descriptor.MasterEpoch());
+        read_only = false;
+    }
+    if (!handle) return tl::make_unexpected(handle.error());
+    auto& shared = handle.value();
+    // BUCKET mode needs no per-fd lock: the allocator hands each object a
+    // unique, non-overlapping on-disk range, so concurrent writers and readers
+    // never touch the same bytes.
+    return ResolvedTarget{shared->fd, nullptr, read_only, shared};
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+DistributedStorageBackend::BatchWriteBlocking(
+    const std::vector<DfsWriteRequest>& requests) {
+    std::vector<tl::expected<void, ErrorCode>> results;
+
+    if (UsesObjectStorage()) {
+        results.assign(requests.size(),
+                       tl::make_unexpected(ErrorCode::NOT_SUPPORTED));
+        return results;
+    }
+    if (!initialized_.load(std::memory_order_acquire)) {
+        results.assign(requests.size(),
+                       tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
+        return results;
+    }
+    auto initialized = ValidateRootIdentity();
+    if (!initialized) {
+        LOG(ERROR) << "DistributedStorageBackend is unavailable: "
+                   << initialized.error();
+        results.assign(requests.size(),
+                       tl::make_unexpected(initialized.error()));
+        return results;
+    }
+
+    // Build validated entry payloads first, including the reserved zero
+    // padding, then issue one write per contiguous bounded-size run. SHARD
+    // keeps the original one-request path because its allocator does not
+    // promise contiguity.
+    if (IsBucketMode()) {
+        if (requests.empty()) return results;
+        const auto epoch = requests.front().descriptor.MasterEpoch();
+        if (std::any_of(requests.begin(), requests.end(),
+                        [&](const auto& request) {
+                            return request.descriptor.MasterEpoch() != epoch;
+                        })) {
+            results.assign(requests.size(),
+                           tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            return results;
+        }
+        auto guard = AcquireBucketEpoch(epoch);
+        if (!guard) {
+            results.assign(requests.size(), tl::make_unexpected(guard.error()));
+            return results;
+        }
+        return BatchWriteBucket(requests);
+    }
+    return BatchWriteShard(requests);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+DistributedStorageBackend::BatchWriteShard(
+    const std::vector<DfsWriteRequest>& requests) {
+    std::vector<tl::expected<void, ErrorCode>> results(
+        requests.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const auto& request = requests[i];
+        auto target = ResolveTarget(request.descriptor, request.key);
+        if (!target) {
+            results[i] = tl::make_unexpected(target.error());
+            continue;
+        }
+        std::vector<iovec> iovs;
+        uint64_t total = 0, value_size = 0;
+        if (request.descriptor.object_size == 0) continue;
+        for (const auto& slice : request.slices) {
+            if ((!slice.ptr && slice.size > 0) ||
+                slice.size > std::numeric_limits<uint64_t>::max() - total) {
+                total = 0;
+                break;
+            }
+            if (slice.size) iovs.push_back({slice.ptr, slice.size});
+            total += slice.size;
+            value_size += slice.size;
+        }
+        if (total == 0 || value_size != request.descriptor.object_size)
+            continue;
+        std::lock_guard<std::mutex> lock(*target->mutex);
+        auto result = fs_adapter_->WriteAt(
+            target->fd, iovs.data(), static_cast<int>(iovs.size()),
+            static_cast<int64_t>(request.descriptor.offset));
+        if (!result)
+            results[i] = tl::make_unexpected(result.error());
+        else if (*result == total)
+            results[i] = {};
+        else
+            results[i] = tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+DistributedStorageBackend::BatchReadShard(
+    const std::vector<DfsReadRequest>& requests) {
+    std::vector<tl::expected<void, ErrorCode>> results(
+        requests.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const auto& request = requests[i];
+        auto target = ResolveTarget(request.descriptor, request.key, true);
+        if (!target) {
+            results[i] = tl::make_unexpected(target.error());
+            continue;
+        }
+        if (request.descriptor.object_size >
+                std::numeric_limits<size_t>::max() ||
+            request.slices.size() >
+                static_cast<size_t>(std::numeric_limits<int>::max())) {
+            continue;
+        }
+
+        uint64_t capacity = 0;
+        bool invalid = false;
+        for (const auto& slice : request.slices) {
+            if ((!slice.ptr && slice.size != 0) ||
+                slice.size > std::numeric_limits<uint64_t>::max() - capacity) {
+                invalid = true;
+                break;
+            }
+            capacity += slice.size;
+        }
+        if (invalid || capacity < request.descriptor.object_size) continue;
+
+        std::vector<iovec> iovs;
+        iovs.reserve(request.slices.size());
+        size_t remaining = static_cast<size_t>(request.descriptor.object_size);
+        for (const auto& slice : request.slices) {
+            if (remaining == 0) break;
+            const size_t size = std::min(slice.size, remaining);
+            if (size != 0) iovs.push_back({slice.ptr, size});
+            remaining -= size;
+        }
+
+        std::lock_guard<std::mutex> lock(*target->mutex);
+        auto result = fs_adapter_->ReadAt(
+            target->fd, iovs.data(), static_cast<int>(iovs.size()),
+            static_cast<int64_t>(request.descriptor.offset));
+        if (!result)
+            results[i] = tl::make_unexpected(result.error());
+        else if (*result == request.descriptor.object_size)
+            results[i] = {};
+        else
+            results[i] = tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+DistributedStorageBackend::BatchReadBlocking(
+    const std::vector<DfsReadRequest>& requests) {
+    const auto timing_start = std::chrono::steady_clock::now();
+    std::vector<tl::expected<void, ErrorCode>> results(
+        requests.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    if (UsesObjectStorage()) {
+        results.assign(requests.size(),
+                       tl::make_unexpected(ErrorCode::NOT_SUPPORTED));
+        return results;
+    }
+    if (!initialized_.load(std::memory_order_acquire)) {
+        std::fill(results.begin(), results.end(),
+                  tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
+        return results;
+    }
+    auto initialized = ValidateRootIdentity();
+    if (!initialized) {
+        LOG(ERROR) << "DistributedStorageBackend is unavailable: "
+                   << initialized.error();
+        std::fill(results.begin(), results.end(),
+                  tl::make_unexpected(initialized.error()));
+        return results;
+    }
+
+    if (!IsBucketMode()) return BatchReadShard(requests);
+
+    if (requests.empty()) return results;
+    const auto epoch = requests.front().descriptor.MasterEpoch();
+    if (std::any_of(requests.begin(), requests.end(), [&](const auto& request) {
+            return request.descriptor.MasterEpoch() != epoch;
+        })) {
+        // The client can refresh this mixed batch once, without changing local
+        // epoch state based on whichever request happened to come first.
+        std::fill(results.begin(), results.end(),
+                  tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE));
+        return results;
+    }
+    auto guard = AcquireBucketEpoch(epoch);
+    if (!guard) {
+        std::fill(results.begin(), results.end(),
+                  tl::make_unexpected(guard.error()));
+        return results;
+    }
+
+    auto tasks = PrepareReadTasks(requests, results);
+    const auto prepare_done = std::chrono::steady_clock::now();
+    ExecuteReadTasks(tasks, requests, results);
+
+    if (dfs_read_trace_enabled()) {
+        const int64_t prepare_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(prepare_done -
+                                                                  timing_start)
+                .count();
+        const int64_t read_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - prepare_done)
+                .count();
+        uint64_t total_bytes = 0;
+        for (const auto& request : requests) {
+            total_bytes += request.descriptor.object_size;
+        }
+        double gbps = 0.0;
+        if (read_us > 0) {
+            // bytes / us == MB/s; /1000 -> GB/s.
+            gbps = static_cast<double>(total_bytes) / read_us / 1000.0;
+        }
+        LOG(INFO) << "BatchRead: requests=" << requests.size()
+                  << " tasks=" << tasks.size() << " bytes=" << total_bytes
+                  << " prepare_us=" << prepare_us << " read_us=" << read_us
+                  << " bandwidth_GBps=" << gbps;
+    }
+    return results;
 }
 
 }  // namespace mooncake

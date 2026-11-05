@@ -19,9 +19,7 @@
 #include "transport/rdma_transport/rdma_endpoint.h"
 
 #include <glog/logging.h>
-#ifdef USE_SHCA
-#include <infiniband/shca_17b_types.h>
-#endif
+#include "das/rdma_compat.h"
 
 #include <cassert>
 #include <cerrno>
@@ -1179,11 +1177,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
         attr.ah_attr.grh.traffic_class =
             static_cast<uint8_t>(globalConfig().ib_traffic_class);
     }
-#ifdef USE_SHCA
-    attr.ah_attr.dlid = u32_to_17(peer_lid);
-#else
-    attr.ah_attr.dlid = static_cast<uint16_t>(peer_lid);
-#endif
+    mooncake::das::SetPeerLid(attr.ah_attr, peer_lid);
     // Set service level if configured (-1 means use default)
     attr.ah_attr.sl = 0;
     if (globalConfig().ib_service_level >= 0) {

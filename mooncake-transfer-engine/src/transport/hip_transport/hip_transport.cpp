@@ -17,6 +17,8 @@
 // Modified by Hygon Information Technology Co., Ltd., 2026.
 
 #include "transport/hip_transport/hip_transport.h"
+#include "das/hip_error.h"
+#include "das/hip_rpc_compat.h"
 
 #include <glog/logging.h>
 
@@ -34,52 +36,6 @@
 #include "hip_device_guard.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
-#ifdef USE_HYGON
-#if USE_FAKE_HIP_RPC
-// hipFabricHandle_t is already provided by hip_runtime.h on DTK; only stub the
-// Hygon RPC entry points that may be unavailable without hylink.
-struct hipFabricHandle_t {
-    unsigned char reserved[64];
-};
-
-static hipError_t hipHsaExtRpcMemoryCreate(void* addr, size_t length,
-                                           hipFabricHandle_t* handle) {
-    (void)addr;
-    (void)length;
-    (void)handle;
-    LOG(ERROR) << "HipTransport: hipHsaExtRpcMemoryCreate is unavailable in "
-                  "the current HIP driver";
-    return hipErrorNotSupported;
-}
-
-static hipError_t hipHsaExtRpcMemoryAttachDevice(const hipFabricHandle_t* handle,
-                                                 size_t num_devices,
-                                                 int* devices,
-                                                 void** shm_addr) {
-    (void)handle;
-    (void)num_devices;
-    (void)devices;
-    (void)shm_addr;
-    LOG(ERROR) << "HipTransport: hipHsaExtRpcMemoryAttachDevice is "
-                  "unavailable in the current HIP driver";
-    return hipErrorNotSupported;
-}
-
-static hipError_t hipHsaExtRpcMemoryDetach(void* shm_addr) {
-    (void)shm_addr;
-    LOG(ERROR) << "HipTransport: hipHsaExtRpcMemoryDetach is unavailable in "
-                  "the current HIP driver";
-    return hipErrorNotSupported;
-}
-#else
-#include "hip/hip_hsa_ext.h"
-#endif
-#include <fstream>
-#include <iomanip>
-#include <mutex>
-#include <sstream>
-#endif
-
 namespace mooncake {
 
 // Pool configuration constants
@@ -118,15 +74,6 @@ struct FdGuard {
     FdGuard& operator=(FdGuard&&) = delete;
 };
 #endif
-
-static bool checkHip(hipError_t result, const char* message) {
-    if (result != hipSuccess) {
-        LOG(ERROR) << message << " (Error code: " << result << " - "
-                   << hipGetErrorString(result) << ")";
-        return false;
-    }
-    return true;
-}
 
 #ifndef USE_HYGON
 // Wrapper around hipMemImportFromShareableHandle to handle ROCm version
@@ -504,87 +451,6 @@ static bool supportFabricMem() {
 
     return true;
 }
-
-#ifdef USE_HYGON
-static std::string getCopyKernelPath() {
-    static std::string cached_path;
-    static std::once_flag flag;
-
-    std::call_once(flag, []() {
-        const char* env_path = getenv("MC_COPY_KERNEL_PATH");
-        if (env_path && strlen(env_path) > 0) {
-            cached_path = std::string(env_path) + "/mc_copy_kernel.co";
-            std::ifstream f(cached_path);
-            if (f.good()) {
-                LOG(INFO) << "Found mc_copy_kernel.co via environment: " << cached_path;
-                return;
-            }
-        }
-
-        std::string default_path = "/usr/local/lib/python3.10/dist-packages/mooncake/mc_copy_kernel.co";
-        std::ifstream f(default_path);
-        if (f.good()) {
-            cached_path = default_path;
-            LOG(INFO) << "HipTransport: Found mc_copy_kernel.co in default path: " << cached_path;
-            return;
-        }
-
-        LOG(ERROR) << "HipTransport: mc_copy_kernel.co not found. "
-                   << "Please set MC_COPY_KERNEL_PATH environment variable "
-                   << "or ensure the file exists at /usr/local/lib/python3.10/dist-packages/mooncake/";
-    });
-
-    return cached_path;
-}
-
-void HipTransport::loadCopyModule() {
-    if (module_loaded_) return;
-
-    int num_devices = 0;
-    if (!checkHip(hipGetDeviceCount(&num_devices), "HipTransport: hipGetDeviceCount failed")) {
-        return;
-    }
-
-    std::string kernel_path = getCopyKernelPath();
-    if (kernel_path.empty()) {
-        return;
-    }
-
-    int original_device = 0;
-    if (!checkHip(hipGetDevice(&original_device), "HipTransport: hipGetDevice failed")) {
-        return;
-    }
-
-    for (int device_id = 0; device_id < num_devices; ++device_id) {
-        if (!checkHip(hipSetDevice(device_id), "HipTransport: hipSetDevice failed")) {
-            return;
-        }
-
-        hipModule_t copy_module;
-        hipFunction_t copy_func;
-        hipError_t err = hipModuleLoad(&copy_module, kernel_path.c_str());
-        if (err != hipSuccess) {
-            LOG(ERROR) << "HipTransport: Failed to load copy_kernel.co: " << hipGetErrorString(err);
-            return;
-        }
-
-        err = hipModuleGetFunction(&copy_func, copy_module, "MCCopyKernel");
-        if (err != hipSuccess) {
-            LOG(ERROR) << "HipTransport: Failed to get MCCopyKernel function: " << hipGetErrorString(err);
-            checkHip(hipModuleUnload(copy_module), "HipTransport: Failed to unload copy module");
-            return;
-        }
-
-        device_copy_modules_[device_id] = copy_module;
-        device_copy_funcs_[device_id] = copy_func;
-    }
-
-    module_loaded_ = true;
-    LOG(INFO) << "HipTransport: Custom MCCopyKernel.co loaded on " << device_copy_funcs_.size() << " devices.";
-    checkHip(hipSetDevice(original_device), "HipTransport: hipSetDevice failed to restore original device");
-    return;
-}
-#endif
 
 HipTransport::HipTransport()
     : use_fabric_mem_(supportFabricMem()),

@@ -28,9 +28,7 @@
 #include <glog/logging.h>
 #include <infiniband/mlx5dv.h>
 #include <infiniband/verbs.h>
-#ifdef USE_SHCA
-#include <infiniband/shca_17b_types.h>
-#endif
+#include "das/rdma_compat.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -213,11 +211,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         }
 
         is_roce_ = (port_attr.link_layer == IBV_LINK_LAYER_ETHERNET);
-#ifdef USE_SHCA
-        lid_ = u17_to_32(port_attr.lid);
-#else
-        lid_ = port_attr.lid;
-#endif
+        lid_ = mooncake::das::DecodeRdmaLid(port_attr.lid);
         device_name_ = nic;
 
         pd_ = ibv_alloc_pd(ctx_);
@@ -399,37 +393,22 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                 // setup into the device transport this value reaches hardware.
                 ah_attr.grh.hop_limit = 255;
                 ah_attr.port_num = 1;
-#ifdef USE_SHCA
                 const uint32_t local_lid =
-                    u17_to_32(qps_[i]->port_attr.lid);
-#else
-                const uint32_t local_lid = qps_[i]->port_attr.lid;
-#endif
+                    mooncake::das::DecodeRdmaLid(qps_[i]->port_attr.lid);
                 // mlx5gda uses ah_attr.dlid as a carrier for the QPC's RoCE
                 // UDP source port. It is not a destination LID in this branch.
                 const uint16_t roce_udp_sport = static_cast<uint16_t>(
                     kRoceUdpEncapValidPort |
                     (local_lid & kRoceUdpEntropyMask));
-#ifdef USE_SHCA
-                ah_attr.dlid = u32_to_17(roce_udp_sport);
-#else
-                ah_attr.dlid = roce_udp_sport;
-#endif
+                mooncake::das::SetPeerLid(ah_attr, roce_udp_sport);
             } else {
-#ifdef USE_SHCA
-                ah_attr.dlid =
-                    u32_to_17(static_cast<uint32_t>(remote_lids[i]));
-#else
-                ah_attr.dlid = static_cast<uint16_t>(remote_lids[i]);
-#endif
+                mooncake::das::SetPeerLid(
+                    ah_attr, static_cast<uint32_t>(remote_lids[i]));
                 ah_attr.port_num = 0;
             }
 
-#ifdef USE_SHCA
-            const uint32_t path_value = u17_to_32(ah_attr.dlid);
-#else
-            const uint32_t path_value = ah_attr.dlid;
-#endif
+            const uint32_t path_value =
+                mooncake::das::DecodeRdmaLid(ah_attr.dlid);
             if (mlx5gda_modify_rc_qp_init2rtr(qps_[i], ah_attr, remote_qpns[i],
                                               IBV_MTU_4096)) {
                 LOG(ERROR) << "[EP IBGDA] init2rtr failed for QP " << i

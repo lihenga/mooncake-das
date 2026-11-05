@@ -20,6 +20,7 @@
 #define RDMA_CONTEXT_H
 
 #include <gflags/gflags.h>
+#include "das/rdma_compat.h"
 #include <glog/logging.h>
 #include <infiniband/verbs.h>
 
@@ -46,19 +47,8 @@
 
 namespace mooncake {
 
-// The historical Mooncake value for outstanding RDMA READ/atomic operations
-// per QP (the IB default most HCAs advertise).
-constexpr int kIdealRdAtomicDepth = 16;
-
-// Program a QP's RD-atomic depth from the device's advertised limit. Capped at
-// kIdealRdAtomicDepth to preserve the previous behaviour on HCAs that support
-// more, and floored at 1 so a device that reports 0 (no single-sided READ
-// support) fails loudly in ibv_modify_qp() instead of silently on every later
-// READ.
-inline int clampRdAtomicDepth(int device_max) {
-    if (device_max <= 0) return 1;
-    return device_max < kIdealRdAtomicDepth ? device_max : kIdealRdAtomicDepth;
-}
+using das::clampRdAtomicDepth;
+using das::kIdealRdAtomicDepth;
 
 class RdmaEndPoint;
 class RdmaTransport;

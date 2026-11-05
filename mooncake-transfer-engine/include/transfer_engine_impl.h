@@ -433,6 +433,10 @@ class TransferEngineImpl {
     }
 
    private:
+#ifdef USE_HYGON
+    int InstallHygonDefaultTransport();
+#endif
+
     struct MemoryRegion {
         void* addr;
         uint64_t length;

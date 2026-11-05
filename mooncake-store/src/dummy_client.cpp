@@ -1,4 +1,5 @@
 #include <async_simple/coro/SyncAwait.h>
+#include "l4/dummy_client_rpc_internal.h"
 #include <csignal>
 #include <ylt/easylog/record.hpp>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
@@ -157,57 +158,6 @@ std::vector<std::vector<uint64_t>> void_ptr_rows_to_u64_nested(
 }  // namespace
 
 namespace mooncake {
-
-template <auto ServiceMethod>
-constexpr bool can_invoke_when_disconnected() {
-    using Method = std::remove_reference_t<decltype(ServiceMethod)>;
-    return std::is_same_v<
-               Method, std::remove_reference_t<decltype(&RealClient::ping)>> ||
-           std::is_same_v<Method,
-                          std::remove_reference_t<
-                              decltype(&RealClient::service_ready_internal)>> ||
-           std::is_same_v<Method,
-                          std::remove_reference_t<
-                              decltype(&RealClient::is_shm_mapped_internal)>> ||
-           std::is_same_v<Method,
-                          std::remove_reference_t<
-                              decltype(&RealClient::ascend_shm_internal)>> ||
-           std::is_same_v<Method,
-                          std::remove_reference_t<
-                              decltype(&RealClient::ascend_ipc_shm_internal)>>;
-}
-
-template <auto ServiceMethod, typename ReturnType, typename... Args>
-tl::expected<ReturnType, ErrorCode> DummyClient::invoke_rpc(Args&&... args) {
-    auto pool = client_accessor_.GetClientPool();
-
-    if constexpr (!can_invoke_when_disconnected<ServiceMethod>()) {
-        if (!connected_.load()) {
-            LOG(ERROR) << "Dummy Client not connected";
-            return tl::make_unexpected(ErrorCode::RPC_FAIL);
-        }
-    }
-
-    return async_simple::coro::syncAwait(
-        [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
-            auto ret = co_await pool->send_request(
-                [&](coro_io::client_reuse_hint,
-                    coro_rpc::coro_rpc_client& client) {
-                    return client.send_request<ServiceMethod>(
-                        std::forward<Args>(args)...);
-                });
-            if (!ret.has_value()) {
-                LOG(ERROR) << "Dummy Client not available";
-                co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
-            }
-            auto result = co_await std::move(ret.value());
-            if (!result) {
-                LOG(ERROR) << "RPC call failed: " << result.error().msg;
-                co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
-            }
-            co_return result->result();
-        }());
-}
 
 template <auto ServiceMethod, typename ResultType, typename... Args>
 std::vector<tl::expected<ResultType, ErrorCode>> DummyClient::invoke_batch_rpc(
@@ -1526,37 +1476,6 @@ int DummyClient::health_check() {
     if (!connected_.load()) return HC_MASTER_UNREACHABLE;
     if (!last_ping_healthy_.load()) return HC_MASTER_UNREACHABLE;
     return HC_HEALTHY;
-}
-
-std::vector<int> DummyClient::probe_dfs_health() {
-    auto result = invoke_rpc<&RealClient::probe_dfs_health,
-                             std::vector<int>>();
-    if (!result) {
-        const int error = toInt(result.error());
-        return {error, error, 0};
-    }
-    return std::move(result.value());
-}
-
-int DummyClient::probe_dfs_read() {
-    auto result = invoke_rpc<&RealClient::probe_dfs_read_rpc, int>();
-    return result ? result.value() : toInt(result.error());
-}
-
-int DummyClient::probe_dfs_write() {
-    auto result = invoke_rpc<&RealClient::probe_dfs_write_rpc, int>();
-    return result ? result.value() : toInt(result.error());
-}
-
-int DummyClient::set_dfs_access_policy(bool allow_read, bool allow_write) {
-    auto result = invoke_rpc<&RealClient::set_dfs_access_policy, int>(
-        allow_read, allow_write);
-    return result ? result.value() : toInt(result.error());
-}
-
-int DummyClient::set_service_endpoint(const std::string& endpoint) {
-    auto result = invoke_rpc<&RealClient::set_service_endpoint, int>(endpoint);
-    return result ? result.value() : toInt(result.error());
 }
 
 int DummyClient::request_hot_cache_fd() {

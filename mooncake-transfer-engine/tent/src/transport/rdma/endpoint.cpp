@@ -19,9 +19,7 @@
 #include "tent/transport/rdma/endpoint.h"
 
 #include <glog/logging.h>
-#ifdef USE_SHCA
-#include <infiniband/shca_17b_types.h>
-#endif
+#include "das/rdma_compat.h"
 
 #include <algorithm>
 #include <cassert>
@@ -952,11 +950,7 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
     attr.ah_attr.grh.hop_limit = params_->hop_limit;
     attr.ah_attr.grh.flow_label = params_->flow_label;
     attr.ah_attr.grh.traffic_class = qp_traffic_class;
-#ifdef USE_SHCA
-    attr.ah_attr.dlid = u32_to_17(peer_lid);
-#else
-    attr.ah_attr.dlid = static_cast<uint16_t>(peer_lid);
-#endif
+    mooncake::das::SetPeerLid(attr.ah_attr, peer_lid);
     attr.ah_attr.sl = qp_service_level;
     attr.ah_attr.src_path_bits = params_->src_path_bits;
     attr.ah_attr.static_rate = params_->static_rate;
@@ -1083,11 +1077,7 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
     qp_attr.max_dest_rd_atomic = ctx->clampDestRdAtomic(1);
     qp_attr.min_rnr_timer = 0x12;
     qp_attr.ah_attr.is_global = 1;
-#ifdef USE_SHCA
-    qp_attr.ah_attr.dlid = u32_to_17(peer_lid);
-#else
-    qp_attr.ah_attr.dlid = static_cast<uint16_t>(peer_lid);
-#endif
+    mooncake::das::SetPeerLid(qp_attr.ah_attr, peer_lid);
     qp_attr.ah_attr.sl = service_level;
     qp_attr.ah_attr.src_path_bits = 0;
     qp_attr.ah_attr.port_num = ctx->portNum();

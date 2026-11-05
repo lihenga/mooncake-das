@@ -5,7 +5,8 @@ set(_extra_build_depends "")
 if(USE_HIP)
   list(APPEND _extra_build_opts --use-hipcc)
   list(APPEND _extra_build_depends
-       ${CMAKE_CURRENT_SOURCE_DIR}/../include/gpu_vendor/hip.h)
+       ${CMAKE_CURRENT_SOURCE_DIR}/../include/gpu_vendor/hip.h
+       ${CMAKE_CURRENT_SOURCE_DIR}/../include/das/hygon_allocator.h)
 elseif(USE_MUSA)
   list(APPEND _extra_build_opts --use-mcc)
   list(APPEND _extra_build_depends

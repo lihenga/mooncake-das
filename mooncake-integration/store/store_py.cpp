@@ -3,6 +3,8 @@
 // Modified by Hygon Information Technology Co., Ltd., 2026.
 
 #include <pybind11/gil.h>  // For GIL management
+#include "das/store_bindings.h"
+#include "das/read_bindings.h"
 #include <pybind11/stl.h>
 #include <numa.h>
 
@@ -1922,71 +1924,7 @@ class MooncakeDistributedNoFRegisterPyWrapper {
 };
 
 PYBIND11_MODULE(store, m) {
-    using mooncake::ReadKeyMapping;
-    using mooncake::ReadLayoutComponent;
-    using mooncake::ReadLayoutDescriptor;
-    auto layout_integer = [](py::handle value) {
-        if (!PyLong_Check(value.ptr()) || PyBool_Check(value.ptr()))
-            throw py::type_error("layout fields and rows require integers");
-        const int negative =
-            PyObject_RichCompareBool(value.ptr(), py::int_(0).ptr(), Py_LT);
-        if (negative < 0) throw py::error_already_set();
-        if (negative)
-            throw py::value_error("layout fields and rows must be nonnegative");
-        const size_t result = PyLong_AsSize_t(value.ptr());
-        if (PyErr_Occurred()) throw py::error_already_set();
-        return result;
-    };
-    py::enum_<ReadKeyMapping>(m, "ReadKeyMapping")
-        .value("PER_ROW", ReadKeyMapping::PER_ROW)
-        .value("PER_ROW_COMPONENT", ReadKeyMapping::PER_ROW_COMPONENT);
-    py::class_<ReadLayoutComponent>(m, "ReadComponent")
-        .def(py::init([layout_integer](py::object base, py::object stride,
-                                       py::object bytes, py::object offset) {
-                 return ReadLayoutComponent(
-                     layout_integer(base), layout_integer(stride),
-                     layout_integer(bytes), layout_integer(offset));
-             }),
-             py::kw_only(), py::arg("destination_base"),
-             py::arg("destination_stride"), py::arg("byte_count"),
-             py::arg("source_offset") = py::int_(0))
-        .def_readonly("destination_base",
-                      &ReadLayoutComponent::destination_base)
-        .def_readonly("destination_stride",
-                      &ReadLayoutComponent::destination_stride)
-        .def_readonly("byte_count", &ReadLayoutComponent::byte_count)
-        .def_readonly("source_offset", &ReadLayoutComponent::source_offset);
-    py::class_<ReadLayoutDescriptor, std::shared_ptr<ReadLayoutDescriptor>>(
-        m, "ReadLayout")
-        .def(
-            py::init([layout_integer](
-                         std::vector<std::string> keys, py::sequence rows,
-                         py::object mapping,
-                         std::vector<ReadLayoutComponent> components) {
-                if (!py::isinstance<ReadKeyMapping>(mapping))
-                    throw py::type_error("key_mapping requires ReadKeyMapping");
-                std::vector<size_t> indices;
-                indices.reserve(py::len(rows));
-                for (py::handle row : rows)
-                    indices.push_back(layout_integer(row));
-                return std::make_shared<ReadLayoutDescriptor>(
-                    std::move(keys), std::move(indices),
-                    mapping.cast<ReadKeyMapping>(), std::move(components));
-            }),
-            py::kw_only(), py::arg("keys"), py::arg("rows"),
-            py::arg("key_mapping"), py::arg("components"))
-        .def_readonly("keys", &ReadLayoutDescriptor::keys)
-        .def_readonly("rows", &ReadLayoutDescriptor::rows)
-        .def_readonly("key_mapping", &ReadLayoutDescriptor::key_mapping)
-        .def_readonly("components", &ReadLayoutDescriptor::components);
-    py::class_<mooncake::ReadPlan, std::shared_ptr<mooncake::ReadPlan>>(
-        m, "ReadPlan", py::dynamic_attr())
-        .def("run", &mooncake::ReadPlan::run, py::call_guard<py::gil_scoped_release>())
-        .def("wait", &mooncake::ReadPlan::wait, py::arg("group"),
-             py::call_guard<py::gil_scoped_release>())
-        .def("stats", &mooncake::ReadPlan::stats)
-        .def("reuse_stats", &mooncake::ReadPlan::reuse_stats);
-
+    das::RegisterReadTypes(m);
     m.def("_serialize_tensor", &serialize_tensor_metadata,
           "Inspect a torch tensor as Mooncake tensor metadata, data pointer, "
           "size, and owner.");
@@ -2287,38 +2225,11 @@ PYBIND11_MODULE(store, m) {
         "Get PyClient from MooncakeDistributedStore (internal use, returns "
         "capsule)");
 
-    py::class_<MooncakeStorePyWrapper>(m, "MooncakeDistributedStore")
+    auto store_class =
+        py::class_<MooncakeStorePyWrapper>(m, "MooncakeDistributedStore");
+    store_class
         .def(py::init<>())
-        .def(
-            "get_capabilities",
-            [](const MooncakeStorePyWrapper &self) {
-                // Local API support only. DummyClient forwards health/metrics
-                // RPCs to a daemon built from the same Mooncake package.
-                const bool embedded = !self.use_dummy_client_;
-                py::dict features;
-                features["dfs_health"] = true;
-                features["dfs_prefetch"] = embedded;
-                features["read_plan"] = embedded;
-                features["read_layout"] = embedded;
-                features["service_metrics"] = true;
-                features["client_http_auto_port"] = true;
-                py::dict result;
-                result["api_version"] = 1;
-                result["scope"] = "local_package";
-                result["client_mode"] = embedded ? "embedded" : "standalone";
-                result["rpc_protocol_version"] = GetMooncakeStoreVersion();
-                result["features"] = std::move(features);
-                result["setup_parameters"] = std::vector<std::string>{
-                    "local_hostname", "metadata_server", "global_segment_size",
-                    "local_buffer_size", "protocol", "rdma_devices",
-                    "master_server_addr", "engine", "enable_ssd_offload",
-                    "ssd_offload_path", "tenant_id", "enable_client_http_server",
-                    "client_http_port", "enable_dfs_prefetch"};
-                return result;
-            },
-            "Describe optional local APIs and setup parameters without an RPC. "
-            "Callable before setup; does not probe a standalone daemon. "
-            "Legacy callers do not need to call this method.")
+
         .def(
             "_get_pyclient_capsule",
             [make_pyclient_capsule](MooncakeStorePyWrapper &self)
@@ -2535,26 +2446,7 @@ PYBIND11_MODULE(store, m) {
              "Health check for store connectivity. "
              "Returns 0 if healthy, 1 if not initialized/closed, "
              "2 if master unreachable.")
-        .def("probe_dfs_health", &MooncakeStorePyWrapper::probe_dfs_health,
-             "Probe DFS read/write health. Returns "
-             "[read_error_code, write_error_code, backend_ready].")
-        .def("probe_dfs_read", &MooncakeStorePyWrapper::probe_dfs_read,
-             "Probe DFS read capability and return an error code.")
-        .def("probe_dfs_write", &MooncakeStorePyWrapper::probe_dfs_write,
-             "Probe DFS write capability and return an error code.")
-        .def(
-            "set_service_endpoint",
-            [](MooncakeStorePyWrapper &self, const std::string &endpoint) {
-                if (!self.store_) return toInt(ErrorCode::INVALID_PARAMS);
-                py::gil_scoped_release release;
-                return self.store_->set_service_endpoint(endpoint);
-            },
-            py::arg("endpoint"),
-            "Enable master-reported service metrics for this immutable service endpoint.")
-        .def("set_dfs_access_policy",
-             &MooncakeStorePyWrapper::set_dfs_access_policy,
-             py::arg("allow_read"), py::arg("allow_write"),
-             "Atomically update DFS read/write access policy.")
+
         .def("get_size",
              [](MooncakeStorePyWrapper &self, const std::string &key) {
                  py::gil_scoped_release release;
@@ -3178,46 +3070,7 @@ PYBIND11_MODULE(store, m) {
             "Get object data directly into multiple pre-allocated buffers for "
             "multiple "
             "keys")
-        .def(
-            "batch_get_into_layouts",
-            [](MooncakeStorePyWrapper &self,
-               const std::vector<std::shared_ptr<ReadLayoutDescriptor>>
-                   &layouts) {
-                if (!self.is_client_initialized())
-                    throw std::runtime_error("Client is not initialized");
-                auto client = self.store_;
-                py::gil_scoped_release release;
-                return mooncake::ReadIntoLayouts(*client, layouts);
-            },
-            py::arg("layouts"),
-            "Ranged get into strided buffers defined by read layouts, using "
-            "active get sessions (no Master RPC).")
-        .def(
-            "create_read_plan",
-            [](MooncakeStorePyWrapper &self,
-               std::vector<mooncake::ReadLayout> layouts, int num_groups,
-               bool reuse_ranges, py::object buffer_owners, bool page_wise,
-               bool borrowed_sessions) {
-                if (!self.is_client_initialized())
-                    throw std::runtime_error("Client is not initialized");
-                std::shared_ptr<mooncake::ReadPlan> plan;
-                {
-                    py::gil_scoped_release release;
-                    plan = std::make_shared<mooncake::ReadPlan>(
-                        self.store_, std::move(layouts), num_groups, reuse_ranges,
-                        page_wise, borrowed_sessions);
-                }
-                auto object = py::cast(plan);
-                object.attr("_buffer_owners") = std::move(buffer_owners);
-                return object;
-            }, py::arg("layouts"), py::arg("num_groups"),
-            py::arg("reuse_ranges") = false, py::arg("buffer_owners") = py::none(),
-            py::arg("page_wise") = false, py::arg("borrowed_sessions") = false,
-            py::keep_alive<0, 1>(),
-            "Create ordered range reads; retain registered destination memory "
-            "until run completes. By default the plan starts and ends get "
-            "sessions; borrowed_sessions=True requires the caller to keep "
-            "sessions for all keys active until run completes.")
+
         .def(
             "batch_get_session_start",
             [](MooncakeStorePyWrapper &self,
@@ -3232,97 +3085,7 @@ PYBIND11_MODULE(store, m) {
             py::arg("keys"),
             "Start a get session: query replicas once and cache them. "
             "Returns SESSION_START_LEASE_EXPIRED (-716) for an expired query.")
-        .def(
-            "batch_get_session_refresh",
-            [](MooncakeStorePyWrapper &self,
-               const std::vector<std::string> &keys) {
-                if (!self.is_client_initialized()) {
-                    LOG(ERROR) << "Client is not initialized";
-                    return std::vector<int>{};
-                }
-                py::gil_scoped_release release;
-                return self.store_->batch_get_session_refresh(keys);
-            },
-            py::arg("keys"),
-            "Refresh leases for active get sessions while preserving cached "
-            "session objects; incompatible refreshed replicas fail and "
-            "invalidate that session. Expiry returns "
-            "SESSION_REFRESH_QUERY_LEASE_EXPIRED (-717) before selection or "
-            "SESSION_REFRESH_COMMIT_LEASE_EXPIRED (-718) before commit.")
-        .def(
-            "batch_get_session_start_with_sources",
-            [](MooncakeStorePyWrapper &self,
-               const std::vector<std::string> &keys) {
-                if (!self.is_client_initialized()) {
-                    LOG(ERROR) << "Client is not initialized";
-                    return std::pair<std::vector<int>,
-                                     std::vector<std::string>>{};
-                }
-                py::gil_scoped_release release;
-                auto result =
-                    self.store_->batch_get_session_start_with_sources(keys);
-                return std::make_pair(std::move(result.codes),
-                                      std::move(result.sources));
-            },
-            py::arg("keys"),
-            "Start get sessions and return each result with its selected "
-            "source; expired queries return SESSION_START_LEASE_EXPIRED (-716).")
-        .def(
-            "batch_get_session_prefetch",
-            [](MooncakeStorePyWrapper &self,
-               const std::vector<std::string> &keys) {
-                if (!self.is_client_initialized()) {
-                    LOG(ERROR) << "Client is not initialized";
-                    return std::vector<int>{};
-                }
-                py::gil_scoped_release release;
-                return self.store_->batch_get_session_prefetch(keys);
-            },
-            py::arg("keys"),
-            "Synchronously read DFS objects in active get sessions into "
-            "Mooncake's dedicated prefetch arena without copying to caller "
-            "buffers. A successful DFS status means the complete object bytes "
-            "remain owned by a compatible active session; non-DFS entries use "
-            "the ordinary range-get path. Returns per-key status; "
-            "SESSION_PREFETCH_LEASE_EXPIRED (-719) checks entry only. "
-            "Successful validated BUCKET reads may finish after lease expiry; "
-            "range-get still requires a live or refreshed lease.")
-        .def(
-            "dfs_prefetch_arena_available",
-            [](MooncakeStorePyWrapper &self) {
-                if (!self.is_client_initialized()) return false;
-                return self.store_->dfs_prefetch_arena_available();
-            },
-            "Whether batch_get_session_prefetch has a DFS staging arena "
-            "(MC_STORE_DFS_PREFETCH_CAPACITY_RATIO). When false every DFS "
-            "prefetch read fails, so callers should not submit prefetches.")
-        .def(
-            "disable_dfs_prefetch",
-            [](MooncakeStorePyWrapper &self) {
-                if (!self.is_client_initialized()) return false;
-                py::gil_scoped_release release;
-                return self.store_->disable_dfs_prefetch();
-            },
-            "Startup-only: disable DFS prefetch and release its unused arena. "
-            "Returns false if a session or arena allocation is active.")
-        .def(
-            "dfs_prefetch_arena_status",
-            [](MooncakeStorePyWrapper &self) {
-                if (!self.is_client_initialized()) {
-                    return std::string("client not initialized");
-                }
-                return self.store_->dfs_prefetch_arena_status();
-            },
-            "\"ready\" or the reason the DFS prefetch arena is unavailable.")
-        .def(
-            "record_prefetched_tokens",
-            [](MooncakeStorePyWrapper &self, uint64_t tokens) {
-                if (!self.is_client_initialized()) return;
-                py::gil_scoped_release release;
-                self.store_->record_prefetched_tokens(tokens);
-            },
-            py::arg("tokens"),
-            "Record prompt tokens successfully prefetched by the direct linker")
+
         .def(
             "batch_get_into_multi_buffer_ranges",
             [](MooncakeStorePyWrapper &self,
@@ -3343,7 +3106,8 @@ PYBIND11_MODULE(store, m) {
             py::arg("all_src_offsets"),
             "Ranged get into multiple buffers using a get session. Expiry "
             "returns SESSION_RANGE_LEASE_EXPIRED (-720) at entry or "
-            "SESSION_MEMORY_TRANSFER_LEASE_EXPIRED (-721) after memory transfer.")
+            "SESSION_MEMORY_TRANSFER_LEASE_EXPIRED (-721) after memory "
+            "transfer.")
         .def(
             "batch_get_session_end",
             [](MooncakeStorePyWrapper &self,
@@ -3516,6 +3280,8 @@ PYBIND11_MODULE(store, m) {
             "Returns:\n"
             "    tuple[QueryTaskResponse | None, int]: (QueryTaskResponse if "
             "success, error code: 0 if success, non-zero if failure)");
+
+    das::RegisterStoreExtensions(store_class);
 
     // Expose NUMA binding as a module-level function (no self required)
     m.def(

@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
+
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 
 file(GLOB SOURCES "*.cpp")
@@ -133,6 +134,7 @@ if(WITH_STORE)
     ${SOURCES}
     ${CACHE_ALLOCATOR_SOURCES}
     store/store_py.cpp
+    store/das/read_bindings.cpp
     store/buffer_pool.cpp
     store/engram_store_py.cpp
     integration_utils.h)

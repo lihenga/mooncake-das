@@ -4,6 +4,19 @@
 
 namespace mooncake::l4 {
 
+UUID DfsSessionEpoch(const std::vector<Replica::Descriptor> &replicas);
+
+bool is_object_range_overflow(size_t offset, size_t size, size_t limit);
+
+const Replica::Descriptor *SelectCompleteMemoryReplica(
+    const std::vector<Replica::Descriptor> &replicas,
+    const std::unordered_set<std::string> &local_endpoints);
+
+tl::expected<QueryResult, ErrorCode> ApplyDfsReadVisibility(
+    const tl::expected<QueryResult, ErrorCode> &query_result, bool allow_dfs);
+
+size_t DfsH2dStreamCount();
+
 uint64_t NextDfsReadTraceId();
 
 std::string DirectSourceForReplica(const Replica::Descriptor &replica);

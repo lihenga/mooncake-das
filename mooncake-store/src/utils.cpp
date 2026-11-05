@@ -600,15 +600,6 @@ int64_t time_gen() {
         .count();
 }
 
-bool dfs_read_trace_enabled() {
-    return GetDfsReadTraceEnabled();
-}
-
-std::string GetEnvStringOr(const char *name, const std::string &default_value) {
-    const char *env_val = std::getenv(name);
-    return env_val ? std::string(env_val) : default_value;
-}
-
 std::string ResolveMooncakeHostId(const std::string &local_hostname) {
     const std::string hostname(TrimAsciiWhitespace(local_hostname));
     const std::string host_id = (hostname == "::1" || hostname == "::")

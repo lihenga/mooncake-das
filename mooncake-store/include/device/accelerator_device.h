@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include "l4/host_copy_range.h"
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -40,14 +41,6 @@ struct PointerInfo {
     int32_t device_id = -1;
 };
 
-struct HostCopyRange {
-    void* dst = nullptr;
-    const void* src = nullptr;
-    size_t size = 0;
-    // Optional device-visible alias for mapped host memory.
-    const void* src_device = nullptr;
-};
-
 class AcceleratorDevice {
    public:
     virtual ~AcceleratorDevice() = default;
@@ -62,45 +55,23 @@ class AcceleratorDevice {
     // Asynchronous host-to-device copy. Backends without stream support use
     // the synchronous implementation as a correctness-preserving fallback.
     virtual bool CopyFromHostAsync(void* dst, const void* src, size_t size,
-                                   void* stream) const {
-        (void)stream;
-        return Copy(dst, src, size, CopyDirection::kHostToDevice);
-    }
+                                   void* stream) const;
     // Submit a set of independent host-to-device copies on one stream. The
     // default implementation deliberately keeps the old semantics; backends
     // with a native scatter-copy primitive or a suitable batch kernel can
     // override it to reduce host submission overhead.
-    virtual bool CopyFromHostBatchAsync(std::span<const HostCopyRange> ranges,
-                                        void* stream,
-                                        bool* used_batch_kernel = nullptr) const {
-        if (used_batch_kernel) *used_batch_kernel = false;
-        bool success = true;
-        for (const auto& range : ranges) {
-            // Keep attempting the remaining ranges. A backend failure for one
-            // range must not turn the logical batch into an early-aborted
-            // submission with an ambiguous partial result.
-            success = CopyFromHostAsync(range.dst, range.src, range.size,
-                                        stream) && success;
-        }
-        return success;
-    }
-    virtual bool CreateStream(void** stream) const {
-        (void)stream;
-        return false;
-    }
-    virtual bool SynchronizeStream(void* stream) const {
-        (void)stream;
-        return true;
-    }
-    virtual void DestroyStream(void* stream) const { (void)stream; }
+    virtual bool CopyFromHostBatchAsync(
+        std::span<const HostCopyRange> ranges, void* stream,
+        bool* used_batch_kernel = nullptr) const;
+    virtual bool CreateStream(void** stream) const;
+    virtual bool SynchronizeStream(void* stream) const;
+    virtual void DestroyStream(void* stream) const;
     virtual PinnedHostBuffer AllocatePinnedHost(size_t size) const = 0;
 
     // Allocate host memory with a device-visible mapping when supported. This
     // is separate from ordinary pinned memory because mapped host access is
     // only needed by the DFS scatter-kernel path.
-    virtual PinnedHostBuffer AllocateMappedPinnedHost(size_t size) const {
-        return AllocatePinnedHost(size);
-    }
+    virtual PinnedHostBuffer AllocateMappedPinnedHost(size_t size) const;
 };
 
 class ProbeCachedAcceleratorDevice : public AcceleratorDevice {

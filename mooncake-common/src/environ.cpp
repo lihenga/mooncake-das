@@ -3,6 +3,7 @@
 // Modified by Hygon Information Technology Co., Ltd., 2026.
 
 #include "environ.h"
+#include "das/defaults.h"
 
 #include <algorithm>
 #include <iostream>
@@ -176,7 +177,7 @@ Environ::Environ(const EnvironSource& source) {
     max_inline_ = ReadInt(source, "MC_MAX_INLINE", 64);
     mtu_ = ReadInt(source, "MC_MTU", 4096);
     workers_per_ctx_ = ReadInt(source, "MC_WORKERS_PER_CTX", 2);
-    slice_size_ = ReadSizeT(source, "MC_SLICE_SIZE", 1048576);
+    slice_size_ = ReadSizeT(source, "MC_SLICE_SIZE", das::kSliceSize);
     retry_cnt_ = ReadInt(source, "MC_RETRY_CNT", 9);
     log_level_ = ReadString(source, "MC_LOG_LEVEL", "INFO");
     disable_metacache_ = ReadBool(source, "MC_DISABLE_METACACHE", false);
@@ -188,7 +189,8 @@ Environ::Environ(const EnvironSource& source) {
     redis_db_index_ = ReadInt(source, "MC_REDIS_DB_INDEX", 0);
     fragment_ratio_ = ReadInt(source, "MC_FRAGMENT_RATIO", 4);
     enable_dest_device_affinity_ =
-        ReadBool(source, "MC_ENABLE_DEST_DEVICE_AFFINITY", true);
+        ReadBool(source, "MC_ENABLE_DEST_DEVICE_AFFINITY",
+                 das::kEnableDestDeviceAffinity);
     use_ipv6_ = ReadBool(source, "MC_USE_IPV6", false);
     min_rpc_port_ = ReadInt(source, "MC_MIN_RPC_PORT",
                             ReadInt(source, "MC_MIN_PRC_PORT", 15000));

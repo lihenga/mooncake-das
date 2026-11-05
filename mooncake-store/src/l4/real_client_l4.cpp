@@ -30,7 +30,6 @@
 
 #include "real_client.h"
 #include "scatter_utils.h"
-#include "registered_pinned_memory.h"
 #include "client_buffer.h"
 #include "replica_selection.h"
 #include "common.h"
@@ -74,7 +73,144 @@
 
 namespace mooncake {
 
+using l4::ApplyDfsReadVisibility;
+using l4::DfsH2dStreamCount;
+using l4::DfsSessionEpoch;
+using l4::FilterQueryResult;
+using l4::is_object_range_overflow;
+using l4::SelectCompleteMemoryReplica;
+using l4::SelectSessionReplica;
+
+namespace {
+
+struct HttpLoggingUpdateRequest {
+    std::optional<std::string> minloglevel;
+    std::optional<int> vlog_level;
+    std::optional<std::string> ylt_severity;
+    std::optional<bool> dfs_read_trace;
+};
+YLT_REFL(HttpLoggingUpdateRequest, minloglevel, vlog_level, ylt_severity,
+         dfs_read_trace);
+
+struct HttpLoggingResponse {
+    bool success{true};
+    std::string minloglevel;
+    int vlog_level{0};
+    std::string ylt_severity;
+    bool dfs_read_trace{false};
+};
+YLT_REFL(HttpLoggingResponse, success, minloglevel, vlog_level, ylt_severity,
+         dfs_read_trace);
+
+void FillLoggingResponse(HttpLoggingResponse *response) {
+    const auto config = GetRuntimeLogConfig();
+    response->minloglevel = config.minloglevel;
+    response->vlog_level = config.vlog_level;
+    response->ylt_severity = config.ylt_severity;
+    response->dfs_read_trace = config.dfs_read_trace;
+}
+
+}  // namespace
+
 namespace l4 {
+
+UUID DfsSessionEpoch(const std::vector<Replica::Descriptor> &replicas) {
+    for (const auto &replica : replicas) {
+        if (replica.is_dfs_replica())
+            return replica.get_dfs_descriptor().MasterEpoch();
+    }
+    return {};
+}
+
+QueryResult FilterQueryResult(const QueryResult &qr,
+                              const Replica::Descriptor &replica,
+                              bool include_object_checksum) {
+    return QueryResult(
+        {replica}, qr.lease_timeout,
+        include_object_checksum ? qr.object_checksum : std::nullopt);
+}
+
+bool is_object_range_overflow(size_t offset, size_t size, size_t limit) {
+    return size > limit || offset > limit - size;
+}
+
+const Replica::Descriptor *SelectCompleteMemoryReplica(
+    const std::vector<Replica::Descriptor> &replicas,
+    const std::unordered_set<std::string> &local_endpoints) {
+    const Replica::Descriptor *first_memory = nullptr;
+    for (const auto &r : replicas) {
+        if (r.status != ReplicaStatus::COMPLETE || !r.is_memory_replica()) {
+            continue;
+        }
+        if (local_endpoints.count(r.get_memory_descriptor()
+                                      .buffer_descriptor.transport_endpoint_)) {
+            return &r;
+        }
+        if (!first_memory) {
+            first_memory = &r;
+        }
+    }
+    return first_memory;
+}
+
+const Replica::Descriptor *SelectSessionReplica(
+    const std::vector<Replica::Descriptor> &replicas,
+    const std::unordered_set<std::string> &local_endpoints, bool allow_dfs) {
+    if (const auto *memory =
+            SelectCompleteMemoryReplica(replicas, local_endpoints)) {
+        return memory;
+    }
+
+    if (!allow_dfs) return nullptr;
+    for (const auto &replica : replicas) {
+        if (replica.status == ReplicaStatus::COMPLETE &&
+            replica.is_dfs_replica()) {
+            return &replica;
+        }
+    }
+    return nullptr;
+}
+
+tl::expected<QueryResult, ErrorCode> ApplyDfsReadVisibility(
+    const tl::expected<QueryResult, ErrorCode> &query_result, bool allow_dfs) {
+    if (!query_result) {
+        return tl::make_unexpected(query_result.error());
+    }
+    if (allow_dfs) return query_result.value();
+
+    std::vector<Replica::Descriptor> memory_replicas;
+    for (const auto &replica : query_result->replicas) {
+        if (replica.status == ReplicaStatus::COMPLETE &&
+            replica.is_memory_replica()) {
+            memory_replicas.push_back(replica);
+        }
+    }
+    if (memory_replicas.empty()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    return QueryResult(std::move(memory_replicas), query_result->lease_timeout,
+                       query_result->object_checksum);
+}
+
+size_t DfsH2dStreamCount() {
+    constexpr size_t kDefaultStreams = 4;
+    const char *value = std::getenv("MC_STORE_DFS_H2D_STREAMS");
+    if (!value || value[0] == '\0') return kDefaultStreams;
+
+    errno = 0;
+    char *end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    const bool digits_only =
+        std::all_of(value, value + std::strlen(value),
+                    [](unsigned char c) { return std::isdigit(c) != 0; });
+    if (!digits_only || errno != 0 || end == value || *end != '\0' ||
+        (parsed != 1 && parsed != 2 && parsed != 4)) {
+        LOG(WARNING) << "Invalid MC_STORE_DFS_H2D_STREAMS='" << value
+                     << "', using " << kDefaultStreams;
+        return kDefaultStreams;
+    }
+    return static_cast<size_t>(parsed);
+}
 
 namespace {
 std::atomic<uint64_t> g_dfs_read_trace_id{0};
@@ -1734,6 +1870,409 @@ RealClient::PlanDfsReadChunks(
     }
     flush_chunk();
     return chunks;
+}
+
+GetSessionStartResult RealClient::batch_get_session_start_with_sources(
+    const std::vector<std::string> &keys) {
+    GetSessionStartResult result{
+        std::vector<int>(keys.size(),
+                         static_cast<int>(toInt(ErrorCode::INVALID_PARAMS))),
+        std::vector<std::string>(keys.size(), "unknown"), false};
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return result;
+    }
+    if (keys.empty()) return result;
+
+    // Master interaction only here: query replicas + lease.
+    const auto query_results = client_->BatchQuery(keys);
+    if (query_results.size() != keys.size()) {
+        LOG(ERROR) << "Session query result size mismatch: expected="
+                   << keys.size() << ", got=" << query_results.size();
+        result.codes.assign(keys.size(),
+                            static_cast<int>(toInt(ErrorCode::RPC_FAIL)));
+        return result;
+    }
+    auto local_endpoints = client_->GetLocalEndpoints();
+    const bool record_access = client_->MetricsEnabled();
+    result.all_memory = true;
+
+    const bool prefetch_cache_enabled = dfs_prefetch_arena_available();
+    std::vector<std::shared_ptr<BufferHandle>> detached_prefetch_buffers;
+    if (prefetch_cache_enabled) {
+        detached_prefetch_buffers.reserve(keys.size());
+    }
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (record_access) {
+            get_session_access_records_.erase(keys[i]);
+        }
+        // A get session owns its prefetch buffer. Starting a new lease must
+        // not inherit pinned bytes from an older lookup of the same key.
+        if (prefetch_cache_enabled) {
+            DetachPrefetchedSessionBuffer(get_session_prefetch_cache_, keys[i],
+                                          detached_prefetch_buffers);
+        }
+        if (!query_results[i]) {
+            result.all_memory = false;
+            result.codes[i] = static_cast<int>(toInt(query_results[i].error()));
+            get_sessions_.erase(keys[i]);
+            continue;
+        }
+
+        const auto &query_result = query_results[i].value();
+        if (query_result.IsLeaseExpired()) {
+            result.all_memory = false;
+            result.codes[i] =
+                static_cast<int>(toInt(ErrorCode::SESSION_START_LEASE_EXPIRED));
+            get_sessions_.erase(keys[i]);
+            continue;
+        }
+
+        const auto *replica = SelectSessionReplica(
+            query_result.replicas, local_endpoints, client_->DfsReadAllowed());
+        if (!replica) {
+            result.all_memory = false;
+            LOG(ERROR) << "No supported complete session replica for key: "
+                       << keys[i];
+            result.codes[i] =
+                static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
+            get_sessions_.erase(keys[i]);
+            continue;
+        }
+        result.all_memory &= replica->is_memory_replica();
+
+        // QueryResult members are const: erase + emplace (no operator=).
+        get_sessions_.erase(keys[i]);
+        get_sessions_.emplace(keys[i],
+                              FilterQueryResult(query_result, *replica));
+        result.sources[i] = DirectSourceForReplica(*replica);
+        result.codes[i] = 0;
+    }
+    return result;
+}
+
+bool RealClient::all_get_sessions_memory(
+    const std::vector<std::string> &keys) const {
+    if (keys.empty()) return false;
+    auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    for (const auto &key : keys) {
+        const auto it = get_sessions_.find(key);
+        if (it == get_sessions_.end() || it->second.IsLeaseExpired(now) ||
+            it->second.replicas.size() != 1 ||
+            !it->second.replicas.front().is_memory_replica())
+            return false;
+    }
+    return true;
+}
+
+bool RealClient::validate_session_range_batch_arguments(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<void *>> &all_buffers,
+    const std::vector<std::vector<size_t>> &all_sizes,
+    const std::vector<std::vector<size_t>> &all_src_offsets) const {
+    if (client_ && keys.size() == all_buffers.size() &&
+        keys.size() == all_sizes.size() &&
+        keys.size() == all_src_offsets.size()) {
+        return true;
+    }
+    LOG(ERROR) << "Invalid get ranges args";
+    return false;
+}
+
+std::vector<SessionRangeReadRequest>
+RealClient::prepare_session_range_read_requests(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<void *>> &all_buffers,
+    const std::vector<std::vector<size_t>> &all_sizes,
+    const std::vector<std::vector<size_t>> &all_src_offsets,
+    std::vector<int> &results, SessionRangeReadContext &context) {
+    std::vector<SessionRangeReadRequest> requests;
+    requests.reserve(keys.size());
+    if (context.record_access) {
+        context.access_sources.resize(keys.size());
+    }
+
+    const bool prefetch_cache_enabled = dfs_prefetch_arena_available();
+    std::vector<std::shared_ptr<BufferHandle>> detached_prefetch_buffers;
+    if (prefetch_cache_enabled) {
+        detached_prefetch_buffers.reserve(keys.size());
+    }
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    CollectOrphanedDfsPrefetchBuffers(prefetch_cache_enabled, context,
+                                      detached_prefetch_buffers);
+    context.cache_gc_done = std::chrono::steady_clock::now();
+
+    auto now = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto &buffers = all_buffers[i];
+        const auto &sizes = all_sizes[i];
+        const auto &offsets = all_src_offsets[i];
+        if (buffers.size() != sizes.size() ||
+            buffers.size() != offsets.size()) {
+            continue;
+        }
+
+        auto session_it = get_sessions_.find(keys[i]);
+        if (session_it == get_sessions_.end()) {
+            continue;
+        }
+        if (session_it->second.replicas.size() != 1) {
+            results[i] = static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
+            continue;
+        }
+
+        const auto &replica = session_it->second.replicas.front();
+        if (context.record_access) {
+            context.access_sources[i] = DirectSourceForReplica(replica);
+        }
+        if (session_it->second.IsLeaseExpired(now)) {
+            if (context.record_access) {
+                const std::string source = DirectSourceForReplica(replica);
+                if (source != "unknown") {
+                    auto [record_it, inserted] =
+                        get_session_access_records_.try_emplace(
+                            keys[i],
+                            GetSessionAccessRecord{source, false, 0, {}});
+                    record_it->second.success = false;
+                }
+            }
+            get_sessions_.erase(session_it);
+            if (prefetch_cache_enabled) {
+                DetachPrefetchedSessionBuffer(get_session_prefetch_cache_,
+                                              keys[i],
+                                              detached_prefetch_buffers);
+            }
+            results[i] =
+                static_cast<int>(toInt(ErrorCode::SESSION_RANGE_LEASE_EXPIRED));
+            continue;
+        }
+
+        uint64_t replica_limit = 0;
+        if (replica.is_memory_replica()) {
+            replica_limit =
+                replica.get_memory_descriptor().buffer_descriptor.size_;
+        } else if (replica.is_dfs_replica()) {
+            replica_limit = calculate_total_size(replica);
+        }
+        if (replica.is_memory_replica() || replica.is_dfs_replica()) {
+            bool overflow = false;
+            for (size_t j = 0; j < buffers.size(); ++j) {
+                if (is_object_range_overflow(offsets[j], sizes[j],
+                                             replica_limit)) {
+                    overflow = true;
+                    break;
+                }
+            }
+            if (overflow) {
+                results[i] = static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+                continue;
+            }
+        }
+
+        results[i] = 0;
+        requests.push_back(SessionRangeReadRequest{
+            keys[i], i, replica, session_it->second,
+            std::vector<void *>(buffers.begin(), buffers.end()),
+            std::vector<size_t>(sizes.begin(), sizes.end()),
+            std::vector<size_t>(offsets.begin(), offsets.end()),
+            session_it->second.lease_timeout});
+    }
+    return requests;
+}
+
+SessionRangeReadPlan RealClient::classify_session_range_read_requests(
+    std::vector<SessionRangeReadRequest> requests,
+    std::vector<int> &results) const {
+    SessionRangeReadPlan plan;
+    plan.memory_requests.reserve(requests.size());
+    plan.dfs_requests.reserve(requests.size());
+    for (auto &request : requests) {
+        if (request.replica.is_memory_replica()) {
+            plan.memory_requests.push_back(std::move(request));
+        } else if (request.replica.is_dfs_replica()) {
+            plan.dfs_requests.push_back(std::move(request));
+        } else {
+            results[request.original_idx] =
+                static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
+        }
+    }
+    return plan;
+}
+
+void RealClient::execute_session_memory_range_reads(
+    const std::vector<SessionRangeReadRequest> &requests,
+    std::vector<int> &results) {
+    if (requests.empty()) {
+        return;
+    }
+
+    std::vector<Replica::Descriptor> replicas;
+    std::vector<std::vector<Slice>> slices;
+    std::vector<std::vector<uint64_t>> src_offsets;
+    replicas.reserve(requests.size());
+    slices.reserve(requests.size());
+    src_offsets.reserve(requests.size());
+    for (const auto &request : requests) {
+        replicas.push_back(request.replica);
+        std::vector<Slice> entry_slices;
+        std::vector<uint64_t> entry_offsets;
+        entry_slices.reserve(request.buffers.size());
+        entry_offsets.reserve(request.src_offsets.size());
+        for (size_t i = 0; i < request.buffers.size(); ++i) {
+            entry_slices.emplace_back(
+                Slice{request.buffers[i], request.sizes[i]});
+            entry_offsets.push_back(
+                static_cast<uint64_t>(request.src_offsets[i]));
+        }
+        slices.push_back(std::move(entry_slices));
+        src_offsets.push_back(std::move(entry_offsets));
+    }
+
+    const auto transfer =
+        client_->BatchTransferReadRanges(replicas, slices, src_offsets);
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    const auto now = std::chrono::steady_clock::now();
+    if (transfer.size() != requests.size()) {
+        LOG(ERROR) << "Session memory range result size mismatch: expected="
+                   << requests.size() << ", got=" << transfer.size();
+    }
+    const size_t completed = std::min(transfer.size(), requests.size());
+    for (size_t i = 0; i < completed; ++i) {
+        const auto &request = requests[i];
+        if (transfer[i]) {
+            if (now >= request.lease_deadline) {
+                results[request.original_idx] = static_cast<int>(
+                    toInt(ErrorCode::SESSION_MEMORY_TRANSFER_LEASE_EXPIRED));
+                get_sessions_.erase(request.key);
+            } else {
+                results[request.original_idx] =
+                    static_cast<int>(transfer[i].value());
+            }
+        } else {
+            results[request.original_idx] =
+                static_cast<int>(toInt(transfer[i].error()));
+        }
+    }
+    for (size_t i = completed; i < requests.size(); ++i) {
+        results[requests[i].original_idx] =
+            static_cast<int>(toInt(ErrorCode::INTERNAL_ERROR));
+    }
+}
+
+void RealClient::process_session_disk_dfs_reads(
+    std::vector<NonMemReadEntry *> &entries, std::vector<int> &results,
+    uint64_t trace_id, bool prefetch_only) {
+    std::vector<SessionRangeReadRequest> requests;
+    requests.reserve(entries.size());
+    for (const auto *entry : entries) {
+        requests.push_back(*entry);
+    }
+    execute_session_dfs_range_reads(requests, results, trace_id, prefetch_only);
+}
+
+void RealClient::execute_session_dfs_range_reads(
+    std::vector<SessionRangeReadRequest> &requests, std::vector<int> &results,
+    uint64_t trace_id, bool prefetch_only) {
+    if (requests.empty()) return;
+
+    std::vector<SessionRangeReadRequest *> entries;
+    entries.reserve(requests.size());
+    for (auto &request : requests) entries.push_back(&request);
+
+    std::shared_lock<std::shared_mutex> dfs_read_lock(
+        dfs_read_lifecycle_mutex_);
+    if (closed_.load(std::memory_order_acquire) || dfs_read_shutting_down_ ||
+        !dfs_h2d_stream_pool_) {
+        for (auto *entry : entries) {
+            results[entry->original_idx] =
+                static_cast<int>(toInt(ErrorCode::TRANSFER_FAIL));
+        }
+        return;
+    }
+
+    if (prefetch_only) {
+        execute_session_dfs_range_reads_batch(entries, results, trace_id, true,
+                                              1, 1, 0, 0);
+        return;
+    }
+
+    const size_t chunk_limit_bytes = dfs_read_chunk_size_;
+
+    size_t request_planned_bytes = 0;
+    auto chunks =
+        PlanDfsReadChunks(entries, chunk_limit_bytes, request_planned_bytes);
+
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        const ErrorCode chunk_error = execute_session_dfs_range_reads_batch(
+            chunks[i], results, trace_id, false, i + 1, chunks.size(),
+            chunk_limit_bytes, request_planned_bytes);
+        if (chunk_error != ErrorCode::DFS_BATCH_GET_TIMEOUT &&
+            chunk_error != ErrorCode::DFS_BATCH_GET_ADMISSION_TIMEOUT) {
+            continue;
+        }
+
+        size_t skipped_entries = 0;
+        for (size_t remaining = i + 1; remaining < chunks.size(); ++remaining) {
+            for (const auto *entry : chunks[remaining]) {
+                results[entry->original_idx] =
+                    static_cast<int>(toInt(chunk_error));
+                ++skipped_entries;
+            }
+        }
+        LOG(ERROR) << "Stopping chunked DFS restore after timeout: trace_id="
+                   << trace_id << ", failed_chunk=" << i + 1 << "/"
+                   << chunks.size()
+                   << ", skipped_chunks=" << chunks.size() - i - 1
+                   << ", skipped_entries=" << skipped_entries
+                   << ", error=" << toString(chunk_error) << " ("
+                   << toInt(chunk_error) << ")";
+        break;
+    }
+}
+
+void RealClient::handle_get_logging(coro_http::coro_http_request &,
+                                    coro_http::coro_http_response &resp) {
+    HttpLoggingResponse response;
+    FillLoggingResponse(&response);
+    std::string body;
+    struct_json::to_json(response, body);
+    resp.add_header("Content-Type", "application/json; charset=utf-8");
+    resp.set_status_and_content(coro_http::status_type::ok, std::move(body));
+}
+
+void RealClient::handle_update_logging(coro_http::coro_http_request &req,
+                                       coro_http::coro_http_response &resp) {
+    HttpLoggingUpdateRequest request;
+    try {
+        struct_json::from_json(request, req.get_body());
+    } catch (const std::exception &e) {
+        resp.set_status_and_content(
+            coro_http::status_type::bad_request,
+            std::string("Invalid JSON body: ") + e.what());
+        return;
+    }
+
+    RuntimeLogConfigUpdate update{
+        .minloglevel = request.minloglevel,
+        .vlog_level = request.vlog_level,
+        .ylt_severity = request.ylt_severity,
+        .dfs_read_trace = request.dfs_read_trace,
+    };
+    std::string error;
+    if (!UpdateRuntimeLogConfig(update, &error)) {
+        resp.set_status_and_content(coro_http::status_type::bad_request,
+                                    std::move(error));
+        return;
+    }
+
+    HttpLoggingResponse response;
+    FillLoggingResponse(&response);
+    std::string body;
+    struct_json::to_json(response, body);
+    resp.add_header("Content-Type", "application/json; charset=utf-8");
+    resp.set_status_and_content(coro_http::status_type::ok, std::move(body));
 }
 
 }  // namespace mooncake

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include "l4/atomic_borrowed_ptr.h"
 #include <array>
 #include <atomic>
 #include <boost/functional/hash.hpp>
@@ -52,20 +53,6 @@
 #include "metadata_store.h"
 
 namespace mooncake {
-
-// Atomically publishes a borrowed allocator pointer. Its unique_ptr owner is
-// kept stable for the lifetime of MasterService.
-template <typename T>
-class AtomicBorrowedPtr {
-   public:
-    T* get() const { return ptr_.load(std::memory_order_acquire); }
-    T* operator->() const { return get(); }
-    operator T*() const { return get(); }
-    void store(T* ptr) { ptr_.store(ptr, std::memory_order_release); }
-
-   private:
-    std::atomic<T*> ptr_{nullptr};
-};
 
 // Forward declaration for MasterSnapshotManager
 class MasterSnapshotManager;

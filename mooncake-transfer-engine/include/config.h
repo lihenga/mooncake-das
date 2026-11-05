@@ -20,6 +20,7 @@
 #define CONFIG_H
 
 #include <glog/logging.h>
+#include "das/defaults.h"
 #include <infiniband/verbs.h>
 
 #include <cstddef>
@@ -65,7 +66,7 @@ struct GlobalConfig {
     ibv_mtu mtu_length = IBV_MTU_4096;
     uint16_t handshake_port = 12001;
     int workers_per_ctx = 2;
-    size_t slice_size = 1048576;
+    size_t slice_size = das::kSliceSize;
     int retry_cnt = 9;
     int auto_gid_max_retries = 2;
     int handshake_listen_backlog = 128;
@@ -99,7 +100,7 @@ struct GlobalConfig {
     uint16_t rpc_max_port = 17000;
     bool use_ipv6 = false;
     size_t fragment_limit = slice_size / 4;
-    bool enable_dest_device_affinity = true;
+    bool enable_dest_device_affinity = das::kEnableDestDeviceAffinity;
     bool enable_hca_peer_affinity = false;
     std::unordered_map<std::string, std::vector<std::string>> nic_peer_affinity;
     bool log_rdma_slice_affinity = false;
@@ -154,7 +155,7 @@ struct GlobalConfig {
     uint32_t rdma_notify_connect_timeout_ms = 10000;
     // ib_pci_relaxed_ordering_mode: 0: off (default), 1: on if supported,
     // 2: auto
-    int ib_pci_relaxed_ordering_mode = 0;
+    int ib_pci_relaxed_ordering_mode = das::kPciRelaxedOrderingMode;
     bool ascend_use_fabric_mem = false;
     bool ascend_agent_mode = false;
     bool sunrise_use_device_mem = false;

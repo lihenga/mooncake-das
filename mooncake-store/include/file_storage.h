@@ -235,6 +235,7 @@ class FileStorage {
         const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
         bool prefer_pinned);
 
+    void InitializeUnifiedDfsBuffer();
     tl::expected<void, ErrorCode> InitDfs();
 
     void ClientBufferGCThreadFunc();

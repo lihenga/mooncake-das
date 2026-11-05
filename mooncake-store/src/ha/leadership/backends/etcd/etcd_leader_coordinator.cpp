@@ -1,4 +1,5 @@
 #include "ha/leadership/backends/etcd/etcd_leader_coordinator.h"
+#include "l4/etcd_service_ready.h"
 
 #include <algorithm>
 #include <atomic>
@@ -23,16 +24,6 @@ namespace etcd {
 namespace {
 
 constexpr int kKeepAliveReadyTimeoutMs = 1000;
-constexpr std::string_view kServiceWarmingPrefix =
-    "__mooncake_service_warming__:";
-
-std::string MakeServiceWarmingValue(const OwnerToken& owner_token) {
-    return std::string(kServiceWarmingPrefix) + owner_token;
-}
-
-bool IsServiceWarmingValue(const std::string& value) {
-    return value.rfind(kServiceWarmingPrefix, 0) == 0;
-}
 // Fallback poll interval used only when a watch cannot be armed (e.g. the watch
 // RPC fails, or the remaining timeout is too small to be worth a watch). The
 // steady-state path blocks on an etcd watch and does not poll.
@@ -273,27 +264,6 @@ EtcdLeaderCoordinator::TryAcquireLeadership(const std::string& leader_address) {
         .session = std::move(session),
         .observed_view = std::nullopt,
     };
-}
-
-ErrorCode EtcdLeaderCoordinator::PublishServiceReady(
-    const LeadershipSession& session) {
-    auto err = EnsureConnected();
-    if (err != ErrorCode::OK) {
-        return err;
-    }
-    const auto owner_token = session.owner_token;
-    const auto warming_value = MakeServiceWarmingValue(owner_token);
-    auto lease_id = ParseLeaseId(session.owner_token);
-    if (!lease_id) {
-        return lease_id.error();
-    }
-    return EtcdHelper::TxnCompareAndPutWithLease(
-        {{.key = master_view_key_,
-          .kind = EtcdHelper::TxnCompareKind::kValueEquals,
-          .expected_value = warming_value}},
-        {{.key = master_view_key_,
-          .value = session.view.leader_address}},
-        lease_id.value());
 }
 
 tl::expected<bool, ErrorCode> EtcdLeaderCoordinator::RenewLeadership(

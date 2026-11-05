@@ -1,4 +1,6 @@
 #include "client_service.h"
+#include "l4/async_dfs_write_context.h"
+#include "l4/client_write_internal.h"
 #include "storage/distributed/dfs_log_limiter.h"
 
 #include <boost/algorithm/string.hpp>
@@ -64,6 +66,208 @@
 
 
 namespace mooncake {
+
+using l4::AllAllocatedTransfersSucceeded;
+using l4::CalculateSliceSize;
+using l4::DetermineFinalizeDecision;
+using l4::FinalizeDecision;
+using l4::HasExpectedReplicaAllocation;
+using l4::NonDfsTransfersSucceeded;
+using l4::ReplicaTransferSummary;
+using l4::ValidatePreferSameNodeWriteConfig;
+
+namespace l4 {
+
+bool NonDfsTransfersSucceeded(const ReplicaTransferSummary& summary) {
+    return summary.successful_memory_transfers ==
+               summary.allocated_memory_replicas &&
+           summary.successful_nof_transfers == summary.allocated_nof_replicas &&
+           summary.failed_memory_transfers == 0 &&
+           summary.failed_nof_transfers == 0;
+}
+
+bool AllAllocatedTransfersSucceeded(const ReplicaTransferSummary& summary) {
+    return NonDfsTransfersSucceeded(summary) &&
+           summary.successful_dfs_transfers == summary.allocated_dfs_replicas &&
+           summary.failed_dfs_transfers == 0;
+}
+
+bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
+                                  const ReplicaTransferSummary& summary,
+                                  bool allow_missing_dfs) {
+    if (config.nof_replica_num == 0 && config.dfs_replica_num == 0) {
+        return summary.allocated_memory_replicas > 0;
+    }
+    if (DetermineReplicaWriteMode(config) ==
+        ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
+        return summary.allocated_memory_replicas +
+                   summary.allocated_nof_replicas >
+               0;
+    }
+    if (allow_missing_dfs && config.dfs_replica_num == 1 &&
+        summary.allocated_dfs_replicas == 0) {
+        return summary.allocated_memory_replicas == config.replica_num &&
+               summary.allocated_nof_replicas == config.nof_replica_num;
+    }
+    return summary.allocated_memory_replicas == config.replica_num &&
+           summary.allocated_nof_replicas == config.nof_replica_num &&
+           summary.allocated_dfs_replicas == config.dfs_replica_num;
+}
+
+std::optional<ErrorCode> ValidatePreferSameNodeWriteConfig(
+    const ReplicateConfig& config) {
+    if (config.nof_replica_num > 0) {
+        LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
+                      "NoF replicas";
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (config.replica_num != 1) {
+        LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
+                      "replica_num != 1";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    return std::nullopt;
+}
+
+FinalizeDecision DetermineFinalizeDecision(
+    const ReplicateConfig& config, const ReplicaTransferSummary& summary,
+    bool allow_missing_dfs, bool allow_memory_only_fallback) {
+    const auto write_mode = DetermineReplicaWriteMode(config);
+    const bool allocation_satisfied =
+        HasExpectedReplicaAllocation(config, summary, allow_missing_dfs);
+
+    const bool dfs_deferred = summary.dfs_completion_deferred;
+    if (dfs_deferred && summary.allocated_memory_replicas > 0 &&
+        summary.allocated_nof_replicas > 0) {
+        LOG(ERROR) << "Deferred DFS completion combined with both MEMORY and "
+                      "NoF replicas is not supported";
+    }
+    // Preserve a completed local tier when an allocated DFS write fails on any
+    // backend. Missing DFS allocation is degradable only for callers that
+    // explicitly enable the bucket-mode memory-only fallback.
+    const bool best_effort_dfs_failure =
+        allow_missing_dfs && config.dfs_replica_num == 1 && !dfs_deferred &&
+        NonDfsTransfersSucceeded(summary) &&
+        ((allow_memory_only_fallback && summary.allocated_dfs_replicas == 0) ||
+         (summary.allocated_dfs_replicas == 1 &&
+          summary.successful_dfs_transfers == 0 &&
+          summary.failed_dfs_transfers > 0));
+    // Return the replica type(s) owned by this finalize call whose transfers
+    // succeeded. Deferred DFS completion stays owned by the background task.
+    const auto successful_type = [&]() -> std::optional<ReplicaType> {
+        const bool memory_succeeded = summary.allocated_memory_replicas > 0 &&
+                                      summary.successful_memory_transfers ==
+                                          summary.allocated_memory_replicas &&
+                                      summary.failed_memory_transfers == 0;
+        const bool nof_succeeded = summary.allocated_nof_replicas > 0 &&
+                                   summary.successful_nof_transfers ==
+                                       summary.allocated_nof_replicas &&
+                                   summary.failed_nof_transfers == 0;
+        const bool dfs_succeeded = !dfs_deferred &&
+                                   summary.allocated_dfs_replicas > 0 &&
+                                   summary.successful_dfs_transfers ==
+                                       summary.allocated_dfs_replicas &&
+                                   summary.failed_dfs_transfers == 0;
+        const size_t successful_types = static_cast<size_t>(memory_succeeded) +
+                                        static_cast<size_t>(nof_succeeded) +
+                                        static_cast<size_t>(dfs_succeeded);
+        if (successful_types == 0) return std::nullopt;
+        if (successful_types > 1) return ReplicaType::ALL;
+        if (memory_succeeded) return ReplicaType::MEMORY;
+        if (nof_succeeded) return ReplicaType::NOF_SSD;
+        return ReplicaType::DFS;
+    };
+
+    // Return the replica type(s) still owned by this finalize call whose
+    // transfers failed. A deferred DFS replica is excluded because the
+    // background task owns its eventual End/Revoke.
+    const auto failed_type = [&]() -> std::optional<ReplicaType> {
+        const bool memory_failed = summary.allocated_memory_replicas > 0 &&
+                                   summary.successful_memory_transfers <
+                                       summary.allocated_memory_replicas;
+        const bool nof_failed =
+            summary.allocated_nof_replicas > 0 &&
+            summary.successful_nof_transfers < summary.allocated_nof_replicas;
+        const bool dfs_failed =
+            !dfs_deferred && summary.allocated_dfs_replicas > 0 &&
+            summary.successful_dfs_transfers < summary.allocated_dfs_replicas;
+        const size_t failed_types = static_cast<size_t>(memory_failed) +
+                                    static_cast<size_t>(nof_failed) +
+                                    static_cast<size_t>(dfs_failed);
+        if (failed_types == 0) return std::nullopt;
+        if (failed_types > 1) return ReplicaType::ALL;
+        if (memory_failed) return ReplicaType::MEMORY;
+        if (nof_failed) return ReplicaType::NOF_SSD;
+        return ReplicaType::DFS;
+    };
+
+    if (write_mode != ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
+        const bool all_transfers_succeeded =
+            AllAllocatedTransfersSucceeded(summary);
+        if (allocation_satisfied && all_transfers_succeeded) {
+            return {.end_type = successful_type(),
+                    .revoke_type = std::nullopt,
+                    .success = true,
+                    .error = ErrorCode::OK};
+        }
+        if (best_effort_dfs_failure) {
+            return {.end_type = successful_type(),
+                    .revoke_type = failed_type(),
+                    .success = true,
+                    .error = ErrorCode::OK};
+        }
+        if (!dfs_deferred) {
+            return {.end_type = std::nullopt,
+                    .revoke_type = ReplicaType::ALL,
+                    .success = false,
+                    .error = allocation_satisfied
+                                 ? (summary.first_error == ErrorCode::OK
+                                        ? ErrorCode::TRANSFER_FAIL
+                                        : summary.first_error)
+                                 : ErrorCode::NO_AVAILABLE_HANDLE};
+        }
+        return {.end_type = successful_type(),
+                .revoke_type = failed_type(),
+                .success = false,
+                .error = allocation_satisfied
+                             ? (summary.first_error == ErrorCode::OK
+                                    ? ErrorCode::TRANSFER_FAIL
+                                    : summary.first_error)
+                             : ErrorCode::NO_AVAILABLE_HANDLE};
+    }
+
+    const bool memory_succeeded = summary.successful_memory_transfers > 0;
+    const bool nof_succeeded = summary.successful_nof_transfers > 0;
+
+    if (memory_succeeded && nof_succeeded) {
+        return {.end_type = successful_type(),
+                .revoke_type = std::nullopt,
+                .success = true,
+                .error = ErrorCode::OK};
+    }
+    if (memory_succeeded) {
+        return {.end_type = ReplicaType::MEMORY,
+                .revoke_type = ReplicaType::NOF_SSD,
+                .success = true,
+                .error = ErrorCode::OK};
+    }
+    if (nof_succeeded) {
+        return {.end_type = ReplicaType::NOF_SSD,
+                .revoke_type = ReplicaType::MEMORY,
+                .success = true,
+                .error = ErrorCode::OK};
+    }
+
+    return {.end_type = successful_type(),
+            .revoke_type = failed_type(),
+            .success = false,
+            .error = summary.first_error == ErrorCode::OK
+                         ? ErrorCode::NO_AVAILABLE_HANDLE
+                         : summary.first_error};
+}
+
+}  // namespace l4
 
 namespace {
 
@@ -736,6 +940,492 @@ void Client::StopDfsWritesAndBufferLogging() {
     DrainAsyncDfsWrites();
     write_thread_pool_.stop();
     StopServiceMetricsReporter();
+}
+
+void Client::RecordBatchServiceDualWriteMetrics(
+    std::vector<PutOperation>& ops) {
+    for (auto& op : ops) {
+        if (!op.service_dual_write_eligible || op.service_metric_recorded ||
+            op.service_metric_excluded ||
+            op.transfer_summary.dfs_completion_deferred) {
+            continue;
+        }
+        if (!op.result.has_value() &&
+            op.result.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
+            continue;
+        }
+
+        const bool memory_succeeded =
+            op.transfer_summary.successful_memory_transfers ==
+            op.requested_memory_replicas;
+        const bool dfs_succeeded =
+            op.transfer_summary.successful_dfs_transfers ==
+            op.requested_dfs_replicas;
+        RecordServiceDualWrite(memory_succeeded, dfs_succeeded);
+        op.service_metric_recorded = true;
+    }
+}
+
+void Client::SubmitDfsWriteChunk(std::vector<PutOperation>& ops,
+                                 const std::vector<size_t>& chunk_indices,
+                                 bool is_upsert, bool allow_async,
+                                 std::chrono::steady_clock::time_point deadline,
+                                 bool* staging_timed_out_out,
+                                 bool* staging_exceeds_limit_out) {
+    if (staging_timed_out_out) *staging_timed_out_out = false;
+    if (staging_exceeds_limit_out) *staging_exceeds_limit_out = false;
+    std::vector<std::string> keys;
+    std::vector<const std::vector<Slice>*> slice_lists;
+    std::vector<DistributedFSDescriptor> descriptors;
+    std::vector<size_t> op_indices;
+    const bool bucket_mode =
+        dfs_storage_backend_ != nullptr &&
+        dfs_storage_backend_->GetAllocatorType() == DfsAllocatorType::BUCKET;
+
+    for (size_t i : chunk_indices) {
+        auto& op = ops[i];
+        if (op.IsResolved() ||
+            op.transfer_summary.allocated_dfs_replicas == 0 ||
+            !NonDfsTransfersSucceeded(op.transfer_summary)) {
+            continue;
+        }
+        // In BUCKET mode, an incomplete requested topology will be revoked.
+        // Skipping the DFS write keeps that revoke unambiguous instead of
+        // racing a background completion.
+        if (bucket_mode && !HasExpectedReplicaAllocation(op.ToReplicateConfig(),
+                                                         op.transfer_summary)) {
+            continue;
+        }
+
+        auto dfs_it = std::find_if(op.replicas.begin(), op.replicas.end(),
+                                   [](const Replica::Descriptor& replica) {
+                                       return replica.is_dfs_replica();
+                                   });
+        if (dfs_it == op.replicas.end()) {
+            op.transfer_summary.RecordFailure(ReplicaType::DFS,
+                                              ErrorCode::INVALID_REPLICA);
+            op.AppendFailureContext("Allocated DFS replica has no descriptor");
+            continue;
+        }
+        keys.push_back(op.key);
+        slice_lists.push_back(&op.slices);
+        descriptors.push_back(dfs_it->get_dfs_descriptor());
+        op_indices.push_back(i);
+    }
+
+    if (keys.empty()) return;
+
+    auto backend = dfs_storage_backend_;
+    if (!backend) {
+        // No backend: fail every affected key here instead of queueing a task
+        // that would dereference a null pointer.
+        LOG(ERROR) << "DFS backend is unavailable; failing " << keys.size()
+                   << " DFS writes";
+        for (const size_t index : op_indices) {
+            auto& op = ops[index];
+            op.transfer_summary.RecordFailure(
+                ReplicaType::DFS, ErrorCode::DFS_SERVICE_UNAVAILABLE);
+            op.AppendFailureContext("DFS backend is not initialized");
+        }
+        return;
+    }
+
+    // Restore the allocator's original contract: BUCKET writes are staged and
+    // asynchronous, while SHARD writes remain synchronous. The configured
+    // deadline limits publication of an asynchronous DFS replica; it does not
+    // turn every allocator into a detached write path.
+    const bool async_write =
+        allow_async && backend->GetAllocatorType() == DfsAllocatorType::BUCKET;
+    if (!async_write) {
+        // The staging wait must fit inside the BatchPut deadline, otherwise
+        // a short MOONCAKE_DFS_BATCH_PUT_TIMEOUT_MS would be ignored and the
+        // caller would block for the full arena wait instead of returning
+        // on time. Mirror the asynchronous path's min(arena_wait, left).
+        const auto sync_staging_wait = [&]() -> std::chrono::milliseconds {
+            if (deadline == std::chrono::steady_clock::time_point::max()) {
+                return dfs_write_arena_wait_;
+            }
+            const auto left =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::max(deadline - std::chrono::steady_clock::now(),
+                             std::chrono::steady_clock::duration::zero()));
+            return std::min(dfs_write_arena_wait_, left);
+        }();
+        auto results = WriteDfsReplicas(keys, slice_lists, descriptors, nullptr,
+                                        sync_staging_wait);
+        for (size_t i = 0; i < results.size(); ++i) {
+            auto& op = ops[op_indices[i]];
+            if (results[i] == ErrorCode::OK) {
+                op.transfer_summary.RecordSuccess(ReplicaType::DFS);
+            } else {
+                op.transfer_summary.RecordFailure(ReplicaType::DFS, results[i]);
+                op.AppendFailureContext("Synchronous DFS write failed: " +
+                                        toString(results[i]));
+            }
+        }
+        return;
+    }
+
+    std::shared_ptr<AsyncDfsWriteContext> context;
+    bool staged = false;
+    bool staging_allocation_timed_out = false;
+    bool staging_request_exceeds_limit = false;
+    try {
+        context = std::make_shared<AsyncDfsWriteContext>();
+        context->deadline = deadline;
+        context->keys = keys;
+        context->descriptors = descriptors;
+        context->backend = std::move(backend);
+        context->unified_buffer_allocator = unified_buffer_allocator_;
+        if (!context->unified_buffer_allocator) {
+            LOG(ERROR) << "DFS_UNIFIED_BUFFER_ALLOCATION_FAILED kind=write "
+                          "mode=asynchronous reason=allocator_unavailable";
+            ObserveUnifiedDfsBufferAllocationFailure(
+                DfsBufferUsageKind::kWrite);
+            throw std::runtime_error("Unified DFS buffer is unavailable");
+        }
+        size_t payload_size = 0;
+        for (const auto* slices : slice_lists) {
+            if (!slices) {
+                throw std::runtime_error("DFS write staging size overflow");
+            }
+            const size_t slice_size = CalculateSliceSize(*slices);
+            if (payload_size >
+                std::numeric_limits<size_t>::max() - slice_size) {
+                throw std::runtime_error("DFS write staging size overflow");
+            }
+            payload_size += slice_size;
+        }
+        const bool deadline_expired =
+            deadline != std::chrono::steady_clock::time_point::max() &&
+            deadline <= std::chrono::steady_clock::now();
+        const auto staging_wait =
+            deadline_expired ? std::chrono::milliseconds::zero()
+            : deadline == std::chrono::steady_clock::time_point::max()
+                ? dfs_write_arena_wait_
+                : std::min(
+                      dfs_write_arena_wait_,
+                      std::chrono::duration_cast<std::chrono::milliseconds>(
+                          deadline - std::chrono::steady_clock::now()));
+        if (deadline_expired) staging_allocation_timed_out = true;
+        context->staging_buffer =
+            context->unified_buffer_allocator->allocate_aligned_wait(
+                payload_size, dfs_write_alignment_, DfsBufferUsageKind::kWrite,
+                staging_wait, &staging_allocation_timed_out,
+                &staging_request_exceeds_limit);
+        if (!context->staging_buffer) {
+            LOG(ERROR) << "DFS_UNIFIED_BUFFER_ALLOCATION_FAILED kind=write "
+                          "mode=asynchronous size="
+                       << payload_size;
+            ObserveUnifiedDfsBufferAllocationFailure(
+                DfsBufferUsageKind::kWrite);
+            throw std::runtime_error("Unified DFS write buffer unavailable");
+        }
+        context->is_upsert = is_upsert;
+        context->object_checksums.resize(keys.size());
+        context->service_dual_writes.resize(keys.size());
+        for (size_t i = 0; i < op_indices.size(); ++i) {
+            const auto& op = ops[op_indices[i]];
+            auto& metric = context->service_dual_writes[i];
+            metric.eligible = op.service_dual_write_eligible;
+            metric.memory_succeeded =
+                op.transfer_summary.successful_memory_transfers ==
+                op.requested_memory_replicas;
+            metric.requested_dfs_replicas = op.requested_dfs_replicas;
+        }
+        staged = StageDfsWriteData(*context, slice_lists);
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to stage async DFS write: " << e.what();
+    }
+    if (!staged) {
+        for (const size_t index : op_indices) {
+            auto& op = ops[index];
+            op.transfer_summary.RecordFailure(ReplicaType::DFS,
+                                              ErrorCode::TRANSFER_FAIL);
+            op.AppendFailureContext(
+                staging_request_exceeds_limit
+                    ? "DFS staging request exceeds the unified buffer limit"
+                    : (staging_allocation_timed_out
+                           ? "DFS staging allocation wait timed out"
+                           : "Failed to stage DFS write data"));
+        }
+        if (staging_timed_out_out) {
+            *staging_timed_out_out = staging_allocation_timed_out;
+        }
+        if (staging_exceeds_limit_out) {
+            *staging_exceeds_limit_out = staging_request_exceeds_limit;
+        }
+        return;
+    }
+
+    // No End may run until the foreground CRC is ready, even if DFS I/O
+    // finishes before the memory replicas are finalized.
+    bool checksums_ready = true;
+    for (size_t i = 0; i < op_indices.size(); ++i) {
+        auto& op = ops[op_indices[i]];
+        ComputePutObjectChecksum(op, context->slices[i], true);
+        context->object_checksums[i] = op.object_checksum;
+        if (op.IsResolved()) checksums_ready = false;
+    }
+    if (!checksums_ready) {
+        for (const size_t index : op_indices) {
+            ops[index].transfer_summary.RecordFailure(ReplicaType::DFS,
+                                                      ErrorCode::TRANSFER_FAIL);
+        }
+        // FinalizeBatchPut revokes all allocations for terminal CRC errors.
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(dfs_inflight_mutex_);
+        if (dfs_writes_shutting_down_.load(std::memory_order_acquire)) {
+            LOG(ERROR) << "Client is shutting down; refusing " << keys.size()
+                       << " async DFS writes";
+            for (const size_t index : op_indices) {
+                auto& op = ops[index];
+                op.transfer_summary.RecordFailure(
+                    ReplicaType::DFS, ErrorCode::DFS_SERVICE_UNAVAILABLE);
+                op.AppendFailureContext("Client is shutting down");
+            }
+            return;
+        }
+        ++dfs_inflight_writes_;
+    }
+
+    auto release_inflight = [this]() {
+        std::lock_guard<std::mutex> lock(dfs_inflight_mutex_);
+        if (dfs_inflight_writes_ > 0) --dfs_inflight_writes_;
+        dfs_inflight_cv_.notify_all();
+    };
+
+    for (const auto& metric : context->service_dual_writes) {
+        if (metric.eligible) BeginServiceDualWritePending();
+    }
+
+    try {
+        {
+            std::lock_guard<std::mutex> lock(service_metrics_mutex_);
+            if (!service_metrics_snapshot_.service_endpoint.empty() &&
+                context->deadline !=
+                    std::chrono::steady_clock::time_point::max()) {
+                service_pending_writes_.push_back(context);
+            }
+        }
+#ifdef MOONCAKE_ENABLE_TEST_FAILPOINTS
+        TestFailPoint::Wait("dfs_write_before_enqueue");
+#endif
+        write_thread_pool_.enqueue([this, context, release_inflight]() {
+            try {
+                RunAsyncDfsWrite(context);
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "Async DFS write task threw: " << e.what();
+                CompleteAsyncDfsWriteMetrics(context, {});
+            } catch (...) {
+                LOG(ERROR) << "Async DFS write task threw an unknown exception";
+                CompleteAsyncDfsWriteMetrics(context, {});
+            }
+            release_inflight();
+        });
+    } catch (const std::exception& e) {
+        // Enqueue may fail after the reporter has already settled the deadline.
+        LOG(ERROR) << "Failed to enqueue async DFS write: " << e.what();
+        release_inflight();
+        const bool metrics_already_settled =
+            context->service_metrics_settled.exchange(true);
+        if (!metrics_already_settled) {
+            for (const auto& metric : context->service_dual_writes) {
+                if (metric.eligible) CancelServiceDualWritePending();
+            }
+        }
+        for (const size_t index : op_indices) {
+            auto& op = ops[index];
+            if (metrics_already_settled && op.service_dual_write_eligible) {
+                // The reporter owns this completion; the foreground must not
+                // count it again when it handles the rejected write.
+                op.service_metric_recorded = true;
+            }
+            op.transfer_summary.RecordFailure(
+                ReplicaType::DFS, ErrorCode::DFS_SERVICE_UNAVAILABLE);
+            op.AppendFailureContext("Failed to enqueue async DFS write");
+        }
+        return;
+    }
+
+    // The foreground never waits for DFS I/O in BUCKET mode. Publish the
+    // successful local tier now; the background task exclusively owns DFS
+    // End/Revoke and applies the deadline only to DFS publication.
+    for (size_t i = 0; i < op_indices.size(); ++i) {
+        auto& op = ops[op_indices[i]];
+        op.transfer_summary.RecordSuccess(ReplicaType::DFS);
+        op.transfer_summary.dfs_completion_deferred = true;
+    }
+}
+
+void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
+                             bool allow_async) {
+    auto backend = dfs_storage_backend_;
+    uint64_t total_dfs_payload_bytes = 0;
+    for (const auto& op : ops) {
+        if (op.IsResolved() ||
+            op.transfer_summary.allocated_dfs_replicas == 0 ||
+            !NonDfsTransfersSucceeded(op.transfer_summary)) {
+            continue;
+        }
+        for (const auto& slice : op.slices) {
+            SaturatingAddBytes(slice.size, &total_dfs_payload_bytes);
+        }
+    }
+    const auto timeout_ms = DfsBatchPutTimeoutMs(
+        dfs_batch_put_timeout_ms_, total_dfs_payload_bytes,
+        dfs_batch_timeout_fixed_ms_.load(std::memory_order_acquire));
+    const auto deadline = dfs_batch_put_timeout_ms_ == 0
+                              ? std::chrono::steady_clock::time_point::max()
+                              : DfsIoDeadlineFromNow(timeout_ms);
+    const bool async_write =
+        allow_async && backend &&
+        backend->GetAllocatorType() == DfsAllocatorType::BUCKET;
+    if (!async_write) {
+        std::vector<size_t> all_indices(ops.size());
+        std::iota(all_indices.begin(), all_indices.end(), 0);
+        SubmitDfsWriteChunk(ops, all_indices, is_upsert, allow_async, deadline,
+                            nullptr);
+        return;
+    }
+
+    const size_t chunk_limit = dfs_write_chunk_size_;
+    std::vector<std::vector<size_t>> chunks;
+    std::vector<size_t> chunk;
+    size_t chunk_bytes = 0;
+    uint64_t total_payload_bytes = 0;
+    const auto flush_chunk = [&]() {
+        if (!chunk.empty()) {
+            chunks.push_back(std::move(chunk));
+            chunk.clear();
+            chunk_bytes = 0;
+        }
+    };
+
+    for (size_t i = 0; i < ops.size(); ++i) {
+        auto& op = ops[i];
+        if (op.IsResolved() ||
+            op.transfer_summary.allocated_dfs_replicas == 0 ||
+            !NonDfsTransfersSucceeded(op.transfer_summary)) {
+            continue;
+        }
+        size_t object_bytes = 0;
+        bool overflow = false;
+        for (const auto& slice : op.slices) {
+            if (slice.size >
+                std::numeric_limits<size_t>::max() - object_bytes) {
+                overflow = true;
+                break;
+            }
+            object_bytes += slice.size;
+        }
+        if (overflow || object_bytes > chunk_limit) {
+            op.transfer_summary.RecordFailure(ReplicaType::DFS,
+                                              ErrorCode::TRANSFER_FAIL);
+            op.AppendFailureContext("DFS object exceeds staging chunk limit");
+            continue;
+        }
+        if (total_payload_bytes <=
+            std::numeric_limits<uint64_t>::max() - object_bytes) {
+            total_payload_bytes += object_bytes;
+        } else {
+            total_payload_bytes = std::numeric_limits<uint64_t>::max();
+        }
+        if (!chunk.empty() && object_bytes > chunk_limit - chunk_bytes) {
+            flush_chunk();
+        }
+        chunk.push_back(i);
+        chunk_bytes += object_bytes;
+    }
+    flush_chunk();
+
+    if (dfs_read_trace_enabled()) {
+        LOG(INFO) << "Async DFS write batch: total_payload_bytes="
+                  << total_payload_bytes << ", chunks=" << chunks.size()
+                  << ", chunk_limit_bytes=" << chunk_limit
+                  << ", timeout_ms=" << timeout_ms;
+    }
+
+    for (size_t chunk_index = 0; chunk_index < chunks.size(); ++chunk_index) {
+        bool staging_timed_out = false;
+        bool staging_exceeds_limit = false;
+        SubmitDfsWriteChunk(ops, chunks[chunk_index], is_upsert, allow_async,
+                            deadline, &staging_timed_out,
+                            &staging_exceeds_limit);
+        if (staging_exceeds_limit) {
+            LOG(WARNING) << "DFS staging request exceeds the unified buffer "
+                            "limit; refusing chunk "
+                         << chunk_index;
+            continue;
+        }
+        if (staging_timed_out) {
+            LOG(WARNING) << "DFS write staging allocation wait timed out; "
+                         << "refusing remaining "
+                         << chunks.size() - chunk_index - 1 << " chunks";
+            for (size_t remaining = chunk_index + 1; remaining < chunks.size();
+                 ++remaining) {
+                for (const size_t op_index : chunks[remaining]) {
+                    auto& op = ops[op_index];
+                    if (!op.IsResolved() &&
+                        op.transfer_summary.allocated_dfs_replicas > 0) {
+                        op.transfer_summary.RecordFailure(
+                            ReplicaType::DFS, ErrorCode::TRANSFER_FAIL);
+                        op.AppendFailureContext(
+                            "DFS staging allocation wait timed out");
+                    }
+                }
+            }
+            break;
+        }
+    }
+}
+
+std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExistByReplicaType(
+    const std::vector<std::string>& keys, ReplicaType replica_type) {
+    auto response =
+        master_client_.BatchExistKeyByReplicaType(keys, replica_type);
+
+    if (response.size() != keys.size()) {
+        LOG(ERROR) << "BatchExistKeyByReplicaType response size mismatch. "
+                   << "Expected: " << keys.size()
+                   << ", Got: " << response.size();
+        std::vector<tl::expected<bool, ErrorCode>> results;
+        results.reserve(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results.emplace_back(tl::unexpected(ErrorCode::RPC_FAIL));
+        }
+        return results;
+    }
+
+    return response;
+}
+
+ReplicateConfig Client::AttachConfig(const ReplicateConfig& config) const {
+    ReplicateConfig client_cfg = config;
+    if (!host_id_.empty()) {
+        client_cfg.host_id = host_id_;
+    }
+    if (!DfsWriteAllowed()) {
+        client_cfg.dfs_replica_num = 0;
+    } else if (DistributedStorageConfig::IsReplicaEnabledFromEnvironment()) {
+        client_cfg.dfs_replica_num = 1;
+    }
+    return client_cfg;
+}
+
+void Client::EnterHaRuntimeMode() {
+    if (!leader_coordinator_) {
+        return;
+    }
+
+    master_client_.EnableHaConnectionPolicy();
+    if (!leader_monitor_running_.exchange(true)) {
+        leader_monitor_thread_ =
+            std::thread([this]() { this->LeaderMonitorThreadMain(); });
+    }
 }
 
 }  // namespace mooncake
