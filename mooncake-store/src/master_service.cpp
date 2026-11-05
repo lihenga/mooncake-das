@@ -5,6 +5,7 @@
 #include "storage/distributed/dfs_root_identity.h"
 #include "storage/distributed/dfs_read_probe.h"
 #include "config/replica_selection_config.h"
+#include "environment_variables.h"
 
 #include <algorithm>
 #include <array>
@@ -480,13 +481,6 @@ MasterService::MasterService(const MasterServiceConfig& config)
                       << record.segment_id << ", client_id=" << record.client_id
                       << ", error=" << toString(result.error());
               }
-              if (dfs_retry_needed_.load(std::memory_order_acquire)) {
-                  dfs_retry_running_.store(true, std::memory_order_release);
-                  dfs_retry_thread_ = std::thread(
-                      &MasterService::DfsAllocatorRetryThreadFunc, this);
-              }
-              dfs_eviction_thread_ =
-                  std::thread(&MasterService::DfsEvictionThreadFunc, this);
           }),
       replica_cleanup_worker_([this] {
           // RFC #4700 slice 1: no metadata sweep while a promotion restore
@@ -720,6 +714,19 @@ MasterService::MasterService(const MasterServiceConfig& config)
     }
 
     dfs_snapshot_epoch_ = generate_uuid();
+    dfs_heartbeat_interval_seconds_.store(
+        std::max<uint32_t>(
+            Environ::ReadOr(FileStorageEnvironmentVariables::
+                                MOONCAKE_OFFLOAD_DFS_HEARTBEAT_INTERVAL_SECONDS,
+                            uint32_t{300}),
+            1),
+        std::memory_order_release);
+    dfs_batch_timeout_fixed_ms_.store(
+        Environ::GetUInt64("MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS",
+                           kDefaultDfsBatchTimeoutFixedMs),
+        std::memory_order_release);
+    dfs_root_guard_interval_ = std::chrono::seconds(std::max(
+        Environ::GetInt("MOONCAKE_DFS_ROOT_GUARD_INTERVAL_SECONDS", 5), 1));
     enable_dfs_bucket_recovery_ =
         Environ::GetBool("MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED", false);
     InitDfsAllocatorFromEnvironment(config);
@@ -838,6 +845,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
             << static_cast<int>(result);
         VLOG(1) << "action=start_cxl_global_allocator";
     }
+    if (dfs_retry_needed_.load(std::memory_order_acquire)) {
+        dfs_retry_running_.store(true, std::memory_order_release);
+        dfs_retry_thread_ =
+            std::thread(&MasterService::DfsAllocatorRetryThreadFunc, this);
+    }
+    dfs_eviction_thread_ =
+        std::thread(&MasterService::DfsEvictionThreadFunc, this);
 }
 
 tl::expected<int, ErrorCode> MasterService::GetDfsShardCount() const {
@@ -4692,6 +4706,10 @@ auto MasterService::ReadReplicaList(const TenantId& tenant_id,
         MasterMetricManager::instance().inc_mem_cache_hit_nums();
         MasterMetricManager::instance().inc_mem_cache_hit_bytes(
             static_cast<int64_t>(metadata.TotalLength()));
+    } else if (replica_list[0].is_dfs_replica()) {
+        MasterMetricManager::instance().inc_dfs_cache_hit_nums();
+        MasterMetricManager::instance().inc_dfs_cache_hit_bytes(
+            static_cast<int64_t>(metadata.TotalLength()));
     } else if (replica_list[0].is_local_disk_replica() ||
                replica_list[0].is_disk_replica()) {
         MasterMetricManager::instance().inc_file_cache_hit_nums();
@@ -5158,10 +5176,12 @@ auto MasterService::PrepareWriteStart(
                    << ", key_size=" << key.size() << ", error=invalid_params";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (config.dfs_replica_num > 1) {
+    if (config.dfs_replica_num > 1 ||
+        (config.dfs_replica_num > 0 &&
+         (config.replica_num == 0 || config.nof_replica_num > 0))) {
         LOG(ERROR) << "key=" << key
                    << ", dfs_replica_num=" << config.dfs_replica_num
-                   << ", error=dfs_replica_num_must_be_0_or_1";
+                   << ", error=unsupported_dfs_replica_policy";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (config.dfs_replica_num > 0 && !tenant_id.IsDefault()) {
@@ -5905,11 +5925,30 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                 const uint64_t slice_length,
                                 const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    if (config.dfs_replica_num > 1 ||
+        (config.dfs_replica_num > 0 &&
+         (config.replica_num == 0 || config.nof_replica_num > 0 ||
+          !tenant_id.IsDefault())))
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
-    auto plan = PrepareWriteStart(client_id, key, object_id.tenant_id,
-                                  slice_length, config, "upsert_start");
+    DfsWriteAdmission dfs_admission{};
+    ReplicateConfig validation_config = config;
+    if (config.dfs_replica_num && !use_kvcs_ &&
+        (!enable_dfs_ || !dfs_allocator_ || !dfs_allocator_->IsInitialized())) {
+        dfs_admission.skip = true;
+        dfs_admission.fallback = ErrorCode::DFS_SERVICE_UNAVAILABLE;
+        validation_config.dfs_replica_num = 0;
+    }
+    auto plan =
+        PrepareWriteStart(client_id, key, object_id.tenant_id, slice_length,
+                          validation_config, "upsert_start");
     if (!plan) {
         return tl::make_unexpected(plan.error());
+    }
+    if (config.dfs_replica_num > 0 &&
+        ((dfs_filter_mode_.load(std::memory_order_acquire) & 1) ||
+         dfs_root_recovery_in_progress_.load(std::memory_order_acquire))) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
     std::optional<std::unique_lock<std::mutex>> weight_group_operation_lock;
     if (!plan->group_id.empty() &&
@@ -6083,7 +6122,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     writer_host_id, allocation_group_id,
                     allocation_residency_affinity_id, now, soft_pin_request,
                     allocation_committed_soft_pin_timeout,
-                    dfs_allocation_failed);
+                    dfs_allocation_failed, &dfs_admission);
                 if (result) {
                     accessor.Get().session_id = allocation_session_id;
                 }
@@ -6123,7 +6162,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         if (existing_memory_replicas != config.replica_num ||
                             existing_nof_replicas != config.nof_replica_num ||
                             (existing_dfs_replicas != config.dfs_replica_num &&
-                             !restore_missing_bucket_dfs)) {
+                             !restore_missing_bucket_dfs &&
+                             !(dfs_admission.skip &&
+                               existing_dfs_replicas == 0))) {
                             LOG(ERROR)
                                 << "key=" << key
                                 << ", error=dfs_upsert_topology_mismatch"
@@ -6230,9 +6271,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     if (!grown) {
                         return tl::make_unexpected(grown.error());
                     }
-                    auto allocation_result =
-                        AllocateReplicas(key, slice_length, allocation_config,
-                                         writer_host_id, dfs_allocation_failed);
+                    auto allocation_result = AllocateReplicas(
+                        key, slice_length, allocation_config, writer_host_id,
+                        dfs_allocation_failed, &dfs_admission);
                     if (!allocation_result) {
                         return tl::make_unexpected(allocation_result.error());
                     }
@@ -6284,7 +6325,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                   allocation_residency_affinity_id, now,
                                   soft_pin_request,
                                   allocation_committed_soft_pin_timeout,
-                                  dfs_allocation_failed);
+                                  dfs_allocation_failed, &dfs_admission);
                 if (allocate_result && accessor.IsPublished()) {
                     accessor.Get().session_id = allocation_session_id;
                 }
@@ -6297,6 +6338,15 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     // maintenance pass, not the write path's: this write fails, the evictor
     // builds headroom, the next one succeeds.
     auto result = AdmitWithDfsRecovery(config, admit);
+    if (!result && !dfs_admission.skip && config.replica_num > 0 &&
+        dfs_admission.fallback &&
+        IsDfsReplicaFallbackError(*dfs_admission.fallback)) {
+        dfs_admission.skip = true;
+        bool failed = false;
+        result = admit(&failed);
+    }
+    if (result && dfs_admission.skip && dfs_admission.fallback)
+        RecordDfsReplicaFallback(key, *dfs_admission.fallback);
     if (result && weight_group_operation_lock) {
         weight_manager_.RecordImportWrite(object_id.tenant_id, group_id);
     }

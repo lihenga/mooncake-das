@@ -1667,7 +1667,6 @@ class MasterService {
         const MasterServiceConfig& config);
     void DfsAllocatorRetryThreadFunc();
     void RunDfsBackfill();
-    size_t dfs_backfill_shard_{0};  // owned by the DFS eviction thread
     bool InitializeDfsRootGuard(const std::string& root,
                                 const std::string& identity);
     bool RecoverDfsRootAfterReplacement(const std::string& root,

@@ -94,6 +94,7 @@ struct ObjectRef {
 struct SlotOwnerState {
     // Whether the owner's in-flight list holds the slot.
     bool in_flight_listed{false};
+    bool dfs_backfill_indexed{false};
     // Whether the owner's eviction index files the slot, at what rank, and
     // under which of the index's own entries for a group, if any.
     bool eviction_filed{false};

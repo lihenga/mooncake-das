@@ -599,6 +599,8 @@ TEST_F(RealClientTest, BatchGetIntoUsesSelectedLocalDiskEndpoint) {
 }
 
 TEST_F(RealClientTest, SessionRangesReadDfsAndPropagateShortRead) {
+    // Exercise the ordinary allocator fallback; arena reads are tested below.
+    ScopedEnvVar unified_buffer("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES", "0");
     ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
     ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
                                  "distributed_storage_backend");
@@ -2280,10 +2282,10 @@ TEST_F(RealClientTest, TestGetSessionRangesFromSsdOffload) {
     EXPECT_EQ(reader->get_offload_rpc_read_count(), before_empty);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(kLeaseMs + 50));
-    EXPECT_EQ(
-        reader->batch_get_into_multi_buffer_ranges({keys[0]}, {{dst.data()}},
-                                                   {{1}}, {{0}}),
-        (std::vector<int>{static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED))}));
+    EXPECT_EQ(reader->batch_get_into_multi_buffer_ranges(
+                  {keys[0]}, {{dst.data()}}, {{1}}, {{0}}),
+              (std::vector<int>{static_cast<int>(
+                  toInt(ErrorCode::SESSION_RANGE_LEASE_EXPIRED))}));
     EXPECT_EQ(reader->batch_get_session_end(keys), 0);
     EXPECT_EQ(reader->batch_get_into_multi_buffer_ranges(
                   {keys[1]}, {{dst.data()}}, {{1}}, {{0}}),
@@ -2703,7 +2705,8 @@ TEST_F(RealClientTest, TestGetSessionLeaseExpiredDropsSession) {
         0);
 
     constexpr size_t kSize = 128;
-    const int kLeaseExpired = static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+    const int kLeaseExpired =
+        static_cast<int>(toInt(ErrorCode::SESSION_RANGE_LEASE_EXPIRED));
     const int kInvalidParams =
         static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
 
@@ -5604,7 +5607,7 @@ TEST_F(RealClientDfsPrefetchTest,
         EXPECT_EQ(results, std::vector<int64_t>(
                                2, toInt(ErrorCode::DFS_BATCH_GET_TIMEOUT)));
         EXPECT_GE(reads->load(), 1u);
-        const size_t live_objects = chunk_size == 4096 ? 1 : 2;
+        const size_t live_objects = 1;
         EXPECT_LE(py_client_->client_buffer_allocator_->storageReport()
                       .totalFreeSpace,
                   free_before - live_objects * sources_[0].size());

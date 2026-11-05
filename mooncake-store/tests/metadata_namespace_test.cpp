@@ -34,6 +34,58 @@ void SetProcessing(Namespace& ns, const std::string& key, bool processing) {
     guard->state().is_processing = processing;
 }
 
+TEST(NamespaceTest, DfsBackfillBatchesAreBoundedAndTrackPublicationLifetime) {
+    Namespace ns;
+    for (const auto& key : {"a", "b", "c", "healthy"}) {
+        ASSERT_NE(test::PublishObject(ns.objects, key), 0u);
+        if (std::string(key) != "healthy") {
+            auto guard = ns.objects.Write(key);
+            guard->state().dfs_backfill.emplace();
+        }
+    }
+    auto first = ns.NextDfsBackfillBatch(2);
+    ASSERT_EQ(first.size(), 2u);
+    EXPECT_EQ(first[0].key, "a");
+    EXPECT_EQ(first[1].key, "b");
+    auto second = ns.NextDfsBackfillBatch(2);
+    ASSERT_EQ(second.size(), 2u);
+    EXPECT_EQ(second[0].key, "c");
+    EXPECT_EQ(second[1].key, "a");
+    {
+        auto guard = ns.objects.Write("a");
+        guard->TearDown();
+        (void)test::PublishEnvelope(*guard);
+        guard->state().dfs_backfill.emplace();
+    }
+    auto replaced = ns.NextDfsBackfillBatch(8);
+    ASSERT_EQ(replaced.size(), 3u);
+    for (const auto& ref : replaced) {
+        if (ref.key == "a") EXPECT_NE(ref.generation, first[0].generation);
+        auto guard = ns.objects.Write(ref);
+        ASSERT_TRUE(guard);
+        guard->TearDown();
+    }
+    EXPECT_TRUE(ns.NextDfsBackfillBatch(8).empty());
+    EXPECT_TRUE(ns.objects.Contains("healthy"));
+}
+
+TEST(NamespaceTest, CompleteDfsReplicaLeavesNoBackfillCandidate) {
+    Namespace ns;
+    ASSERT_NE(test::PublishObject(ns.objects, "healthy"), 0u);
+    {
+        auto guard = ns.objects.Write("healthy");
+        guard->state().dfs_backfill.emplace();
+        std::vector<Replica> replicas;
+        replicas.emplace_back(DistributedFSDescriptor{},
+                              ReplicaStatus::COMPLETE);
+        guard->metadata().AddReplicas(std::move(replicas));
+    }
+    EXPECT_TRUE(ns.NextDfsBackfillBatch(8).empty());
+    auto guard = ns.objects.Read("healthy");
+    ASSERT_TRUE(guard);
+    EXPECT_FALSE(guard->state().dfs_backfill);
+}
+
 TEST(NamespaceTest, InFlightListsOnlyObjectsWithWork) {
     Namespace ns;
     ASSERT_NE(test::PublishObject(ns.objects, "idle"), 0u);

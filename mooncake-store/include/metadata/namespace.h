@@ -28,6 +28,7 @@
 #include "metadata/lease_eviction_index.h"
 #include "metadata/namespace_policy.h"
 #include "metadata/object_route.h"
+#include "l4/dfs_backfill_index.h"
 #include "tenant_id.h"
 #include "types.h"
 
@@ -114,6 +115,10 @@ class Namespace final : private route::RouteObserver {
         return keys;
     }
 
+    std::vector<route::ObjectRef> NextDfsBackfillBatch(size_t limit) {
+        return dfs_backfill_index_.NextBatch(limit);
+    }
+
    private:
     PolicyContext Context(const route::WriteGuard& guard) const {
         return PolicyContext{id_, attachment_.get(), guard};
@@ -121,6 +126,7 @@ class Namespace final : private route::RouteObserver {
 
     void OnWriteRelease(const route::WriteGuard& guard) override {
         SyncInFlight(guard);
+        dfs_backfill_index_.Sync(guard);
         eviction_index_->OnWrite(guard);
         if (policy_ != nullptr) {
             policy_->OnWriteRelease(Context(guard));
@@ -132,7 +138,8 @@ class Namespace final : private route::RouteObserver {
     }
 
     static bool IsInitial(const route::SlotOwnerState& owner) {
-        return !owner.in_flight_listed && !owner.eviction_filed &&
+        return !owner.in_flight_listed && !owner.dfs_backfill_indexed &&
+               !owner.eviction_filed &&
                owner.policy_words == decltype(owner.policy_words){};
     }
 
@@ -186,6 +193,7 @@ class Namespace final : private route::RouteObserver {
     // must outlive the hooks the lists hold.
     std::array<InFlightStripe, kInFlightStripeCount> in_flight_;
     const std::unique_ptr<EvictionIndex> eviction_index_;
+    l4::DfsBackfillIndex dfs_backfill_index_;
 };
 
 }  // namespace metadata

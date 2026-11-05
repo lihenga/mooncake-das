@@ -14,7 +14,7 @@ functions retain the calls that connect those definitions to the main flow.
 
 | Area | Implementation / support |
 | --- | --- |
-| DFS write submission, async ownership and service reporting | `mooncake-store/src/l4/client_service_l4.cpp`, `include/l4/client_write_internal.h`, `include/l4/async_dfs_write_context.h` |
+| DFS synchronous writes, async ownership and write outcome reporting | `mooncake-store/src/l4/client_service_l4.cpp`, `include/l4/client_write_internal.h`, `include/l4/async_dfs_write_context.h` |
 | DFS initialization, recovery, bucket eviction and backfill | `mooncake-store/src/l4/master_service_l4.cpp` |
 | Session refresh, prefetch, chunked reads and H2D scatter | `mooncake-store/src/l4/real_client_l4.cpp`, `include/l4/session_read_types.h`, `include/l4/dfs_h2d_stream_pool.h` |
 | Bucket descriptors, epoch validation, batch I/O and admission | `mooncake-store/src/l4/distributed_storage_backend_l4.cpp`, `include/l4/dfs_descriptor_internal.h` |
@@ -135,3 +135,48 @@ cross-node RDMA, real DFS deployment or model-serving performance.
 - After updating packaging, parse TOML and check source/target membership:
   conflict-free merges can duplicate `[tool.mooncake]`, ReadLayout sources,
   test targets or Python registrations.
+
+
+## Lifecycle and regression checks for the next update
+
+- Start DFS recovery/eviction/backfill workers once after Master initialization,
+  and join them during destruction. Graceful-unmount callbacks only unmount;
+  never place worker startup in a callback while resolving constructor hunks.
+  The native backfill and grace-period unmount tests cover this boundary.
+- `Client::WriteDfsReplicas` now lives with the DFS-specific write pipeline in
+  `src/l4/client_service_l4.cpp`. Community Put/Upsert keep their call sites.
+  Per-key DFS outcome counters count successful bytes and failed keys even when
+  a successful MEMORY replica makes the public write return success.
+- Asynchronous write counters settle exactly once through the context's
+  completion gate. A deadline reporter and a late worker cannot count the same
+  write twice; they retain buffer ownership until physical I/O completes.
+- Rebuild every tested executable against the current shared library before a
+  wide run. A stale Master test executable may still reference removed public
+  testing wrappers even though the current TestPeer API builds successfully.
+- Use explicit native test contracts: aligned shard reservations have no extra
+  padding page; DFS-only writes are rejected before publication; MEMORY stays
+  readable when DFS I/O fails; batch lease errors stay batch-stage errors;
+  default Master pools fail connection attempts promptly, with opt-in retries.
+
+- DFS backfill selection uses `include/l4/dfs_backfill_index.h`, synchronized
+  at namespace write-release. It snapshots at most 256 candidate publications
+  per maintenance tick and never scans healthy objects. Keep the generation
+  when resolving a snapshot so a deleted/recreated key cannot inherit old work.
+
+- Resolve `FileStorage`'s backend before initializing the unified DFS arena:
+  filesystem DFS can be inferred from the distributed backend even when the
+  caller did not pre-populate `enable_dfs`. Arena initialization belongs after
+  that inference and before client staging/prefetch receives its allocator.
+- Reconcile the environment-to-Master snapshot fields together with their
+  client heartbeat consumers. Keeping setters without constructor parsing can
+  silently replace configured heartbeat/timeout budgets with defaults.
+- Keep DFS hit accounting beside the community first-readable-replica choice.
+  A DFS descriptor later in a memory-first list is not a DFS hit.
+- Both Put and Upsert pass DFS admission/fallback state through every physical
+  allocation path. Reuse the same fallback error policy; never disable a key's
+  validity/liveness checks to accommodate an obsolete fixture.
+
+- A process-wide RPC pool can retain a closed socket when a server restarts at
+  the same address. `MasterClient::Connect` retries only its read-only
+  `ServiceReady` transport failure once; timeouts and business RPCs are never
+  replayed by this bootstrap recovery.

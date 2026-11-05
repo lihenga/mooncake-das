@@ -1189,14 +1189,9 @@ void MasterService::RunDfsBackfill() {
     std::shared_lock lock(master_state_mutex_);
     VisitNamespaces([&](const TenantId& tenant_id, metadata::Namespace& ns) {
         if (full) return;
-        std::vector<route::ObjectRef> refs;
-        for (auto object : ns.objects.ReadCursor()) {
-            if (object.state().dfs_backfill) refs.push_back(object.ref());
-        }
-        if (refs.empty()) return;
-        const size_t first = dfs_backfill_shard_ % refs.size();
-        for (size_t i = 0; i < refs.size() && !full; ++i) {
-            const auto& ref = refs[(first + i) % refs.size()];
+        const auto refs = ns.NextDfsBackfillBatch(kBatchSize - attempted);
+        for (const auto& ref : refs) {
+            if (full) break;
             MetadataAccessorRW accessor(this, tenant_id, ref);
             if (!accessor.IsPublished()) continue;
             auto& state = accessor.GetState();
@@ -1242,7 +1237,6 @@ void MasterService::RunDfsBackfill() {
             }
             if (attempted >= kBatchSize) full = true;
         }
-        dfs_backfill_shard_ = first + attempted;
     });
 }
 

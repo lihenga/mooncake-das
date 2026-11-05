@@ -58,8 +58,6 @@ FileStorage::FileStorage(const FileStorageConfig& config,
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
 
-    InitializeUnifiedDfsBuffer();
-
     auto create_storage_backend_result = CreateStorageBackend(
         config_, client_ ? client_->GetDfsRootIdentity() : std::string{});
     if (!create_storage_backend_result) {
@@ -88,6 +86,10 @@ FileStorage::FileStorage(const FileStorageConfig& config,
             client_->SetDfsStorageBackend(distributed_backend);
         }
     }
+
+    // The resolved distributed backend determines DFS mode. Initialize its
+    // arena only after that mode is known, including inferred filesystem DFS.
+    InitializeUnifiedDfsBuffer();
 
     // Register the client buffer with the process-wide io_uring fixed-buffer
     // mechanism. This must happen before any I/O threads start so that they

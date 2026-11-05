@@ -1283,6 +1283,11 @@ class Client {
     // Callers must pass the configured arena wait (dfs_write_arena_wait_,
     // derived from MC_STORE_DFS_WRITE_ARENA_WAIT_MS). The default only exists
     // as a safety net and is not the configured value.
+    void RecordDfsWriteResults(
+        const std::vector<ErrorCode>& outcomes,
+        const std::vector<DistributedFSDescriptor>& descriptors,
+        uint64_t latency_us);
+
     std::vector<ErrorCode> WriteDfsReplicas(
         const std::vector<std::string>& keys,
         const std::vector<const std::vector<Slice>*>& slice_lists,

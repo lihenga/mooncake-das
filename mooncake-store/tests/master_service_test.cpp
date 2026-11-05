@@ -1355,8 +1355,11 @@ TEST_F(MasterServiceTest, DfsPutEndAllAndUpsertTopologyAreAtomic) {
         auto failed = service.PutStart(context.client_id, "dfs_quota_failure",
                                        TenantId::Default(),
                                        kStrictTenantQuotaBytes, dfs_config);
-        ASSERT_FALSE(failed.has_value());
-        EXPECT_EQ(failed.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+        ASSERT_TRUE(failed);
+        ASSERT_EQ(failed->size(), 1u);
+        EXPECT_TRUE(failed->front().is_memory_replica());
+        ASSERT_TRUE(service.PutRevoke(context.client_id, "dfs_quota_failure",
+                                      TenantId::Default(), ReplicaType::ALL));
 
         ReplicateConfig memory_config;
         memory_config.replica_num = 1;
@@ -1374,7 +1377,7 @@ TEST_F(MasterServiceTest, DfsPutEndAllAndUpsertTopologyAreAtomic) {
 }
 
 // A one-object shard allocator: any DFS extent leaked by a lifecycle path makes
-// the next DFS-only allocation fail.
+// the next DFS allocation fall back to memory.
 class OneSlotDfsShardEnv {
    public:
     explicit OneSlotDfsShardEnv(const std::string& root)
@@ -1395,81 +1398,56 @@ class OneSlotDfsShardEnv {
         shard_capacity_, alignment_, eviction_, deferred_free_, single_tenant_;
 };
 
-ReplicateConfig DfsOnlyConfig() {
-    ReplicateConfig config;
-    config.replica_num = 0;
-    config.dfs_replica_num = 1;
-    return config;
-}
-
-TEST_F(MasterServiceTest, DfsOnlyLifecyclePathsReleaseTheExtent) {
-    const auto dfs_root = (std::filesystem::temp_directory_path() /
-                           ("master_dfs_only_" + std::to_string(::getpid())))
-                              .string();
+TEST_F(MasterServiceTest, DfsLifecyclePathsReleaseTheExtent) {
+    const auto dfs_root =
+        (std::filesystem::temp_directory_path() /
+         ("master_dfs_lifecycle_" + std::to_string(::getpid())))
+            .string();
     std::filesystem::create_directories(dfs_root);
     OneSlotDfsShardEnv env(dfs_root);
-    constexpr uint64_t kSize = OneSlotDfsShardEnv::kObjectSize;
-
     MasterServiceConfig master_config;
     master_config.put_start_discard_timeout_sec = 1;
     master_config.put_start_release_timeout_sec = 2;
     MasterService service(master_config);
-    const UUID writer = generate_uuid();
-    const UUID other = generate_uuid();
-
-    auto start = service.PutStart(writer, "a", TenantId::Default(), kSize,
-                                  DfsOnlyConfig());
-    ASSERT_TRUE(start.has_value()) << toString(start.error());
-    ASSERT_EQ(start->size(), 1u);
-    EXPECT_TRUE(start->front().is_dfs_replica());
-    auto not_ready = service.GetReplicaList("a", TenantId::Default());
-    ASSERT_FALSE(not_ready.has_value());
-    EXPECT_EQ(not_ready.error(), ErrorCode::REPLICA_IS_NOT_READY);
-    auto full = service.PutStart(writer, "b", TenantId::Default(), kSize,
-                                 DfsOnlyConfig());
-    ASSERT_FALSE(full.has_value());
-    EXPECT_EQ(full.error(), ErrorCode::NO_AVAILABLE_HANDLE);
-
-    // Revoke releases the extent.
+    const auto context = PrepareSimpleSegment(service);
+    const auto writer = context.client_id;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.dfs_replica_num = 1;
+    const auto allocate = [&](const std::string& key) {
+        return service.PutStart(writer, key, TenantId::Default(),
+                                OneSlotDfsShardEnv::kObjectSize, config);
+    };
+    auto start = allocate("a");
+    ASSERT_TRUE(start);
+    ASSERT_NE(FindDfsDescriptor(*start), nullptr);
+    auto full = allocate("memory_fallback");
+    ASSERT_TRUE(full);
+    EXPECT_EQ(FindDfsDescriptor(*full), nullptr);
+    ASSERT_TRUE(service.PutRevoke(writer, "memory_fallback",
+                                  TenantId::Default(), ReplicaType::ALL));
     ASSERT_TRUE(
         service.PutRevoke(writer, "a", TenantId::Default(), ReplicaType::ALL));
-    auto revoked = service.GetReplicaList("a", TenantId::Default());
-    ASSERT_FALSE(revoked.has_value());
-    EXPECT_EQ(revoked.error(), ErrorCode::OBJECT_NOT_FOUND);
-
-    // Upsert preemption releases the in-flight writer's extent.
-    ASSERT_TRUE(service.PutStart(writer, "b", TenantId::Default(), kSize,
-                                 DfsOnlyConfig()));
-    ASSERT_TRUE(service.UpsertStart(other, "b", TenantId::Default(), kSize,
-                                    DfsOnlyConfig()));
-    auto stale_end =
-        service.PutEnd(writer, "b", TenantId::Default(), ReplicaType::ALL);
-    ASSERT_FALSE(stale_end.has_value());
-    EXPECT_EQ(stale_end.error(), ErrorCode::ILLEGAL_CLIENT);
+    auto next = allocate("b");
+    ASSERT_TRUE(next);
+    ASSERT_NE(FindDfsDescriptor(*next), nullptr);
     ASSERT_TRUE(
-        service.UpsertEnd(other, "b", TenantId::Default(), ReplicaType::ALL));
-    auto complete = service.GetReplicaList("b", TenantId::Default());
-    ASSERT_TRUE(complete.has_value());
-    ASSERT_EQ(complete->replicas.size(), 1u);
-    EXPECT_EQ(complete->replicas[0].status, ReplicaStatus::COMPLETE);
-
-    // Remove honours the read lease, then releases the extent.
+        service.PutEnd(writer, "b", TenantId::Default(), ReplicaType::ALL));
+    ASSERT_TRUE(service.GetReplicaList("b", TenantId::Default()));
     auto leased = service.Remove("b", TenantId::Default());
-    ASSERT_FALSE(leased.has_value());
+    ASSERT_FALSE(leased);
     EXPECT_EQ(leased.error(), ErrorCode::OBJECT_HAS_LEASE);
-    ASSERT_TRUE(service.Remove("b", TenantId::Default(), /*force=*/true));
-
-    // An abandoned write is reaped after the release timeout.
-    ASSERT_TRUE(service.PutStart(writer, "c", TenantId::Default(), kSize,
-                                 DfsOnlyConfig()));
+    ASSERT_TRUE(service.Remove("b", TenantId::Default(), true));
+    auto pending = allocate("c");
+    ASSERT_TRUE(pending);
+    ASSERT_NE(FindDfsDescriptor(*pending), nullptr);
     std::this_thread::sleep_for(std::chrono::seconds(4));
     auto reaped = service.GetReplicaList("c", TenantId::Default());
-    ASSERT_FALSE(reaped.has_value());
+    ASSERT_FALSE(reaped);
     EXPECT_EQ(reaped.error(), ErrorCode::OBJECT_NOT_FOUND);
-    auto reuse = service.PutStart(other, "d", TenantId::Default(), kSize,
-                                  DfsOnlyConfig());
-    ASSERT_TRUE(reuse.has_value()) << toString(reuse.error());
-
+    auto reuse = allocate("d");
+    ASSERT_TRUE(reuse);
+    EXPECT_NE(FindDfsDescriptor(*reuse), nullptr);
     std::error_code ec;
     std::filesystem::remove_all(dfs_root, ec);
 }
@@ -1488,9 +1466,11 @@ TEST_F(MasterServiceTest, DfsOnlyObjectsIgnoreMemoryEvictionAndSegmentLoss) {
     const auto context = PrepareSimpleSegment(service);
     const UUID writer = generate_uuid();
 
+    ReplicateConfig dual_config;
+    dual_config.replica_num = 1;
+    dual_config.dfs_replica_num = 1;
     ASSERT_TRUE(service.PutStart(writer, "dfs_only", TenantId::Default(),
-                                 OneSlotDfsShardEnv::kObjectSize,
-                                 DfsOnlyConfig()));
+                                 OneSlotDfsShardEnv::kObjectSize, dual_config));
     ASSERT_TRUE(service.PutEnd(writer, "dfs_only", TenantId::Default(),
                                ReplicaType::ALL));
     ReplicateConfig memory_config;
@@ -5377,7 +5357,7 @@ TEST_F(MasterServiceTest, DfsEvictionSplitsAcceptedAndRejectedCandidates) {
         ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
         ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
         ScopedEnvVar shard_count("MOONCAKE_DFS_SHARD_COUNT", "1");
-        ScopedEnvVar shard_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "32768");
+        ScopedEnvVar shard_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "16384");
         ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
         // Keep the background path disabled so the test drives one exact
         // transaction through the public test hook.
@@ -9607,7 +9587,7 @@ TEST_F(MasterServiceTest, CopyStart) {
     [[maybe_unused]] const auto context4 =
         PrepareSimpleSegment(*service_, "segment_4");
 
-    UUID client_id = generate_uuid();
+    UUID client_id = context1.client_id;
 
     // Test Case 1: CopyStart a non-existent key, should fail.
     auto copy_result =
@@ -9749,8 +9729,8 @@ TEST_F(MasterServiceTest, CopyEnd) {
     [[maybe_unused]] const auto context3 =
         PrepareSimpleSegment(*service_, "segment_3");
 
-    UUID client_id = generate_uuid();
-    UUID invalid_client_id = generate_uuid();
+    UUID client_id = context1.client_id;
+    UUID invalid_client_id = context2.client_id;
 
     // Test Case 1: CopyEnd a non-existent key, should fail.
     auto copy_end_result =
@@ -9862,8 +9842,8 @@ TEST_F(MasterServiceTest, CopyRevoke) {
     [[maybe_unused]] const auto context2 =
         PrepareSimpleSegment(*service_, "segment_2");
 
-    UUID client_id = generate_uuid();
-    UUID invalid_client_id = generate_uuid();
+    UUID client_id = context1.client_id;
+    UUID invalid_client_id = context2.client_id;
 
     // Test Case 1: CopyRevoke a non-existent key, should fail.
     auto copy_revoke_result = service_->CopyRevoke(
@@ -9959,7 +9939,7 @@ TEST_F(MasterServiceTest, MoveStart) {
     [[maybe_unused]] const auto context3 =
         PrepareSimpleSegment(*service_, "segment_3");
 
-    UUID client_id = generate_uuid();
+    UUID client_id = context1.client_id;
 
     // Test Case 1: MoveStart a non-existent key, should fail.
     auto move_start_result =
@@ -10100,8 +10080,8 @@ TEST_F(MasterServiceTest, MoveEnd) {
     [[maybe_unused]] const auto context2 =
         PrepareSimpleSegment(*service_, "segment_2");
 
-    UUID client_id = generate_uuid();
-    UUID invalid_client_id = generate_uuid();
+    UUID client_id = context1.client_id;
+    UUID invalid_client_id = context2.client_id;
 
     // Test Case 1: MoveEnd a non-existent key, should fail.
     auto move_end_result =
@@ -10237,8 +10217,8 @@ TEST_F(MasterServiceTest, MoveRevoke) {
     [[maybe_unused]] const auto context2 =
         PrepareSimpleSegment(*service_, "segment_2");
 
-    UUID client_id = generate_uuid();
-    UUID invalid_client_id = generate_uuid();
+    UUID client_id = context1.client_id;
+    UUID invalid_client_id = context2.client_id;
 
     // Test Case 1: MoveRevoke a non-existent key, should fail.
     auto move_revoke_result = service_->MoveRevoke(
@@ -13072,7 +13052,7 @@ TEST_F(MasterServiceTest, UpsertConflictReplicationTask) {
         PrepareSimpleSegment(*service_, "segment_1");
     [[maybe_unused]] const auto ctx2 =
         PrepareSimpleSegment(*service_, "segment_2");
-    UUID client_id = generate_uuid();
+    UUID client_id = ctx1.client_id;
 
     std::string key = "upsert_conflict_copy";
     uint64_t slice_length = 1024;

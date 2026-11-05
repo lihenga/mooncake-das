@@ -141,6 +141,18 @@ class DfsSyncClientTest : public ::testing::Test {
         return config;
     }
 
+    void ExpectMemoryOnlyValue(const std::string& key,
+                               const std::string& expected) {
+        auto query = writer_->Query(key);
+        ASSERT_TRUE(query);
+        ASSERT_EQ(query->replicas.size(), 1u);
+        ASSERT_TRUE(query->replicas.front().is_memory_replica());
+        std::string output(expected.size(), '\0');
+        std::vector<Slice> slices{{output.data(), output.size()}};
+        ASSERT_TRUE(writer_->Get(key, *query, slices));
+        EXPECT_EQ(output, expected);
+    }
+
     // Reads through Query + Client::Get and checks that DFS is the only
     // replica.
     void ExpectDfsOnlyValue(const std::string& key,
@@ -270,29 +282,14 @@ TEST_F(DfsSyncClientSmallDfsCapacityTest,
 
     ReplicateConfig config;
     config.replica_num = 1;
-    std::vector<int> full_shards;
-    for (int i = 0; i < 32 && full_shards.size() < 2; ++i) {
+    const size_t capacity = 2 * DfsShardCapacity();
+    for (size_t i = 0; i < capacity / 4096; ++i) {
         const std::string key = "dfs_fallback_fill_" + std::to_string(i);
         std::string payload(4096, static_cast<char>('a' + i % 26));
         std::vector<Slice> slices{{payload.data(), payload.size()}};
-        ASSERT_TRUE(writer_->Put(key, slices, config).has_value());
-
-        auto query = writer_->Query(key);
-        ASSERT_TRUE(query.has_value());
-        for (const auto& replica : query->replicas) {
-            if (!replica.is_dfs_replica()) continue;
-            const int shard_idx = replica.get_dfs_descriptor().shard_idx;
-            bool already_full = false;
-            for (const int filled_shard : full_shards) {
-                if (filled_shard == shard_idx) {
-                    already_full = true;
-                    break;
-                }
-            }
-            if (!already_full) full_shards.push_back(shard_idx);
-        }
+        ASSERT_TRUE(writer_->Put(key, slices, config));
+        ASSERT_TRUE(QueryDfsOnly(key));
     }
-    ASSERT_EQ(full_shards.size(), 2u);
 
     const std::string key = "dfs_fallback_batch";
     std::string payload(4096, 'Z');
@@ -392,7 +389,7 @@ TEST_F(DfsSyncClientTest, PreferSameNodeBatchPutReturnsAfterDfsWrite) {
     ExpectDfsValue(keys[1], values[1]);
 }
 
-TEST_F(DfsSyncClientTest, BatchDfsFailureOnlyRevokesFailedKey) {
+TEST_F(DfsSyncClientTest, BatchDfsFailureKeepsMemoryAndRevokesOnlyDfs) {
     std::vector<std::string> keys{"sync_success", "sync_failure"};
     std::vector<std::string> values{std::string(4096, 'G'),
                                     std::string(4096, 'H')};
@@ -402,16 +399,12 @@ TEST_F(DfsSyncClientTest, BatchDfsFailureOnlyRevokesFailedKey) {
     auto results = writer_->BatchPut(keys, slices, DfsConfig());
     ASSERT_EQ(results.size(), keys.size());
     EXPECT_TRUE(results[0].has_value());
-    ASSERT_FALSE(results[1].has_value());
-    EXPECT_EQ(results[1].error(), ErrorCode::FILE_WRITE_FAIL);
+    ASSERT_TRUE(results[1].has_value());
     ExpectDfsValue(keys[0], values[0]);
-
-    auto failed_query = writer_->Query(keys[1]);
-    ASSERT_FALSE(failed_query.has_value());
-    EXPECT_EQ(failed_query.error(), ErrorCode::OBJECT_NOT_FOUND);
+    ExpectMemoryOnlyValue(keys[1], values[1]);
 }
 
-TEST_F(DfsSyncClientTest, MissingDfsBackendRevokesObject) {
+TEST_F(DfsSyncClientTest, MissingDfsBackendKeepsCompletedMemory) {
     auto client_without_backend = CreateClient("127.0.0.1:18103");
     ASSERT_NE(client_without_backend, nullptr);
     std::string value(4096, 'I');
@@ -419,11 +412,8 @@ TEST_F(DfsSyncClientTest, MissingDfsBackendRevokesObject) {
 
     auto result =
         client_without_backend->Put("sync_no_backend", slices, DfsConfig());
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
-    auto query = client_without_backend->Query("sync_no_backend");
-    ASSERT_FALSE(query.has_value());
-    EXPECT_EQ(query.error(), ErrorCode::OBJECT_NOT_FOUND);
+    ASSERT_TRUE(result);
+    ExpectMemoryOnlyValue("sync_no_backend", value);
 }
 
 TEST_F(DfsSyncClientTest, ExistingClientUsesOnlineExpandedDfsCapacity) {
@@ -575,9 +565,7 @@ TEST_F(DfsSyncClientTest,
             writer_->BatchGet({key}, queries, read_slices, prefer_same_node);
         ASSERT_EQ(results.size(), 1);
         ASSERT_FALSE(results[0].has_value());
-        EXPECT_EQ(results[0].error(), prefer_same_node
-                                          ? ErrorCode::LEASE_EXPIRED
-                                          : ErrorCode::BATCH_GET_LEASE_EXPIRED);
+        EXPECT_EQ(results[0].error(), ErrorCode::BATCH_GET_LEASE_EXPIRED);
         EXPECT_EQ(output, value);
     }
 }
@@ -732,7 +720,8 @@ TEST_F(DfsSyncClientTest, DfsMetricsCountWriteFailureSeparatelyFromOps) {
     auto results = writer_->BatchPut(keys, slices, DfsConfig());
     ASSERT_EQ(results.size(), keys.size());
     ASSERT_TRUE(results[0].has_value());
-    ASSERT_FALSE(results[1].has_value());
+    ASSERT_TRUE(results[1].has_value());
+    ExpectMemoryOnlyValue(keys[1], values[1]);
 
     // The failed key must not inflate ops/bytes; it lands in the error family
     // instead, keyed by the ErrorCode name.
@@ -756,8 +745,8 @@ TEST_F(DfsSyncClientTest, DfsMetricsRecordUnavailableBackend) {
     std::vector<Slice> slices{{value.data(), value.size()}};
     auto result = client_without_backend->Put("dfs_metric_no_backend", slices,
                                               DfsConfig());
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    ASSERT_TRUE(result);
+    ExpectMemoryOnlyValue("dfs_metric_no_backend", value);
     EXPECT_EQ(metric->dfs_write_errors.value(unavailable_label), 1);
     EXPECT_EQ(metric->dfs_write_ops.value(), 0);
 }
@@ -784,99 +773,42 @@ TEST_F(DfsSyncClientTest, DfsMetricsAppearInSerializedOutput) {
     EXPECT_NE(summary->find("=== DFS Metrics Summary ==="), std::string::npos);
 }
 
-TEST_F(DfsSyncClientTest, DfsOnlyPutGetRemoveAndReput) {
-    const std::string key = "dfs_only_put";
-    std::string value(4096, 'a');
+TEST_F(DfsSyncClientTest, DfsOnlyWritesAreRejectedWithoutPublishingMetadata) {
+    std::string value(4096, 'D');
     std::vector<Slice> slices{{value.data(), value.size()}};
-    ASSERT_TRUE(writer_->Put(key, slices, DfsOnlyConfig()).has_value());
-    ExpectDfsOnlyValue(key, value);
+    auto put = writer_->Put("dfs_only_put", slices, DfsOnlyConfig());
+    ASSERT_FALSE(put);
+    EXPECT_EQ(put.error(), ErrorCode::INVALID_PARAMS);
+    ExpectNotFound("dfs_only_put");
+    auto upsert = writer_->Upsert("dfs_only_upsert", slices, DfsOnlyConfig());
+    ASSERT_FALSE(upsert);
+    EXPECT_EQ(upsert.error(), ErrorCode::INVALID_PARAMS);
+    ExpectNotFound("dfs_only_upsert");
+    std::vector<std::string> keys{"dfs_only_a", "dfs_only_b"};
+    std::vector<std::string> values(2, value);
+    auto batches = MakeSlices(values);
+    for (bool is_upsert : {false, true}) {
+        auto results =
+            is_upsert ? writer_->BatchUpsert(keys, batches, DfsOnlyConfig())
+                      : writer_->BatchPut(keys, batches, DfsOnlyConfig());
+        ASSERT_EQ(results.size(), keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            ASSERT_FALSE(results[i]);
+            EXPECT_EQ(results[i].error(), ErrorCode::INVALID_PARAMS);
+            ExpectNotFound(keys[i]);
+        }
+    }
+    EXPECT_EQ(adapter_->WriteCalls(), 0);
 
-    WaitForReadLeaseExpiry();
-    ASSERT_TRUE(writer_->Remove(key).has_value());
-    ExpectNotFound(key);
-
-    std::string larger(8192, 'b');
-    std::vector<Slice> larger_slices{{larger.data(), larger.size()}};
-    ASSERT_TRUE(writer_->Put(key, larger_slices, DfsOnlyConfig()).has_value());
-    ExpectDfsOnlyValue(key, larger);
-}
-
-TEST_F(DfsSyncClientTest, DfsOnlyBatchFailureOnlyRevokesFailedKey) {
-    std::vector<std::string> keys{"dfs_only_ok", "dfs_only_fail"};
-    std::vector<std::string> values{std::string(4096, 'c'),
-                                    std::string(4096, 'd')};
-    auto slices = MakeSlices(values);
-    adapter_->FailWriteCall(adapter_->WriteCalls() + 2);
-
-    auto results = writer_->BatchPut(keys, slices, DfsOnlyConfig());
-    adapter_->ClearWriteFailure();
-    ASSERT_EQ(results.size(), keys.size());
-    EXPECT_TRUE(results[0].has_value());
-    ASSERT_FALSE(results[1].has_value());
-    EXPECT_EQ(results[1].error(), ErrorCode::FILE_WRITE_FAIL);
-    ExpectDfsOnlyValue(keys[0], values[0]);
-    ExpectNotFound(keys[1]);
-
-    // The revoked key and its extent can be reused.
-    std::vector<Slice> retry{{values[1].data(), values[1].size()}};
-    ASSERT_TRUE(writer_->Put(keys[1], retry, DfsOnlyConfig()).has_value());
-    ExpectDfsOnlyValue(keys[1], values[1]);
-}
-
-TEST_F(DfsSyncClientTest, DfsOnlyUpsertSameSizeResizeAndBatch) {
-    const std::string key = "dfs_only_upsert";
-    std::string initial(4096, 'e');
-    std::vector<Slice> initial_slices{{initial.data(), initial.size()}};
-    ASSERT_TRUE(
-        writer_->Upsert(key, initial_slices, DfsOnlyConfig()).has_value());
-    ExpectDfsOnlyValue(key, initial);
-
-    WaitForReadLeaseExpiry();
-    std::string same_size(4096, 'f');
-    std::vector<Slice> same_slices{{same_size.data(), same_size.size()}};
-    ASSERT_TRUE(writer_->Upsert(key, same_slices, DfsOnlyConfig()).has_value());
-    ExpectDfsOnlyValue(key, same_size);
-
-    WaitForReadLeaseExpiry();
-    std::string resized(12288, 'g');
-    std::vector<Slice> resized_slices{{resized.data(), resized.size()}};
-    ASSERT_TRUE(
-        writer_->Upsert(key, resized_slices, DfsOnlyConfig()).has_value());
-    ExpectDfsOnlyValue(key, resized);
-
-    WaitForReadLeaseExpiry();
-    std::vector<std::string> keys{key, "dfs_only_upsert_new"};
-    std::vector<std::string> values{std::string(4096, 'h'),
-                                    std::string(4096, 'i')};
-    auto batch_slices = MakeSlices(values);
-    auto results = writer_->BatchUpsert(keys, batch_slices, DfsOnlyConfig());
-    ASSERT_EQ(results.size(), keys.size());
-    ASSERT_TRUE(results[0].has_value());
-    ASSERT_TRUE(results[1].has_value());
-    ExpectDfsOnlyValue(keys[0], values[0]);
-    ExpectDfsOnlyValue(keys[1], values[1]);
-}
-
-TEST_F(DfsSyncClientTest, DfsOnlyUpsertMatchesMemoryLostTopology) {
-    const std::string key = "dfs_only_memory_lost";
-    std::string initial(4096, 'j');
-    std::vector<Slice> initial_slices{{initial.data(), initial.size()}};
-    ASSERT_TRUE(writer_->Put(key, initial_slices, DfsConfig()).has_value());
-    ASSERT_TRUE(provider_->UnmountSegment(segment_, segment_size_).has_value());
-    ExpectDfsOnlyValue(key, initial);
-
-    WaitForReadLeaseExpiry();
-    std::string updated(4096, 'k');
-    std::vector<Slice> updated_slices{{updated.data(), updated.size()}};
-    auto mismatched = writer_->Upsert(key, updated_slices, DfsConfig());
-    ASSERT_FALSE(mismatched.has_value());
-    EXPECT_EQ(mismatched.error(), ErrorCode::INVALID_PARAMS);
-    ExpectDfsOnlyValue(key, initial);
-
-    WaitForReadLeaseExpiry();
-    ASSERT_TRUE(
-        writer_->Upsert(key, updated_slices, DfsOnlyConfig()).has_value());
-    ExpectDfsOnlyValue(key, updated);
+    // Losing the memory provider after a supported dual write still permits
+    // DFS reads; it does not turn unsupported DFS-only writes into valid ones.
+    ASSERT_TRUE(writer_->Put("surviving_dfs", slices, DfsConfig()));
+    ASSERT_TRUE(provider_->UnmountSegment(segment_, segment_size_));
+    ExpectDfsOnlyValue("surviving_dfs", value);
+    auto replace = writer_->Upsert("surviving_dfs", slices, DfsOnlyConfig());
+    ASSERT_FALSE(replace);
+    EXPECT_EQ(replace.error(), ErrorCode::INVALID_PARAMS);
+    ExpectDfsOnlyValue("surviving_dfs", value);
 }
 
 }  // namespace mooncake::test

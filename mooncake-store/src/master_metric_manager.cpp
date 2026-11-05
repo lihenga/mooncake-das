@@ -694,6 +694,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     dfs_replica_skipped_total_.inc({"FILE_OPEN_FAIL"}, 0);
     dfs_replica_skipped_total_.inc({"FILE_WRITE_FAIL"}, 0);
     dfs_replica_skipped_total_.inc({"NO_AVAILABLE_HANDLE"}, 0);
+    dfs_replica_skipped_total_.inc({"DFS_SERVICE_UNAVAILABLE"}, 0);
     dfs_bucket_ready_count_.update(0);
     dfs_bucket_create_inflight_.update(0);
     dfs_bucket_create_total_.inc({"success"}, 0);

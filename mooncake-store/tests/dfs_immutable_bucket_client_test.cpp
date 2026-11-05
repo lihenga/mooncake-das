@@ -1571,6 +1571,10 @@ TEST_F(DfsBucketClientTest, TimelyBoundedBatchPutPublishesAsynchronously) {
     ASSERT_NE(writer_, nullptr);
     writer_->SetDfsStorageBackend(backend_);
 
+    auto* metrics = writer_->GetDfsMetricPtr();
+    ASSERT_NE(metrics, nullptr);
+    const auto ops = metrics->dfs_write_ops.value();
+    const auto bytes = metrics->dfs_write_bytes.value();
     const std::string key = "bounded_write_is_published";
     std::vector<std::string> values{std::string(4096, 'P')};
     auto slices = MakeSlices(values);
@@ -1583,6 +1587,8 @@ TEST_F(DfsBucketClientTest, TimelyBoundedBatchPutPublishesAsynchronously) {
     ASSERT_TRUE(query.has_value());
     ASSERT_EQ(query->replicas.size(), 1u);
     EXPECT_EQ(query->replicas[0].status, ReplicaStatus::COMPLETE);
+    EXPECT_EQ(metrics->dfs_write_ops.value(), ops + 1);
+    EXPECT_EQ(metrics->dfs_write_bytes.value(), bytes + values.front().size());
 }
 
 TEST_F(DfsBucketClientTest, FailedBoundedAsyncWriteKeepsMemoryReplica) {
@@ -1592,6 +1598,13 @@ TEST_F(DfsBucketClientTest, FailedBoundedAsyncWriteKeepsMemoryReplica) {
     ASSERT_NE(writer_, nullptr);
     writer_->SetDfsStorageBackend(backend_);
 
+    PauseHolderPolling();
+    auto* metrics = writer_->GetDfsMetricPtr();
+    ASSERT_NE(metrics, nullptr);
+    const auto ops = metrics->dfs_write_ops.value();
+    const std::array<std::string, 1> label{
+        toString(ErrorCode::FILE_WRITE_FAIL)};
+    const auto errors = metrics->dfs_write_errors.value(label);
     const std::string key = "bucket_write_fail";
     std::string value(4096, 'F');
 
@@ -1607,7 +1620,15 @@ TEST_F(DfsBucketClientTest, FailedBoundedAsyncWriteKeepsMemoryReplica) {
 
     // The background task must revoke the DFS replica rather than leaving it
     // PROCESSING forever.
+    const auto completed =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (metrics->dfs_write_errors.value(label) == errors &&
+           std::chrono::steady_clock::now() < completed) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
     ASSERT_TRUE(WaitForKeyGone(key));
+    EXPECT_EQ(metrics->dfs_write_ops.value(), ops);
+    EXPECT_EQ(metrics->dfs_write_errors.value(label), errors + 1);
     adapter_->FailAllWrites(false);
 
     auto query = writer_->Query(key);
@@ -2245,6 +2266,9 @@ TEST_F(DfsBucketClientTest, UpsertKeepsSynchronousDfsSemantics) {
 
     // Upsert stays synchronous, so the new value is readable as soon as it
     // returns, but it must use a newly appended range.
+    // Verification queries grant a read lease; an upsert must wait for it.
+    std::this_thread::sleep_until(initial_query->lease_timeout +
+                                  std::chrono::milliseconds(50));
     std::string updated(4096, 'V');
     std::vector<Slice> updated_slices{{updated.data(), updated.size()}};
     ASSERT_TRUE(writer_->Upsert(key, updated_slices, DfsConfig()).has_value());
@@ -2267,6 +2291,14 @@ TEST_F(DfsBucketClientTest, BatchUpsertKeepsSynchronousDfsSemantics) {
     for (const auto& result : put_results) ASSERT_TRUE(result.has_value());
     for (const auto& key : keys) ASSERT_TRUE(WaitForDfsReplica(key));
 
+    auto lease_deadline = std::chrono::steady_clock::now();
+    for (const auto& key : keys) {
+        auto query = QueryDfsOnly(key);
+        ASSERT_TRUE(query);
+        lease_deadline = std::max(lease_deadline, query->lease_timeout);
+    }
+    std::this_thread::sleep_until(lease_deadline +
+                                  std::chrono::milliseconds(50));
     std::vector<std::string> updated{std::string(4096, 'E'),
                                      std::string(4096, 'F')};
     auto updated_slices = MakeSlices(updated);

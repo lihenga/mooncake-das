@@ -90,6 +90,18 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
                                    std::string>(ha_probe_client_accessor_)
             : invoke_rpc_with_pool<&WrappedMasterService::ServiceReady,
                                    std::string>(*client_accessor_);
+    // A process-wide pool can retain a socket to an earlier server at this
+    // address. ServiceReady is read-only: retry one failed transport probe
+    // after the pool discards that socket, without replaying business RPCs or
+    // extending a request timeout.
+    if (!result && result.error() == ErrorCode::RPC_FAIL) {
+        result =
+            use_ha_control_pool
+                ? invoke_rpc_with_pool<&WrappedMasterService::ServiceReady,
+                                       std::string>(ha_probe_client_accessor_)
+                : invoke_rpc_with_pool<&WrappedMasterService::ServiceReady,
+                                       std::string>(*client_accessor_);
+    }
     if (!result.has_value()) {
         timer.LogResponse("error_code=", result.error());
         return result.error();

@@ -2067,7 +2067,8 @@ RealClient::prepare_session_range_read_requests(
             replica.is_disk_replica() || replica.is_local_disk_replica()) {
             bool overflow = false;
             for (size_t j = 0; j < buffers.size(); ++j) {
-                if (is_object_range_overflow(offsets[j], sizes[j],
+                if ((sizes[j] != 0 && buffers[j] == nullptr) ||
+                    is_object_range_overflow(offsets[j], sizes[j],
                                              replica_limit)) {
                     overflow = true;
                     break;
@@ -2080,6 +2081,9 @@ RealClient::prepare_session_range_read_requests(
         }
 
         results[i] = 0;
+        if (std::all_of(sizes.begin(), sizes.end(),
+                        [](size_t size) { return size == 0; }))
+            continue;
         requests.push_back(SessionRangeReadRequest{
             keys[i], i, replica, session_it->second,
             std::vector<void *>(buffers.begin(), buffers.end()),

@@ -14,6 +14,8 @@ struct Client::AsyncDfsWriteContext {
         size_t requested_dfs_replicas = 0;
     };
 
+    const std::chrono::steady_clock::time_point started_at =
+        std::chrono::steady_clock::now();
     std::vector<std::string> keys;
     std::vector<DistributedFSDescriptor> descriptors;
     std::shared_ptr<ClientBufferAllocator> unified_buffer_allocator;
