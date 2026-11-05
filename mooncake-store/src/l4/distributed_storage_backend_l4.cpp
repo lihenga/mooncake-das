@@ -1405,11 +1405,11 @@ DistributedStorageBackend::BatchWriteShard(
                 static_cast<int64_t>(request.descriptor.offset));
         };
         auto result = perform();
-        if ((!result || *result != total) && fs_adapter_->SupportsFdReopen() &&
-            (result || result.error() == ErrorCode::FILE_WRITE_FAIL)) {
+        if (!result && fs_adapter_->SupportsFdReopen() &&
+            result.error() == ErrorCode::FILE_WRITE_FAIL) {
             auto reopened = ReopenShardLocked(shard);
             if (!reopened) {
-                results[i] = tl::make_unexpected(reopened.error());
+                results[i] = tl::make_unexpected(result.error());
                 continue;
             }
             result = perform();
@@ -1493,12 +1493,11 @@ DistributedStorageBackend::BatchReadShard(
                     (request.range_read ? request.value_offset : 0)));
         };
         auto result = perform();
-        if ((!result || *result != requested_size) &&
-            fs_adapter_->SupportsFdReopen() &&
-            (result || result.error() == ErrorCode::FILE_READ_FAIL)) {
+        if (!result && fs_adapter_->SupportsFdReopen() &&
+            result.error() == ErrorCode::FILE_READ_FAIL) {
             auto reopened = ReopenShardLocked(shard, true);
             if (!reopened) {
-                results[i] = tl::make_unexpected(reopened.error());
+                results[i] = tl::make_unexpected(result.error());
                 continue;
             }
             result = perform();

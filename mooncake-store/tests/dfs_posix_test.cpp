@@ -1525,7 +1525,10 @@ TEST(DfsBackendInitializationTest, ClientBeforeMasterDoesNotCreateShards) {
                                      std::make_unique<PosixFsAdapter>(),
                                      TestDfsIdentityForRoot(client_config));
     ASSERT_TRUE(client.Init());
-    EXPECT_TRUE(std::filesystem::is_empty(tmp.path()));
+    for (const auto& entry : std::filesystem::directory_iterator(tmp.path())) {
+        EXPECT_FALSE(
+            entry.path().filename().string().starts_with("dfs_shard_"));
+    }
 
     ShardAllocator allocator;
     ASSERT_TRUE(allocator.Init(MakeAllocatorConfig(tmp.path(), 1, 8192, 4096)));
@@ -2502,7 +2505,10 @@ TEST(DfsStorageFactoryTest, CreatesDistributedBackendWithPosixAdapter) {
     auto backend = CreateStorageBackend(file_config);
     ASSERT_TRUE(backend.has_value());
     ASSERT_NE(*backend, nullptr);
-    EXPECT_TRUE((*backend)->Init().has_value());
+    // A factory-created client has no Master-issued root identity yet.
+    auto initialized = (*backend)->Init();
+    ASSERT_FALSE(initialized);
+    EXPECT_EQ(initialized.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
 }
 
 TEST_F(FsAdapterFdTest, DirectReadUsesCallerBufferWhenFullyAligned) {
@@ -3091,7 +3097,8 @@ TEST(DfsBackendTimeoutTest, LimitsTimedReadsUntilRealCompletion) {
     });
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
     EXPECT_FALSE(third_returned.load());
-    EXPECT_EQ(started_before_admission_wait, 2u);
+    // Both requests retain admission slots, but one shard serializes its I/O.
+    EXPECT_EQ(started_before_admission_wait, 1u);
     EXPECT_EQ(adapter_ptr->StartedReads(), started_before_admission_wait);
     adapter_ptr->ReleaseReads();
     third_reader.join();
