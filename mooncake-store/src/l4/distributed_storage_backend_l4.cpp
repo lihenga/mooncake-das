@@ -71,9 +71,9 @@ void ReadDfsBucketEnvironment(DistributedStorageConfig& config) {
     // An unknown allocator type name is recorded rather than corrected, so the
     // master surfaces a configuration error instead of silently using SHARD.
     const std::string allocator_type_name = Environ::GetString(
-        "MOONCAKE_DFS_ALLOCATOR_TYPE", ToString(config.allocator_type));
+        "MOONCAKE_DFS_ALLOCATOR_TYPE", config.allocator_type);
     if (auto parsed = ParseDfsAllocatorType(allocator_type_name)) {
-        config.allocator_type = *parsed;
+        config.allocator_type = ToString(*parsed);
     } else {
         LOG(ERROR) << "Unknown MOONCAKE_DFS_ALLOCATOR_TYPE '"
                    << allocator_type_name << "', expected 'shard' or 'bucket'";
@@ -142,11 +142,10 @@ struct MergedReadScratch {
 
 thread_local MergedReadScratch merged_read_scratch;
 
-
 }  // namespace
 
-using l4::kBucketFilePrefix;
 using l4::kBucketDataSuffix;
+using l4::kBucketFilePrefix;
 
 bool DistributedStorageConfig::ValidateForBucketAllocator() const {
     if (bucket_capacity == 0) {
@@ -230,8 +229,8 @@ DistributedStorageBackend::TryEnsureInitialized() {
     return InitLocked();
 }
 
-tl::expected<void, ErrorCode>
-DistributedStorageBackend::ValidateRootIdentity() const {
+tl::expected<void, ErrorCode> DistributedStorageBackend::ValidateRootIdentity()
+    const {
     if (UsesObjectStorage()) return {};
     if (expected_root_identity_.empty() ||
         expected_root_identity_.size() > kMaxDfsRootIdentitySize ||
@@ -240,10 +239,9 @@ DistributedStorageBackend::ValidateRootIdentity() const {
     }
 
     std::vector<char> contents(expected_root_identity_.size() + 1);
-    const std::string marker_path =
-        root_dir_ + "/" + kDfsRootIdentityFileName;
-    auto read_result = fs_adapter_->ReadFile(
-        marker_path, contents.data(), contents.size());
+    const std::string marker_path = root_dir_ + "/" + kDfsRootIdentityFileName;
+    auto read_result =
+        fs_adapter_->ReadFile(marker_path, contents.data(), contents.size());
     if (!read_result || *read_result != expected_root_identity_.size() ||
         std::memcmp(contents.data(), expected_root_identity_.data(),
                     expected_root_identity_.size()) != 0) {
@@ -253,17 +251,11 @@ DistributedStorageBackend::ValidateRootIdentity() const {
 }
 
 void DistributedStorageBackend::ResetFailedInitializationLocked() {
-    for (auto& shard : shard_files_) {
+    for (auto& [_, shard] : shard_files_) {
         if (shard && fs_adapter_) {
-            const int write_fd = shard->write_fd.load();
-            if (write_fd >= 0) {
-                (void)fs_adapter_->CloseFile(write_fd);
-            }
-            if (shard->read_fd >= 0 && shard->read_fd != write_fd) {
+            if (shard->fd >= 0) (void)fs_adapter_->CloseFile(shard->fd);
+            if (shard->read_fd >= 0 && shard->read_fd != shard->fd)
                 (void)fs_adapter_->CloseFile(shard->read_fd);
-            }
-            shard->read_fd = -1;
-            shard->write_fd.store(-1);
         }
     }
     shard_files_.clear();
@@ -324,7 +316,8 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeRead() {
 
         const auto expected =
             BuildDfsReadProbeContents(expected_root_identity_, probe_index);
-        if (std::memcmp(buffer.get(), expected.data(), kDfsReadProbeSize) != 0) {
+        if (std::memcmp(buffer.get(), expected.data(), kDfsReadProbeSize) !=
+            0) {
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
     }
@@ -372,29 +365,16 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite() {
     active_health_probe_path_ = new_probe_path;
 
     if (!IsBucketMode()) {
-        std::vector<int> new_write_fds;
-        new_write_fds.reserve(shard_files_.size());
-        for (const auto& shard : shard_files_) {
-            if (shard->write_fd.load(std::memory_order_acquire) >= 0) {
-                new_write_fds.push_back(-1);
-                continue;
-            }
-            auto fd = fs_adapter_->OpenFile(shard->path);
-            if (!fd) {
-                for (int opened_fd : new_write_fds) {
-                    if (opened_fd >= 0) (void)fs_adapter_->CloseFile(opened_fd);
-                }
-                return tl::make_unexpected(fd.error());
-            }
-            new_write_fds.push_back(*fd);
-        }
-        for (size_t i = 0; i < shard_files_.size(); ++i) {
-            if (new_write_fds[i] >= 0) {
-                shard_files_[i]->write_fd.store(new_write_fds[i],
-                                                std::memory_order_release);
-            }
+        std::lock_guard cache_lock(shard_files_mutex_);
+        for (auto& [_, shard] : shard_files_) {
+            std::lock_guard shard_lock(shard->mutex);
+            if (shard->fd >= 0) continue;
+            auto fd = fs_adapter_->OpenFileReadWriteExisting(shard->path);
+            if (!fd) return tl::make_unexpected(fd.error());
+            shard->fd = *fd;
         }
     }
+
     return {};
 }
 
@@ -408,16 +388,15 @@ DistributedStorageBackend::GetOrOpenBucket(int64_t bucket_id,
         if (it != bucket_id_cache_.end()) return it->second;
     }
 
-    const std::string path = canonical_root_dir_ + "/" + kBucketFilePrefix +
-                             ImmutableBucketAllocator::FormatBucketId(bucket_id) +
-                             kBucketDataSuffix;
+    const std::string path =
+        canonical_root_dir_ + "/" + kBucketFilePrefix +
+        ImmutableBucketAllocator::FormatBucketId(bucket_id) + kBucketDataSuffix;
     auto fd_result = fs_adapter_->OpenFileReadWriteExisting(path);
     if (!fd_result) {
         static DfsLogLimiter log_limiter;
         if (auto suppressed = log_limiter.ShouldLog()) {
             LOG(ERROR) << "Failed to open DFS bucket file " << path << ": "
-                       << fd_result.error()
-                       << ", suppressed=" << *suppressed;
+                       << fd_result.error() << ", suppressed=" << *suppressed;
         }
         return tl::make_unexpected(fd_result.error());
     }
@@ -446,8 +425,8 @@ DistributedStorageBackend::GetOrOpenBucket(int64_t bucket_id,
     return it->second;
 }
 
-tl::expected<bool, ErrorCode>
-DistributedStorageBackend::CleanupBucketFd(int64_t bucket_id) {
+tl::expected<bool, ErrorCode> DistributedStorageBackend::CleanupBucketFd(
+    int64_t bucket_id) {
     if (!IsBucketMode() || bucket_id < 0) return false;
 
     std::shared_ptr<OpenFileHandle> regular_handle;
@@ -455,14 +434,16 @@ DistributedStorageBackend::CleanupBucketFd(int64_t bucket_id) {
     {
         std::lock_guard<std::mutex> lock(bucket_cache_mutex_);
         auto regular_it = bucket_id_cache_.find(bucket_id);
-        if (regular_it != bucket_id_cache_.end()) regular_handle = regular_it->second;
+        if (regular_it != bucket_id_cache_.end())
+            regular_handle = regular_it->second;
         auto direct_it = bucket_id_direct_cache_.find(bucket_id);
-        if (direct_it != bucket_id_direct_cache_.end()) direct_handle = direct_it->second;
+        if (direct_it != bucket_id_direct_cache_.end())
+            direct_handle = direct_it->second;
     }
     if (!regular_handle && !direct_handle) return false;
 
     const auto& handle = regular_handle ? regular_handle : direct_handle;
-    struct stat path_stat {};
+    struct stat path_stat{};
     if (::stat(handle->path.c_str(), &path_stat) == 0) return false;
     if (errno != ENOENT && errno != ESTALE) {
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
@@ -578,12 +559,15 @@ DistributedStorageBackend::CleanupStaleBucketFds(
     std::vector<int64_t> bucket_ids;
     {
         std::lock_guard<std::mutex> lock(bucket_cache_mutex_);
-        bucket_ids.reserve(bucket_id_cache_.size() + bucket_id_direct_cache_.size());
+        bucket_ids.reserve(bucket_id_cache_.size() +
+                           bucket_id_direct_cache_.size());
         for (const auto& [bucket_id, handle] : bucket_id_cache_) {
-            if (!active_ids.contains(bucket_id)) bucket_ids.push_back(bucket_id);
+            if (!active_ids.contains(bucket_id))
+                bucket_ids.push_back(bucket_id);
         }
         for (const auto& [bucket_id, handle] : bucket_id_direct_cache_) {
-            if (!active_ids.contains(bucket_id)) bucket_ids.push_back(bucket_id);
+            if (!active_ids.contains(bucket_id))
+                bucket_ids.push_back(bucket_id);
         }
     }
     std::sort(bucket_ids.begin(), bucket_ids.end());
@@ -632,9 +616,9 @@ DistributedStorageBackend::GetOrOpenBucketDirect(int64_t bucket_id,
         if (it != bucket_id_direct_cache_.end()) return it->second;
     }
 
-    const std::string path = canonical_root_dir_ + "/" + kBucketFilePrefix +
-                             ImmutableBucketAllocator::FormatBucketId(bucket_id) +
-                             kBucketDataSuffix;
+    const std::string path =
+        canonical_root_dir_ + "/" + kBucketFilePrefix +
+        ImmutableBucketAllocator::FormatBucketId(bucket_id) + kBucketDataSuffix;
     auto fd_result = fs_adapter_->OpenFileDirect(path);
     if (!fd_result) {
         if (fd_result.error() != ErrorCode::NOT_SUPPORTED) {
@@ -702,7 +686,8 @@ DistributedStorageBackend::BatchWriteBucket(
                 break;
             }
             if (slice.size) {
-                std::memcpy(payload.data() + payload_offset, slice.ptr, slice.size);
+                std::memcpy(payload.data() + payload_offset, slice.ptr,
+                            slice.size);
                 payload_offset += slice.size;
                 value_size += slice.size;
             }
@@ -711,8 +696,7 @@ DistributedStorageBackend::BatchWriteBucket(
             results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             continue;
         }
-        prepared.push_back({i, std::move(*target),
-                            request.descriptor.offset,
+        prepared.push_back({i, std::move(*target), request.descriptor.offset,
                             std::move(payload)});
     }
 
@@ -834,16 +818,26 @@ DistributedStorageBackend::PrepareReadTasks(
             }
             capacity += slice.size;
         }
-        if (invalid || capacity < request.descriptor.object_size) continue;
+        const uint64_t requested_size =
+            request.range_read ? capacity : request.descriptor.object_size;
+        if (invalid ||
+            (request.range_read &&
+             (request.value_offset > request.descriptor.object_size ||
+              requested_size >
+                  request.descriptor.object_size - request.value_offset)) ||
+            (!request.range_read && capacity < requested_size))
+            continue;
 
         ReadTask task;
         task.target = std::move(*target);
-        task.io_offset = request.descriptor.offset;
-        task.total_size = IsBucketMode() ? request.descriptor.aligned_size
-                                         : request.descriptor.object_size;
-        task.direct_read = distributed_config_.direct_read_enabled &&
-                           task.target.direct_read;
-        task.entries.push_back({i, request.descriptor.offset});
+        task.io_offset = request.descriptor.offset +
+                         (request.range_read ? request.value_offset : 0);
+        task.total_size = request.range_read ? requested_size
+                          : IsBucketMode()   ? request.descriptor.aligned_size
+                                             : requested_size;
+        task.direct_read =
+            distributed_config_.direct_read_enabled && task.target.direct_read;
+        task.entries.push_back({i, task.io_offset});
         const bool merge_candidate =
             IsBucketMode() && distributed_config_.batch_read_merge_enabled &&
             task.total_size <= kMaxMergedIo;
@@ -855,24 +849,24 @@ DistributedStorageBackend::PrepareReadTasks(
     }
 
     if (!IsBucketMode() || !distributed_config_.batch_read_merge_enabled) {
-        tasks.insert(tasks.end(), std::make_move_iterator(oversized_tasks.begin()),
+        tasks.insert(tasks.end(),
+                     std::make_move_iterator(oversized_tasks.begin()),
                      std::make_move_iterator(oversized_tasks.end()));
         return tasks;
     }
-    std::sort(tasks.begin(), tasks.end(), [](const ReadTask& a,
-                                             const ReadTask& b) {
-        if (a.target.fd != b.target.fd) {
-            return a.target.fd < b.target.fd;
-        }
-        return a.io_offset < b.io_offset;
-    });
+    std::sort(tasks.begin(), tasks.end(),
+              [](const ReadTask& a, const ReadTask& b) {
+                  if (a.target.fd != b.target.fd) {
+                      return a.target.fd < b.target.fd;
+                  }
+                  return a.io_offset < b.io_offset;
+              });
 
     std::vector<ReadTask> merged;
     merged.reserve(tasks.size());
     for (auto& task : tasks) {
         const uint64_t task_end = task.io_offset + task.total_size;
-        if (!merged.empty() &&
-            merged.back().target.fd == task.target.fd &&
+        if (!merged.empty() && merged.back().target.fd == task.target.fd &&
             merged.back().target.mutex == task.target.mutex &&
             merged.back().io_offset + merged.back().total_size ==
                 task.io_offset &&
@@ -923,7 +917,8 @@ void DistributedStorageBackend::ExecuteSingleReadTask(
     uint64_t collected = 0;
     for (const auto& slice : request.slices) {
         if (collected >= read_size) break;
-        const uint64_t size = std::min<uint64_t>(slice.size, read_size - collected);
+        const uint64_t size =
+            std::min<uint64_t>(slice.size, read_size - collected);
         if (size != 0) {
             iovs.push_back({slice.ptr, static_cast<size_t>(size)});
             collected += size;
@@ -933,7 +928,8 @@ void DistributedStorageBackend::ExecuteSingleReadTask(
     // that allocated object_size bytes), absorb the trailing padding with the
     // sink so the iovec total matches the on-disk reserved size.
     if (collected < read_size) {
-        iovs.push_back({sink.data(), static_cast<size_t>(read_size - collected)});
+        iovs.push_back(
+            {sink.data(), static_cast<size_t>(read_size - collected)});
     }
 
     constexpr size_t kMaxIovChunk = 1024;
@@ -954,15 +950,16 @@ void DistributedStorageBackend::ExecuteSingleReadTask(
              j < iovs.size() && pending.size() < kMaxIovChunk; ++j) {
             pending.push_back(iovs[j]);
         }
-        auto read_result = task.direct_read
-                               ? fs_adapter_->DirectReadAt(
-                                     task.target.fd, pending.data(),
-                                     static_cast<int>(pending.size()),
-                                     static_cast<int64_t>(entry.value_offset + done))
-                               : fs_adapter_->ReadAt(
-                                     task.target.fd, pending.data(),
-                                     static_cast<int>(pending.size()),
-                                     static_cast<int64_t>(entry.value_offset + done));
+        auto read_result =
+            task.direct_read
+                ? fs_adapter_->DirectReadAt(
+                      task.target.fd, pending.data(),
+                      static_cast<int>(pending.size()),
+                      static_cast<int64_t>(entry.value_offset + done))
+                : fs_adapter_->ReadAt(
+                      task.target.fd, pending.data(),
+                      static_cast<int>(pending.size()),
+                      static_cast<int64_t>(entry.value_offset + done));
         if (!read_result) {
             error = read_result.error();
             break;
@@ -987,9 +984,9 @@ void DistributedStorageBackend::ExecuteSingleReadTask(
     if (error == ErrorCode::OK && done != read_size) {
         error = ErrorCode::FILE_READ_FAIL;
     }
-    results[entry.request_index] =
-        error == ErrorCode::OK ? tl::expected<void, ErrorCode>{}
-                               : tl::make_unexpected(error);
+    results[entry.request_index] = error == ErrorCode::OK
+                                       ? tl::expected<void, ErrorCode>{}
+                                       : tl::make_unexpected(error);
 }
 
 void DistributedStorageBackend::ExecuteMergedReadTask(
@@ -1034,7 +1031,8 @@ void DistributedStorageBackend::ExecuteMergedReadTask(
         }
         if (collected < reserved) {
             const size_t padding = static_cast<size_t>(reserved - collected);
-            scratch.iovs.push_back({scratch.sink.data() + sink_offset, padding});
+            scratch.iovs.push_back(
+                {scratch.sink.data() + sink_offset, padding});
             sink_offset += padding;
         }
     }
@@ -1056,15 +1054,15 @@ void DistributedStorageBackend::ExecuteMergedReadTask(
              ++j) {
             scratch.pending.push_back(scratch.iovs[j]);
         }
-        auto read_result = task.direct_read
-                               ? fs_adapter_->DirectReadAt(
-                                     task.target.fd, scratch.pending.data(),
-                                     static_cast<int>(scratch.pending.size()),
-                                     static_cast<int64_t>(task.io_offset + done))
-                               : fs_adapter_->ReadAt(
-                                     task.target.fd, scratch.pending.data(),
-                                     static_cast<int>(scratch.pending.size()),
-                                     static_cast<int64_t>(task.io_offset + done));
+        auto read_result =
+            task.direct_read ? fs_adapter_->DirectReadAt(
+                                   task.target.fd, scratch.pending.data(),
+                                   static_cast<int>(scratch.pending.size()),
+                                   static_cast<int64_t>(task.io_offset + done))
+                             : fs_adapter_->ReadAt(
+                                   task.target.fd, scratch.pending.data(),
+                                   static_cast<int>(scratch.pending.size()),
+                                   static_cast<int64_t>(task.io_offset + done));
         if (!read_result) {
             error = read_result.error();
             break;
@@ -1091,9 +1089,9 @@ void DistributedStorageBackend::ExecuteMergedReadTask(
         error = ErrorCode::FILE_READ_FAIL;
     }
     for (const auto& entry : task.entries) {
-        results[entry.request_index] =
-            error == ErrorCode::OK ? tl::expected<void, ErrorCode>{}
-                                   : tl::make_unexpected(error);
+        results[entry.request_index] = error == ErrorCode::OK
+                                           ? tl::expected<void, ErrorCode>{}
+                                           : tl::make_unexpected(error);
     }
 }
 
@@ -1109,7 +1107,8 @@ void DistributedStorageBackend::ExecuteReadTasks(
     }
 
     const size_t worker_count = std::min<size_t>(
-        static_cast<size_t>(distributed_config_.batch_read_threads), tasks.size());
+        static_cast<size_t>(distributed_config_.batch_read_threads),
+        tasks.size());
     std::atomic<size_t> next_task{0};
     std::mutex completion_mutex;
     std::condition_variable completion_cv;
@@ -1159,7 +1158,8 @@ void DistributedStorageBackend::ExecuteReadTasks(
     }
 
     std::unique_lock<std::mutex> lock(completion_mutex);
-    completion_cv.wait(lock, [&pending_workers] { return pending_workers == 0; });
+    completion_cv.wait(lock,
+                       [&pending_workers] { return pending_workers == 0; });
 }
 
 ErrorCode DistributedStorageBackend::AcquireInflightReadUntil(
@@ -1175,11 +1175,11 @@ ErrorCode DistributedStorageBackend::AcquireInflightReadUntil(
                inflight_read_bytes_ <=
                    distributed_config_.batch_get_max_inflight_bytes - bytes;
     };
-    const auto capacity_available_or_dfs_timed_out =
-        [this, &capacity_available] {
-            return capacity_available() ||
-                   dfs_read_timed_out_.load(std::memory_order_acquire);
-        };
+    const auto capacity_available_or_dfs_timed_out = [this,
+                                                      &capacity_available] {
+        return capacity_available() ||
+               dfs_read_timed_out_.load(std::memory_order_acquire);
+    };
     while (true) {
         if (dfs_read_timed_out_.load(std::memory_order_acquire)) {
             return ErrorCode::DFS_BATCH_GET_TIMEOUT;
@@ -1190,8 +1190,7 @@ ErrorCode DistributedStorageBackend::AcquireInflightReadUntil(
             return ErrorCode::OK;
         }
         if (deadline == std::chrono::steady_clock::time_point::max()) {
-            inflight_read_cv_.wait(lock,
-                                   capacity_available_or_dfs_timed_out);
+            inflight_read_cv_.wait(lock, capacity_available_or_dfs_timed_out);
         } else if (!inflight_read_cv_.wait_until(
                        lock, deadline, capacity_available_or_dfs_timed_out)) {
             return ErrorCode::DFS_BATCH_GET_ADMISSION_TIMEOUT;
@@ -1225,8 +1224,7 @@ tl::expected<void, ErrorCode>
 DistributedStorageBackend::InitBucketModeLocked() {
     canonical_root_dir_ = CanonicalizePath(root_dir_);
     if (canonical_root_dir_.empty()) {
-        LOG(ERROR) << "Failed to canonicalize DFS root directory "
-                   << root_dir_;
+        LOG(ERROR) << "Failed to canonicalize DFS root directory " << root_dir_;
         ResetFailedInitializationLocked();
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
@@ -1243,25 +1241,9 @@ DistributedStorageBackend::InitBucketModeLocked() {
     initialized_.store(true, std::memory_order_release);
     LOG(INFO) << "DistributedStorageBackend initialized in bucket mode, "
                  "fsdir="
-              << root_dir_ << ", bucket_capacity="
-              << distributed_config_.bucket_capacity;
+              << root_dir_
+              << ", bucket_capacity=" << distributed_config_.bucket_capacity;
     return {};
-}
-
-std::optional<DfsAllocatorType> ParseDfsAllocatorType(std::string_view name) {
-    if (name == "shard" || name == "SHARD") return DfsAllocatorType::SHARD;
-    if (name == "bucket" || name == "BUCKET") return DfsAllocatorType::BUCKET;
-    return std::nullopt;
-}
-
-const char* ToString(DfsAllocatorType type) {
-    switch (type) {
-        case DfsAllocatorType::SHARD:
-            return "shard";
-        case DfsAllocatorType::BUCKET:
-            return "bucket";
-    }
-    return "unknown";
 }
 
 bool DistributedStorageConfig::IsReplicaEnabledFromEnvironment() {
@@ -1280,35 +1262,12 @@ DistributedStorageBackend::ResolveTarget(
     const DistributedFSDescriptor& descriptor, const std::string& key,
     bool read_only) {
     if (!IsBucketMode()) {
-        if (descriptor.shard_idx < 0 ||
-            descriptor.shard_idx >= static_cast<int>(shard_files_.size())) {
-            LOG(ERROR) << "Invalid DFS shard_idx " << descriptor.shard_idx
-                       << " for key " << key;
+        if (!IsDfsDescriptorRangeValid(descriptor, distributed_config_))
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        auto& shard = *shard_files_[descriptor.shard_idx];
-        if (descriptor.file_path != shard.path) {
-            LOG(ERROR) << "DFS path mismatch for key " << key
-                       << ", descriptor=" << descriptor.file_path
-                       << ", configured=" << shard.path;
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        if (!IsDfsDescriptorRangeValid(descriptor, distributed_config_)) {
-            LOG(ERROR) << "Invalid DFS descriptor range for key " << key
-                       << ", offset=" << descriptor.offset
-                       << ", object_size=" << descriptor.object_size
-                       << ", aligned_size=" << descriptor.aligned_size
-                       << ", shard_capacity="
-                       << distributed_config_.shard_capacity;
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        const int fd = read_only
-                           ? shard.read_fd
-                           : shard.write_fd.load(std::memory_order_acquire);
-        if (fd < 0) {
-            return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
-        }
-        return ResolvedTarget{fd, &shard.mutex, false, nullptr};
+        auto shard = GetOrOpenShard(descriptor, read_only);
+        if (!shard) return tl::make_unexpected(shard.error());
+        return ResolvedTarget{read_only ? (*shard)->read_fd : (*shard)->fd,
+                              &(*shard)->mutex, false, nullptr};
     }
 
     // BUCKET mode: the descriptor carries an allocator-chosen path, so it must
@@ -1416,7 +1375,9 @@ DistributedStorageBackend::BatchWriteShard(
         requests.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     for (size_t i = 0; i < requests.size(); ++i) {
         const auto& request = requests[i];
-        auto target = ResolveTarget(request.descriptor, request.key);
+        if (!IsDfsDescriptorRangeValid(request.descriptor, distributed_config_))
+            continue;
+        auto target = GetOrOpenShard(request.descriptor);
         if (!target) {
             results[i] = tl::make_unexpected(target.error());
             continue;
@@ -1436,10 +1397,23 @@ DistributedStorageBackend::BatchWriteShard(
         }
         if (total == 0 || value_size != request.descriptor.object_size)
             continue;
-        std::lock_guard<std::mutex> lock(*target->mutex);
-        auto result = fs_adapter_->WriteAt(
-            target->fd, iovs.data(), static_cast<int>(iovs.size()),
-            static_cast<int64_t>(request.descriptor.offset));
+        auto& shard = **target;
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        auto perform = [&] {
+            return fs_adapter_->WriteAt(
+                shard.fd, iovs.data(), static_cast<int>(iovs.size()),
+                static_cast<int64_t>(request.descriptor.offset));
+        };
+        auto result = perform();
+        if (!result && fs_adapter_->SupportsFdReopen() &&
+            result.error() == ErrorCode::FILE_WRITE_FAIL) {
+            auto reopened = ReopenShardLocked(shard);
+            if (!reopened) {
+                results[i] = tl::make_unexpected(result.error());
+                continue;
+            }
+            result = perform();
+        }
         if (!result)
             results[i] = tl::make_unexpected(result.error());
         else if (*result == total)
@@ -1457,7 +1431,9 @@ DistributedStorageBackend::BatchReadShard(
         requests.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     for (size_t i = 0; i < requests.size(); ++i) {
         const auto& request = requests[i];
-        auto target = ResolveTarget(request.descriptor, request.key, true);
+        if (!IsDfsDescriptorRangeValid(request.descriptor, distributed_config_))
+            continue;
+        auto target = GetOrOpenShard(request.descriptor, true);
         if (!target) {
             results[i] = tl::make_unexpected(target.error());
             continue;
@@ -1479,11 +1455,19 @@ DistributedStorageBackend::BatchReadShard(
             }
             capacity += slice.size;
         }
-        if (invalid || capacity < request.descriptor.object_size) continue;
+        const uint64_t requested_size =
+            request.range_read ? capacity : request.descriptor.object_size;
+        if (invalid ||
+            (request.range_read &&
+             (request.value_offset > request.descriptor.object_size ||
+              requested_size >
+                  request.descriptor.object_size - request.value_offset)) ||
+            (!request.range_read && capacity < requested_size))
+            continue;
 
         std::vector<iovec> iovs;
         iovs.reserve(request.slices.size());
-        size_t remaining = static_cast<size_t>(request.descriptor.object_size);
+        size_t remaining = static_cast<size_t>(requested_size);
         for (const auto& slice : request.slices) {
             if (remaining == 0) break;
             const size_t size = std::min(slice.size, remaining);
@@ -1491,13 +1475,36 @@ DistributedStorageBackend::BatchReadShard(
             remaining -= size;
         }
 
-        std::lock_guard<std::mutex> lock(*target->mutex);
-        auto result = fs_adapter_->ReadAt(
-            target->fd, iovs.data(), static_cast<int>(iovs.size()),
-            static_cast<int64_t>(request.descriptor.offset));
+        auto& shard = **target;
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        auto file_size = fs_adapter_->GetFileSize(shard.path);
+        if (!file_size ||
+            request.descriptor.offset > static_cast<uint64_t>(*file_size) ||
+            request.descriptor.object_size >
+                static_cast<uint64_t>(*file_size) - request.descriptor.offset) {
+            results[i] = tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            continue;
+        }
+        auto perform = [&] {
+            return fs_adapter_->ReadAt(
+                shard.read_fd, iovs.data(), static_cast<int>(iovs.size()),
+                static_cast<int64_t>(
+                    request.descriptor.offset +
+                    (request.range_read ? request.value_offset : 0)));
+        };
+        auto result = perform();
+        if (!result && fs_adapter_->SupportsFdReopen() &&
+            result.error() == ErrorCode::FILE_READ_FAIL) {
+            auto reopened = ReopenShardLocked(shard, true);
+            if (!reopened) {
+                results[i] = tl::make_unexpected(result.error());
+                continue;
+            }
+            result = perform();
+        }
         if (!result)
             results[i] = tl::make_unexpected(result.error());
-        else if (*result == request.descriptor.object_size)
+        else if (*result == requested_size)
             results[i] = {};
         else
             results[i] = tl::make_unexpected(ErrorCode::FILE_READ_FAIL);

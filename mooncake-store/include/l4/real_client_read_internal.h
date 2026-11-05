@@ -21,8 +21,8 @@ uint64_t NextDfsReadTraceId();
 
 std::string DirectSourceForReplica(const Replica::Descriptor &replica);
 
-bool CompatibleSessionCacheRefresh(
-    const QueryResult &old_session, const QueryResult &fresh_session);
+bool CompatibleSessionCacheRefresh(const QueryResult &old_session,
+                                   const QueryResult &fresh_session);
 
 bool SameGetSessionSnapshot(const QueryResult &lhs, const QueryResult &rhs);
 
@@ -33,9 +33,10 @@ void DetachPrefetchedSessionBuffer(
     const std::string &key,
     std::vector<std::shared_ptr<BufferHandle>> &detached_buffers);
 
-QueryResult FilterQueryResult(
-    const QueryResult &qr, const Replica::Descriptor &replica,
-    bool include_object_checksum = true);
+QueryResult FilterQueryResult(const QueryResult &qr,
+                              const Replica::Descriptor &replica,
+                              bool include_object_checksum = true,
+                              bool preserve_memory_candidates = true);
 
 const Replica::Descriptor *SelectSessionReplica(
     const std::vector<Replica::Descriptor> &replicas,

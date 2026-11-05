@@ -73,7 +73,7 @@ class DfsBufferUsageTracker {
     }
 
     DfsBufferAdmissionFailure TryReserve(DfsBufferUsageKind kind,
-                                          uint64_t bytes) {
+                                         uint64_t bytes) {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto index = static_cast<size_t>(kind);
         if (bytes > std::numeric_limits<uint64_t>::max() - reserved_total_) {
@@ -92,17 +92,16 @@ class DfsBufferUsageTracker {
         if (capacity_bytes_ > 0 && total_after > capacity_bytes_) {
             return DfsBufferAdmissionFailure::kCapacity;
         }
-        const auto read_index =
-            static_cast<size_t>(DfsBufferUsageKind::kRead);
+        const auto read_index = static_cast<size_t>(DfsBufferUsageKind::kRead);
         if (bytes_[read_index] >
             std::numeric_limits<uint64_t>::max() - reserved_[read_index]) {
             return DfsBufferAdmissionFailure::kOverflow;
         }
         const auto current_read_bytes =
             bytes_[read_index] + reserved_[read_index];
-        const auto effective_read_protection = std::min(
-            capacity_bytes_,
-            std::max(read_min_protection_bytes_, current_read_bytes));
+        const auto effective_read_protection =
+            std::min(capacity_bytes_,
+                     std::max(read_min_protection_bytes_, current_read_bytes));
         const auto non_read_after = total_after - current_read_bytes;
 
         switch (kind) {
@@ -110,22 +109,20 @@ class DfsBufferUsageTracker {
                 break;
             case DfsBufferUsageKind::kPrefetch: {
                 if (capacity_bytes_ > 0 &&
-                    non_read_after > capacity_bytes_ -
-                                         effective_read_protection) {
+                    non_read_after >
+                        capacity_bytes_ - effective_read_protection) {
                     return DfsBufferAdmissionFailure::kReadReserve;
                 }
                 const auto prefetch_bytes =
                     bytes_[static_cast<size_t>(DfsBufferUsageKind::kPrefetch)];
                 if (prefetch_bytes >
-                        std::numeric_limits<uint64_t>::max() -
-                            reserved_[index]) {
+                    std::numeric_limits<uint64_t>::max() - reserved_[index]) {
                     return DfsBufferAdmissionFailure::kOverflow;
                 }
                 const auto prefetch_reserved =
                     prefetch_bytes + reserved_[index];
                 if (bytes >
-                    std::numeric_limits<uint64_t>::max() -
-                        prefetch_reserved) {
+                    std::numeric_limits<uint64_t>::max() - prefetch_reserved) {
                     return DfsBufferAdmissionFailure::kOverflow;
                 }
                 if (admission_configured_ &&
@@ -136,8 +133,8 @@ class DfsBufferUsageTracker {
             }
             case DfsBufferUsageKind::kWrite:
                 if (capacity_bytes_ > 0 &&
-                    non_read_after > capacity_bytes_ -
-                                         effective_read_protection) {
+                    non_read_after >
+                        capacity_bytes_ - effective_read_protection) {
                     return DfsBufferAdmissionFailure::kReadReserve;
                 }
                 break;
@@ -159,12 +156,10 @@ class DfsBufferUsageTracker {
             const auto index = static_cast<size_t>(kind);
             DCHECK_GE(reserved_[index], reserved);
             DCHECK_GE(reserved_total_, reserved);
-            reserved_[index] = reserved_[index] >= reserved
-                                   ? reserved_[index] - reserved
-                                   : 0;
-            reserved_total_ = reserved_total_ >= reserved
-                                  ? reserved_total_ - reserved
-                                  : 0;
+            reserved_[index] =
+                reserved_[index] >= reserved ? reserved_[index] - reserved : 0;
+            reserved_total_ =
+                reserved_total_ >= reserved ? reserved_total_ - reserved : 0;
             bytes_[index] += actual;
             total_bytes_ += actual;
             peak_total_bytes_ = std::max(peak_total_bytes_, total_bytes_);
@@ -194,10 +189,10 @@ class DfsBufferUsageTracker {
         const auto index = static_cast<size_t>(kind);
         DCHECK_GE(reserved_[index], bytes);
         DCHECK_GE(reserved_total_, bytes);
-        reserved_[index] = reserved_[index] >= bytes
-                               ? reserved_[index] - bytes
-                               : 0;
-        reserved_total_ = reserved_total_ >= bytes ? reserved_total_ - bytes : 0;
+        reserved_[index] =
+            reserved_[index] >= bytes ? reserved_[index] - bytes : 0;
+        reserved_total_ =
+            reserved_total_ >= bytes ? reserved_total_ - bytes : 0;
     }
 
     void Add(DfsBufferUsageKind kind, uint64_t bytes) {
@@ -234,9 +229,8 @@ class DfsBufferUsageTracker {
         std::lock_guard<std::mutex> lock(mutex_);
         auto& value = bytes_[static_cast<size_t>(kind)];
         DCHECK_GE(value, bytes)
-            << "DFS buffer usage underflow for kind="
-            << static_cast<int>(kind) << ", current=" << value
-            << ", remove=" << bytes;
+            << "DFS buffer usage underflow for kind=" << static_cast<int>(kind)
+            << ", current=" << value << ", remove=" << bytes;
         DCHECK_GE(total_bytes_, bytes)
             << "DFS total buffer usage underflow: current=" << total_bytes_
             << ", remove=" << bytes;
@@ -300,7 +294,8 @@ class DfsBufferAllocationUsage {
     }
 
     DfsBufferAllocationUsage(const DfsBufferAllocationUsage&) = delete;
-    DfsBufferAllocationUsage& operator=(const DfsBufferAllocationUsage&) = delete;
+    DfsBufferAllocationUsage& operator=(const DfsBufferAllocationUsage&) =
+        delete;
 
    private:
     std::shared_ptr<DfsBufferUsageTracker> tracker_;

@@ -1,3 +1,10 @@
+#include <condition_variable>
+#include <fstream>
+#include <iterator>
+#include "storage/distributed/dfs_global_allocator.h"
+#include "storage/distributed/dfs_io_timeout.h"
+#include "storage/distributed/dfs_root_identity.h"
+#include "storage/distributed/dfs_read_probe.h"
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <sys/stat.h>
@@ -5,14 +12,14 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
-#include <iterator>
+#include <functional>
+#include <future>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -21,57 +28,14 @@
 #include <vector>
 
 #include "replica.h"
-#include "storage/distributed/dfs_global_allocator.h"
-#include "storage/distributed/dfs_io_timeout.h"
-#include "storage/distributed/dfs_root_identity.h"
-#include "storage/distributed/dfs_read_probe.h"
+#include "storage/distributed/shard_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #include "storage_backend.h"
 
 namespace mooncake::test {
-
-namespace {
-
 const std::string kTestDfsRootIdentity =
     SerializeDfsRootIdentity("dfs_posix_test", UUID{1, 2});
-
-bool WriteTestDfsRootIdentity(const std::string& root) {
-    const std::string marker_path =
-        root + "/" + kDfsRootIdentityFileName;
-    std::ofstream marker(marker_path, std::ios::binary | std::ios::trunc);
-    marker.write(kTestDfsRootIdentity.data(),
-                 static_cast<std::streamsize>(kTestDfsRootIdentity.size()));
-    return marker.good();
-}
-
-std::string TestDfsReadProbePath(const std::string& root,
-                                 size_t probe_index) {
-    return root + "/" +
-           std::string(kDfsReadProbeDirectoryNames.at(probe_index)) + "/" +
-           kDfsReadProbeFileName;
-}
-
-bool WriteTestDfsReadProbes(const std::string& root) {
-    for (size_t probe_index = 0;
-         probe_index < kDfsReadProbeDirectoryNames.size(); ++probe_index) {
-        const std::filesystem::path directory =
-            std::filesystem::path(root) /
-            kDfsReadProbeDirectoryNames[probe_index];
-        std::error_code ec;
-        std::filesystem::create_directory(directory, ec);
-        if (ec || !std::filesystem::is_directory(directory)) return false;
-        std::ofstream probe(TestDfsReadProbePath(root, probe_index),
-                            std::ios::binary | std::ios::trunc);
-        const auto contents =
-            BuildDfsReadProbeContents(kTestDfsRootIdentity, probe_index);
-        probe.write(contents.data(), contents.size());
-        if (!probe.good()) return false;
-    }
-    return true;
-}
-
-}  // namespace
 
 class TempDir {
    public:
@@ -115,7 +79,6 @@ class EnvGuard {
         Save("MOONCAKE_DFS_SHARD_CAPACITY");
         Save("MOONCAKE_DFS_ALIGNMENT");
         Save("MOONCAKE_DFS_SINGLE_TENANT");
-        Save("MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS");
     }
 
     ~EnvGuard() {
@@ -167,35 +130,16 @@ class AlignedBuffer {
     size_t size_ = 0;
 };
 
-class TrackingDirectPosixFsAdapter : public PosixFsAdapter {
-   public:
-    int aligned_reads() const { return aligned_reads_; }
-    int staged_reads() const { return staged_reads_; }
-
-   protected:
-    tl::expected<size_t, ErrorCode> DirectReadAtAligned(
-        int fd, iovec* iov, int iovcnt, int64_t offset) override {
-        ++aligned_reads_;
-        return PosixFsAdapter::DirectReadAtAligned(fd, iov, iovcnt, offset);
-    }
-
-    tl::expected<size_t, ErrorCode> DirectReadAtStaged(
-        int fd, iovec* iov, int iovcnt, int64_t offset) override {
-        ++staged_reads_;
-        return PosixFsAdapter::DirectReadAtStaged(fd, iov, iovcnt, offset);
-    }
-
-   private:
-    int aligned_reads_ = 0;
-    int staged_reads_ = 0;
-};
-
 void ConfigurePosixDfs(EnvGuard& env) {
     env.Set("MOONCAKE_DFS_FS_ADAPTER", "posix");
     env.Set("MOONCAKE_DFS_SINGLE_TENANT", "1");
     env.Set("MOONCAKE_DFS_EVICTION_ENABLED", "0");
     env.Set("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
 }
+
+// Small-shard tests use objects that reserve two 4 KiB pages, so a few of
+// them fill a shard and cross the eviction watermarks.
+constexpr uint64_t kTwoPageObject = 8 * 1024;
 
 DistributedStorageConfig MakeAllocatorConfig(const std::string& mount_path,
                                              int shard_count,
@@ -209,8 +153,8 @@ DistributedStorageConfig MakeAllocatorConfig(const std::string& mount_path,
     return config;
 }
 
-std::vector<DfsGlobalAllocator::EvictionCandidate>
-PrepareAndCommitPreparedEviction(DfsGlobalAllocator& allocator) {
+std::vector<ShardAllocator::EvictionCandidate> PrepareAndCommitPreparedEviction(
+    ShardAllocator& allocator) {
     auto pending = allocator.PrepareEviction();
     auto candidates = pending.Candidates();
     allocator.CommitPreparedEviction(std::move(pending));
@@ -267,86 +211,6 @@ TEST_F(FsAdapterFdTest, WriteAtReadAt) {
     EXPECT_EQ(std::memcmp(write_buf, read_buf, sizeof(write_buf)), 0);
 
     adapter_->CloseFile(*fd);
-}
-
-TEST_F(FsAdapterFdTest, DirectReadUsesCallerBufferWhenFullyAligned) {
-    const std::string path = tmp_->file("direct_aligned.data");
-    TrackingDirectPosixFsAdapter adapter;
-    ASSERT_TRUE(adapter.Init(tmp_->path()).has_value());
-    ASSERT_TRUE(adapter.PreallocateFile(path, 2 * 4096).has_value());
-
-    auto write_fd = adapter.OpenFile(path);
-    ASSERT_TRUE(write_fd.has_value());
-    AlignedBuffer source(2 * 4096);
-    ASSERT_NE(source.data(), nullptr);
-    std::memset(source.data(), 'A', 4096);
-    std::memset(source.data() + 4096, 'B', 4096);
-    iovec write_iov{source.data(), source.size()};
-    ASSERT_EQ(adapter.WriteAt(*write_fd, &write_iov, 1, 0).value(),
-              source.size());
-    ASSERT_TRUE(adapter.CloseFile(*write_fd).has_value());
-
-    auto direct_fd = adapter.OpenFileDirect(path);
-    ASSERT_TRUE(direct_fd.has_value());
-    AlignedBuffer first(4096), second(4096);
-    ASSERT_NE(first.data(), nullptr);
-    ASSERT_NE(second.data(), nullptr);
-    iovec reads[2]{{first.data(), first.size()},
-                   {second.data(), second.size()}};
-    auto result = adapter.DirectReadAt(*direct_fd, reads, 2, 0);
-    ASSERT_TRUE(result.has_value());
-    EXPECT_EQ(*result, 2 * 4096u);
-    EXPECT_EQ(adapter.aligned_reads(), 1);
-    EXPECT_EQ(adapter.staged_reads(), 0);
-    EXPECT_EQ(std::memcmp(first.data(), source.data(), 4096), 0);
-    EXPECT_EQ(std::memcmp(second.data(), source.data() + 4096, 4096), 0);
-    EXPECT_TRUE(adapter.CloseFile(*direct_fd).has_value());
-}
-
-TEST_F(FsAdapterFdTest, DirectReadStagesUnalignedRequestsWithoutOverflow) {
-    const std::string path = tmp_->file("direct_staged.data");
-    TrackingDirectPosixFsAdapter adapter;
-    ASSERT_TRUE(adapter.Init(tmp_->path()).has_value());
-    ASSERT_TRUE(adapter.PreallocateFile(path, 4096).has_value());
-
-    auto write_fd = adapter.OpenFile(path);
-    ASSERT_TRUE(write_fd.has_value());
-    std::vector<char> source(4096, 'S');
-    iovec write_iov{source.data(), source.size()};
-    ASSERT_EQ(adapter.WriteAt(*write_fd, &write_iov, 1, 0).value(),
-              source.size());
-    ASSERT_TRUE(adapter.CloseFile(*write_fd).has_value());
-
-    auto direct_fd = adapter.OpenFileDirect(path);
-    ASSERT_TRUE(direct_fd.has_value());
-
-    AlignedBuffer storage(4098);
-    ASSERT_NE(storage.data(), nullptr);
-    storage.data()[0] = 'L';
-    storage.data()[4097] = 'R';
-    iovec unaligned_address{storage.data() + 1, 4096};
-    auto address_result =
-        adapter.DirectReadAt(*direct_fd, &unaligned_address, 1, 0);
-    ASSERT_TRUE(address_result.has_value());
-    EXPECT_EQ(*address_result, 4096u);
-    EXPECT_EQ(storage.data()[0], 'L');
-    EXPECT_EQ(storage.data()[4097], 'R');
-
-    AlignedBuffer short_target(4096);
-    ASSERT_NE(short_target.data(), nullptr);
-    short_target.data()[1234] = 'G';
-    iovec unaligned_length{short_target.data(), 1234};
-    auto length_result =
-        adapter.DirectReadAt(*direct_fd, &unaligned_length, 1, 0);
-    ASSERT_TRUE(length_result.has_value());
-    EXPECT_EQ(*length_result, 1234u);
-    EXPECT_EQ(short_target.data()[1234], 'G');
-
-    EXPECT_EQ(adapter.aligned_reads(), 0);
-    EXPECT_EQ(adapter.staged_reads(), 2);
-    EXPECT_EQ(std::memcmp(storage.data() + 1, source.data(), 4096), 0);
-    EXPECT_EQ(std::memcmp(short_target.data(), source.data(), 1234), 0);
-    EXPECT_TRUE(adapter.CloseFile(*direct_fd).has_value());
 }
 
 TEST_F(FsAdapterFdTest, MultiIovWriteRead) {
@@ -457,12 +321,123 @@ TEST_F(FsAdapterFdTest, PreallocateLargeSparseFile) {
     adapter_->CloseFile(*fd);
 }
 
-TEST(DfsGlobalAllocatorTest, AllocateFreeAndFormatShardIdx) {
+std::string TestDfsReadProbePath(const std::string& root, size_t probe_index) {
+    return root + "/" +
+           std::string(kDfsReadProbeDirectoryNames.at(probe_index)) + "/" +
+           kDfsReadProbeFileName;
+}
+
+bool WriteTestDfsRootIdentity(const std::string& root) {
+    const std::string marker_path = root + "/" + kDfsRootIdentityFileName;
+    std::ofstream marker(marker_path, std::ios::binary | std::ios::trunc);
+    marker.write(kTestDfsRootIdentity.data(),
+                 static_cast<std::streamsize>(kTestDfsRootIdentity.size()));
+    return marker.good();
+}
+
+bool WriteTestDfsReadProbes(const std::string& root) {
+    for (size_t probe_index = 0;
+         probe_index < kDfsReadProbeDirectoryNames.size(); ++probe_index) {
+        const std::filesystem::path directory =
+            std::filesystem::path(root) /
+            kDfsReadProbeDirectoryNames[probe_index];
+        std::error_code ec;
+        std::filesystem::create_directory(directory, ec);
+        if (ec || !std::filesystem::is_directory(directory)) return false;
+        std::ofstream probe(TestDfsReadProbePath(root, probe_index),
+                            std::ios::binary | std::ios::trunc);
+        const auto contents =
+            BuildDfsReadProbeContents(kTestDfsRootIdentity, probe_index);
+        probe.write(contents.data(), contents.size());
+        if (!probe.good()) return false;
+    }
+    return true;
+}
+
+std::string TestDfsIdentityForRoot(const DistributedStorageConfig& config) {
+    // Direct backend tests supply the identity normally issued by the Master.
+    (void)WriteTestDfsRootIdentity(config.fsdir);
+    return kTestDfsRootIdentity;
+}
+
+class TrackingDirectPosixFsAdapter : public PosixFsAdapter {
+   public:
+    int aligned_reads() const { return aligned_reads_; }
+    int staged_reads() const { return staged_reads_; }
+
+   protected:
+    tl::expected<size_t, ErrorCode> DirectReadAtAligned(
+        int fd, iovec* iov, int iovcnt, int64_t offset) override {
+        ++aligned_reads_;
+        return PosixFsAdapter::DirectReadAtAligned(fd, iov, iovcnt, offset);
+    }
+
+    tl::expected<size_t, ErrorCode> DirectReadAtStaged(
+        int fd, iovec* iov, int iovcnt, int64_t offset) override {
+        ++staged_reads_;
+        return PosixFsAdapter::DirectReadAtStaged(fd, iov, iovcnt, offset);
+    }
+
+   private:
+    int aligned_reads_ = 0;
+    int staged_reads_ = 0;
+};
+
+class BlockingReadPosixFsAdapter : public PosixFsAdapter {
+   public:
+    void BlockReads() {
+        std::lock_guard lock(mutex_);
+        blocked_ = true;
+    }
+    void ReleaseReads() {
+        std::lock_guard lock(mutex_);
+        blocked_ = false;
+        cv_.notify_all();
+    }
+    bool WaitUntilCompleted(size_t count, std::chrono::milliseconds timeout) {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(
+            lock, timeout, [this, count] { return completed_reads_ >= count; });
+    }
+    bool WaitUntilStarted(size_t count, std::chrono::milliseconds timeout) {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, timeout,
+                            [this, count] { return started_reads_ >= count; });
+    }
+    size_t StartedReads() {
+        std::lock_guard lock(mutex_);
+        return started_reads_;
+    }
+    tl::expected<size_t, ErrorCode> ReadAt(int fd, iovec* iov, int iovcnt,
+                                           int64_t offset) override {
+        {
+            std::unique_lock lock(mutex_);
+            ++started_reads_;
+            cv_.notify_all();
+            cv_.wait(lock, [this] { return !blocked_; });
+        }
+        auto result = PosixFsAdapter::ReadAt(fd, iov, iovcnt, offset);
+        {
+            std::lock_guard lock(mutex_);
+            ++completed_reads_;
+        }
+        cv_.notify_all();
+        return result;
+    }
+
+   private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool blocked_ = false;
+    size_t started_reads_ = 0;
+    size_t completed_reads_ = 0;
+};
+TEST(ShardAllocatorTest, AllocateFreeAndFormatShardIdx) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     TempDir tmp("dfs_alloc");
 
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     ASSERT_TRUE(
         alloc.Init(MakeAllocatorConfig(tmp.path(), 4, 1024 * 1024, 4096)));
 
@@ -477,70 +452,21 @@ TEST(DfsGlobalAllocatorTest, AllocateFreeAndFormatShardIdx) {
     auto desc2 = alloc.Allocate("key2", 100);
     EXPECT_TRUE(desc2.has_value());
 
-    EXPECT_EQ(DfsGlobalAllocator::FormatShardIdx(0, 64), "00");
-    EXPECT_EQ(DfsGlobalAllocator::FormatShardIdx(9, 64), "09");
-    EXPECT_EQ(DfsGlobalAllocator::FormatShardIdx(10, 64), "10");
-    EXPECT_EQ(DfsGlobalAllocator::FormatShardIdx(63, 64), "63");
-    EXPECT_EQ(DfsGlobalAllocator::FormatShardIdx(100, 1000), "100");
+    EXPECT_EQ(ShardAllocator::FormatShardIdx(0, 64), "00");
+    EXPECT_EQ(ShardAllocator::FormatShardIdx(9, 64), "09");
+    EXPECT_EQ(ShardAllocator::FormatShardIdx(10, 64), "10");
+    EXPECT_EQ(ShardAllocator::FormatShardIdx(63, 64), "63");
+    EXPECT_EQ(ShardAllocator::FormatShardIdx(100, 1000), "100");
 }
 
-TEST(DistributedStorageConfigTest, ReadsValidatesAndFormatsEnvironment) {
-    EnvGuard env;
-    TempDir tmp("dfs_config");
-    env.Set("MOONCAKE_DFS_ROOT_DIR", tmp.path().c_str());
-    env.Set("MOONCAKE_DFS_FS_ADAPTER", "posix");
-    env.Set("MOONCAKE_DFS_SHARD_COUNT", "8");
-    env.Set("MOONCAKE_DFS_SHARD_CAPACITY", "1048576");
-    env.Set("MOONCAKE_DFS_ALIGNMENT", "4096");
-    env.Set("MOONCAKE_DFS_SINGLE_TENANT", "1");
-    env.Set("MOONCAKE_DFS_EVICTION_ENABLED", "1");
-    env.Set("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.85");
-    env.Set("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.65");
-    env.Set("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "12");
-    env.Set("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL", "3");
-    env.Set("MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS", "65432");
-    env.Set("MOONCAKE_DFS_BATCH_GET_MAX_INFLIGHT_BATCHES", "7");
-    env.Set("MOONCAKE_DFS_BATCH_GET_MAX_INFLIGHT_BYTES", "12345678");
-
-    const auto config = DistributedStorageConfig::FromEnvironment();
-    EXPECT_EQ(config.fsdir, tmp.path());
-    EXPECT_EQ(config.fs_adapter_type, "posix");
-    EXPECT_EQ(config.shard_count, 8);
-    EXPECT_EQ(config.shard_capacity, 1048576);
-    EXPECT_EQ(config.alignment, 4096);
-    EXPECT_TRUE(config.eviction_enabled);
-    EXPECT_DOUBLE_EQ(config.eviction_high_watermark, 0.85);
-    EXPECT_DOUBLE_EQ(config.eviction_low_watermark, 0.65);
-    EXPECT_EQ(config.deferred_free_duration, std::chrono::seconds(12));
-    EXPECT_EQ(config.eviction_check_interval, std::chrono::seconds(3));
-    EXPECT_EQ(config.batch_timeout_fixed_ms, 65432u);
-    EXPECT_EQ(config.batch_get_max_inflight_batches, 7u);
-    EXPECT_EQ(config.batch_get_max_inflight_bytes, 12345678u);
-    EXPECT_TRUE(config.Validate());
-    EXPECT_TRUE(config.ValidateForAllocator());
-
-    const std::string formatted = config.FormatStr();
-    EXPECT_NE(formatted.find("fs_adapter_type=posix"), std::string::npos);
-    EXPECT_NE(formatted.find("shard_count=8"), std::string::npos);
-    EXPECT_NE(formatted.find("eviction_high_watermark=0.85"),
-              std::string::npos);
-    EXPECT_NE(formatted.find("batch_timeout_fixed_ms=65432"),
-              std::string::npos);
-
-    auto invalid_eviction = config;
-    invalid_eviction.eviction_low_watermark = 0.9;
-    EXPECT_TRUE(invalid_eviction.Validate());
-    EXPECT_FALSE(invalid_eviction.ValidateForAllocator());
-}
-
-TEST(DfsGlobalAllocatorTest, InitReturnsSpecificErrors) {
+TEST(ShardAllocatorTest, InitReturnsSpecificErrors) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     TempDir tmp("dfs_init_error");
 
     DistributedStorageConfig invalid_config =
         MakeAllocatorConfig(tmp.path(), 1, 1024 * 1024, 3);
-    DfsGlobalAllocator invalid_allocator;
+    ShardAllocator invalid_allocator;
     auto invalid_result = invalid_allocator.Init(invalid_config);
     ASSERT_FALSE(invalid_result);
     EXPECT_EQ(invalid_result.error(), ErrorCode::INVALID_PARAMS);
@@ -552,55 +478,212 @@ TEST(DfsGlobalAllocatorTest, InitReturnsSpecificErrors) {
 
     DistributedStorageConfig file_error_config =
         MakeAllocatorConfig(file_path, 1, 1024 * 1024, 4096);
-    DfsGlobalAllocator file_error_allocator;
+    ShardAllocator file_error_allocator;
     auto file_error_result = file_error_allocator.Init(file_error_config);
     ASSERT_FALSE(file_error_result);
     EXPECT_EQ(file_error_result.error(), ErrorCode::FILE_WRITE_FAIL);
 }
 
-TEST(DfsGlobalAllocatorTest, AllocateReservesAlignmentPadding) {
+TEST(ShardAllocatorTest, AllocateReservesOnlyAlignedSize) {
     EnvGuard env;
     ConfigurePosixDfs(env);
-    TempDir tmp("dfs_alloc_padding");
+    TempDir tmp("dfs_alloc_exact_fit");
 
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8 * 1024, 4096)));
 
-    auto desc = alloc.Allocate("key1", 100);
-    ASSERT_TRUE(desc.has_value());
-    EXPECT_EQ(desc->aligned_size, 4096);
-    EXPECT_EQ(desc->offset % 4096, 0);
+    auto first = alloc.Allocate("key1", 100);
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->aligned_size, 4096);
+    EXPECT_EQ(first->offset, 0);
+    auto second = alloc.Allocate("key2", 100);
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(second->offset, 4096);
+    EXPECT_EQ(alloc.GetUsedBytes(), 8 * 1024);
 
-    auto exhausted = alloc.Allocate("key2", 100);
+    auto exhausted = alloc.Allocate("key3", 100);
     EXPECT_FALSE(exhausted.has_value());
     EXPECT_EQ(exhausted.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
-    alloc.Free(desc->offset, desc->aligned_size, desc->shard_idx, "key1");
-    auto after_free = alloc.Allocate("key3", 100);
-    EXPECT_TRUE(after_free.has_value());
+    alloc.Free(first->offset, first->aligned_size, first->shard_idx, "key1");
+    auto after_free = alloc.Allocate("key4", 100);
+    ASSERT_TRUE(after_free.has_value());
+    EXPECT_EQ(after_free->offset, 0);
+
+    // A payload whose aligned size equals the whole shard fits exactly.
+    TempDir whole_tmp("dfs_alloc_whole_shard");
+    ShardAllocator whole;
+    ASSERT_TRUE(
+        whole.Init(MakeAllocatorConfig(whole_tmp.path(), 1, 8 * 1024, 4096)));
+    auto full = whole.Allocate("full", 8 * 1024 - 1);
+    ASSERT_TRUE(full.has_value());
+    EXPECT_EQ(full->offset, 0);
+    EXPECT_EQ(full->aligned_size, 8 * 1024);
+    auto too_large = whole.Allocate("too_large", 8 * 1024 + 1);
+    EXPECT_FALSE(too_large.has_value());
 }
 
-TEST(DfsGlobalAllocatorTest, ExhaustionAndEviction) {
+TEST(ShardAllocatorTest, MegabytePayloadsPackWithoutAlignmentHeadroom) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    constexpr uint64_t kMiB = 1024 * 1024;
+    constexpr uint64_t kShardCapacity = 32 * kMiB;
+
+    struct Case {
+        uint64_t size;
+        uint64_t reserved;
+        size_t count;
+    };
+    // Reservations follow the allocator's size classes (eight per power of
+    // two), so only payloads off a class boundary reserve extra bytes.
+    const std::vector<Case> cases{
+        {kMiB, kMiB, 32},
+        {kMiB + 1, kMiB + kMiB / 8, 28},
+        {kMiB + kMiB / 2, kMiB + kMiB / 2, 21},
+        {2 * kMiB, 2 * kMiB, 16},
+        {3 * kMiB - 123, 3 * kMiB, 10},
+        {4 * kMiB, 4 * kMiB, 8},
+        {8 * kMiB, 8 * kMiB, 4},
+    };
+
+    for (const auto& c : cases) {
+        SCOPED_TRACE("size=" + std::to_string(c.size));
+        TempDir tmp("dfs_alloc_mib");
+        ShardAllocator alloc;
+        ASSERT_TRUE(alloc.Init(
+            MakeAllocatorConfig(tmp.path(), 1, kShardCapacity, 4096)));
+        FileStorageConfig file_config;
+        file_config.storage_backend_type = StorageBackendType::kDistributed;
+        file_config.storage_filepath = tmp.path();
+        DistributedStorageBackend client(
+            file_config,
+            MakeAllocatorConfig(tmp.path(), 1, kShardCapacity, 4096),
+            std::make_unique<PosixFsAdapter>(),
+            TestDfsIdentityForRoot(
+                MakeAllocatorConfig(tmp.path(), 1, kShardCapacity, 4096)));
+        ASSERT_TRUE(client.Init());
+
+        std::vector<DistributedFSDescriptor> descs;
+        while (true) {
+            auto desc =
+                alloc.Allocate("k" + std::to_string(descs.size()), c.size);
+            if (!desc) {
+                EXPECT_EQ(desc.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+                break;
+            }
+            EXPECT_EQ(desc->offset % 4096, 0);
+            EXPECT_EQ(desc->offset, descs.size() * c.reserved);
+            descs.push_back(*desc);
+        }
+        ASSERT_EQ(descs.size(), c.count);
+        EXPECT_EQ(alloc.GetUsedBytes(), c.count * c.reserved);
+
+        // Write a distinct pattern into every object, then read all of them
+        // back: overlapping extents would clobber a neighbour's bytes.
+        std::vector<std::string> values;
+        for (size_t i = 0; i < descs.size(); ++i) {
+            values.emplace_back(c.size, static_cast<char>('a' + i % 26));
+            values.back().back() = static_cast<char>('A' + i % 26);
+            auto writes =
+                client.BatchWrite({{"k" + std::to_string(i),
+                                    descs[i],
+                                    {{values[i].data(), values[i].size()}}}});
+            ASSERT_EQ(writes.size(), 1);
+            ASSERT_TRUE(writes[0]) << "write " << i;
+        }
+        for (size_t i = 0; i < descs.size(); ++i) {
+            std::string output(c.size, '\0');
+            auto reads = client.BatchRead({{"k" + std::to_string(i),
+                                            descs[i],
+                                            {{output.data(), output.size()}}}});
+            ASSERT_EQ(reads.size(), 1);
+            ASSERT_TRUE(reads[0]) << "read " << i;
+            EXPECT_TRUE(output == values[i]) << "readback mismatch " << i;
+        }
+    }
+}
+
+TEST(ShardAllocatorTest, MixedMegabytePayloadsStayAlignedAcrossReuse) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    constexpr uint64_t kMiB = 1024 * 1024;
+    const std::vector<uint64_t> sizes{kMiB,         kMiB + 1, kMiB + kMiB / 3,
+                                      2 * kMiB - 7, 3 * kMiB, 5 * kMiB + 4097,
+                                      7 * kMiB / 2};
+
+    for (uint64_t alignment : {uint64_t{4096}, uint64_t{64 * 1024}, kMiB}) {
+        SCOPED_TRACE("alignment=" + std::to_string(alignment));
+        TempDir tmp("dfs_alloc_mixed_mib");
+        ShardAllocator alloc;
+        ASSERT_TRUE(alloc.Init(
+            MakeAllocatorConfig(tmp.path(), 1, 256 * kMiB, alignment)));
+
+        std::map<uint64_t, std::pair<std::string, DistributedFSDescriptor>>
+            live;
+        auto check_live = [&]() {
+            uint64_t previous_end = 0;
+            for (const auto& [offset, entry] : live) {
+                const auto& desc = entry.second;
+                EXPECT_EQ(offset % alignment, 0);
+                EXPECT_GE(offset, previous_end);
+                previous_end = offset + desc.aligned_size;
+                EXPECT_LE(previous_end, 256 * kMiB);
+            }
+        };
+
+        for (int round = 0; round < 4; ++round) {
+            size_t allocated = 0;
+            for (size_t i = 0;; ++i) {
+                const std::string key =
+                    "r" + std::to_string(round) + "_" + std::to_string(i);
+                auto desc = alloc.Allocate(key, sizes[i % sizes.size()]);
+                if (!desc) break;
+                ASSERT_TRUE(
+                    live.emplace(desc->offset, std::make_pair(key, *desc))
+                        .second);
+                ++allocated;
+            }
+            EXPECT_GT(allocated, round == 0 ? 50u : 10u);
+            check_live();
+            // Free every other live object to create aligned holes of mixed
+            // sizes, which the next round refills.
+            bool drop = true;
+            for (auto it = live.begin(); it != live.end();) {
+                if (drop) {
+                    const auto& [key, desc] = it->second;
+                    alloc.Free(key, desc);
+                    it = live.erase(it);
+                } else {
+                    ++it;
+                }
+                drop = !drop;
+            }
+        }
+        check_live();
+    }
+}
+
+TEST(ShardAllocatorTest, ExhaustionAndEviction) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     env.Set("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.5");
     env.Set("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.25");
     TempDir tmp("dfs_exhaust");
 
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     ASSERT_TRUE(
         alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 32 * 1024, 4096)));
 
     std::vector<DistributedFSDescriptor> descs;
     for (int i = 0; i < 4; ++i) {
-        auto desc = alloc.Allocate("k" + std::to_string(i), 100);
+        auto desc = alloc.Allocate("k" + std::to_string(i), kTwoPageObject);
         ASSERT_TRUE(desc.has_value()) << "allocation " << i;
         alloc.UpdateAccess("k" + std::to_string(i), desc->shard_idx,
                            desc->offset);
         descs.push_back(*desc);
     }
 
-    auto exhausted = alloc.Allocate("k_exhausted", 100);
+    auto exhausted = alloc.Allocate("k_exhausted", kTwoPageObject);
     EXPECT_FALSE(exhausted.has_value());
     EXPECT_EQ(exhausted.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
@@ -611,29 +694,29 @@ TEST(DfsGlobalAllocatorTest, ExhaustionAndEviction) {
 
     // Prepare only reserves candidates; their extents are not reusable until
     // the master accepts and commits the transaction.
-    auto before_commit = alloc.Allocate("k_before_commit", 100);
+    auto before_commit = alloc.Allocate("k_before_commit", kTwoPageObject);
     EXPECT_FALSE(before_commit.has_value());
 
     alloc.CommitPreparedEviction(std::move(pending));
 
-    auto after_evict = alloc.Allocate("k_after_evict", 100);
+    auto after_evict = alloc.Allocate("k_after_evict", kTwoPageObject);
     EXPECT_TRUE(after_evict.has_value());
 }
 
-TEST(DfsGlobalAllocatorTest, RestorePreparedEvictionPreservesCandidateOrder) {
+TEST(ShardAllocatorTest, RestorePreparedEvictionPreservesCandidateOrder) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     env.Set("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.9");
     env.Set("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.7");
     TempDir tmp("dfs_abort_eviction");
 
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     ASSERT_TRUE(
         alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 32 * 1024, 4096)));
 
     for (int i = 0; i < 4; ++i) {
         const std::string key = "k" + std::to_string(i);
-        auto desc = alloc.Allocate(key, 100);
+        auto desc = alloc.Allocate(key, kTwoPageObject);
         ASSERT_TRUE(desc.has_value()) << "allocation " << i;
         alloc.UpdateAccess(key, desc->shard_idx, desc->offset);
     }
@@ -651,21 +734,21 @@ TEST(DfsGlobalAllocatorTest, RestorePreparedEvictionPreservesCandidateOrder) {
     alloc.RestorePreparedEviction(std::move(retry));
 }
 
-TEST(DfsGlobalAllocatorTest, PartialResolutionContinuesToLowWatermark) {
+TEST(ShardAllocatorTest, PartialResolutionContinuesToLowWatermark) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     env.Set("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.9");
     env.Set("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.7");
     TempDir tmp("dfs_partial_eviction");
 
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     ASSERT_TRUE(
         alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 32 * 1024, 4096)));
 
     std::vector<DistributedFSDescriptor> descs;
     for (int i = 0; i < 4; ++i) {
         const std::string key = "k" + std::to_string(i);
-        auto desc = alloc.Allocate(key, 100);
+        auto desc = alloc.Allocate(key, kTwoPageObject);
         ASSERT_TRUE(desc.has_value()) << "allocation " << i;
         alloc.UpdateAccess(key, desc->shard_idx, desc->offset);
         descs.push_back(*desc);
@@ -691,7 +774,7 @@ TEST(DfsGlobalAllocatorTest, PartialResolutionContinuesToLowWatermark) {
     EXPECT_TRUE(complete.Empty());
 }
 
-TEST(DfsGlobalAllocatorTest, EvictionCountsPendingFreeTowardWatermarks) {
+TEST(ShardAllocatorTest, EvictionCountsPendingFreeTowardWatermarks) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     env.Set("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.9");
@@ -699,13 +782,13 @@ TEST(DfsGlobalAllocatorTest, EvictionCountsPendingFreeTowardWatermarks) {
     env.Set("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "30");
     TempDir tmp("dfs_pending_watermark");
 
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     ASSERT_TRUE(
         alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 32 * 1024, 4096)));
 
     for (int i = 0; i < 4; ++i) {
         const std::string key = "k" + std::to_string(i);
-        auto desc = alloc.Allocate(key, 100);
+        auto desc = alloc.Allocate(key, kTwoPageObject);
         ASSERT_TRUE(desc.has_value()) << "allocation " << i;
         alloc.UpdateAccess(key, desc->shard_idx, desc->offset);
     }
@@ -718,26 +801,26 @@ TEST(DfsGlobalAllocatorTest, EvictionCountsPendingFreeTowardWatermarks) {
     auto repeated = PrepareAndCommitPreparedEviction(alloc);
     EXPECT_TRUE(repeated.empty());
 
-    auto before_release = alloc.Allocate("k_before_release", 100);
+    auto before_release = alloc.Allocate("k_before_release", kTwoPageObject);
     EXPECT_FALSE(before_release.has_value());
     EXPECT_EQ(before_release.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 }
 
-TEST(DfsGlobalAllocatorTest, FreeRemovesLruEntryBeforeOffsetReuse) {
+TEST(ShardAllocatorTest, FreeRemovesLruEntryBeforeOffsetReuse) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     TempDir tmp("dfs_free_lru_reuse");
 
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8 * 1024, 4096)));
 
-    auto desc_a = alloc.Allocate("A", 100);
+    auto desc_a = alloc.Allocate("A", kTwoPageObject);
     ASSERT_TRUE(desc_a.has_value());
     alloc.UpdateAccess("A", desc_a->shard_idx, desc_a->offset);
 
     alloc.Free(desc_a->offset, desc_a->aligned_size, desc_a->shard_idx, "A");
 
-    auto desc_b = alloc.Allocate("B", 100);
+    auto desc_b = alloc.Allocate("B", kTwoPageObject);
     ASSERT_TRUE(desc_b.has_value());
     ASSERT_EQ(desc_b->offset, desc_a->offset);
     alloc.UpdateAccess("B", desc_b->shard_idx, desc_b->offset);
@@ -747,21 +830,21 @@ TEST(DfsGlobalAllocatorTest, FreeRemovesLruEntryBeforeOffsetReuse) {
     EXPECT_EQ(evicted.front().key, "B");
 }
 
-TEST(DfsGlobalAllocatorTest, StaleFreeDoesNotReleaseReusedOffset) {
+TEST(ShardAllocatorTest, StaleFreeDoesNotReleaseReusedOffset) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     TempDir tmp("dfs_stale_free");
 
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8 * 1024, 4096)));
 
-    auto desc_a = alloc.Allocate("A", 100);
+    auto desc_a = alloc.Allocate("A", kTwoPageObject);
     ASSERT_TRUE(desc_a.has_value());
     alloc.UpdateAccess("A", desc_a->shard_idx, desc_a->offset);
 
     alloc.Free(desc_a->offset, desc_a->aligned_size, desc_a->shard_idx, "A");
 
-    auto desc_b = alloc.Allocate("B", 100);
+    auto desc_b = alloc.Allocate("B", kTwoPageObject);
     ASSERT_TRUE(desc_b.has_value());
     ASSERT_EQ(desc_b->offset, desc_a->offset);
     alloc.UpdateAccess("B", desc_b->shard_idx, desc_b->offset);
@@ -773,12 +856,12 @@ TEST(DfsGlobalAllocatorTest, StaleFreeDoesNotReleaseReusedOffset) {
     EXPECT_EQ(evicted.front().key, "B");
 }
 
-TEST(DfsGlobalAllocatorTest, ConcurrentAllocate) {
+TEST(ShardAllocatorTest, ConcurrentAllocate) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     TempDir tmp("dfs_concurrent");
 
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     ASSERT_TRUE(
         alloc.Init(MakeAllocatorConfig(tmp.path(), 4, 128 * 1024, 4096)));
 
@@ -804,6 +887,294 @@ TEST(DfsGlobalAllocatorTest, ConcurrentAllocate) {
 
     EXPECT_EQ(success_count.load(), kThreadCount);
     EXPECT_EQ(fail_count.load(), 0);
+}
+
+TEST(ShardAllocatorTest, ExpansionValidatesCountAndUsesEmptyShards) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_expand_capacity");
+    ShardAllocator alloc;
+    ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8192, 4096)));
+    auto old = alloc.Allocate("old", kTwoPageObject);
+    ASSERT_TRUE(old);
+    ASSERT_FALSE(alloc.Allocate("full", kTwoPageObject));
+
+    for (int count : {-1, 0}) {
+        auto result = alloc.ExpandShards(count);
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+    auto unchanged = alloc.ExpandShards(1);
+    ASSERT_TRUE(unchanged);
+    EXPECT_EQ(*unchanged, 1);
+    auto expanded = alloc.ExpandShards(2);
+    ASSERT_TRUE(expanded);
+    EXPECT_EQ(*expanded, 2);
+    EXPECT_EQ(alloc.GetShardCount(), 2);
+    // GetFileCount reports the shard file count in shard mode.
+    EXPECT_EQ(alloc.GetFileCount(), 2u);
+    ASSERT_TRUE(alloc.ExpandShards(2));
+    auto shrink = alloc.ExpandShards(1);
+    ASSERT_FALSE(shrink);
+    EXPECT_EQ(shrink.error(), ErrorCode::INVALID_PARAMS);
+
+    // This key still prefers the full original shard. Expansion must provide
+    // usable capacity even when hashing does not select the new shard.
+    std::string key;
+    for (int i = 0; i < 1000; ++i) {
+        key = "fallback_" + std::to_string(i);
+        if (std::hash<std::string>{}(key) % 2 == 0) break;
+    }
+    ASSERT_EQ(std::hash<std::string>{}(key) % 2, 0);
+    auto added = alloc.Allocate(key, kTwoPageObject);
+    ASSERT_TRUE(added);
+    EXPECT_EQ(added->shard_idx, 1);
+    alloc.Free(old->offset, old->aligned_size, old->shard_idx, "old");
+    alloc.Free(added->offset, added->aligned_size, added->shard_idx, key);
+}
+
+TEST(ShardAllocatorTest, ExpansionPreservesLegacyPathsAndRestartsLayout) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_expand_legacy");
+    // Seed the legacy padded layout rather than relying on how new roots are
+    // named after this change. Crossing 100 must never rename these files.
+    PosixFsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(tmp.path()));
+    for (int i = 0; i < 100; ++i) {
+        const auto path = tmp.file(
+            "dfs_shard_" + ShardAllocator::FormatShardIdx(i, 100) + ".data");
+        ASSERT_TRUE(adapter.PreallocateFile(path, 8192));
+    }
+    std::string old_path;
+    {
+        ShardAllocator alloc;
+        ASSERT_TRUE(
+            alloc.Init(MakeAllocatorConfig(tmp.path(), 100, 8192, 4096)));
+        auto old = alloc.Allocate("preserved", 100);
+        ASSERT_TRUE(old);
+        old_path = old->file_path;
+        const int fd = ::open(old_path.c_str(), O_WRONLY);
+        ASSERT_GE(fd, 0);
+        const char marker = 'P';
+        EXPECT_EQ(::pwrite(fd, &marker, 1, old->offset), 1);
+        EXPECT_EQ(::close(fd), 0);
+        ASSERT_TRUE(alloc.ExpandShards(101));
+        EXPECT_EQ(alloc.GetShardCount(), 101);
+        EXPECT_TRUE(std::filesystem::exists(old_path));
+        char readback = 0;
+        const int read_fd = ::open(old_path.c_str(), O_RDONLY);
+        ASSERT_GE(read_fd, 0);
+        EXPECT_EQ(::pread(read_fd, &readback, 1, old->offset), 1);
+        EXPECT_EQ(::close(read_fd), 0);
+        EXPECT_EQ(readback, marker);
+    }
+    // Only the shard layout is recovered. This deliberately makes no claim
+    // about recovering the previous object's allocation or Master metadata.
+    ShardAllocator restarted;
+    ASSERT_TRUE(restarted.Init(MakeAllocatorConfig(tmp.path(), 2, 8192, 4096)));
+    EXPECT_EQ(restarted.GetShardCount(), 101);
+    EXPECT_TRUE(std::filesystem::exists(old_path));
+}
+
+TEST(ShardAllocatorTest, ExpansionRetainsPaddedLegacyShardDescriptors) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_expand_padded");
+    PosixFsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(tmp.path()));
+    ASSERT_TRUE(adapter.PreallocateFile(tmp.file("dfs_shard_000.data"), 8192));
+    ASSERT_TRUE(adapter.PreallocateFile(tmp.file("dfs_shard_001.data"), 8192));
+    ShardAllocator alloc;
+    ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 2, 8192, 4096)));
+    auto old = alloc.Allocate("old", 100);
+    ASSERT_TRUE(old);
+    EXPECT_EQ(old->file_path,
+              tmp.file(old->shard_idx == 0 ? "dfs_shard_000.data"
+                                           : "dfs_shard_001.data"));
+    ASSERT_TRUE(alloc.ExpandShards(3));
+    EXPECT_TRUE(std::filesystem::exists(old->file_path));
+    EXPECT_FALSE(std::filesystem::exists(tmp.file("dfs_shard_00.data")));
+    EXPECT_FALSE(std::filesystem::exists(tmp.file("dfs_shard_01.data")));
+}
+
+TEST(ShardAllocatorTest, InitRejectsMalformedShardNames) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    for (const std::string& name :
+         {"dfs_shard_0.data", "dfs_shard_.data", "dfs_shard_+0.data",
+          "dfs_shard_-1.data", "dfs_shard_00x.data",
+          "dfs_shard_2147483647.data", "dfs_shard_2147483648.data"}) {
+        SCOPED_TRACE(name);
+        TempDir tmp("dfs_invalid_shard_name");
+        PosixFsAdapter adapter;
+        ASSERT_TRUE(adapter.Init(tmp.path()));
+        ASSERT_TRUE(adapter.PreallocateFile(tmp.file(name), 8192));
+        ShardAllocator alloc;
+        auto result =
+            alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8192, 4096));
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+        EXPECT_FALSE(alloc.IsInitialized());
+        EXPECT_EQ(alloc.GetShardCount(), 0);
+        EXPECT_EQ(std::filesystem::file_size(tmp.file(name)), 8192);
+        EXPECT_FALSE(std::filesystem::exists(tmp.file("dfs_shard_00.data")));
+    }
+}
+
+TEST(ShardAllocatorTest, InitRejectsAmbiguousOrNoncontiguousLayout) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    for (const std::string& second_name :
+         {"dfs_shard_000.data", "dfs_shard_02.data"}) {
+        SCOPED_TRACE(second_name);
+        TempDir tmp("dfs_invalid_shard_layout");
+        PosixFsAdapter adapter;
+        ASSERT_TRUE(adapter.Init(tmp.path()));
+        ASSERT_TRUE(
+            adapter.PreallocateFile(tmp.file("dfs_shard_00.data"), 8192));
+        ASSERT_TRUE(adapter.PreallocateFile(tmp.file(second_name), 8192));
+        ShardAllocator alloc;
+        auto result =
+            alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8192, 4096));
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+        EXPECT_EQ(alloc.GetShardCount(), 0);
+        EXPECT_EQ(std::filesystem::file_size(tmp.file("dfs_shard_00.data")),
+                  8192);
+        EXPECT_EQ(std::filesystem::file_size(tmp.file(second_name)), 8192);
+        EXPECT_FALSE(std::filesystem::exists(tmp.file("dfs_shard_01.data")));
+    }
+}
+
+TEST(ShardAllocatorTest, InitRejectsExistingCapacityWithoutTruncation) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_invalid_shard_capacity");
+    const auto path = tmp.file("dfs_shard_00.data");
+    PosixFsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(tmp.path()));
+    ASSERT_TRUE(adapter.PreallocateFile(path, 4096));
+    ShardAllocator alloc;
+    auto result = alloc.Init(MakeAllocatorConfig(tmp.path(), 2, 8192, 4096));
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_FALSE(alloc.IsInitialized());
+    EXPECT_EQ(alloc.GetShardCount(), 0);
+    EXPECT_EQ(std::filesystem::file_size(path), 4096);
+    EXPECT_FALSE(std::filesystem::exists(tmp.file("dfs_shard_01.data")));
+}
+
+TEST(ShardAllocatorTest, FailedExpansionPreservesExistingUnpublishedShard) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_expand_existing_failure");
+    ShardAllocator alloc;
+    ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8192, 4096)));
+    // A previous interrupted expansion may have left a complete shard. Failed
+    // retries must only clean files created by the current operation.
+    const auto existing = tmp.file("dfs_shard_01.data");
+    PosixFsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(tmp.path()));
+    ASSERT_TRUE(adapter.PreallocateFile(existing, 8192));
+    const auto blocked = tmp.file("dfs_shard_03.data");
+    ASSERT_TRUE(std::filesystem::create_directory(blocked));
+    auto result = alloc.ExpandShards(4);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(alloc.GetShardCount(), 1);
+    EXPECT_EQ(std::filesystem::file_size(existing), 8192);
+    EXPECT_FALSE(std::filesystem::exists(tmp.file("dfs_shard_02.data")));
+    ASSERT_TRUE(std::filesystem::remove(blocked));
+    ASSERT_TRUE(alloc.ExpandShards(4));
+    EXPECT_EQ(alloc.GetShardCount(), 4);
+}
+
+TEST(ShardAllocatorTest, FailedExpansionDoesNotPublishPartialCapacity) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_expand_failure");
+    ShardAllocator alloc;
+    ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8192, 4096)));
+    // The second new shard cannot be prepared. The first must not become
+    // visible to allocators when the whole expansion request fails.
+    const auto blocked = tmp.file("dfs_shard_02.data");
+    ASSERT_TRUE(std::filesystem::create_directory(blocked));
+    auto result = alloc.ExpandShards(3);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(alloc.GetShardCount(), 1);
+    EXPECT_FALSE(std::filesystem::exists(tmp.file("dfs_shard_01.data")));
+    auto old = alloc.Allocate("still_usable", kTwoPageObject);
+    ASSERT_TRUE(old);
+    EXPECT_EQ(old->shard_idx, 0);
+    EXPECT_FALSE(alloc.Allocate("not_published", kTwoPageObject));
+    ASSERT_TRUE(std::filesystem::remove(blocked));
+    ASSERT_TRUE(alloc.ExpandShards(3));
+    EXPECT_EQ(alloc.GetShardCount(), 3);
+}
+
+TEST(ShardAllocatorTest, PreparedEvictionRemainsValidAcrossExpansion) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_expand_eviction");
+    ShardAllocator alloc;
+    ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8192, 4096)));
+    auto old = alloc.Allocate("old", kTwoPageObject);
+    ASSERT_TRUE(old);
+    alloc.UpdateAccess("old", old->shard_idx, old->offset);
+    auto pending = alloc.PrepareEviction();
+    ASSERT_EQ(pending.Candidates().size(), 1);
+    ASSERT_TRUE(alloc.ExpandShards(2));
+    alloc.CommitPreparedEviction(std::move(pending));
+    auto after = alloc.Allocate("after", kTwoPageObject);
+    ASSERT_TRUE(after);
+    alloc.Free(after->offset, after->aligned_size, after->shard_idx, "after");
+    EXPECT_TRUE(alloc.PrepareEviction().Empty());
+}
+
+TEST(ShardAllocatorTest, ConcurrentExpansionAllocationAndEvictionRestore) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_expand_concurrent");
+    ShardAllocator alloc;
+    ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 1 << 20, 4096)));
+    std::atomic<bool> start{false};
+    std::atomic<int> failures{0};
+    std::vector<std::thread> workers;
+    for (int worker = 0; worker < 4; ++worker) {
+        workers.emplace_back([&, worker] {
+            while (!start.load()) std::this_thread::yield();
+            for (int i = 0; i < 200; ++i) {
+                const auto key = "worker_" + std::to_string(worker) + "_" +
+                                 std::to_string(i);
+                auto desc = alloc.Allocate(key, 100);
+                if (!desc) {
+                    ++failures;
+                    continue;
+                }
+                alloc.UpdateAccess(key, desc->shard_idx, desc->offset);
+                alloc.Free(desc->offset, desc->aligned_size, desc->shard_idx,
+                           key);
+            }
+        });
+    }
+    workers.emplace_back([&] {
+        while (!start.load()) std::this_thread::yield();
+        for (int i = 0; i < 200; ++i) {
+            auto pending = alloc.PrepareEviction();
+            alloc.RestorePreparedEviction(std::move(pending));
+        }
+    });
+    workers.emplace_back([&] {
+        while (!start.load()) std::this_thread::yield();
+        for (int count = 2; count <= 8; ++count) {
+            if (!alloc.ExpandShards(count)) ++failures;
+        }
+    });
+    start.store(true);
+    for (auto& worker : workers) worker.join();
+    EXPECT_EQ(failures.load(), 0);
+    EXPECT_EQ(alloc.GetShardCount(), 8);
+    EXPECT_TRUE(alloc.PrepareEviction().Empty());
 }
 
 TEST(ReplicaDfsTest, HelpersAndDescriptor) {
@@ -847,7 +1218,6 @@ class DfsBackendTest : public ::testing::Test {
    protected:
     void SetUp() override {
         tmp_ = std::make_unique<TempDir>("dfs_backend");
-        ASSERT_TRUE(WriteTestDfsRootIdentity(tmp_->path()));
         FileStorageConfig file_config;
         file_config.storage_backend_type = StorageBackendType::kDistributed;
         file_config.storage_filepath = tmp_->path();
@@ -859,9 +1229,18 @@ class DfsBackendTest : public ::testing::Test {
         distributed_config.shard_capacity = 64 * 1024 * 1024;
         distributed_config.alignment = 4096;
 
+        // The master prepares shard files; client initialization only sets up
+        // the adapter and must not create or open files before descriptors.
+        PosixFsAdapter adapter;
+        ASSERT_TRUE(adapter.Init(tmp_->path()));
+        for (int i = 0; i < distributed_config.shard_count; ++i) {
+            ASSERT_TRUE(adapter.PreallocateFile(
+                ShardPath(i), distributed_config.shard_capacity));
+        }
+
         backend_ = std::make_unique<DistributedStorageBackend>(
-            file_config, distributed_config,
-            std::make_unique<PosixFsAdapter>(), kTestDfsRootIdentity);
+            file_config, distributed_config, std::make_unique<PosixFsAdapter>(),
+            TestDfsIdentityForRoot(distributed_config));
         ASSERT_TRUE(backend_->Init().has_value());
     }
 
@@ -872,7 +1251,7 @@ class DfsBackendTest : public ::testing::Test {
 
     std::string ShardPath(int shard_idx) const {
         return tmp_->file("dfs_shard_" +
-                          DfsGlobalAllocator::FormatShardIdx(shard_idx, 4) +
+                          ShardAllocator::FormatShardIdx(shard_idx, 4) +
                           ".data");
     }
 
@@ -880,520 +1259,68 @@ class DfsBackendTest : public ::testing::Test {
     std::unique_ptr<DistributedStorageBackend> backend_;
 };
 
-TEST(DfsTimeoutPolicyTest, ScalesConfiguredBaselineByBatchSize) {
-    constexpr uint64_t kBaseMs = 10000;
-    constexpr uint64_t kFixedMs = kDefaultDfsBatchTimeoutFixedMs;
-    EXPECT_EQ(DfsBatchGetTimeoutMs(kBaseMs, kDfsTimeoutOneGiB, kFixedMs),
-              90000u);
-    EXPECT_EQ(DfsBatchGetTimeoutMs(kBaseMs, kDfsTimeoutOneGiB + 1, kFixedMs),
-              150000u);
-    EXPECT_EQ(DfsBatchGetTimeoutMs(kBaseMs, kDfsTimeoutFourGiB, kFixedMs),
-              150000u);
-    EXPECT_EQ(
-        DfsBatchGetTimeoutMs(kBaseMs, kDfsTimeoutFourGiB + 1, kFixedMs),
-        230000u);
-
-    EXPECT_EQ(DfsBatchPutTimeoutMs(kBaseMs, kDfsTimeoutOneGiB, kFixedMs),
-              110000u);
-    EXPECT_EQ(DfsBatchPutTimeoutMs(kBaseMs, kDfsTimeoutOneGiB + 1, kFixedMs),
-              230000u);
-    EXPECT_EQ(DfsBatchPutTimeoutMs(kBaseMs, kDfsTimeoutFourGiB, kFixedMs),
-              230000u);
-    EXPECT_EQ(
-        DfsBatchPutTimeoutMs(kBaseMs, kDfsTimeoutFourGiB + 1, kFixedMs),
-        390000u);
-
-    EXPECT_EQ(DfsBatchGetTimeoutMs(kBaseMs, kDfsTimeoutOneGiB, 1234),
-              21234u);
-    EXPECT_EQ(DfsBatchPutTimeoutMs(kBaseMs, kDfsTimeoutOneGiB, 1234),
-              41234u);
-    EXPECT_EQ(DfsBatchGetTimeoutMs(0, kDfsTimeoutFourGiB + 1, kFixedMs), 0u);
-    EXPECT_EQ(DfsBatchPutTimeoutMs(0, kDfsTimeoutFourGiB + 1, kFixedMs), 0u);
-}
-
-class BlockingReadPosixFsAdapter : public PosixFsAdapter {
-   public:
-    void BlockReads() {
-        std::lock_guard lock(mutex_);
-        blocked_ = true;
-    }
-    void ReleaseReads() {
-        std::lock_guard lock(mutex_);
-        blocked_ = false;
-        cv_.notify_all();
-    }
-    bool WaitUntilCompleted(size_t count, std::chrono::milliseconds timeout) {
-        std::unique_lock lock(mutex_);
-        return cv_.wait_for(lock, timeout,
-                            [this, count] { return completed_reads_ >= count; });
-    }
-    bool WaitUntilStarted(size_t count, std::chrono::milliseconds timeout) {
-        std::unique_lock lock(mutex_);
-        return cv_.wait_for(lock, timeout,
-                            [this, count] { return started_reads_ >= count; });
-    }
-    size_t StartedReads() {
-        std::lock_guard lock(mutex_);
-        return started_reads_;
-    }
-    tl::expected<size_t, ErrorCode> ReadAt(int fd, iovec* iov, int iovcnt,
-                                           int64_t offset) override {
-        {
-            std::unique_lock lock(mutex_);
-            ++started_reads_;
-            cv_.notify_all();
-            cv_.wait(lock, [this] { return !blocked_; });
-        }
-        auto result = PosixFsAdapter::ReadAt(fd, iov, iovcnt, offset);
-        {
-            std::lock_guard lock(mutex_);
-            ++completed_reads_;
-        }
-        cv_.notify_all();
-        return result;
-    }
-
-   private:
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    bool blocked_ = false;
-    size_t started_reads_ = 0;
-    size_t completed_reads_ = 0;
-};
-
-TEST(DfsBackendTimeoutTest, RequiresOwnerForTimeoutAndQuarantinesIt) {
-    TempDir tmp("dfs_read_timeout");
-    ASSERT_TRUE(WriteTestDfsRootIdentity(tmp.path()));
-    FileStorageConfig file_config;
-    file_config.storage_backend_type = StorageBackendType::kDistributed;
-    file_config.storage_filepath = tmp.path();
-    DistributedStorageConfig config;
-    config.fsdir = tmp.path();
-    config.fs_adapter_type = "posix";
-    config.shard_count = 1;
-    config.shard_capacity = 64 * 1024;
-    config.alignment = 4096;
-    config.direct_read_enabled = false;
-    config.batch_get_timeout_ms = 50;
-    config.batch_timeout_fixed_ms = 0;
-
-    auto adapter = std::make_unique<BlockingReadPosixFsAdapter>();
-    auto* adapter_ptr = adapter.get();
-    auto backend = std::make_shared<DistributedStorageBackend>(
-        file_config, config, std::move(adapter), kTestDfsRootIdentity);
-    ASSERT_TRUE(backend->Init().has_value());
-
-    const std::string shard =
-        tmp.file("dfs_shard_" + DfsGlobalAllocator::FormatShardIdx(0, 1) +
-                 ".data");
-    const DistributedFSDescriptor descriptor{shard, 0, 4096, 4096, 0};
-    std::string source(4096, 'R');
-    auto writes = backend->BatchWrite(
-        {{"timeout_read", descriptor, {{source.data(), source.size()}}}});
-    ASSERT_EQ(writes.size(), 1u);
-    ASSERT_TRUE(writes[0].has_value());
-
-    std::string destination(4096, 'S');
-    std::atomic<bool> ownerless_returned{false};
-    std::vector<tl::expected<void, ErrorCode>> ownerless_result;
-    adapter_ptr->BlockReads();
-    std::thread ownerless_reader([&] {
-        ownerless_result = backend->BatchRead(
-            {{"timeout_read", descriptor,
-              {{destination.data(), destination.size()}}}});
-        ownerless_returned.store(true);
-    });
-    EXPECT_TRUE(adapter_ptr->WaitUntilStarted(1, std::chrono::seconds(2)));
-    std::this_thread::sleep_for(std::chrono::milliseconds(120));
-    EXPECT_FALSE(ownerless_returned.load());
-    adapter_ptr->ReleaseReads();
-    ownerless_reader.join();
-    ASSERT_EQ(ownerless_result.size(), 1u);
-    ASSERT_TRUE(ownerless_result[0].has_value());
-    EXPECT_EQ(destination, source);
-
-    destination.assign(4096, 'S');
-    std::atomic<bool> owner_released{false};
-    auto owner = std::shared_ptr<void>(destination.data(),
-                                      [&owner_released](void*) {
-                                          owner_released.store(true);
-                                      });
-    adapter_ptr->BlockReads();
-    auto reads = backend->BatchRead({{"timeout_read", descriptor,
-                                     {{destination.data(), destination.size()}},
-                                     owner}});
-    owner.reset();
-    ASSERT_EQ(reads.size(), 1u);
-    ASSERT_FALSE(reads[0].has_value());
-    EXPECT_EQ(reads[0].error(), ErrorCode::DFS_BATCH_GET_TIMEOUT);
-    EXPECT_EQ(destination, std::string(4096, 'S'));
-    EXPECT_FALSE(owner_released.load());
-
-    adapter_ptr->ReleaseReads();
-    ASSERT_TRUE(
-        adapter_ptr->WaitUntilCompleted(2, std::chrono::seconds(2)));
-    EXPECT_EQ(destination, source);
-    for (int i = 0; i < 200 && !owner_released.load(); ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    EXPECT_TRUE(owner_released.load());
-}
-
-TEST(DfsBackendTimeoutTest, LimitsTimedReadsUntilRealCompletion) {
-    TempDir tmp("dfs_read_inflight_limit");
-    ASSERT_TRUE(WriteTestDfsRootIdentity(tmp.path()));
-    ASSERT_TRUE(WriteTestDfsReadProbes(tmp.path()));
-
-    FileStorageConfig file_config;
-    file_config.storage_backend_type = StorageBackendType::kDistributed;
-    file_config.storage_filepath = tmp.path();
-    DistributedStorageConfig config;
-    config.fsdir = tmp.path();
-    config.fs_adapter_type = "posix";
-    config.shard_count = 1;
-    config.shard_capacity = 64 * 1024;
-    config.alignment = 4096;
-    config.direct_read_enabled = false;
-    config.batch_get_timeout_ms = 20;
-    config.batch_timeout_fixed_ms = 0;
-    config.batch_get_max_inflight_batches = 2;
-    config.batch_get_max_inflight_bytes = 12288;
-
-    auto adapter = std::make_unique<BlockingReadPosixFsAdapter>();
-    auto* adapter_ptr = adapter.get();
-    auto backend = std::make_shared<DistributedStorageBackend>(
-        file_config, config, std::move(adapter), kTestDfsRootIdentity);
-    ASSERT_TRUE(backend->Init().has_value());
-
-    const std::string shard =
-        tmp.file("dfs_shard_" + DfsGlobalAllocator::FormatShardIdx(0, 1) +
-                 ".data");
-    const DistributedFSDescriptor descriptor{shard, 0, 4096, 4096, 0};
-    std::string source(4096, 'R');
-    ASSERT_TRUE(backend->BatchWrite(
-        {{"limited_read", descriptor, {{source.data(), source.size()}}}})[0]);
-
-    std::string first(4096, '1'), second(4096, '2'), third(4096, '3');
-    std::atomic<size_t> released_owners{0};
-    auto first_owner = std::shared_ptr<void>(first.data(), [&](void*) {
-        released_owners.fetch_add(1);
-    });
-    auto second_owner = std::shared_ptr<void>(second.data(), [&](void*) {
-        released_owners.fetch_add(1);
-    });
-    adapter_ptr->BlockReads();
-    auto read = [&](std::string& destination,
-                    std::shared_ptr<void> owner = nullptr) {
-        return backend->BatchRead(
-            {{"limited_read", descriptor,
-              {{destination.data(), destination.size()}}, std::move(owner)}})[0];
-    };
-
-    EXPECT_FALSE(read(first, first_owner).has_value());
-    first_owner.reset();
-    ASSERT_TRUE(backend->ProbeRead().has_value());
-    EXPECT_FALSE(read(second, second_owner).has_value());
-    second_owner.reset();
-    ASSERT_TRUE(backend->ProbeRead().has_value());
-    const auto started_before_admission_wait = adapter_ptr->StartedReads();
-    std::atomic<bool> third_returned{false};
-    std::vector<tl::expected<void, ErrorCode>> third_result;
-    std::thread third_reader([&] {
-        third_result = backend->BatchRead(
-            {{"limited_read", descriptor,
-              {{third.data(), third.size()}}}});
-        third_returned.store(true);
-    });
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    EXPECT_FALSE(third_returned.load());
-    EXPECT_EQ(started_before_admission_wait, 2u);
-    EXPECT_EQ(adapter_ptr->StartedReads(), started_before_admission_wait);
-    adapter_ptr->ReleaseReads();
-    third_reader.join();
-    ASSERT_TRUE(
-        adapter_ptr->WaitUntilCompleted(3, std::chrono::seconds(2)));
-    ASSERT_EQ(third_result.size(), 1u);
-    EXPECT_TRUE(third_result[0].has_value());
-    EXPECT_EQ(third, source);
-    for (int i = 0; i < 200 && released_owners.load() != 2; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    ASSERT_EQ(released_owners.load(), 2u);
-    ASSERT_TRUE(backend->ProbeRead().has_value());
-}
-
-TEST(DfsBackendTimeoutTest, TimeoutLatchWakesInflightAdmissionWaiter) {
-    TempDir tmp("dfs_read_inflight_timeout_latch");
-    ASSERT_TRUE(WriteTestDfsRootIdentity(tmp.path()));
-
-    FileStorageConfig file_config;
-    file_config.storage_backend_type = StorageBackendType::kDistributed;
-    file_config.storage_filepath = tmp.path();
-    DistributedStorageConfig config;
-    config.fsdir = tmp.path();
-    config.fs_adapter_type = "posix";
-    config.shard_count = 1;
-    config.shard_capacity = 64 * 1024;
-    config.alignment = 4096;
-    config.direct_read_enabled = false;
-    config.batch_get_timeout_ms = 100;
-    config.batch_timeout_fixed_ms = 0;
-    config.batch_get_max_inflight_batches = 1;
-    config.batch_get_max_inflight_bytes = 4096;
-
-    auto adapter = std::make_unique<BlockingReadPosixFsAdapter>();
-    auto* adapter_ptr = adapter.get();
-    auto backend = std::make_shared<DistributedStorageBackend>(
-        file_config, config, std::move(adapter), kTestDfsRootIdentity);
-    ASSERT_TRUE(backend->Init().has_value());
-
-    const std::string shard =
-        tmp.file("dfs_shard_" + DfsGlobalAllocator::FormatShardIdx(0, 1) +
-                 ".data");
-    const DistributedFSDescriptor descriptor{shard, 0, 4096, 4096, 0};
-    std::string source(4096, 'R');
-    ASSERT_TRUE(backend->BatchWrite(
-        {{"latched_read", descriptor, {{source.data(), source.size()}}}})[0]);
-
-    std::string first(4096, '1');
-    std::string queued(4096, '2');
-    auto first_owner = std::shared_ptr<void>(first.data(), [](void*) {});
-    auto queued_owner = std::shared_ptr<void>(queued.data(), [](void*) {});
-    std::vector<tl::expected<void, ErrorCode>> first_results;
-    std::vector<tl::expected<void, ErrorCode>> queued_results;
-
-    adapter_ptr->BlockReads();
-    std::thread first_reader([&] {
-        first_results = backend->BatchRead(
-            {{"latched_read", descriptor,
-              {{first.data(), first.size()}}, first_owner}});
-    });
-    EXPECT_TRUE(adapter_ptr->WaitUntilStarted(1, std::chrono::seconds(2)));
-
-    std::thread queued_reader([&] {
-        queued_results = backend->BatchRead(
-            {{"latched_read", descriptor,
-              {{queued.data(), queued.size()}}, queued_owner}});
-    });
-
-    first_reader.join();
-    queued_reader.join();
-    const size_t started_reads = adapter_ptr->StartedReads();
-    adapter_ptr->ReleaseReads();
-    EXPECT_TRUE(
-        adapter_ptr->WaitUntilCompleted(1, std::chrono::seconds(2)));
-
-    ASSERT_EQ(first_results.size(), 1u);
-    ASSERT_FALSE(first_results[0].has_value());
-    EXPECT_EQ(first_results[0].error(), ErrorCode::DFS_BATCH_GET_TIMEOUT);
-    ASSERT_EQ(queued_results.size(), 1u);
-    ASSERT_FALSE(queued_results[0].has_value());
-    EXPECT_EQ(queued_results[0].error(), ErrorCode::DFS_BATCH_GET_TIMEOUT);
-    EXPECT_EQ(started_reads, 1u);
-}
-
-TEST(DfsBackendTimeoutTest, RejectsReadThatExceedsInflightByteLimit) {
-    TempDir tmp("dfs_read_inflight_byte_limit");
-    ASSERT_TRUE(WriteTestDfsRootIdentity(tmp.path()));
-    FileStorageConfig file_config;
-    file_config.storage_backend_type = StorageBackendType::kDistributed;
-    file_config.storage_filepath = tmp.path();
-    DistributedStorageConfig config;
-    config.fsdir = tmp.path();
-    config.fs_adapter_type = "posix";
-    config.shard_count = 1;
-    config.shard_capacity = 64 * 1024;
-    config.alignment = 4096;
-    config.direct_read_enabled = false;
-    config.batch_get_timeout_ms = 20;
-    config.batch_timeout_fixed_ms = 0;
-    config.batch_get_max_inflight_batches = 2;
-    config.batch_get_max_inflight_bytes = 4095;
-
-    auto adapter = std::make_unique<BlockingReadPosixFsAdapter>();
-    auto* adapter_ptr = adapter.get();
-    auto backend = std::make_shared<DistributedStorageBackend>(
-        file_config, config, std::move(adapter), kTestDfsRootIdentity);
-    ASSERT_TRUE(backend->Init().has_value());
-
-    const std::string shard =
-        tmp.file("dfs_shard_" + DfsGlobalAllocator::FormatShardIdx(0, 1) +
-                 ".data");
-    const DistributedFSDescriptor descriptor{shard, 0, 4096, 4096, 0};
-    std::string source(4096, 'R');
-    ASSERT_TRUE(backend->BatchWrite(
-        {{"large_read", descriptor, {{source.data(), source.size()}}}})[0]);
-
-    std::string destination(4096, 'D');
-    auto read = backend->BatchRead(
-        {{"large_read", descriptor,
-          {{destination.data(), destination.size()}}}});
-    ASSERT_EQ(read.size(), 1u);
-    ASSERT_FALSE(read[0].has_value());
-    EXPECT_EQ(read[0].error(),
-              ErrorCode::DFS_BATCH_GET_ADMISSION_TIMEOUT);
-    EXPECT_EQ(adapter_ptr->StartedReads(), 0u);
-    EXPECT_EQ(destination, std::string(4096, 'D'));
-}
-
-TEST(DfsRootMarkerTest, ShardAllocatorPublishesFormatMarker) {
-    TempDir tmp("dfs_root_marker");
-    DistributedStorageConfig config;
-    config.fsdir = tmp.path();
-    config.fs_adapter_type = "posix";
-    config.shard_count = 1;
-    config.shard_capacity = 64 * 1024;
-    config.alignment = 4096;
-
-    DfsGlobalAllocator allocator;
-    ASSERT_TRUE(allocator.Init(config));
-    EXPECT_TRUE(std::filesystem::exists(tmp.file(kDfsRootMarkerFileName)));
-}
-
-TEST(DfsRootMarkerTest, ShardAllocatorDoesNotOverwriteInvalidMarker) {
-    TempDir tmp("dfs_root_invalid_marker");
-    const std::string marker_path = tmp.file(kDfsRootMarkerFileName);
-    {
-        std::ofstream marker(marker_path, std::ios::binary);
-        marker << "unexpected-format\n";
-    }
-    DistributedStorageConfig config;
-    config.fsdir = tmp.path();
-    config.fs_adapter_type = "posix";
-    config.shard_count = 1;
-    config.shard_capacity = 64 * 1024;
-    config.alignment = 4096;
-
-    DfsGlobalAllocator allocator;
-    EXPECT_FALSE(allocator.Init(config).has_value());
-    std::ifstream marker(marker_path, std::ios::binary);
-    const std::string contents((std::istreambuf_iterator<char>(marker)),
-                               std::istreambuf_iterator<char>());
-    EXPECT_EQ(contents, "unexpected-format\n");
-}
-
-TEST_F(DfsBackendTest, HealthProbesUseStrictDirectDedicatedFile) {
-    const std::string first_probe_path =
-        TestDfsReadProbePath(tmp_->path(), 0);
-    const std::string second_probe_path =
-        TestDfsReadProbePath(tmp_->path(), 1);
-    EXPECT_FALSE(std::filesystem::exists(first_probe_path));
-    EXPECT_FALSE(std::filesystem::exists(second_probe_path));
-
-    auto read_before_write = backend_->ProbeRead();
-    ASSERT_FALSE(read_before_write.has_value());
-    EXPECT_EQ(read_before_write.error(), ErrorCode::FILE_NOT_FOUND);
-
-    ASSERT_TRUE(std::filesystem::create_directory(
-        std::filesystem::path(tmp_->path()) /
-        kDfsReadProbeDirectoryNames[0]));
-    {
-        std::ofstream probe(first_probe_path, std::ios::binary);
-        ASSERT_TRUE(probe.good());
-        const auto contents =
-            BuildDfsReadProbeContents(kTestDfsRootIdentity, 0);
-        probe.write(contents.data(), contents.size());
-    }
-    EXPECT_FALSE(backend_->ProbeRead().has_value())
-        << "both read-probe files are required";
-
-    ASSERT_TRUE(WriteTestDfsReadProbes(tmp_->path()));
-    EXPECT_EQ(std::filesystem::file_size(first_probe_path), kDfsReadProbeSize);
-    EXPECT_EQ(std::filesystem::file_size(second_probe_path), kDfsReadProbeSize);
-    EXPECT_TRUE(backend_->ProbeRead().has_value())
-        << "read probe must not depend on a prior client write probe";
-
-    ASSERT_TRUE(backend_->ProbeWrite().has_value());
-    FileStorageConfig second_file_config;
-    second_file_config.storage_backend_type = StorageBackendType::kDistributed;
-    second_file_config.storage_filepath = tmp_->path();
-    DistributedStorageConfig second_distributed_config;
-    second_distributed_config.fsdir = tmp_->path();
-    second_distributed_config.fs_adapter_type = "posix";
-    second_distributed_config.shard_count = 4;
-    second_distributed_config.shard_capacity = 64 * 1024 * 1024;
-    second_distributed_config.alignment = 4096;
-    DistributedStorageBackend second_client_backend(
-        second_file_config, second_distributed_config,
-        std::make_unique<PosixFsAdapter>(), kTestDfsRootIdentity);
-    ASSERT_TRUE(second_client_backend.Init().has_value());
-    ASSERT_TRUE(second_client_backend.ProbeWrite().has_value());
-
-    size_t probe_file_count = 0;
-    for (const auto& entry : std::filesystem::directory_iterator(tmp_->path())) {
-        if (entry.path().filename().string().starts_with(
-                ".mooncake_dfs_health_probe_")) {
-            ++probe_file_count;
-        }
-    }
-    EXPECT_EQ(probe_file_count, 2u);
-    EXPECT_TRUE(backend_->ProbeRead().has_value());
-
-    const int fd = ::open(second_probe_path.c_str(), O_WRONLY | O_CLOEXEC);
-    ASSERT_GE(fd, 0);
-    constexpr char kCorruptPayload[] = "bad!";
-    ASSERT_EQ(::pwrite(fd, kCorruptPayload, sizeof(kCorruptPayload) - 1,
-                       2 * kDfsReadProbeBlockSize),
-              static_cast<ssize_t>(sizeof(kCorruptPayload) - 1));
-    ASSERT_EQ(::close(fd), 0);
-    EXPECT_FALSE(backend_->ProbeRead().has_value());
-
-    ASSERT_TRUE(WriteTestDfsReadProbes(tmp_->path()));
-    ASSERT_TRUE(backend_->ProbeWrite().has_value());
-    EXPECT_TRUE(backend_->ProbeRead().has_value());
-
-    probe_file_count = 0;
-    for (const auto& entry : std::filesystem::directory_iterator(tmp_->path())) {
-        if (entry.path().filename().string().starts_with(
-                ".mooncake_dfs_health_probe_")) {
-            ++probe_file_count;
-        }
-    }
-    EXPECT_EQ(probe_file_count, 2u);
-}
-
-TEST(PosixFsAdapterTest, StrictDirectOpenRejectsSymlink) {
-    TempDir tmp("strict_direct_no_follow");
-    const std::string target = tmp.file("target");
-    const std::string link = tmp.file("link");
-    {
-        std::ofstream output(target, std::ios::binary);
-        const auto contents =
-            BuildDfsReadProbeContents(kTestDfsRootIdentity, 0);
-        output.write(contents.data(), contents.size());
-    }
-    ASSERT_EQ(::symlink(target.c_str(), link.c_str()), 0);
-    PosixFsAdapter adapter;
-    ASSERT_TRUE(adapter.Init(tmp.path()));
-    EXPECT_FALSE(adapter.OpenFileDirectStrict(link).has_value());
-}
-
 class ControlledPosixFsAdapter : public PosixFsAdapter {
    public:
-    void FailNextFileCreate() { fail_file_create_.store(true); }
+    void FailOpenCall(int call) { fail_open_call_ = call; }
+    int OpenCallCount() const { return open_calls_.load(); }
+
+    tl::expected<int, ErrorCode> OpenFileReadWriteExisting(
+        const std::string& path) override {
+        if (++open_calls_ == fail_open_call_) {
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+        return PosixFsAdapter::OpenFileReadWriteExisting(path);
+    }
+
     void FailWriteCall(int call) { fail_write_call_ = call; }
-    void FailReadCall(int call) { fail_read_call_ = call; }
     void ShortWriteCall(int call) { short_write_call_ = call; }
+    void FailReadCall(int call) { fail_read_call_ = call; }
     void ShortReadCall(int call) { short_read_call_ = call; }
+    // Offset-based injection persists across the backend's reopen-and-retry, so
+    // it models a permanently bad object rather than a single transient call.
+    void FailWriteAtOffset(int64_t offset) { fail_write_offset_ = offset; }
+    void ShortWriteAtOffset(int64_t offset) { short_write_offset_ = offset; }
+    void FailReadAtOffset(int64_t offset) { fail_read_offset_ = offset; }
+    void ShortReadAtOffset(int64_t offset) { short_read_offset_ = offset; }
+    // Fails the first write at this offset, then clears itself. Models a
+    // transient stale-descriptor hiccup that a single reopen recovers from.
+    void FailWriteAtOffsetOnce(int64_t offset) {
+        fail_write_offset_once_.store(offset);
+    }
     int WriteCallCount() const { return write_calls_.load(); }
     int ReadCallCount() const { return read_calls_.load(); }
 
-    tl::expected<size_t, ErrorCode> WriteFile(
-        const std::string& path, std::span<const char> data) override {
-        if (fail_file_create_.exchange(false)) {
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-        }
-        return PosixFsAdapter::WriteFile(path, data);
+    // Toggles the backend's fd-reopen gating. Defaults to true so the adapter
+    // behaves like a real PosixFsAdapter; set false to model an adapter whose
+    // I/O faults are not fd-recoverable (e.g. 3FS).
+    void SetSupportsFdReopen(bool v) { supports_reopen_ = v; }
+    bool SupportsFdReopen() const override { return supports_reopen_; }
+
+    std::vector<tl::expected<size_t, ErrorCode>> BatchWriteAt(
+        std::span<const FdIoRequest> requests) override {
+        ADD_FAILURE() << "POSIX shard writes must retain per-request I/O";
+        return PosixFsAdapter::BatchWriteAt(requests);
+    }
+
+    std::vector<tl::expected<size_t, ErrorCode>> BatchReadAt(
+        std::span<const FdIoRequest> requests) override {
+        ADD_FAILURE() << "POSIX shard reads must retain per-request I/O";
+        return PosixFsAdapter::BatchReadAt(requests);
     }
 
     tl::expected<size_t, ErrorCode> WriteAt(int fd, const iovec* iov,
                                             int iovcnt,
                                             int64_t offset) override {
         const int call = ++write_calls_;
-        if (call == fail_write_call_) {
+        int64_t once = fail_write_offset_once_.load();
+        if (once >= 0 && once == offset &&
+            fail_write_offset_once_.compare_exchange_strong(once, -1)) {
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
-        if (call == short_write_call_) {
+        if (call == fail_write_call_ || offset == fail_write_offset_) {
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        if (call == short_write_call_ || offset == short_write_offset_) {
             size_t total_size = 0;
             for (int i = 0; i < iovcnt; ++i) {
                 total_size += iov[i].iov_len;
@@ -1406,10 +1333,10 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     tl::expected<size_t, ErrorCode> ReadAt(int fd, iovec* iov, int iovcnt,
                                            int64_t offset) override {
         const int call = ++read_calls_;
-        if (call == fail_read_call_) {
-            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        if (call == fail_read_call_ || offset == fail_read_offset_) {
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
-        if (call == short_read_call_) {
+        if (call == short_read_call_ || offset == short_read_offset_) {
             size_t total_size = 0;
             for (int i = 0; i < iovcnt; ++i) {
                 total_size += iov[i].iov_len;
@@ -1420,37 +1347,465 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     }
 
    private:
-    std::atomic<bool> fail_file_create_{false};
+    std::atomic<int> open_calls_{0};
+    int fail_open_call_ = -1;
     std::atomic<int> write_calls_{0};
     std::atomic<int> read_calls_{0};
     int fail_write_call_ = -1;
     int short_write_call_ = -1;
     int fail_read_call_ = -1;
     int short_read_call_ = -1;
+    int64_t fail_write_offset_ = -1;
+    int64_t short_write_offset_ = -1;
+    int64_t fail_read_offset_ = -1;
+    int64_t short_read_offset_ = -1;
+    std::atomic<int64_t> fail_write_offset_once_{-1};
+    bool supports_reopen_ = true;
+
+   public:
+    void FailNextFileCreate() { fail_file_create_.store(true); }
+    tl::expected<size_t, ErrorCode> WriteFile(
+        const std::string& path, std::span<const char> data) override {
+        if (fail_file_create_.exchange(false)) {
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        return PosixFsAdapter::WriteFile(path, data);
+    }
+
+   private:
+    std::atomic<bool> fail_file_create_{false};
 };
 
-TEST_F(DfsBackendTest, HealthWriteProbeFailsWhenCreatingANewFileFails) {
+// Builds a backend backed by a ControlledPosixFsAdapter pointed at an existing
+// shard directory (shards must already be preallocated, as
+// DfsBackendTest::SetUp does). Returns the un-Init'd backend and hands back the
+// adapter pointer so the caller can program fault injection. The caller owns
+// Init() so it can ASSERT.
+std::unique_ptr<DistributedStorageBackend> MakeControlledBackend(
+    const std::string& dir, ControlledPosixFsAdapter** out_adapter) {
     FileStorageConfig file_config;
     file_config.storage_backend_type = StorageBackendType::kDistributed;
-    file_config.storage_filepath = tmp_->path();
+    file_config.storage_filepath = dir;
 
     DistributedStorageConfig distributed_config;
-    distributed_config.fsdir = tmp_->path();
+    distributed_config.fsdir = dir;
     distributed_config.fs_adapter_type = "posix";
     distributed_config.shard_count = 4;
     distributed_config.shard_capacity = 64 * 1024 * 1024;
     distributed_config.alignment = 4096;
 
     auto adapter = std::make_unique<ControlledPosixFsAdapter>();
-    auto* controlled_adapter = adapter.get();
-    DistributedStorageBackend backend(file_config, distributed_config,
-                                      std::move(adapter), kTestDfsRootIdentity);
-    ASSERT_TRUE(backend.Init().has_value());
+    *out_adapter = adapter.get();
+    return std::make_unique<DistributedStorageBackend>(
+        file_config, distributed_config, std::move(adapter),
+        TestDfsIdentityForRoot(distributed_config));
+}
 
-    controlled_adapter->FailNextFileCreate();
-    auto result = backend.ProbeWrite();
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::FILE_WRITE_FAIL);
+class BlockingShardFsAdapter : public PosixFsAdapter {
+   public:
+    BlockingShardFsAdapter(std::string path, bool block_file_size)
+        : path_(std::move(path)), block_file_size_(block_file_size) {}
+
+    bool WaitUntilBlocked() {
+        return blocked_.wait_for(std::chrono::seconds(5)) ==
+               std::future_status::ready;
+    }
+
+    void Release() {
+        if (!released_once_.exchange(true)) release_signal_.set_value();
+    }
+
+    int OpenCallCount() const { return open_calls_.load(); }
+
+    tl::expected<size_t, ErrorCode> GetFileSize(
+        const std::string& path) override {
+        if (path == path_ && block_file_size_) Block();
+        return PosixFsAdapter::GetFileSize(path);
+    }
+
+    tl::expected<int, ErrorCode> OpenFileReadWriteExisting(
+        const std::string& path) override {
+        if (path == path_) {
+            ++open_calls_;
+            if (!block_file_size_) Block();
+        }
+        return PosixFsAdapter::OpenFileReadWriteExisting(path);
+    }
+
+   private:
+    void Block() {
+        if (!blocked_once_.exchange(true)) blocked_signal_.set_value();
+        released_.wait();
+    }
+
+    std::string path_;
+    bool block_file_size_;
+    std::atomic<int> open_calls_{0};
+    std::atomic<bool> blocked_once_{false};
+    std::atomic<bool> released_once_{false};
+    std::promise<void> blocked_signal_;
+    std::future<void> blocked_{blocked_signal_.get_future()};
+    std::promise<void> release_signal_;
+    std::shared_future<void> released_{release_signal_.get_future().share()};
+};
+
+TEST_F(DfsBackendTest, SlowShardInitializationDoesNotBlockOtherShards) {
+    for (bool block_file_size : {false, true}) {
+        SCOPED_TRACE(block_file_size ? "GetFileSize" : "OpenFile");
+        FileStorageConfig file_config;
+        file_config.storage_backend_type = StorageBackendType::kDistributed;
+        file_config.storage_filepath = tmp_->path();
+        auto config =
+            MakeAllocatorConfig(tmp_->path(), 4, 64 * 1024 * 1024, 4096);
+        config.fs_adapter_type = "posix";
+        auto adapter = std::make_unique<BlockingShardFsAdapter>(
+            ShardPath(1), block_file_size);
+        auto* controlled = adapter.get();
+        backend_ = std::make_unique<DistributedStorageBackend>(
+            file_config, config, std::move(adapter),
+            TestDfsIdentityForRoot(config));
+        ASSERT_TRUE(backend_->Init());
+
+        auto write_and_read = [&](int index, uint64_t offset) {
+            std::string input(4096, 'V'), output(4096, '\0');
+            const DistributedFSDescriptor descriptor{ShardPath(index), offset,
+                                                     4096, 4096, index};
+            auto writes = backend_->BatchWrite(
+                {{"value", descriptor, {{input.data(), input.size()}}}});
+            auto reads = backend_->BatchRead(
+                {{"value", descriptor, {{output.data(), output.size()}}}});
+            return writes.size() == 1 && writes[0] && reads.size() == 1 &&
+                   reads[0] && output == input;
+        };
+        ASSERT_TRUE(write_and_read(0, 0));
+
+        // Release the adapter before waiting on any async future's destructor,
+        // including when an assertion fails while initialization is blocked.
+        std::future<bool> first, same_shard, other_shards;
+        struct ReleaseOnExit {
+            BlockingShardFsAdapter* adapter;
+            ~ReleaseOnExit() { adapter->Release(); }
+        } release{controlled};
+        first = std::async(std::launch::async,
+                           [&] { return write_and_read(1, 0); });
+        ASSERT_TRUE(controlled->WaitUntilBlocked());
+        same_shard = std::async(std::launch::async,
+                                [&] { return write_and_read(1, 4096); });
+        other_shards = std::async(std::launch::async, [&] {
+            std::string output(4096, '\0');
+            auto reads =
+                backend_->BatchRead({{"cached",
+                                      {ShardPath(0), 0, 4096, 4096, 0},
+                                      {{output.data(), output.size()}}}});
+            return reads.size() == 1 && reads[0] &&
+                   output == std::string(4096, 'V') &&
+                   write_and_read(0, 4096) && write_and_read(2, 0);
+        });
+        EXPECT_EQ(other_shards.wait_for(std::chrono::seconds(5)),
+                  std::future_status::ready);
+        EXPECT_EQ(same_shard.wait_for(std::chrono::seconds(0)),
+                  std::future_status::timeout);
+        controlled->Release();
+        EXPECT_TRUE(first.get());
+        EXPECT_TRUE(same_shard.get());
+        EXPECT_TRUE(other_shards.get());
+        EXPECT_EQ(controlled->OpenCallCount(), 1);
+    }
+}
+
+TEST(DfsBackendInitializationTest, ClientBeforeMasterDoesNotCreateShards) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_client_before_master");
+    const auto client_config = MakeAllocatorConfig(tmp.path(), 4, 8192, 4096);
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp.path();
+    DistributedStorageBackend client(file_config, client_config,
+                                     std::make_unique<PosixFsAdapter>(),
+                                     TestDfsIdentityForRoot(client_config));
+    ASSERT_TRUE(client.Init());
+    for (const auto& entry : std::filesystem::directory_iterator(tmp.path())) {
+        EXPECT_FALSE(
+            entry.path().filename().string().starts_with("dfs_shard_"));
+    }
+
+    ShardAllocator allocator;
+    ASSERT_TRUE(allocator.Init(MakeAllocatorConfig(tmp.path(), 1, 8192, 4096)));
+    EXPECT_EQ(allocator.GetShardCount(), 1);
+    EXPECT_FALSE(std::filesystem::exists(tmp.file("dfs_shard_01.data")));
+    ASSERT_TRUE(allocator.ExpandShards(4));
+    auto descriptor = allocator.Allocate("after_master_start", 100);
+    ASSERT_TRUE(descriptor);
+    std::string value(100, 'S'), output(100, '\0');
+    auto writes = client.BatchWrite(
+        {{"after_master_start", *descriptor, {{value.data(), value.size()}}}});
+    ASSERT_EQ(writes.size(), 1);
+    ASSERT_TRUE(writes[0]);
+    auto reads = client.BatchRead({{"after_master_start",
+                                    *descriptor,
+                                    {{output.data(), output.size()}}}});
+    ASSERT_EQ(reads.size(), 1);
+    ASSERT_TRUE(reads[0]);
+    EXPECT_EQ(output, value);
+}
+
+TEST(DfsBackendInitializationTest, DoesNotCacheRolledBackPreparedShard) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_prepared_shard_rollback");
+    auto config = MakeAllocatorConfig(tmp.path(), 1, 8192, 4096);
+    ShardAllocator allocator;
+    ASSERT_TRUE(allocator.Init(config));
+    PosixFsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(tmp.path()));
+    const auto path = tmp.file("dfs_shard_01.data");
+    // Reproduce the preparation window before an expansion publishes shard 1.
+    ASSERT_TRUE(adapter.PreallocateFile(path, config.shard_capacity));
+    const int prepared_fd = ::open(path.c_str(), O_RDONLY);
+    ASSERT_GE(prepared_fd, 0);
+    struct stat prepared_stat{};
+    ASSERT_EQ(::fstat(prepared_fd, &prepared_stat), 0);
+
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp.path();
+    auto client_config = config;
+    client_config.shard_count = 2;
+    DistributedStorageBackend writer(file_config, client_config,
+                                     std::make_unique<PosixFsAdapter>(),
+                                     TestDfsIdentityForRoot(client_config));
+    ASSERT_TRUE(writer.Init());
+    // A failed expansion removes the unpublished file. Keep its old inode
+    // alive until retry creates a different file with the same pathname.
+    ASSERT_TRUE(std::filesystem::remove(path));
+    ASSERT_TRUE(allocator.ExpandShards(2));
+    struct stat published_stat{};
+    ASSERT_EQ(::stat(path.c_str(), &published_stat), 0);
+    EXPECT_NE(prepared_stat.st_ino, published_stat.st_ino);
+    ASSERT_EQ(::close(prepared_fd), 0);
+
+    std::string key;
+    for (int i = 0; i < 1000; ++i) {
+        key = "retry_shard_" + std::to_string(i);
+        if (std::hash<std::string>{}(key) % 2 == 1) break;
+    }
+    ASSERT_EQ(std::hash<std::string>{}(key) % 2, 1);
+    auto descriptor = allocator.Allocate(key, 100);
+    ASSERT_TRUE(descriptor);
+    ASSERT_EQ(descriptor->shard_idx, 1);
+    std::string value(100, 'R'), output(100, '\0');
+    auto writes =
+        writer.BatchWrite({{key, *descriptor, {{value.data(), value.size()}}}});
+    ASSERT_EQ(writes.size(), 1);
+    ASSERT_TRUE(writes[0]);
+    DistributedStorageBackend reader(file_config, config,
+                                     std::make_unique<PosixFsAdapter>(),
+                                     TestDfsIdentityForRoot(config));
+    ASSERT_TRUE(reader.Init());
+    auto reads = reader.BatchRead(
+        {{key, *descriptor, {{output.data(), output.size()}}}});
+    ASSERT_EQ(reads.size(), 1);
+    ASSERT_TRUE(reads[0]);
+    EXPECT_EQ(output, value);
+}
+
+TEST(DfsBackendInitializationTest, OpensLegacyPaddedDescriptorWithoutAliases) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_backend_legacy_padding");
+    const auto config = MakeAllocatorConfig(tmp.path(), 2, 8192, 4096);
+    PosixFsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(tmp.path()));
+    const auto path = tmp.file("dfs_shard_000.data");
+    ASSERT_TRUE(adapter.PreallocateFile(path, config.shard_capacity));
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp.path();
+    DistributedStorageBackend client(file_config, config,
+                                     std::make_unique<PosixFsAdapter>(),
+                                     TestDfsIdentityForRoot(config));
+    ASSERT_TRUE(client.Init());
+    const DistributedFSDescriptor descriptor{path, 0, 100, 4096, 0};
+    std::string value(100, 'L'), output(100, '\0');
+    auto writes = client.BatchWrite(
+        {{"legacy", descriptor, {{value.data(), value.size()}}}});
+    ASSERT_EQ(writes.size(), 1);
+    ASSERT_TRUE(writes[0]);
+    auto reads = client.BatchRead(
+        {{"legacy", descriptor, {{output.data(), output.size()}}}});
+    ASSERT_EQ(reads.size(), 1);
+    ASSERT_TRUE(reads[0]);
+    EXPECT_EQ(output, value);
+    EXPECT_FALSE(std::filesystem::exists(tmp.file("dfs_shard_00.data")));
+    EXPECT_FALSE(std::filesystem::exists(tmp.file("dfs_shard_01.data")));
+}
+
+// Four shard files exist before initialization. A descriptor published after
+// capacity expansion must work without restarting that existing client.
+TEST_F(DfsBackendTest, OpensNewShardDescriptorAfterClientInitialization) {
+    const std::string new_path = ShardPath(4);
+    PosixFsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(tmp_->path()));
+    ASSERT_TRUE(adapter.PreallocateFile(new_path, 64 * 1024 * 1024));
+
+    AlignedBuffer expected(4096), actual(4096);
+    ASSERT_NE(expected.data(), nullptr);
+    ASSERT_NE(actual.data(), nullptr);
+    expected.Fill('N');
+    actual.Fill('X');
+    const DistributedFSDescriptor descriptor{new_path, 0, 4096, 4096, 4};
+
+    auto writes = backend_->BatchWrite(
+        {{"new_shard", descriptor, {{expected.data(), expected.size()}}}});
+    ASSERT_EQ(writes.size(), 1);
+    ASSERT_TRUE(writes[0].has_value());
+    auto reads = backend_->BatchRead(
+        {{"new_shard", descriptor, {{actual.data(), actual.size()}}}});
+    ASSERT_EQ(reads.size(), 1);
+    ASSERT_TRUE(reads[0].has_value());
+    EXPECT_EQ(std::memcmp(expected.data(), actual.data(), expected.size()), 0);
+}
+
+TEST_F(DfsBackendTest, LazyOpenRetriesAfterOpenFailure) {
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp_->path();
+    auto config = MakeAllocatorConfig(tmp_->path(), 4, 64 * 1024 * 1024, 4096);
+    config.fs_adapter_type = "posix";
+    auto adapter = std::make_unique<ControlledPosixFsAdapter>();
+    auto* controlled = adapter.get();
+    controlled->FailOpenCall(1);
+    backend_ = std::make_unique<DistributedStorageBackend>(
+        file_config, config, std::move(adapter),
+        TestDfsIdentityForRoot(config));
+    ASSERT_TRUE(backend_->Init());
+
+    std::string input(4096, 'R'), output(4096, '\0');
+    const DistributedFSDescriptor descriptor{ShardPath(1), 0, 4096, 4096, 1};
+    const std::vector<DfsWriteRequest> request{
+        {"retry", descriptor, {{input.data(), input.size()}}}};
+    auto failed = backend_->BatchWrite(request);
+    ASSERT_EQ(failed.size(), 1);
+    ASSERT_FALSE(failed[0]);
+    EXPECT_EQ(failed[0].error(), ErrorCode::FILE_OPEN_FAIL);
+    auto retried = backend_->BatchWrite(request);
+    ASSERT_EQ(retried.size(), 1);
+    ASSERT_TRUE(retried[0]);
+    auto reads = backend_->BatchRead(
+        {{"retry", descriptor, {{output.data(), output.size()}}}});
+    ASSERT_EQ(reads.size(), 1);
+    ASSERT_TRUE(reads[0]);
+    EXPECT_EQ(output, input);
+    EXPECT_EQ(controlled->OpenCallCount(), 2);
+}
+
+TEST_F(DfsBackendTest, LazyOpenRejectsMissingAndMalformedShardFiles) {
+    AlignedBuffer value(4096);
+    ASSERT_NE(value.data(), nullptr);
+    value.Fill('V');
+    const auto missing = ShardPath(4);
+    auto write = backend_->BatchWrite({{"missing",
+                                        {missing, 0, 4096, 4096, 4},
+                                        {{value.data(), value.size()}}}});
+    ASSERT_EQ(write.size(), 1);
+    EXPECT_FALSE(write[0]);
+    EXPECT_FALSE(std::filesystem::exists(missing));
+
+    PosixFsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(tmp_->path()));
+    ASSERT_TRUE(adapter.PreallocateFile(missing, 8192));
+    write = backend_->BatchWrite({{"wrong_capacity",
+                                   {missing, 0, 4096, 4096, 4},
+                                   {{value.data(), value.size()}}}});
+    ASSERT_EQ(write.size(), 1);
+    ASSERT_FALSE(write[0]);
+    EXPECT_EQ(write[0].error(), ErrorCode::INVALID_PARAMS);
+
+    const auto mismatched = ShardPath(5);
+    ASSERT_TRUE(adapter.PreallocateFile(mismatched, 64 * 1024 * 1024));
+    write = backend_->BatchWrite({{"wrong_index",
+                                   {mismatched, 0, 4096, 4096, 4},
+                                   {{value.data(), value.size()}}}});
+    ASSERT_EQ(write.size(), 1);
+    ASSERT_FALSE(write[0]);
+    EXPECT_EQ(write[0].error(), ErrorCode::INVALID_PARAMS);
+}
+
+// Once a shard is open, only the exact path validated at open time skips
+// normalization. Aliases and changed descriptors must still be validated
+// against the cached shard without reopening it.
+TEST_F(DfsBackendTest, CachedShardRevalidatesChangedDescriptors) {
+    ControlledPosixFsAdapter* controlled = nullptr;
+    auto backend = MakeControlledBackend(tmp_->path(), &controlled);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    AlignedBuffer buf(4096);
+    ASSERT_NE(buf.data(), nullptr);
+    const auto read = [&](const std::string& path, int shard_idx) {
+        auto results = backend->BatchRead({{"cached",
+                                            {path, 0, 4096, 4096, shard_idx},
+                                            {{buf.data(), buf.size()}}}});
+        return results.at(0);
+    };
+    const std::filesystem::path root(tmp_->path());
+    const auto name = std::filesystem::path(ShardPath(0)).filename();
+
+    ASSERT_TRUE(read(ShardPath(0), 0));
+    ASSERT_TRUE(read(ShardPath(0), 0));
+    EXPECT_TRUE(read((root / "." / name).string(), 0));
+
+    for (const auto& [path, shard_idx] :
+         std::vector<std::pair<std::string, int>>{
+             {ShardPath(1), 0},
+             {ShardPath(0), 1},
+             {(root / ".." / name).string(), 0}}) {
+        SCOPED_TRACE(path + " shard_idx=" + std::to_string(shard_idx));
+        auto result = read(path, shard_idx);
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+    EXPECT_EQ(controlled->OpenCallCount(), 1);
+}
+
+TEST_F(DfsBackendTest, ConcurrentLazyOpenPreservesIndependentWrites) {
+    PosixFsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(tmp_->path()));
+    const auto path = ShardPath(4);
+    ASSERT_TRUE(adapter.PreallocateFile(path, 64 * 1024 * 1024));
+    std::atomic<bool> start{false};
+    std::atomic<int> failures{0};
+    std::vector<std::thread> workers;
+    for (int i = 0; i < 8; ++i) {
+        workers.emplace_back([&, i] {
+            AlignedBuffer input(4096), output(4096);
+            if (!input.data() || !output.data()) {
+                ++failures;
+                return;
+            }
+            input.Fill(static_cast<char>('A' + i));
+            output.Fill('X');
+            const DistributedFSDescriptor descriptor{
+                path, static_cast<uint64_t>(i) * 4096, 4096, 4096, 4};
+            while (!start.load()) std::this_thread::yield();
+            auto writes =
+                backend_->BatchWrite({{std::to_string(i),
+                                       descriptor,
+                                       {{input.data(), input.size()}}}});
+            auto reads =
+                backend_->BatchRead({{std::to_string(i),
+                                      descriptor,
+                                      {{output.data(), output.size()}}}});
+            if (writes.size() != 1 || !writes[0] || reads.size() != 1 ||
+                !reads[0] ||
+                std::memcmp(input.data(), output.data(), input.size())) {
+                ++failures;
+            }
+        });
+    }
+    start.store(true);
+    for (auto& worker : workers) worker.join();
+    EXPECT_EQ(failures.load(), 0);
 }
 
 TEST_F(DfsBackendTest, BatchWriteUsesExplicitDescriptors) {
@@ -1504,10 +1859,13 @@ TEST_F(DfsBackendTest, BatchWritePreservesPerKeyWriteErrors) {
     auto* controlled_adapter = adapter.get();
     auto backend = std::make_unique<DistributedStorageBackend>(
         file_config, distributed_config, std::move(adapter),
-        kTestDfsRootIdentity);
+        TestDfsIdentityForRoot(distributed_config));
     ASSERT_TRUE(backend->Init().has_value());
-    controlled_adapter->FailWriteCall(2);
-    controlled_adapter->ShortWriteCall(3);
+    // Offset-based injection so the reopen-and-retry hits the same failure and
+    // the error still surfaces. "failed" is a hard error (retried once);
+    // "short" is a short write (not retried).
+    controlled_adapter->FailWriteAtOffset(4096);
+    controlled_adapter->ShortWriteAtOffset(8192);
 
     AlignedBuffer write_buf(4096);
     ASSERT_NE(write_buf.data(), nullptr);
@@ -1529,6 +1887,9 @@ TEST_F(DfsBackendTest, BatchWritePreservesPerKeyWriteErrors) {
     EXPECT_EQ(results[1].error(), ErrorCode::FILE_WRITE_FAIL);
     ASSERT_FALSE(results[2].has_value());
     EXPECT_EQ(results[2].error(), ErrorCode::FILE_WRITE_FAIL);
+    // Shard opened once, then reopened once for the hard-failed write; the
+    // short write is not retried.
+    EXPECT_EQ(controlled_adapter->OpenCallCount(), 2);
 }
 
 TEST_F(DfsBackendTest, BatchReadUsesExplicitDescriptorsAndMultipleSlices) {
@@ -1598,7 +1959,7 @@ TEST_F(DfsBackendTest, BatchReadPreservesPerKeyErrors) {
     auto* controlled_adapter = adapter.get();
     auto backend = std::make_unique<DistributedStorageBackend>(
         file_config, distributed_config, std::move(adapter),
-        kTestDfsRootIdentity);
+        TestDfsIdentityForRoot(distributed_config));
     ASSERT_TRUE(backend->Init().has_value());
 
     AlignedBuffer write_buf(4096);
@@ -1616,8 +1977,8 @@ TEST_F(DfsBackendTest, BatchReadPreservesPerKeyErrors) {
         ASSERT_TRUE(result.has_value());
     }
 
-    controlled_adapter->FailReadCall(2);
-    controlled_adapter->ShortReadCall(3);
+    controlled_adapter->FailReadAtOffset(4096);
+    controlled_adapter->ShortReadAtOffset(8192);
     AlignedBuffer out0(4096), out1(4096), out2(4096), out3(4096);
     std::vector<DfsReadRequest> reads{
         {"ok_0", writes[0].descriptor, {{out0.data(), out0.size()}}},
@@ -1629,11 +1990,309 @@ TEST_F(DfsBackendTest, BatchReadPreservesPerKeyErrors) {
     ASSERT_EQ(read_results.size(), reads.size());
     EXPECT_TRUE(read_results[0].has_value());
     ASSERT_FALSE(read_results[1].has_value());
-    EXPECT_EQ(read_results[1].error(), ErrorCode::FILE_OPEN_FAIL);
+    EXPECT_EQ(read_results[1].error(), ErrorCode::FILE_READ_FAIL);
     ASSERT_FALSE(read_results[2].has_value());
     EXPECT_EQ(read_results[2].error(), ErrorCode::FILE_READ_FAIL);
     EXPECT_TRUE(read_results[3].has_value());
     EXPECT_EQ(std::memcmp(write_buf.data(), out3.data(), write_buf.size()), 0);
+    // One open for the initial writes, one reopen for the hard-failed read; the
+    // short read is not retried.
+    EXPECT_EQ(controlled_adapter->OpenCallCount(), 2);
+}
+
+TEST_F(DfsBackendTest, RangeReadRejectsTruncatedObjectWithoutReadingTail) {
+    AlignedBuffer write_buf(4096);
+    ASSERT_NE(write_buf.data(), nullptr);
+    write_buf.Fill('T');
+    const DistributedFSDescriptor desc{ShardPath(0), 0, 4096, 4096, 0};
+    auto write_results = backend_->BatchWrite(
+        {{"key", desc, {{write_buf.data(), write_buf.size()}}}});
+    ASSERT_EQ(write_results.size(), 1);
+    ASSERT_TRUE(write_results[0].has_value());
+
+    AlignedBuffer window(512);
+    ASSERT_NE(window.data(), nullptr);
+    const DfsReadRequest request{
+        "key", desc, {{window.data(), window.size()}}, 0, true};
+    auto intact = backend_->BatchRead({request});
+    ASSERT_EQ(intact.size(), 1);
+    ASSERT_TRUE(intact[0].has_value());
+    EXPECT_EQ(std::memcmp(write_buf.data(), window.data(), window.size()), 0);
+
+    // The requested 512 bytes are still present. The object is not.
+    std::error_code ec;
+    std::filesystem::resize_file(desc.file_path,
+                                 desc.offset + desc.object_size / 2, ec);
+    ASSERT_FALSE(ec) << ec.message();
+    window.Fill('Z');
+    auto truncated = backend_->BatchRead({request});
+    ASSERT_EQ(truncated.size(), 1);
+    ASSERT_FALSE(truncated[0].has_value());
+    EXPECT_EQ(truncated[0].error(), ErrorCode::FILE_READ_FAIL);
+    EXPECT_EQ(window.data()[0], 'Z');
+}
+
+TEST_F(DfsBackendTest, WriteReopensStaleDescriptorAndSucceeds) {
+    ControlledPosixFsAdapter* controlled = nullptr;
+    auto backend = MakeControlledBackend(tmp_->path(), &controlled);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    // The first write fails as if the descriptor went stale; the backend should
+    // reopen the shard once and retry, so the write ultimately succeeds.
+    controlled->FailWriteCall(1);
+
+    AlignedBuffer write_buf(4096);
+    ASSERT_NE(write_buf.data(), nullptr);
+    write_buf.Fill('W');
+    const DistributedFSDescriptor desc{ShardPath(0), 0, 4096, 4096, 0};
+    auto results = backend->BatchWrite(
+        {{"key", desc, {{write_buf.data(), write_buf.size()}}}});
+    ASSERT_EQ(results.size(), 1);
+    EXPECT_TRUE(results[0].has_value());
+    // One failed write + one retried write.
+    EXPECT_EQ(controlled->WriteCallCount(), 2);
+    // One initial open in GetOrOpenShard + one reopen.
+    EXPECT_EQ(controlled->OpenCallCount(), 2);
+
+    AlignedBuffer read_buf(4096);
+    ASSERT_NE(read_buf.data(), nullptr);
+    auto read_results = backend->BatchRead(
+        {{"key", desc, {{read_buf.data(), read_buf.size()}}}});
+    ASSERT_EQ(read_results.size(), 1);
+    ASSERT_TRUE(read_results[0].has_value());
+    EXPECT_EQ(std::memcmp(write_buf.data(), read_buf.data(), write_buf.size()),
+              0);
+}
+
+TEST_F(DfsBackendTest, ReadReopensStaleDescriptorAndSucceeds) {
+    ControlledPosixFsAdapter* controlled = nullptr;
+    auto backend = MakeControlledBackend(tmp_->path(), &controlled);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    AlignedBuffer write_buf(4096);
+    ASSERT_NE(write_buf.data(), nullptr);
+    write_buf.Fill('R');
+    const DistributedFSDescriptor desc{ShardPath(0), 0, 4096, 4096, 0};
+    auto write_results = backend->BatchWrite(
+        {{"key", desc, {{write_buf.data(), write_buf.size()}}}});
+    ASSERT_EQ(write_results.size(), 1);
+    ASSERT_TRUE(write_results[0].has_value());
+    const int opens_after_write = controlled->OpenCallCount();
+
+    // The first read fails; the backend should reopen the shard once and retry.
+    controlled->FailReadCall(1);
+    AlignedBuffer read_buf(4096);
+    ASSERT_NE(read_buf.data(), nullptr);
+    auto read_results = backend->BatchRead(
+        {{"key", desc, {{read_buf.data(), read_buf.size()}}}});
+    ASSERT_EQ(read_results.size(), 1);
+    ASSERT_TRUE(read_results[0].has_value());
+    // One failed read + one retried read.
+    EXPECT_EQ(controlled->ReadCallCount(), 2);
+    // The read path reopens exactly once on top of the shard already opened by
+    // the write.
+    EXPECT_EQ(controlled->OpenCallCount(), opens_after_write + 1);
+    EXPECT_EQ(std::memcmp(write_buf.data(), read_buf.data(), write_buf.size()),
+              0);
+}
+
+TEST_F(DfsBackendTest, WriteReopenExhaustedSurfacesError) {
+    ControlledPosixFsAdapter* controlled = nullptr;
+    auto backend = MakeControlledBackend(tmp_->path(), &controlled);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    // A persistent failure at this offset survives the reopen-and-retry, so the
+    // error must surface after exactly one retry.
+    controlled->FailWriteAtOffset(0);
+
+    AlignedBuffer write_buf(4096);
+    ASSERT_NE(write_buf.data(), nullptr);
+    const DistributedFSDescriptor desc{ShardPath(0), 0, 4096, 4096, 0};
+    auto results = backend->BatchWrite(
+        {{"key", desc, {{write_buf.data(), write_buf.size()}}}});
+    ASSERT_EQ(results.size(), 1);
+    ASSERT_FALSE(results[0].has_value());
+    EXPECT_EQ(results[0].error(), ErrorCode::FILE_WRITE_FAIL);
+    // Retry is bounded to one attempt: initial write + one retry.
+    EXPECT_EQ(controlled->WriteCallCount(), 2);
+    // Initial open + one reopen; no unbounded reopen loop.
+    EXPECT_EQ(controlled->OpenCallCount(), 2);
+}
+
+TEST_F(DfsBackendTest, ReadReopenExhaustedSurfacesError) {
+    ControlledPosixFsAdapter* controlled = nullptr;
+    auto backend = MakeControlledBackend(tmp_->path(), &controlled);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    AlignedBuffer write_buf(4096);
+    ASSERT_NE(write_buf.data(), nullptr);
+    write_buf.Fill('X');
+    const DistributedFSDescriptor desc{ShardPath(0), 0, 4096, 4096, 0};
+    auto write_results = backend->BatchWrite(
+        {{"key", desc, {{write_buf.data(), write_buf.size()}}}});
+    ASSERT_EQ(write_results.size(), 1);
+    ASSERT_TRUE(write_results[0].has_value());
+    const int reads_before = controlled->ReadCallCount();
+
+    // Persistent read failure survives the reopen-and-retry.
+    controlled->FailReadAtOffset(0);
+    AlignedBuffer read_buf(4096);
+    ASSERT_NE(read_buf.data(), nullptr);
+    auto read_results = backend->BatchRead(
+        {{"key", desc, {{read_buf.data(), read_buf.size()}}}});
+    ASSERT_EQ(read_results.size(), 1);
+    ASSERT_FALSE(read_results[0].has_value());
+    EXPECT_EQ(read_results[0].error(), ErrorCode::FILE_READ_FAIL);
+    // Retry bounded to one attempt: initial read + one retry.
+    EXPECT_EQ(controlled->ReadCallCount(), reads_before + 2);
+}
+
+TEST_F(DfsBackendTest, WriteSkipsReopenWhenAdapterOptsOut) {
+    ControlledPosixFsAdapter* controlled = nullptr;
+    auto backend = MakeControlledBackend(tmp_->path(), &controlled);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    // An adapter whose faults are not fd-recoverable (SupportsFdReopen() ==
+    // false, modelling 3FS) must surface the write error directly, with no
+    // reopen-and-retry.
+    controlled->SetSupportsFdReopen(false);
+    controlled->FailWriteCall(1);
+
+    AlignedBuffer write_buf(4096);
+    ASSERT_NE(write_buf.data(), nullptr);
+    const DistributedFSDescriptor desc{ShardPath(0), 0, 4096, 4096, 0};
+    auto results = backend->BatchWrite(
+        {{"key", desc, {{write_buf.data(), write_buf.size()}}}});
+    ASSERT_EQ(results.size(), 1);
+    ASSERT_FALSE(results[0].has_value());
+    EXPECT_EQ(results[0].error(), ErrorCode::FILE_WRITE_FAIL);
+    // No retry and no reopen: exactly one write, one initial open.
+    EXPECT_EQ(controlled->WriteCallCount(), 1);
+    EXPECT_EQ(controlled->OpenCallCount(), 1);
+}
+
+TEST_F(DfsBackendTest, ReadSkipsReopenWhenAdapterOptsOut) {
+    ControlledPosixFsAdapter* controlled = nullptr;
+    auto backend = MakeControlledBackend(tmp_->path(), &controlled);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    AlignedBuffer write_buf(4096);
+    ASSERT_NE(write_buf.data(), nullptr);
+    write_buf.Fill('N');
+    const DistributedFSDescriptor desc{ShardPath(0), 0, 4096, 4096, 0};
+    auto write_results = backend->BatchWrite(
+        {{"key", desc, {{write_buf.data(), write_buf.size()}}}});
+    ASSERT_EQ(write_results.size(), 1);
+    ASSERT_TRUE(write_results[0].has_value());
+    const int opens_after_write = controlled->OpenCallCount();
+
+    // Opt out of fd reopen, then fail the read: the error must surface with no
+    // reopen-and-retry.
+    controlled->SetSupportsFdReopen(false);
+    controlled->FailReadCall(1);
+    AlignedBuffer read_buf(4096);
+    ASSERT_NE(read_buf.data(), nullptr);
+    auto read_results = backend->BatchRead(
+        {{"key", desc, {{read_buf.data(), read_buf.size()}}}});
+    ASSERT_EQ(read_results.size(), 1);
+    ASSERT_FALSE(read_results[0].has_value());
+    EXPECT_EQ(read_results[0].error(), ErrorCode::FILE_READ_FAIL);
+    // No reopen on the read path when the adapter opts out.
+    EXPECT_EQ(controlled->OpenCallCount(), opens_after_write);
+}
+
+TEST_F(DfsBackendTest, ReopenOpenFailureLeavesShardReopenable) {
+    ControlledPosixFsAdapter* controlled = nullptr;
+    auto backend = MakeControlledBackend(tmp_->path(), &controlled);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    // First write fails, triggering a reopen whose OpenFile (the 2nd open) also
+    // fails. The shard's fd must be reset to -1 so a later request can re-open
+    // it and succeed.
+    controlled->FailWriteCall(1);
+    controlled->FailOpenCall(2);
+
+    AlignedBuffer write_buf(4096);
+    ASSERT_NE(write_buf.data(), nullptr);
+    write_buf.Fill('Z');
+    const DistributedFSDescriptor desc{ShardPath(0), 0, 4096, 4096, 0};
+    auto first = backend->BatchWrite(
+        {{"key", desc, {{write_buf.data(), write_buf.size()}}}});
+    ASSERT_EQ(first.size(), 1);
+    ASSERT_FALSE(first[0].has_value());
+    EXPECT_EQ(first[0].error(), ErrorCode::FILE_WRITE_FAIL);
+
+    // The reopen failure left fd == -1; the next write re-initializes the shard
+    // (3rd open) and succeeds because both the write-fail and open-fail
+    // triggers are one-shot on earlier call indices.
+    auto second = backend->BatchWrite(
+        {{"key", desc, {{write_buf.data(), write_buf.size()}}}});
+    ASSERT_EQ(second.size(), 1);
+    ASSERT_TRUE(second[0].has_value());
+    EXPECT_EQ(controlled->OpenCallCount(), 3);
+
+    AlignedBuffer read_buf(4096);
+    ASSERT_NE(read_buf.data(), nullptr);
+    auto read_results = backend->BatchRead(
+        {{"key", desc, {{read_buf.data(), read_buf.size()}}}});
+    ASSERT_EQ(read_results.size(), 1);
+    ASSERT_TRUE(read_results[0].has_value());
+    EXPECT_EQ(std::memcmp(write_buf.data(), read_buf.data(), write_buf.size()),
+              0);
+}
+
+TEST_F(DfsBackendTest, ConcurrentWritesWithReopenPreserveData) {
+    ControlledPosixFsAdapter* controlled = nullptr;
+    auto backend = MakeControlledBackend(tmp_->path(), &controlled);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    constexpr int kThreads = 8;
+    constexpr int64_t kBlock = 4096;
+    // One thread's write fails exactly once and must recover via a single
+    // reopen. Because all shard I/O is serialized by the per-shard mutex, the
+    // close+reopen cannot race the other threads' concurrent writes.
+    controlled->FailWriteAtOffsetOnce(3 * kBlock);
+
+    std::vector<std::unique_ptr<AlignedBuffer>> buffers(kThreads);
+    for (int i = 0; i < kThreads; ++i) {
+        buffers[i] = std::make_unique<AlignedBuffer>(kBlock);
+        ASSERT_NE(buffers[i]->data(), nullptr);
+        buffers[i]->Fill(static_cast<char>('A' + i));
+    }
+
+    std::vector<std::thread> threads;
+    std::atomic<int> failures{0};
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([&, i]() {
+            const DistributedFSDescriptor desc{ShardPath(0), i * kBlock, kBlock,
+                                               kBlock, 0};
+            auto results = backend->BatchWrite(
+                {{"key_" + std::to_string(i),
+                  desc,
+                  {{buffers[i]->data(), buffers[i]->size()}}}});
+            if (results.size() != 1 || !results[0].has_value()) {
+                ++failures;
+            }
+        });
+    }
+    for (auto& t : threads) t.join();
+    EXPECT_EQ(failures.load(), 0);
+
+    // Every distinct offset must hold exactly the bytes its writer produced,
+    // including the offset that went through the reopen path.
+    for (int i = 0; i < kThreads; ++i) {
+        AlignedBuffer read_buf(kBlock);
+        ASSERT_NE(read_buf.data(), nullptr);
+        const DistributedFSDescriptor desc{ShardPath(0), i * kBlock, kBlock,
+                                           kBlock, 0};
+        auto read_results =
+            backend->BatchRead({{"key_" + std::to_string(i),
+                                 desc,
+                                 {{read_buf.data(), read_buf.size()}}}});
+        ASSERT_EQ(read_results.size(), 1);
+        ASSERT_TRUE(read_results[0].has_value());
+        EXPECT_EQ(std::memcmp(buffers[i]->data(), read_buf.data(), kBlock), 0);
+    }
 }
 
 TEST_F(DfsBackendTest, RejectsInvalidDescriptorRangesBeforeIo) {
@@ -1654,7 +2313,7 @@ TEST_F(DfsBackendTest, RejectsInvalidDescriptorRangesBeforeIo) {
     auto* controlled_adapter = adapter.get();
     auto backend = std::make_unique<DistributedStorageBackend>(
         file_config, distributed_config, std::move(adapter),
-        kTestDfsRootIdentity);
+        TestDfsIdentityForRoot(distributed_config));
     ASSERT_TRUE(backend->Init().has_value());
 
     AlignedBuffer small_buf(4096);
@@ -1824,17 +2483,15 @@ TEST_F(DfsBackendTest, FailurePaths) {
     ASSERT_FALSE(write.has_value());
     EXPECT_EQ(write.error(), ErrorCode::INVALID_PARAMS);
 
-    auto read =
-        adapter.ReadFile(tmp_->file("does_not_exist"), buf, sizeof(buf));
-    ASSERT_FALSE(read.has_value());
-    EXPECT_EQ(read.error(), ErrorCode::FILE_NOT_FOUND);
+    auto open = adapter.OpenExistingFile(tmp_->file("does_not_exist"));
+    ASSERT_FALSE(open.has_value());
+    EXPECT_EQ(open.error(), ErrorCode::FILE_NOT_FOUND);
 }
 
 TEST(DfsStorageFactoryTest, CreatesDistributedBackendWithPosixAdapter) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     TempDir tmp("dfs_factory");
-    ASSERT_TRUE(WriteTestDfsRootIdentity(tmp.path()));
     env.Set("MOONCAKE_DFS_ROOT_DIR", tmp.path().c_str());
     env.Set("MOONCAKE_DFS_SHARD_COUNT", "2");
     env.Set("MOONCAKE_DFS_SHARD_CAPACITY", "1048576");
@@ -1845,10 +2502,890 @@ TEST(DfsStorageFactoryTest, CreatesDistributedBackendWithPosixAdapter) {
     file_config.storage_backend_type = StorageBackendType::kDistributed;
     file_config.storage_filepath = tmp.path();
 
-    auto backend = CreateStorageBackend(file_config, kTestDfsRootIdentity);
+    auto backend = CreateStorageBackend(file_config);
     ASSERT_TRUE(backend.has_value());
     ASSERT_NE(*backend, nullptr);
-    EXPECT_TRUE((*backend)->Init().has_value());
+    // A factory-created client has no Master-issued root identity yet.
+    auto initialized = (*backend)->Init();
+    ASSERT_FALSE(initialized);
+    EXPECT_EQ(initialized.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
 }
 
+TEST_F(FsAdapterFdTest, DirectReadUsesCallerBufferWhenFullyAligned) {
+    const std::string path = tmp_->file("direct_aligned.data");
+    TrackingDirectPosixFsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(tmp_->path()).has_value());
+    ASSERT_TRUE(adapter.PreallocateFile(path, 2 * 4096).has_value());
+
+    auto write_fd = adapter.OpenFile(path);
+    ASSERT_TRUE(write_fd.has_value());
+    AlignedBuffer source(2 * 4096);
+    ASSERT_NE(source.data(), nullptr);
+    std::memset(source.data(), 'A', 4096);
+    std::memset(source.data() + 4096, 'B', 4096);
+    iovec write_iov{source.data(), source.size()};
+    ASSERT_EQ(adapter.WriteAt(*write_fd, &write_iov, 1, 0).value(),
+              source.size());
+    ASSERT_TRUE(adapter.CloseFile(*write_fd).has_value());
+
+    auto direct_fd = adapter.OpenFileDirect(path);
+    ASSERT_TRUE(direct_fd.has_value());
+    AlignedBuffer first(4096), second(4096);
+    ASSERT_NE(first.data(), nullptr);
+    ASSERT_NE(second.data(), nullptr);
+    iovec reads[2]{{first.data(), first.size()},
+                   {second.data(), second.size()}};
+    auto result = adapter.DirectReadAt(*direct_fd, reads, 2, 0);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 2 * 4096u);
+    EXPECT_EQ(adapter.aligned_reads(), 1);
+    EXPECT_EQ(adapter.staged_reads(), 0);
+    EXPECT_EQ(std::memcmp(first.data(), source.data(), 4096), 0);
+    EXPECT_EQ(std::memcmp(second.data(), source.data() + 4096, 4096), 0);
+    EXPECT_TRUE(adapter.CloseFile(*direct_fd).has_value());
+}
+
+TEST_F(FsAdapterFdTest, DirectReadStagesUnalignedRequestsWithoutOverflow) {
+    const std::string path = tmp_->file("direct_staged.data");
+    TrackingDirectPosixFsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(tmp_->path()).has_value());
+    ASSERT_TRUE(adapter.PreallocateFile(path, 4096).has_value());
+
+    auto write_fd = adapter.OpenFile(path);
+    ASSERT_TRUE(write_fd.has_value());
+    std::vector<char> source(4096, 'S');
+    iovec write_iov{source.data(), source.size()};
+    ASSERT_EQ(adapter.WriteAt(*write_fd, &write_iov, 1, 0).value(),
+              source.size());
+    ASSERT_TRUE(adapter.CloseFile(*write_fd).has_value());
+
+    auto direct_fd = adapter.OpenFileDirect(path);
+    ASSERT_TRUE(direct_fd.has_value());
+
+    AlignedBuffer storage(4098);
+    ASSERT_NE(storage.data(), nullptr);
+    storage.data()[0] = 'L';
+    storage.data()[4097] = 'R';
+    iovec unaligned_address{storage.data() + 1, 4096};
+    auto address_result =
+        adapter.DirectReadAt(*direct_fd, &unaligned_address, 1, 0);
+    ASSERT_TRUE(address_result.has_value());
+    EXPECT_EQ(*address_result, 4096u);
+    EXPECT_EQ(storage.data()[0], 'L');
+    EXPECT_EQ(storage.data()[4097], 'R');
+
+    AlignedBuffer short_target(4096);
+    ASSERT_NE(short_target.data(), nullptr);
+    short_target.data()[1234] = 'G';
+    iovec unaligned_length{short_target.data(), 1234};
+    auto length_result =
+        adapter.DirectReadAt(*direct_fd, &unaligned_length, 1, 0);
+    ASSERT_TRUE(length_result.has_value());
+    EXPECT_EQ(*length_result, 1234u);
+    EXPECT_EQ(short_target.data()[1234], 'G');
+
+    EXPECT_EQ(adapter.aligned_reads(), 0);
+    EXPECT_EQ(adapter.staged_reads(), 2);
+    EXPECT_EQ(std::memcmp(storage.data() + 1, source.data(), 4096), 0);
+    EXPECT_EQ(std::memcmp(short_target.data(), source.data(), 1234), 0);
+    EXPECT_TRUE(adapter.CloseFile(*direct_fd).has_value());
+}
+
+TEST(DfsGlobalAllocatorTest, AllocateFreeAndFormatShardIdx) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_alloc");
+
+    DfsGlobalAllocator alloc;
+    ASSERT_TRUE(
+        alloc.Init(MakeAllocatorConfig(tmp.path(), 4, 1024 * 1024, 4096)));
+
+    auto desc = alloc.Allocate("key1", 100);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_EQ(desc->aligned_size, 4096);
+    EXPECT_GE(desc->shard_idx, 0);
+    EXPECT_LT(desc->shard_idx, 4);
+    EXPECT_EQ(desc->offset % 4096, 0);
+
+    alloc.Free(desc->offset, desc->aligned_size, desc->shard_idx, "key1");
+    auto desc2 = alloc.Allocate("key2", 100);
+    EXPECT_TRUE(desc2.has_value());
+
+    EXPECT_EQ(ShardAllocator::FormatShardIdx(0, 64), "00");
+    EXPECT_EQ(ShardAllocator::FormatShardIdx(9, 64), "09");
+    EXPECT_EQ(ShardAllocator::FormatShardIdx(10, 64), "10");
+    EXPECT_EQ(ShardAllocator::FormatShardIdx(63, 64), "63");
+    EXPECT_EQ(ShardAllocator::FormatShardIdx(100, 1000), "100");
+}
+
+TEST(DistributedStorageConfigTest, ReadsValidatesAndFormatsEnvironment) {
+    EnvGuard env;
+    TempDir tmp("dfs_config");
+    env.Set("MOONCAKE_DFS_ROOT_DIR", tmp.path().c_str());
+    env.Set("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    env.Set("MOONCAKE_DFS_SHARD_COUNT", "8");
+    env.Set("MOONCAKE_DFS_SHARD_CAPACITY", "1048576");
+    env.Set("MOONCAKE_DFS_ALIGNMENT", "4096");
+    env.Set("MOONCAKE_DFS_SINGLE_TENANT", "1");
+    env.Set("MOONCAKE_DFS_EVICTION_ENABLED", "1");
+    env.Set("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.85");
+    env.Set("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.65");
+    env.Set("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "12");
+    env.Set("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL", "3");
+    env.Set("MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS", "65432");
+    env.Set("MOONCAKE_DFS_BATCH_GET_MAX_INFLIGHT_BATCHES", "7");
+    env.Set("MOONCAKE_DFS_BATCH_GET_MAX_INFLIGHT_BYTES", "12345678");
+
+    const auto config = DistributedStorageConfig::FromEnvironment();
+    EXPECT_EQ(config.fsdir, tmp.path());
+    EXPECT_EQ(config.fs_adapter_type, "posix");
+    EXPECT_EQ(config.shard_count, 8);
+    EXPECT_EQ(config.shard_capacity, 1048576);
+    EXPECT_EQ(config.alignment, 4096);
+    EXPECT_TRUE(config.eviction_enabled);
+    EXPECT_DOUBLE_EQ(config.eviction_high_watermark, 0.85);
+    EXPECT_DOUBLE_EQ(config.eviction_low_watermark, 0.65);
+    EXPECT_EQ(config.deferred_free_duration, std::chrono::seconds(12));
+    EXPECT_EQ(config.eviction_check_interval, std::chrono::seconds(3));
+    EXPECT_EQ(config.batch_timeout_fixed_ms, 65432u);
+    EXPECT_EQ(config.batch_get_max_inflight_batches, 7u);
+    EXPECT_EQ(config.batch_get_max_inflight_bytes, 12345678u);
+    EXPECT_TRUE(config.Validate());
+    EXPECT_TRUE(config.ValidateForAllocator());
+
+    const std::string formatted = config.FormatStr();
+    EXPECT_NE(formatted.find("fs_adapter_type=posix"), std::string::npos);
+    EXPECT_NE(formatted.find("shard_count=8"), std::string::npos);
+    EXPECT_NE(formatted.find("eviction_high_watermark=0.85"),
+              std::string::npos);
+    EXPECT_NE(formatted.find("batch_timeout_fixed_ms=65432"),
+              std::string::npos);
+
+    auto invalid_eviction = config;
+    invalid_eviction.eviction_low_watermark = 0.9;
+    EXPECT_TRUE(invalid_eviction.Validate());
+    EXPECT_FALSE(invalid_eviction.ValidateForAllocator());
+}
+
+TEST(DfsGlobalAllocatorTest, InitReturnsSpecificErrors) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_init_error");
+
+    DistributedStorageConfig invalid_config =
+        MakeAllocatorConfig(tmp.path(), 1, 1024 * 1024, 3);
+    DfsGlobalAllocator invalid_allocator;
+    auto invalid_result = invalid_allocator.Init(invalid_config);
+    ASSERT_FALSE(invalid_result);
+    EXPECT_EQ(invalid_result.error(), ErrorCode::INVALID_PARAMS);
+
+    const std::string file_path = tmp.file("not_a_directory");
+    const int fd = ::open(file_path.c_str(), O_CREAT | O_WRONLY, 0600);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::close(fd), 0);
+
+    DistributedStorageConfig file_error_config =
+        MakeAllocatorConfig(file_path, 1, 1024 * 1024, 4096);
+    DfsGlobalAllocator file_error_allocator;
+    auto file_error_result = file_error_allocator.Init(file_error_config);
+    ASSERT_FALSE(file_error_result);
+    EXPECT_EQ(file_error_result.error(), ErrorCode::FILE_WRITE_FAIL);
+}
+
+
+
+TEST(DfsGlobalAllocatorTest, ExhaustionAndEviction) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    env.Set("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.5");
+    env.Set("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.25");
+    TempDir tmp("dfs_exhaust");
+
+    DfsGlobalAllocator alloc;
+    ASSERT_TRUE(
+        alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 16 * 1024, 4096)));
+
+    std::vector<DistributedFSDescriptor> descs;
+    for (int i = 0; i < 4; ++i) {
+        auto desc = alloc.Allocate("k" + std::to_string(i), 100);
+        ASSERT_TRUE(desc.has_value()) << "allocation " << i;
+        alloc.UpdateAccess("k" + std::to_string(i), desc->shard_idx,
+                           desc->offset);
+        descs.push_back(*desc);
+    }
+
+    auto exhausted = alloc.Allocate("k_exhausted", 100);
+    EXPECT_FALSE(exhausted.has_value());
+    EXPECT_EQ(exhausted.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+    auto pending = alloc.PrepareEviction();
+    auto evicted = pending.Candidates();
+    ASSERT_FALSE(evicted.empty());
+    EXPECT_EQ(evicted.front().key, "k0");
+
+    // Prepare only reserves candidates; their extents are not reusable until
+    // the master accepts and commits the transaction.
+    auto before_commit = alloc.Allocate("k_before_commit", 100);
+    EXPECT_FALSE(before_commit.has_value());
+
+    alloc.CommitPreparedEviction(std::move(pending));
+
+    auto after_evict = alloc.Allocate("k_after_evict", 100);
+    EXPECT_TRUE(after_evict.has_value());
+}
+
+TEST(DfsGlobalAllocatorTest, RestorePreparedEvictionPreservesCandidateOrder) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    env.Set("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.9");
+    env.Set("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.7");
+    TempDir tmp("dfs_abort_eviction");
+
+    DfsGlobalAllocator alloc;
+    ASSERT_TRUE(
+        alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 16 * 1024, 4096)));
+
+    for (int i = 0; i < 4; ++i) {
+        const std::string key = "k" + std::to_string(i);
+        auto desc = alloc.Allocate(key, 100);
+        ASSERT_TRUE(desc.has_value()) << "allocation " << i;
+        alloc.UpdateAccess(key, desc->shard_idx, desc->offset);
+    }
+
+    auto pending = alloc.PrepareEviction();
+    ASSERT_EQ(pending.Candidates().size(), 2);
+    EXPECT_EQ(pending.Candidates()[0].key, "k0");
+    EXPECT_EQ(pending.Candidates()[1].key, "k1");
+    alloc.RestorePreparedEviction(std::move(pending));
+
+    auto retry = alloc.PrepareEviction();
+    ASSERT_EQ(retry.Candidates().size(), 2);
+    EXPECT_EQ(retry.Candidates()[0].key, "k0");
+    EXPECT_EQ(retry.Candidates()[1].key, "k1");
+    alloc.RestorePreparedEviction(std::move(retry));
+}
+
+TEST(DfsGlobalAllocatorTest, PartialResolutionContinuesToLowWatermark) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    env.Set("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.9");
+    env.Set("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.7");
+    TempDir tmp("dfs_partial_eviction");
+
+    DfsGlobalAllocator alloc;
+    ASSERT_TRUE(
+        alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 16 * 1024, 4096)));
+
+    std::vector<DistributedFSDescriptor> descs;
+    for (int i = 0; i < 4; ++i) {
+        const std::string key = "k" + std::to_string(i);
+        auto desc = alloc.Allocate(key, 100);
+        ASSERT_TRUE(desc.has_value()) << "allocation " << i;
+        alloc.UpdateAccess(key, desc->shard_idx, desc->offset);
+        descs.push_back(*desc);
+    }
+
+    auto pending = alloc.PrepareEviction();
+    ASSERT_EQ(pending.Candidates().size(), 2);
+    EXPECT_EQ(pending.Candidates()[0].key, "k0");
+    EXPECT_EQ(pending.Candidates()[1].key, "k1");
+
+    alloc.ResolvePreparedEviction(std::move(pending), {true, false});
+    alloc.UpdateAccess("k1", descs[1].shard_idx, descs[1].offset);
+
+    // Accepting only k0 drops usage below the high watermark but not the low
+    // watermark. The same active eviction cycle must therefore continue and
+    // reach k2 behind the restored, protected k1.
+    auto continuation = alloc.PrepareEviction();
+    ASSERT_EQ(continuation.Candidates().size(), 1);
+    EXPECT_EQ(continuation.Candidates().front().key, "k2");
+    alloc.CommitPreparedEviction(std::move(continuation));
+
+    auto complete = alloc.PrepareEviction();
+    EXPECT_TRUE(complete.Empty());
+}
+
+TEST(DfsGlobalAllocatorTest, EvictionCountsPendingFreeTowardWatermarks) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    env.Set("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.9");
+    env.Set("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.7");
+    env.Set("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "30");
+    TempDir tmp("dfs_pending_watermark");
+
+    DfsGlobalAllocator alloc;
+    ASSERT_TRUE(
+        alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 16 * 1024, 4096)));
+
+    for (int i = 0; i < 4; ++i) {
+        const std::string key = "k" + std::to_string(i);
+        auto desc = alloc.Allocate(key, 100);
+        ASSERT_TRUE(desc.has_value()) << "allocation " << i;
+        alloc.UpdateAccess(key, desc->shard_idx, desc->offset);
+    }
+
+    auto evicted = PrepareAndCommitPreparedEviction(alloc);
+    ASSERT_EQ(evicted.size(), 2);
+    EXPECT_EQ(evicted[0].key, "k0");
+    EXPECT_EQ(evicted[1].key, "k1");
+
+    auto repeated = PrepareAndCommitPreparedEviction(alloc);
+    EXPECT_TRUE(repeated.empty());
+
+    auto before_release = alloc.Allocate("k_before_release", 100);
+    EXPECT_FALSE(before_release.has_value());
+    EXPECT_EQ(before_release.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+}
+
+TEST(DfsGlobalAllocatorTest, FreeRemovesLruEntryBeforeOffsetReuse) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_free_lru_reuse");
+
+    DfsGlobalAllocator alloc;
+    ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 4 * 1024, 4096)));
+
+    auto desc_a = alloc.Allocate("A", 100);
+    ASSERT_TRUE(desc_a.has_value());
+    alloc.UpdateAccess("A", desc_a->shard_idx, desc_a->offset);
+
+    alloc.Free(desc_a->offset, desc_a->aligned_size, desc_a->shard_idx, "A");
+
+    auto desc_b = alloc.Allocate("B", 100);
+    ASSERT_TRUE(desc_b.has_value());
+    ASSERT_EQ(desc_b->offset, desc_a->offset);
+    alloc.UpdateAccess("B", desc_b->shard_idx, desc_b->offset);
+
+    auto evicted = PrepareAndCommitPreparedEviction(alloc);
+    ASSERT_EQ(evicted.size(), 1);
+    EXPECT_EQ(evicted.front().key, "B");
+}
+
+TEST(DfsGlobalAllocatorTest, StaleFreeDoesNotReleaseReusedOffset) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_stale_free");
+
+    DfsGlobalAllocator alloc;
+    ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 4 * 1024, 4096)));
+
+    auto desc_a = alloc.Allocate("A", 100);
+    ASSERT_TRUE(desc_a.has_value());
+    alloc.UpdateAccess("A", desc_a->shard_idx, desc_a->offset);
+
+    alloc.Free(desc_a->offset, desc_a->aligned_size, desc_a->shard_idx, "A");
+
+    auto desc_b = alloc.Allocate("B", 100);
+    ASSERT_TRUE(desc_b.has_value());
+    ASSERT_EQ(desc_b->offset, desc_a->offset);
+    alloc.UpdateAccess("B", desc_b->shard_idx, desc_b->offset);
+
+    alloc.Free(desc_a->offset, desc_a->aligned_size, desc_a->shard_idx, "A");
+
+    auto evicted = PrepareAndCommitPreparedEviction(alloc);
+    ASSERT_EQ(evicted.size(), 1);
+    EXPECT_EQ(evicted.front().key, "B");
+}
+
+TEST(DfsGlobalAllocatorTest, ConcurrentAllocate) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_concurrent");
+
+    DfsGlobalAllocator alloc;
+    ASSERT_TRUE(
+        alloc.Init(MakeAllocatorConfig(tmp.path(), 4, 128 * 1024, 4096)));
+
+    constexpr int kThreadCount = 32;
+    std::vector<std::thread> threads;
+    std::atomic<int> success_count{0};
+    std::atomic<int> fail_count{0};
+    for (int i = 0; i < kThreadCount; ++i) {
+        threads.emplace_back([&alloc, &success_count, &fail_count, i]() {
+            std::string key = "key_" + std::to_string(i);
+            auto desc = alloc.Allocate(key, 100);
+            if (desc.has_value()) {
+                success_count++;
+                alloc.UpdateAccess(key, desc->shard_idx, desc->offset);
+                alloc.Free(desc->offset, desc->aligned_size, desc->shard_idx,
+                           key);
+            } else {
+                fail_count++;
+            }
+        });
+    }
+    for (auto& thread : threads) thread.join();
+
+    EXPECT_EQ(success_count.load(), kThreadCount);
+    EXPECT_EQ(fail_count.load(), 0);
+}
+
+TEST(DfsTimeoutPolicyTest, ScalesConfiguredBaselineByBatchSize) {
+    constexpr uint64_t kBaseMs = 10000;
+    constexpr uint64_t kFixedMs = kDefaultDfsBatchTimeoutFixedMs;
+    EXPECT_EQ(DfsBatchGetTimeoutMs(kBaseMs, kDfsTimeoutOneGiB, kFixedMs),
+              90000u);
+    EXPECT_EQ(DfsBatchGetTimeoutMs(kBaseMs, kDfsTimeoutOneGiB + 1, kFixedMs),
+              150000u);
+    EXPECT_EQ(DfsBatchGetTimeoutMs(kBaseMs, kDfsTimeoutFourGiB, kFixedMs),
+              150000u);
+    EXPECT_EQ(DfsBatchGetTimeoutMs(kBaseMs, kDfsTimeoutFourGiB + 1, kFixedMs),
+              230000u);
+
+    EXPECT_EQ(DfsBatchPutTimeoutMs(kBaseMs, kDfsTimeoutOneGiB, kFixedMs),
+              110000u);
+    EXPECT_EQ(DfsBatchPutTimeoutMs(kBaseMs, kDfsTimeoutOneGiB + 1, kFixedMs),
+              230000u);
+    EXPECT_EQ(DfsBatchPutTimeoutMs(kBaseMs, kDfsTimeoutFourGiB, kFixedMs),
+              230000u);
+    EXPECT_EQ(DfsBatchPutTimeoutMs(kBaseMs, kDfsTimeoutFourGiB + 1, kFixedMs),
+              390000u);
+
+    EXPECT_EQ(DfsBatchGetTimeoutMs(kBaseMs, kDfsTimeoutOneGiB, 1234), 21234u);
+    EXPECT_EQ(DfsBatchPutTimeoutMs(kBaseMs, kDfsTimeoutOneGiB, 1234), 41234u);
+    EXPECT_EQ(DfsBatchGetTimeoutMs(0, kDfsTimeoutFourGiB + 1, kFixedMs), 0u);
+    EXPECT_EQ(DfsBatchPutTimeoutMs(0, kDfsTimeoutFourGiB + 1, kFixedMs), 0u);
+}
+
+TEST(DfsBackendTimeoutTest, RequiresOwnerForTimeoutAndQuarantinesIt) {
+    TempDir tmp("dfs_read_timeout");
+    ASSERT_TRUE(WriteTestDfsRootIdentity(tmp.path()));
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp.path();
+    DistributedStorageConfig config;
+    config.fsdir = tmp.path();
+    config.fs_adapter_type = "posix";
+    config.shard_count = 1;
+    config.shard_capacity = 64 * 1024;
+    config.alignment = 4096;
+    config.direct_read_enabled = false;
+    config.batch_get_timeout_ms = 50;
+    config.batch_timeout_fixed_ms = 0;
+
+    // Shard files are prepared by the Master before client I/O.
+    ShardAllocator allocator;
+    ASSERT_TRUE(allocator.Init(config));
+
+    auto adapter = std::make_unique<BlockingReadPosixFsAdapter>();
+    auto* adapter_ptr = adapter.get();
+    auto backend = std::make_shared<DistributedStorageBackend>(
+        file_config, config, std::move(adapter), kTestDfsRootIdentity);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    const std::string shard =
+        tmp.file("dfs_shard_" + ShardAllocator::FormatShardIdx(0, 1) + ".data");
+    const DistributedFSDescriptor descriptor{shard, 0, 4096, 4096, 0};
+    std::string source(4096, 'R');
+    auto writes = backend->BatchWrite(
+        {{"timeout_read", descriptor, {{source.data(), source.size()}}}});
+    ASSERT_EQ(writes.size(), 1u);
+    ASSERT_TRUE(writes[0].has_value());
+
+    std::string destination(4096, 'S');
+    std::atomic<bool> ownerless_returned{false};
+    std::vector<tl::expected<void, ErrorCode>> ownerless_result;
+    adapter_ptr->BlockReads();
+    std::thread ownerless_reader([&] {
+        ownerless_result =
+            backend->BatchRead({{"timeout_read",
+                                 descriptor,
+                                 {{destination.data(), destination.size()}}}});
+        ownerless_returned.store(true);
+    });
+    EXPECT_TRUE(adapter_ptr->WaitUntilStarted(1, std::chrono::seconds(2)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    EXPECT_FALSE(ownerless_returned.load());
+    adapter_ptr->ReleaseReads();
+    ownerless_reader.join();
+    ASSERT_EQ(ownerless_result.size(), 1u);
+    ASSERT_TRUE(ownerless_result[0].has_value());
+    EXPECT_EQ(destination, source);
+
+    destination.assign(4096, 'S');
+    std::atomic<bool> owner_released{false};
+    auto owner = std::shared_ptr<void>(
+        destination.data(),
+        [&owner_released](void*) { owner_released.store(true); });
+    adapter_ptr->BlockReads();
+    auto reads =
+        backend->BatchRead({{"timeout_read",
+                             descriptor,
+                             {{destination.data(), destination.size()}},
+                             owner}});
+    owner.reset();
+    ASSERT_EQ(reads.size(), 1u);
+    ASSERT_FALSE(reads[0].has_value());
+    EXPECT_EQ(reads[0].error(), ErrorCode::DFS_BATCH_GET_TIMEOUT);
+    EXPECT_EQ(destination, std::string(4096, 'S'));
+    EXPECT_FALSE(owner_released.load());
+
+    adapter_ptr->ReleaseReads();
+    ASSERT_TRUE(adapter_ptr->WaitUntilCompleted(2, std::chrono::seconds(2)));
+    EXPECT_EQ(destination, source);
+    for (int i = 0; i < 200 && !owner_released.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_TRUE(owner_released.load());
+}
+
+TEST(DfsBackendTimeoutTest, LimitsTimedReadsUntilRealCompletion) {
+    TempDir tmp("dfs_read_inflight_limit");
+    ASSERT_TRUE(WriteTestDfsRootIdentity(tmp.path()));
+    ASSERT_TRUE(WriteTestDfsReadProbes(tmp.path()));
+
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp.path();
+    DistributedStorageConfig config;
+    config.fsdir = tmp.path();
+    config.fs_adapter_type = "posix";
+    config.shard_count = 1;
+    config.shard_capacity = 64 * 1024;
+    config.alignment = 4096;
+    config.direct_read_enabled = false;
+    config.batch_get_timeout_ms = 20;
+    config.batch_timeout_fixed_ms = 0;
+    config.batch_get_max_inflight_batches = 2;
+    config.batch_get_max_inflight_bytes = 12288;
+
+    // Shard files are prepared by the Master before client I/O.
+    ShardAllocator allocator;
+    ASSERT_TRUE(allocator.Init(config));
+
+    auto adapter = std::make_unique<BlockingReadPosixFsAdapter>();
+    auto* adapter_ptr = adapter.get();
+    auto backend = std::make_shared<DistributedStorageBackend>(
+        file_config, config, std::move(adapter), kTestDfsRootIdentity);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    const std::string shard =
+        tmp.file("dfs_shard_" + ShardAllocator::FormatShardIdx(0, 1) + ".data");
+    const DistributedFSDescriptor descriptor{shard, 0, 4096, 4096, 0};
+    std::string source(4096, 'R');
+    ASSERT_TRUE(backend->BatchWrite(
+        {{"limited_read", descriptor, {{source.data(), source.size()}}}})[0]);
+
+    std::string first(4096, '1'), second(4096, '2'), third(4096, '3');
+    std::atomic<size_t> released_owners{0};
+    auto first_owner = std::shared_ptr<void>(
+        first.data(), [&](void*) { released_owners.fetch_add(1); });
+    auto second_owner = std::shared_ptr<void>(
+        second.data(), [&](void*) { released_owners.fetch_add(1); });
+    adapter_ptr->BlockReads();
+    auto read = [&](std::string& destination,
+                    std::shared_ptr<void> owner = nullptr) {
+        return backend->BatchRead({{"limited_read",
+                                    descriptor,
+                                    {{destination.data(), destination.size()}},
+                                    std::move(owner)}})[0];
+    };
+
+    EXPECT_FALSE(read(first, first_owner).has_value());
+    first_owner.reset();
+    ASSERT_TRUE(backend->ProbeRead().has_value());
+    EXPECT_FALSE(read(second, second_owner).has_value());
+    second_owner.reset();
+    ASSERT_TRUE(backend->ProbeRead().has_value());
+    const auto started_before_admission_wait = adapter_ptr->StartedReads();
+    std::atomic<bool> third_returned{false};
+    std::vector<tl::expected<void, ErrorCode>> third_result;
+    std::thread third_reader([&] {
+        third_result = backend->BatchRead(
+            {{"limited_read", descriptor, {{third.data(), third.size()}}}});
+        third_returned.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_FALSE(third_returned.load());
+    // Both requests retain admission slots, but one shard serializes its I/O.
+    EXPECT_EQ(started_before_admission_wait, 1u);
+    EXPECT_EQ(adapter_ptr->StartedReads(), started_before_admission_wait);
+    adapter_ptr->ReleaseReads();
+    third_reader.join();
+    ASSERT_TRUE(adapter_ptr->WaitUntilCompleted(3, std::chrono::seconds(2)));
+    ASSERT_EQ(third_result.size(), 1u);
+    EXPECT_TRUE(third_result[0].has_value());
+    EXPECT_EQ(third, source);
+    for (int i = 0; i < 200 && released_owners.load() != 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_EQ(released_owners.load(), 2u);
+    ASSERT_TRUE(backend->ProbeRead().has_value());
+}
+
+TEST(DfsBackendTimeoutTest, TimeoutLatchWakesInflightAdmissionWaiter) {
+    TempDir tmp("dfs_read_inflight_timeout_latch");
+    ASSERT_TRUE(WriteTestDfsRootIdentity(tmp.path()));
+
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp.path();
+    DistributedStorageConfig config;
+    config.fsdir = tmp.path();
+    config.fs_adapter_type = "posix";
+    config.shard_count = 1;
+    config.shard_capacity = 64 * 1024;
+    config.alignment = 4096;
+    config.direct_read_enabled = false;
+    config.batch_get_timeout_ms = 100;
+    config.batch_timeout_fixed_ms = 0;
+    config.batch_get_max_inflight_batches = 1;
+    config.batch_get_max_inflight_bytes = 4096;
+
+    // Shard files are prepared by the Master before client I/O.
+    ShardAllocator allocator;
+    ASSERT_TRUE(allocator.Init(config));
+
+    auto adapter = std::make_unique<BlockingReadPosixFsAdapter>();
+    auto* adapter_ptr = adapter.get();
+    auto backend = std::make_shared<DistributedStorageBackend>(
+        file_config, config, std::move(adapter), kTestDfsRootIdentity);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    const std::string shard =
+        tmp.file("dfs_shard_" + ShardAllocator::FormatShardIdx(0, 1) + ".data");
+    const DistributedFSDescriptor descriptor{shard, 0, 4096, 4096, 0};
+    std::string source(4096, 'R');
+    ASSERT_TRUE(backend->BatchWrite(
+        {{"latched_read", descriptor, {{source.data(), source.size()}}}})[0]);
+
+    std::string first(4096, '1');
+    std::string queued(4096, '2');
+    auto first_owner = std::shared_ptr<void>(first.data(), [](void*) {});
+    auto queued_owner = std::shared_ptr<void>(queued.data(), [](void*) {});
+    std::vector<tl::expected<void, ErrorCode>> first_results;
+    std::vector<tl::expected<void, ErrorCode>> queued_results;
+
+    adapter_ptr->BlockReads();
+    std::thread first_reader([&] {
+        first_results = backend->BatchRead({{"latched_read",
+                                             descriptor,
+                                             {{first.data(), first.size()}},
+                                             first_owner}});
+    });
+    EXPECT_TRUE(adapter_ptr->WaitUntilStarted(1, std::chrono::seconds(2)));
+
+    std::thread queued_reader([&] {
+        queued_results = backend->BatchRead({{"latched_read",
+                                              descriptor,
+                                              {{queued.data(), queued.size()}},
+                                              queued_owner}});
+    });
+
+    first_reader.join();
+    queued_reader.join();
+    const size_t started_reads = adapter_ptr->StartedReads();
+    adapter_ptr->ReleaseReads();
+    EXPECT_TRUE(adapter_ptr->WaitUntilCompleted(1, std::chrono::seconds(2)));
+
+    ASSERT_EQ(first_results.size(), 1u);
+    ASSERT_FALSE(first_results[0].has_value());
+    EXPECT_EQ(first_results[0].error(), ErrorCode::DFS_BATCH_GET_TIMEOUT);
+    ASSERT_EQ(queued_results.size(), 1u);
+    ASSERT_FALSE(queued_results[0].has_value());
+    EXPECT_EQ(queued_results[0].error(), ErrorCode::DFS_BATCH_GET_TIMEOUT);
+    EXPECT_EQ(started_reads, 1u);
+}
+
+TEST(DfsBackendTimeoutTest, RejectsReadThatExceedsInflightByteLimit) {
+    TempDir tmp("dfs_read_inflight_byte_limit");
+    ASSERT_TRUE(WriteTestDfsRootIdentity(tmp.path()));
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp.path();
+    DistributedStorageConfig config;
+    config.fsdir = tmp.path();
+    config.fs_adapter_type = "posix";
+    config.shard_count = 1;
+    config.shard_capacity = 64 * 1024;
+    config.alignment = 4096;
+    config.direct_read_enabled = false;
+    config.batch_get_timeout_ms = 20;
+    config.batch_timeout_fixed_ms = 0;
+    config.batch_get_max_inflight_batches = 2;
+    config.batch_get_max_inflight_bytes = 4095;
+
+    // Shard files are prepared by the Master before client I/O.
+    ShardAllocator allocator;
+    ASSERT_TRUE(allocator.Init(config));
+
+    auto adapter = std::make_unique<BlockingReadPosixFsAdapter>();
+    auto* adapter_ptr = adapter.get();
+    auto backend = std::make_shared<DistributedStorageBackend>(
+        file_config, config, std::move(adapter), kTestDfsRootIdentity);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    const std::string shard =
+        tmp.file("dfs_shard_" + ShardAllocator::FormatShardIdx(0, 1) + ".data");
+    const DistributedFSDescriptor descriptor{shard, 0, 4096, 4096, 0};
+    std::string source(4096, 'R');
+    ASSERT_TRUE(backend->BatchWrite(
+        {{"large_read", descriptor, {{source.data(), source.size()}}}})[0]);
+
+    std::string destination(4096, 'D');
+    auto read =
+        backend->BatchRead({{"large_read",
+                             descriptor,
+                             {{destination.data(), destination.size()}}}});
+    ASSERT_EQ(read.size(), 1u);
+    ASSERT_FALSE(read[0].has_value());
+    EXPECT_EQ(read[0].error(), ErrorCode::DFS_BATCH_GET_ADMISSION_TIMEOUT);
+    EXPECT_EQ(adapter_ptr->StartedReads(), 0u);
+    EXPECT_EQ(destination, std::string(4096, 'D'));
+}
+
+TEST(DfsRootMarkerTest, ShardAllocatorPublishesFormatMarker) {
+    TempDir tmp("dfs_root_marker");
+    DistributedStorageConfig config;
+    config.fsdir = tmp.path();
+    config.fs_adapter_type = "posix";
+    config.shard_count = 1;
+    config.shard_capacity = 64 * 1024;
+    config.alignment = 4096;
+
+    DfsGlobalAllocator allocator;
+    ASSERT_TRUE(allocator.Init(config));
+    EXPECT_TRUE(std::filesystem::exists(tmp.file(kDfsRootMarkerFileName)));
+}
+
+TEST(DfsRootMarkerTest, ShardAllocatorDoesNotOverwriteInvalidMarker) {
+    TempDir tmp("dfs_root_invalid_marker");
+    const std::string marker_path = tmp.file(kDfsRootMarkerFileName);
+    {
+        std::ofstream marker(marker_path, std::ios::binary);
+        marker << "unexpected-format\n";
+    }
+    DistributedStorageConfig config;
+    config.fsdir = tmp.path();
+    config.fs_adapter_type = "posix";
+    config.shard_count = 1;
+    config.shard_capacity = 64 * 1024;
+    config.alignment = 4096;
+
+    DfsGlobalAllocator allocator;
+    EXPECT_FALSE(allocator.Init(config).has_value());
+    std::ifstream marker(marker_path, std::ios::binary);
+    const std::string contents((std::istreambuf_iterator<char>(marker)),
+                               std::istreambuf_iterator<char>());
+    EXPECT_EQ(contents, "unexpected-format\n");
+}
+
+TEST_F(DfsBackendTest, HealthProbesUseStrictDirectDedicatedFile) {
+    const std::string first_probe_path = TestDfsReadProbePath(tmp_->path(), 0);
+    const std::string second_probe_path = TestDfsReadProbePath(tmp_->path(), 1);
+    EXPECT_FALSE(std::filesystem::exists(first_probe_path));
+    EXPECT_FALSE(std::filesystem::exists(second_probe_path));
+
+    auto read_before_write = backend_->ProbeRead();
+    ASSERT_FALSE(read_before_write.has_value());
+    EXPECT_EQ(read_before_write.error(), ErrorCode::FILE_NOT_FOUND);
+
+    ASSERT_TRUE(std::filesystem::create_directory(
+        std::filesystem::path(tmp_->path()) / kDfsReadProbeDirectoryNames[0]));
+    {
+        std::ofstream probe(first_probe_path, std::ios::binary);
+        ASSERT_TRUE(probe.good());
+        const auto contents =
+            BuildDfsReadProbeContents(kTestDfsRootIdentity, 0);
+        probe.write(contents.data(), contents.size());
+    }
+    EXPECT_FALSE(backend_->ProbeRead().has_value())
+        << "both read-probe files are required";
+
+    ASSERT_TRUE(WriteTestDfsReadProbes(tmp_->path()));
+    EXPECT_EQ(std::filesystem::file_size(first_probe_path), kDfsReadProbeSize);
+    EXPECT_EQ(std::filesystem::file_size(second_probe_path), kDfsReadProbeSize);
+    EXPECT_TRUE(backend_->ProbeRead().has_value())
+        << "read probe must not depend on a prior client write probe";
+
+    ASSERT_TRUE(backend_->ProbeWrite().has_value());
+    FileStorageConfig second_file_config;
+    second_file_config.storage_backend_type = StorageBackendType::kDistributed;
+    second_file_config.storage_filepath = tmp_->path();
+    DistributedStorageConfig second_distributed_config;
+    second_distributed_config.fsdir = tmp_->path();
+    second_distributed_config.fs_adapter_type = "posix";
+    second_distributed_config.shard_count = 4;
+    second_distributed_config.shard_capacity = 64 * 1024 * 1024;
+    second_distributed_config.alignment = 4096;
+    DistributedStorageBackend second_client_backend(
+        second_file_config, second_distributed_config,
+        std::make_unique<PosixFsAdapter>(), kTestDfsRootIdentity);
+    ASSERT_TRUE(second_client_backend.Init().has_value());
+    ASSERT_TRUE(second_client_backend.ProbeWrite().has_value());
+
+    size_t probe_file_count = 0;
+    for (const auto& entry :
+         std::filesystem::directory_iterator(tmp_->path())) {
+        if (entry.path().filename().string().starts_with(
+                ".mooncake_dfs_health_probe_")) {
+            ++probe_file_count;
+        }
+    }
+    EXPECT_EQ(probe_file_count, 2u);
+    EXPECT_TRUE(backend_->ProbeRead().has_value());
+
+    const int fd = ::open(second_probe_path.c_str(), O_WRONLY | O_CLOEXEC);
+    ASSERT_GE(fd, 0);
+    constexpr char kCorruptPayload[] = "bad!";
+    ASSERT_EQ(::pwrite(fd, kCorruptPayload, sizeof(kCorruptPayload) - 1,
+                       2 * kDfsReadProbeBlockSize),
+              static_cast<ssize_t>(sizeof(kCorruptPayload) - 1));
+    ASSERT_EQ(::close(fd), 0);
+    EXPECT_FALSE(backend_->ProbeRead().has_value());
+
+    ASSERT_TRUE(WriteTestDfsReadProbes(tmp_->path()));
+    ASSERT_TRUE(backend_->ProbeWrite().has_value());
+    EXPECT_TRUE(backend_->ProbeRead().has_value());
+
+    probe_file_count = 0;
+    for (const auto& entry :
+         std::filesystem::directory_iterator(tmp_->path())) {
+        if (entry.path().filename().string().starts_with(
+                ".mooncake_dfs_health_probe_")) {
+            ++probe_file_count;
+        }
+    }
+    EXPECT_EQ(probe_file_count, 2u);
+}
+
+TEST(PosixFsAdapterTest, StrictDirectOpenRejectsSymlink) {
+    TempDir tmp("strict_direct_no_follow");
+    const std::string target = tmp.file("target");
+    const std::string link = tmp.file("link");
+    {
+        std::ofstream output(target, std::ios::binary);
+        const auto contents =
+            BuildDfsReadProbeContents(kTestDfsRootIdentity, 0);
+        output.write(contents.data(), contents.size());
+    }
+    ASSERT_EQ(::symlink(target.c_str(), link.c_str()), 0);
+    PosixFsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(tmp.path()));
+    EXPECT_FALSE(adapter.OpenFileDirectStrict(link).has_value());
+}
+
+TEST_F(DfsBackendTest, HealthWriteProbeFailsWhenCreatingANewFileFails) {
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp_->path();
+
+    DistributedStorageConfig distributed_config;
+    distributed_config.fsdir = tmp_->path();
+    distributed_config.fs_adapter_type = "posix";
+    distributed_config.shard_count = 4;
+    distributed_config.shard_capacity = 64 * 1024 * 1024;
+    distributed_config.alignment = 4096;
+
+    auto adapter = std::make_unique<ControlledPosixFsAdapter>();
+    auto* controlled_adapter = adapter.get();
+    DistributedStorageBackend backend(file_config, distributed_config,
+                                      std::move(adapter), kTestDfsRootIdentity);
+    ASSERT_TRUE(backend.Init().has_value());
+
+    controlled_adapter->FailNextFileCreate();
+    auto result = backend.ProbeWrite();
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::FILE_WRITE_FAIL);
+}
 }  // namespace mooncake::test

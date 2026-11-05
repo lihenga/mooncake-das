@@ -31,6 +31,8 @@ constexpr bool can_invoke_when_disconnected() {
 
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> DummyClient::invoke_rpc(Args&&... args) {
+    RpcDrainGuard::ScopedCall inflight(rpc_drain_);
+    if (!inflight.ok()) return tl::make_unexpected(ErrorCode::RPC_FAIL);
     auto pool = client_accessor_.GetClientPool();
 
     if constexpr (!can_invoke_when_disconnected<ServiceMethod>()) {

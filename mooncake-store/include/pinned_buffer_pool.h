@@ -83,8 +83,7 @@ class PinnedBufferPool {
         }
     };
 
-    explicit PinnedBufferPool(
-        size_t max_cached_bytes = kDefaultMaxCachedBytes)
+    explicit PinnedBufferPool(size_t max_cached_bytes = kDefaultMaxCachedBytes)
         : max_cached_bytes_(max_cached_bytes) {}
 
     ~PinnedBufferPool() { Clear(); }

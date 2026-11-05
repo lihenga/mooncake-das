@@ -175,6 +175,12 @@ inline std::string EscapePrometheusLabel(std::string_view input) {
     return escaped;
 }
 
+struct HttpDfsShardCountResponse {
+    bool success{true};
+    int shard_count{0};
+};
+YLT_REFL(HttpDfsShardCountResponse, success, shard_count);
+
 struct HttpTenantQuotaSnapshot {
     std::string tenant_id;
     uint64_t requested_quota_bytes{0};

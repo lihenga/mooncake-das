@@ -15,8 +15,9 @@ namespace mooncake {
 namespace {
 
 std::string ToLower(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(),
-                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    std::transform(
+        value.begin(), value.end(), value.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
     return value;
 }
 
@@ -41,7 +42,8 @@ bool ParseGlogLevel(const std::string& value, int* level,
     return true;
 }
 
-easylog::Severity ParseYltLevel(const std::string& value, std::string* normalized) {
+easylog::Severity ParseYltLevel(const std::string& value,
+                                std::string* normalized) {
     const auto lower = ToLower(value);
     if (lower == "trace") {
         *normalized = "TRACE";
@@ -154,7 +156,8 @@ bool UpdateRuntimeLogConfig(const RuntimeLogConfigUpdate& update,
     }
     if (update.ylt_severity.has_value() &&
         !IsValidYltLevel(*update.ylt_severity)) {
-        *error = "ylt_severity must be TRACE, DEBUG, INFO, WARN, ERROR, or CRITICAL";
+        *error =
+            "ylt_severity must be TRACE, DEBUG, INFO, WARN, ERROR, or CRITICAL";
         return false;
     }
 

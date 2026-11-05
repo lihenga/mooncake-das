@@ -72,7 +72,11 @@ def _detect_manylinux_tag() -> str:
                     # Output format: "glibc X.Y" or "X.Y"
                     ver_str = result.stdout.strip()
                     ver = ver_str.split()[-1] if "glibc" in ver_str else ver_str
-            except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            except (
+                subprocess.CalledProcessError,
+                FileNotFoundError,
+                subprocess.TimeoutExpired,
+            ):
                 pass
 
         # Fallback: use ctypes with dynamic libc detection
@@ -109,7 +113,11 @@ def _detect_manylinux_tag() -> str:
                                         libc_path = parts[1].strip()
                                         libc = ctypes.CDLL(libc_path)
                                         break
-                    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+                    except (
+                        subprocess.CalledProcessError,
+                        FileNotFoundError,
+                        subprocess.TimeoutExpired,
+                    ):
                         pass
 
                 if libc is not None:
@@ -172,7 +180,7 @@ def get_platform() -> str:
 
 def get_version_add() -> None:
     command = "git config --global --add safe.directory " + pwd
-    result = subprocess.run(command, shell=True, capture_output=False, text=True)
+    subprocess.run(command, shell=True, capture_output=False, text=True)
     deepep_root = os.path.dirname(os.path.abspath(__file__))
     add_version_path = os.path.join(os.path.join(deepep_root, "mooncake"), "version.py")
     base_version = get_base_version()
@@ -189,9 +197,13 @@ def get_version_add() -> None:
         rocm_version = lines[0].strip().replace(".", "")
         version += ".dtk" + rocm_version
 
-    sha = subprocess.check_output(
-        ["git", "rev-parse", "--short=6", "HEAD"], cwd=deepep_root
-    ).decode("ascii").strip()
+    sha = (
+        subprocess.check_output(
+            ["git", "rev-parse", "--short=6", "HEAD"], cwd=deepep_root
+        )
+        .decode("ascii")
+        .strip()
+    )
     version += f".g{sha}"
 
     new_version_content = f"""
@@ -234,17 +246,17 @@ def _prev_minor_version():
     return f"{{__version_tuple__[0]}}.{{__version_tuple__[1] - 1}}"
 """
 
-    with open(add_version_path, encoding="utf-8",mode="w") as file:
+    with open(add_version_path, encoding="utf-8", mode="w") as file:
         file.write(new_version_content)
     file.close()
 
 
 def get_version() -> str:
     get_version_add()
-    version_file = 'mooncake/version.py'
-    with open(version_file, encoding='utf-8') as f:
-        exec(compile(f.read(), version_file, 'exec'))
-    return locals()['__hcu_version__']
+    version_file = "mooncake/version.py"
+    with open(version_file, encoding="utf-8") as f:
+        exec(compile(f.read(), version_file, "exec"))
+    return locals()["__hcu_version__"]
 
 
 def get_mooncake_version() -> str:
@@ -259,13 +271,13 @@ class BinaryDistribution(Distribution):
     def has_ext_modules(self):
         return True
 
+
 class CustomBdistWheel(bdist_wheel):
     def finalize_options(self):
         super().finalize_options()
         self.root_is_pure = False
         self.plat_name_supplied = True
         self.plat_name = get_platform()
-
 
 
 # ---------------------------------------------------------------------------

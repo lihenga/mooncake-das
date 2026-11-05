@@ -12,9 +12,7 @@ list(
   l4/master_metric_manager_l4.cpp
   l4/segment_metrics.cpp
   l4/rpc_service_l4.cpp
-  l4/master_admin_service_l4.cpp
-  l4/dfs_global_allocator_l4.cpp
-  l4/etcd_service_ready.cpp)
+  l4/master_admin_service_l4.cpp)
 
 list(
   APPEND

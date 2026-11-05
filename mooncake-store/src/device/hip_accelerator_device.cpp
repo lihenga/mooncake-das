@@ -130,14 +130,14 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
 
 #if defined(USE_HYGON)
     PinnedHostBuffer AllocateMappedPinnedHost(size_t size) const override {
-        void *addr = nullptr;
+        void* addr = nullptr;
         if (AllocateHipPinnedHost(&addr, size, hipHostMallocMapped) !=
             hipSuccess) {
             hipGetLastError();
             return PinnedHostBuffer();
         }
 
-        void *device_addr = nullptr;
+        void* device_addr = nullptr;
         if (GetHipHostDevicePointer(&device_addr, addr) != hipSuccess) {
             hipGetLastError();
             FreeHipPinnedHost(addr);
