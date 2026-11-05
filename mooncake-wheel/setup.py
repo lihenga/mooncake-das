@@ -271,7 +271,6 @@ class BinaryDistribution(Distribution):
     def has_ext_modules(self):
         return True
 
-
 class CustomBdistWheel(bdist_wheel):
     def finalize_options(self):
         super().finalize_options()
