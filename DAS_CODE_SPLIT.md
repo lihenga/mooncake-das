@@ -32,6 +32,7 @@ functions retain the calls that connect those definitions to the main flow.
 | ReadPlan / ReadLayout type bindings | `mooncake-integration/store/das/read_bindings.cpp` |
 | Optional Store method bindings | `mooncake-integration/store/das/store_bindings.h` |
 | Python wheel/driver compatibility | `mooncake-wheel/mooncake/_variant_compat.py` |
+| Store extension source membership | `mooncake-store/src/l4/sources.cmake` |
 
 Paths abbreviated as `include/` or `src/` in the Store rows are relative to
 `mooncake-store/`. Independently added modules such as `read_plan.*`,
@@ -85,6 +86,10 @@ implementations:
 7. Review residual diffs against the fixed community point and review behavior
    against the pre-refactor branch. A smaller line count alone is not proof of
    reduced merge risk or equivalent behavior.
+8. Keep code already accepted upstream in its community form. For the fixed
+   v0.3.14 target, the classic/TENT SHCA conversions and RDMA depth helpers
+   stay inline; only additional device-transport adaptations use
+   `das/rdma_compat.h`. See `DAS_UPSTREAM_0_3_14.md` before integrating that tag.
 
 ## Build and focused validation
 

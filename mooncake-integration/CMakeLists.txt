@@ -134,7 +134,6 @@ if(WITH_STORE)
     ${SOURCES}
     ${CACHE_ALLOCATOR_SOURCES}
     store/store_py.cpp
-    store/das/read_bindings.cpp
     store/buffer_pool.cpp
     store/engram_store_py.cpp
     integration_utils.h)
@@ -339,4 +338,8 @@ if(SKBUILD)
     install(TARGETS ${_mooncake_python_shared_targets}
             LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
   endif()
+endif()
+
+if(WITH_STORE)
+  target_sources(store PRIVATE store/das/read_bindings.cpp)
 endif()

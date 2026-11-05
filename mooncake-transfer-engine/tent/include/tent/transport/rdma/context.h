@@ -20,7 +20,6 @@
 #define TENT_CONTEXT_H
 
 #include <gflags/gflags.h>
-#include "das/rdma_compat.h"
 #include <glog/logging.h>
 #include <infiniband/verbs.h>
 
@@ -147,7 +146,11 @@ class RdmaContext {
 
    private:
     static uint8_t clampRdAtomicRequest(uint8_t requested, int device_max) {
-        return mooncake::das::ClampRdAtomicRequest(requested, device_max);
+        if (requested == 0) return 0;
+        if (device_max <= 0) return 1;
+        if (static_cast<int>(requested) > device_max)
+            return static_cast<uint8_t>(device_max);
+        return requested;
     }
 
     int openDevice(const std::string &device_name, uint8_t port);

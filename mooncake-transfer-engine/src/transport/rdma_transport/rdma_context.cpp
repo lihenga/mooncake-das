@@ -25,7 +25,9 @@
 #include <netinet/in.h>
 #include <sys/epoll.h>
 #include <unistd.h>
-#include "das/rdma_compat.h"
+#ifdef USE_SHCA
+#include <infiniband/shca_17b_types.h>
+#endif
 
 #include <atomic>
 #include <cassert>
@@ -1429,7 +1431,11 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         // All checks passed, assign member variables
         context_ = context;
         port_ = port;
-        lid_ = mooncake::das::DecodeRdmaLid(attr.lid);
+#ifdef USE_SHCA
+        lid_ = u17_to_32(attr.lid);
+#else
+        lid_ = attr.lid;
+#endif
         active_mtu_ = attr.active_mtu;
         active_speed_ = attr.active_speed;
         active_width_ = attr.active_width;
