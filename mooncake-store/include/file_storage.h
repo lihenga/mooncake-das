@@ -91,6 +91,13 @@ class FileStorage {
     [[nodiscard]] std::optional<BufferHandle> AllocatePinnedStagingBuffer(
         size_t size, size_t alignment = 1) const;
 
+    [[nodiscard]] size_t PinnedRestoreArenaCapacity() const {
+        return pinned_restore_arena_ ? pinned_restore_arena_->capacity : 0;
+    }
+
+    [[nodiscard]] offset_allocator::OffsetAllocStorageReport
+    PinnedRestoreArenaReport() const;
+
     // Dedicated arena for waiting-queue DFS prefetch staging, allocated once
     // at construction. It is the only staging source for prefetch reads;
     // there is no runtime pinned allocation fallback.

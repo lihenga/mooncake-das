@@ -1151,6 +1151,11 @@ class RealClient : public PyClient {
         // Arena occupancy (capacity - free, including alignment and bin
         // rounding) observed right after allocations; not an exact peak.
         std::atomic<uint64_t> occupied_bytes_observed_peak{0};
+        // Peak of occupied_before_request + request_bytes. Unlike
+        // occupied_bytes_observed_peak this also counts the requests that did
+        // not fit, so it is the capacity the arena would need to never fail.
+        std::atomic<uint64_t> needed_peak{0};
+        std::atomic<uint64_t> max_request_bytes{0};
         // Minimum observed conservative lower bound of the largest free
         // region.
         std::atomic<uint64_t> largest_free_region_min{UINT64_MAX};
@@ -1161,6 +1166,31 @@ class RealClient : public PyClient {
     std::shared_ptr<PrefetchArenaStats> prefetch_arena_stats_;
     std::shared_ptr<BufferHandle> AllocatePrefetchArenaRegion(size_t size,
                                                               size_t alignment);
+
+    // DFS range-get staging (the restore arena, with the ordinary client
+    // buffer as its overflow fallback). Usage is sampled once per batch, which
+    // is enough to size the pool: the peak of "occupied now + this request".
+    struct RestoreArenaStats {
+        std::atomic<uint64_t> alloc_ok{0};
+        std::atomic<uint64_t> alloc_fail{0};
+        // Falls back to client_buffer_allocator_ after the arena refused.
+        std::atomic<uint64_t> fallback_client_buffer{0};
+        // Peak of occupied_bytes + request_bytes, including the requests that
+        // did not fit.
+        std::atomic<uint64_t> needed_peak{0};
+        // Largest single request seen; a chunk size below this always fails.
+        std::atomic<uint64_t> max_request_bytes{0};
+        std::atomic<uint64_t> client_buffer_peak{0};
+        std::atomic<int64_t> last_summary_ns{0};
+    };
+    std::shared_ptr<RestoreArenaStats> restore_arena_stats_;
+    // Records one restore-arena allocation attempt and logs a rate-limited
+    // summary. `needed` is occupied-before + request, i.e. what the arena would
+    // have to hold to satisfy this batch without falling back.
+    void ObserveRestoreArenaAllocation(size_t request_bytes, bool from_arena,
+                                       bool fallback_used);
+    void LogRestoreArenaSummary(const char *reason);
+
     std::unique_ptr<DfsH2dStreamPool> dfs_h2d_stream_pool_;
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.

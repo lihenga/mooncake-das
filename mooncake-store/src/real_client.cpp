@@ -1993,6 +1993,20 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
         prefetch_arena_available_.store(prefetch_arena_available,
                                         std::memory_order_release);
+        // Always create the counters: with no restore arena they still report
+        // how large one would need to be for these batches to stop staging in
+        // the client buffer.
+        restore_arena_stats_ = std::make_shared<RestoreArenaStats>();
+        if (file_storage_->HasPinnedRestoreArena()) {
+            const auto report = file_storage_->PinnedRestoreArenaReport();
+            LOG(INFO) << "DFS get arena: capacity="
+                      << file_storage_->PinnedRestoreArenaCapacity()
+                      << ", free_bytes=" << report.totalFreeSpace;
+        } else {
+            LOG(WARNING) << "DFS get arena is not configured "
+                            "(MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES); DFS "
+                            "range-gets stage in the client buffer";
+        }
     }
     client_requester_ = std::make_shared<ClientRequester>();
     const bool should_start_http_server =
@@ -2240,6 +2254,10 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         get_session_prefetch_cache_.clear();
         prefetch_arena_available_.store(false, std::memory_order_release);
         prefetch_arena_stats_.reset();
+    }
+    if (restore_arena_stats_) {
+        LogRestoreArenaSummary("final");
+        restore_arena_stats_.reset();
     }
     if (!client_) {
         // Not initialized or already cleaned; treat as success for idempotence
@@ -6759,6 +6777,115 @@ std::string RealClient::dfs_prefetch_arena_status() const {
     return file_storage_->PinnedPrefetchArenaStatus();
 }
 
+// Restore-arena (DFS range-get) sizing. The arena is request-scoped, so the
+// number that matters is "occupied now + this request": that is what the pool
+// must hold to serve the batch without falling back. Sampling the failed
+// request too is what makes the peak an upper bound rather than the smaller
+// value that happened to fit.
+void RealClient::ObserveRestoreArenaAllocation(size_t request_bytes,
+                                               bool from_arena,
+                                               bool fallback_used) {
+    auto stats = restore_arena_stats_;
+    if (!stats) return;
+
+    uint64_t occupied = 0;
+    if (file_storage_) {
+        const auto report = file_storage_->PinnedRestoreArenaReport();
+        const uint64_t capacity = file_storage_->PinnedRestoreArenaCapacity();
+        occupied = capacity > report.totalFreeSpace
+                       ? capacity - report.totalFreeSpace
+                       : 0;
+    }
+    // A successful allocation already includes this request in `occupied`; a
+    // failed one left the arena untouched, so add the request that did not fit.
+    uint64_t needed = occupied;
+    if (!from_arena) {
+        needed = request_bytes > std::numeric_limits<uint64_t>::max() - occupied
+                     ? std::numeric_limits<uint64_t>::max()
+                     : occupied + request_bytes;
+    }
+    uint64_t peak = stats->needed_peak.load(std::memory_order_relaxed);
+    while (needed > peak && !stats->needed_peak.compare_exchange_weak(
+                                peak, needed, std::memory_order_relaxed)) {
+    }
+    uint64_t request_peak =
+        stats->max_request_bytes.load(std::memory_order_relaxed);
+    while (request_bytes > request_peak &&
+           !stats->max_request_bytes.compare_exchange_weak(
+               request_peak, request_bytes, std::memory_order_relaxed)) {
+    }
+    if (from_arena) {
+        stats->alloc_ok.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        stats->alloc_fail.fetch_add(1, std::memory_order_relaxed);
+        if (fallback_used) {
+            stats->fallback_client_buffer.fetch_add(1,
+                                                    std::memory_order_relaxed);
+            // The client buffer also serves non-DFS staging, so its occupancy
+            // is tracked separately from the request that spilled over.
+            if (client_buffer_allocator_) {
+                const auto cb_report =
+                    client_buffer_allocator_->storageReport();
+                const uint64_t cb_used =
+                    client_buffer_allocator_->size() > cb_report.totalFreeSpace
+                        ? client_buffer_allocator_->size() -
+                              cb_report.totalFreeSpace
+                        : 0;
+                uint64_t cb_peak =
+                    stats->client_buffer_peak.load(std::memory_order_relaxed);
+                while (cb_used > cb_peak &&
+                       !stats->client_buffer_peak.compare_exchange_weak(
+                           cb_peak, cb_used, std::memory_order_relaxed)) {
+                }
+            }
+        }
+    }
+
+    constexpr int64_t kSummaryIntervalNs = 30LL * 1000 * 1000 * 1000;
+    const int64_t now_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    int64_t last_ns = stats->last_summary_ns.load(std::memory_order_relaxed);
+    if (now_ns - last_ns >= kSummaryIntervalNs &&
+        stats->last_summary_ns.compare_exchange_strong(
+            last_ns, now_ns, std::memory_order_relaxed)) {
+        LogRestoreArenaSummary("summary");
+    }
+}
+
+void RealClient::LogRestoreArenaSummary(const char *reason) {
+    auto stats = restore_arena_stats_;
+    if (!stats) return;
+    uint64_t capacity = 0;
+    uint64_t free_bytes = 0;
+    uint64_t largest_free = 0;
+    if (file_storage_) {
+        const auto report = file_storage_->PinnedRestoreArenaReport();
+        capacity = file_storage_->PinnedRestoreArenaCapacity();
+        free_bytes = report.totalFreeSpace;
+        largest_free = report.largestFreeRegion;
+    }
+    const uint64_t occupied = capacity > free_bytes ? capacity - free_bytes : 0;
+    LOG(INFO) << "DFS get arena " << reason
+              << ": capacity=" << capacity
+              << ", allocated_bytes=" << occupied
+              << ", free_bytes=" << free_bytes
+              << ", largest_free_region_lower_bound=" << largest_free
+              << ", needed_peak_bytes="
+              << stats->needed_peak.load(std::memory_order_relaxed)
+              << ", max_request_bytes="
+              << stats->max_request_bytes.load(std::memory_order_relaxed)
+              << ", alloc_ok="
+              << stats->alloc_ok.load(std::memory_order_relaxed)
+              << ", alloc_fail="
+              << stats->alloc_fail.load(std::memory_order_relaxed)
+              << ", client_buffer_fallbacks="
+              << stats->fallback_client_buffer.load(std::memory_order_relaxed)
+              << ", client_buffer_peak_bytes="
+              << stats->client_buffer_peak.load(std::memory_order_relaxed);
+}
+
 std::shared_ptr<BufferHandle> RealClient::AllocatePrefetchArenaRegion(
     size_t size, size_t alignment) {
     auto stats = prefetch_arena_stats_;
@@ -6785,6 +6912,24 @@ std::shared_ptr<BufferHandle> RealClient::AllocatePrefetchArenaRegion(
     const uint64_t capacity = file_storage_->PinnedPrefetchArenaCapacity();
     const uint64_t occupied =
         capacity > report.totalFreeSpace ? capacity - report.totalFreeSpace : 0;
+    // "occupied before this request + request" is the arena size that would
+    // have served it. A failure leaves the arena untouched, so the requested
+    // bytes must be added; a success already has them counted in `occupied`.
+    const uint64_t needed =
+        !allocation && size <= std::numeric_limits<uint64_t>::max() - occupied
+            ? occupied + size
+            : occupied;
+    uint64_t needed_peak = stats->needed_peak.load(std::memory_order_relaxed);
+    while (needed > needed_peak &&
+           !stats->needed_peak.compare_exchange_weak(
+               needed_peak, needed, std::memory_order_relaxed)) {
+    }
+    uint64_t request_peak =
+        stats->max_request_bytes.load(std::memory_order_relaxed);
+    while (size > request_peak &&
+           !stats->max_request_bytes.compare_exchange_weak(
+               request_peak, size, std::memory_order_relaxed)) {
+    }
     std::shared_ptr<BufferHandle> region;
     if (!allocation) {
         const uint64_t failures =
@@ -6846,6 +6991,10 @@ std::shared_ptr<BufferHandle> RealClient::AllocatePrefetchArenaRegion(
             << ", occupied_bytes_observed_peak="
             << stats->occupied_bytes_observed_peak.load(
                    std::memory_order_relaxed)
+            << ", needed_peak_bytes="
+            << stats->needed_peak.load(std::memory_order_relaxed)
+            << ", max_request_bytes="
+            << stats->max_request_bytes.load(std::memory_order_relaxed)
             << ", largest_free_region_lower_bound=" << report.largestFreeRegion
             << ", largest_free_region_min="
             << stats->largest_free_region_min.load(std::memory_order_relaxed);
@@ -7820,18 +7969,47 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
             prefetch_arena_alloc_fail = arena == nullptr;
         } else {
             std::optional<BufferHandle> allocation;
+            bool restore_arena_allocated = false;
             if (file_storage_) {
                 allocation = file_storage_->AllocatePinnedStagingBuffer(
                     arena_size, dfs_alignment);
-                pinned_restore_arena_used = allocation.has_value();
+                restore_arena_allocated = allocation.has_value();
+                pinned_restore_arena_used = restore_arena_allocated;
+                if (!allocation) {
+                    const auto report =
+                        file_storage_->PinnedRestoreArenaReport();
+                    const uint64_t capacity =
+                        file_storage_->PinnedRestoreArenaCapacity();
+                    const uint64_t occupied =
+                        capacity > report.totalFreeSpace
+                            ? capacity - report.totalFreeSpace
+                            : 0;
+                    LOG_EVERY_N(WARNING, 64)
+                        << "DFS get arena exhausted, falling back to the "
+                           "client buffer: request_bytes="
+                        << arena_size << ", allocated_bytes=" << occupied
+                        << ", free_bytes=" << report.totalFreeSpace
+                        << ", largest_free_region_lower_bound="
+                        << report.largestFreeRegion
+                        << ", capacity=" << capacity
+                        << ", fallbacks="
+                        << (restore_arena_stats_
+                                ? restore_arena_stats_->fallback_client_buffer
+                                      .load(std::memory_order_relaxed)
+                                : 0);
+                }
             }
+            bool client_buffer_allocated = false;
             if (!allocation && client_buffer_allocator_) {
                 allocation = client_buffer_allocator_->allocate_aligned(
                     arena_size, dfs_alignment);
+                client_buffer_allocated = allocation.has_value();
             }
             if (allocation) {
                 arena = std::make_shared<BufferHandle>(std::move(*allocation));
             }
+            ObserveRestoreArenaAllocation(arena_size, restore_arena_allocated,
+                                          client_buffer_allocated);
         }
         if (arena) {
             arena_capacity = arena->size();

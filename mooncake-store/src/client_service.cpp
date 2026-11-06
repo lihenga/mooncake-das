@@ -658,7 +658,9 @@ Client::Client(const std::string& local_hostname,
               << " ms (0 baseline disables)";
 
     LOG(INFO) << "DFS write buffer, chunk_size=" << dfs_write_chunk_size_
-              << ", chunk_count=" << dfs_write_arena_count_;
+              << ", chunk_count=" << dfs_write_arena_count_
+              << ", total_bytes="
+              << dfs_write_chunk_size_ * dfs_write_arena_count_;
 
     if (metrics_) {
         if (metrics_->GetReportingInterval() > 0) {
@@ -4080,8 +4082,12 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
     std::vector<size_t> chunk;
     size_t chunk_bytes = 0;
     uint64_t total_payload_bytes = 0;
+    size_t max_chunk_payload_bytes = 0;
     const auto flush_chunk = [&]() {
         if (!chunk.empty()) {
+            if (chunk_bytes > max_chunk_payload_bytes) {
+                max_chunk_payload_bytes = chunk_bytes;
+            }
             chunks.push_back(std::move(chunk));
             chunk.clear();
             chunk_bytes = 0;
@@ -4123,10 +4129,19 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
     }
     flush_chunk();
 
+    // Sizing telemetry: `chunks` is what this batch demands from the pool, and
+    // max_chunk_payload_bytes vs chunk_limit says whether one slot's chunk size
+    // is the right size.
+    if (dfs_write_staging_pool_) {
+        dfs_write_staging_pool_->ObserveBatch(chunks.size(),
+                                              max_chunk_payload_bytes);
+    }
+
     if (dfs_read_trace_enabled()) {
         LOG(INFO) << "Async DFS write batch: total_payload_bytes="
                   << total_payload_bytes << ", chunks=" << chunks.size()
                   << ", chunk_limit_bytes=" << chunk_limit
+                  << ", max_chunk_payload_bytes=" << max_chunk_payload_bytes
                   << ", arena_count=" << dfs_write_arena_count_
                   << ", timeout_ms=" << timeout_ms;
     }

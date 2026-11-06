@@ -172,6 +172,12 @@ std::optional<BufferHandle> FileStorage::AllocatePinnedStagingBuffer(
     return pinned_restore_arena_allocator_->allocate_aligned(size, alignment);
 }
 
+offset_allocator::OffsetAllocStorageReport
+FileStorage::PinnedRestoreArenaReport() const {
+    if (!pinned_restore_arena_allocator_) return {0, 0};
+    return pinned_restore_arena_allocator_->storageReport();
+}
+
 void FileStorage::InitPinnedPrefetchArena(
     const FileStorageConfig& config, const std::shared_ptr<Client>& client) {
     if (config.pinned_prefetch_arena_size <= 0) {
