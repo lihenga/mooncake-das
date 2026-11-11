@@ -804,10 +804,7 @@ class Client {
     void SetDfsStorageBackend(
         std::shared_ptr<DistributedStorageBackend> backend);
 
-    void SetDfsAccessPolicy(bool allow_read, bool allow_write) {
-        dfs_read_allowed_.store(allow_read, std::memory_order_release);
-        dfs_write_allowed_.store(allow_write, std::memory_order_release);
-    }
+    void SetDfsAccessPolicy(bool allow_read, bool allow_write);
     [[nodiscard]] bool DfsReadAllowed() const {
         return dfs_read_allowed_.load(std::memory_order_acquire);
     }

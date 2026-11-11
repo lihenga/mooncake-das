@@ -19,6 +19,7 @@
 #include "fs_adapter.h"
 #include "replica.h"
 #include "storage/distributed/dfs_io_timeout.h"
+#include "storage/distributed/dfs_log_limiter.h"
 #include "storage/distributed/object_storage_adapter.h"
 #include "storage/distributed/dfs_allocator_interface.h"
 #include "storage_backend.h"
@@ -340,6 +341,7 @@ class DistributedStorageBackend
     DistributedStorageConfig distributed_config_;
     std::atomic<uint64_t> batch_timeout_fixed_ms_;
     std::string expected_root_identity_;
+    mutable DfsLogLimiter identity_log_limiter_;
     std::function<tl::expected<std::string, ErrorCode>()> root_identity_provider_;
     std::string root_dir_;
     std::string descriptor_root_dir_;

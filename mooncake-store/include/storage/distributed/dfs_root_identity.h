@@ -14,6 +14,18 @@ inline constexpr std::string_view kDfsRootIdentityMagic =
     "mooncake-dfs-root-identity-v1";
 inline constexpr size_t kMaxDfsRootIdentitySize = 256;
 
+// Preserve exact marker bytes on one log line, including malformed contents.
+inline std::string DfsRootIdentityForLog(std::string_view identity) {
+    constexpr char hex[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(identity.size() * 2);
+    for (unsigned char byte : identity) {
+        result += hex[byte >> 4];
+        result += hex[byte & 15];
+    }
+    return result;
+}
+
 inline std::string SerializeDfsRootIdentity(const std::string& cluster_id,
                                             const UUID& token) {
     if (!IsValidClusterIdComponent(cluster_id) || token == UUID{}) {

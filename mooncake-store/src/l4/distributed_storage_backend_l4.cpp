@@ -75,6 +75,14 @@ DistributedStorageBackend::TryEnsureInitialized() {
     }
     std::unique_lock<std::mutex> lock(init_mutex_, std::try_to_lock);
     if (!lock.owns_lock()) {
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(WARNING) << "DFS backend unavailable: reason=init_lock_busy"
+                         << ", backend=" << this << ", root=" << root_dir_
+                         << ", error_code="
+                         << toInt(ErrorCode::DFS_SERVICE_UNAVAILABLE)
+                         << ", suppressed=" << *suppressed;
+        }
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
     return InitLocked();
@@ -86,6 +94,15 @@ DistributedStorageBackend::ValidateRootIdentity() const {
     if (expected_root_identity_.empty() ||
         expected_root_identity_.size() > kMaxDfsRootIdentitySize ||
         !fs_adapter_) {
+        if (auto suppressed = identity_log_limiter_.ShouldLog()) {
+            LOG(ERROR)
+                << "DFS identity validation failed: reason=invalid_expectation"
+                << ", backend=" << this << ", root=" << root_dir_
+                << ", expected_size=" << expected_root_identity_.size()
+                << ", adapter_present=" << (fs_adapter_ != nullptr)
+                << ", error_code=" << toInt(ErrorCode::DFS_SERVICE_UNAVAILABLE)
+                << ", suppressed=" << *suppressed;
+        }
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
 
@@ -97,6 +114,31 @@ DistributedStorageBackend::ValidateRootIdentity() const {
     if (!read_result || *read_result != expected_root_identity_.size() ||
         std::memcmp(contents.data(), expected_root_identity_.data(),
                     expected_root_identity_.size()) != 0) {
+        if (auto suppressed = identity_log_limiter_.ShouldLog()) {
+            LOG(ERROR) << "DFS identity validation failed: reason="
+                       << (!read_result ? "marker_read_failed"
+                           : *read_result != expected_root_identity_.size()
+                               ? "marker_size_mismatch"
+                               : "marker_content_mismatch")
+                       << ", backend=" << this << ", marker=" << marker_path
+                       << ", initialized=" << IsInitialized() << ", error_code="
+                       << toInt(ErrorCode::DFS_SERVICE_UNAVAILABLE)
+                       << ", read_error_code="
+                       << (read_result ? 0 : toInt(read_result.error()))
+                       << ", expected_size=" << expected_root_identity_.size()
+                       << ", read_size=" << (read_result ? *read_result : 0)
+                       << ", expected_identity_hex="
+                       << DfsRootIdentityForLog(expected_root_identity_)
+                       << ", observed_identity_prefix_hex="
+                       << DfsRootIdentityForLog(
+                              read_result
+                                  ? std::string_view(
+                                        contents.data(),
+                                        std::min(*read_result, contents.size()))
+                                  : std::string_view{})
+                       << ", read_limit=" << contents.size()
+                       << ", suppressed=" << *suppressed;
+        }
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
     return {};
@@ -129,13 +171,27 @@ void DistributedStorageBackend::ResetFailedInitializationLocked() {
 }
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeRead() {
+    const auto fail =
+        [this](const char* stage, ErrorCode error,
+               std::string_view path = {}) -> tl::expected<void, ErrorCode> {
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(WARNING) << "DFS health probe failed: operation=read, stage="
+                         << stage << ", backend=" << this
+                         << ", root=" << root_dir_ << ", path=" << path
+                         << ", error_code=" << toInt(error)
+                         << ", suppressed=" << *suppressed;
+        }
+        return tl::make_unexpected(error);
+    };
     auto initialized = TryEnsureInitialized();
-    if (!initialized) return initialized;
+    if (!initialized)
+        return fail("initialize_or_identity", initialized.error());
     if (UsesObjectStorage()) return {};
     void* raw = nullptr;
     if (::posix_memalign(&raw, kDfsReadProbeBlockSize, kDfsReadProbeSize) !=
         0) {
-        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        return fail("allocate_buffer", ErrorCode::NO_AVAILABLE_HANDLE);
     }
     std::unique_ptr<void, decltype(&::free)> buffer(raw, &::free);
 
@@ -146,15 +202,15 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeRead() {
             std::string(kDfsReadProbeDirectoryNames[probe_index]) + "/" +
             kDfsReadProbeFileName;
         auto size = fs_adapter_->GetFileSize(probe_path);
-        if (!size) return tl::make_unexpected(size.error());
+        if (!size) return fail("stat_probe", size.error(), probe_path);
         if (*size != kDfsReadProbeSize) {
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            return fail("probe_size", ErrorCode::FILE_READ_FAIL, probe_path);
         }
 
         // Open and close on every probe. Strict open has no buffered fallback
         // and PosixFsAdapter uses O_RDONLY|O_DIRECT|O_CLOEXEC|O_NOFOLLOW.
         auto fd = fs_adapter_->OpenFileDirectStrict(probe_path);
-        if (!fd) return tl::make_unexpected(fd.error());
+        if (!fd) return fail("open_direct", fd.error(), probe_path);
         size_t total_read = 0;
         while (total_read < kDfsReadProbeSize) {
             iovec iov{static_cast<char*>(buffer.get()) + total_read,
@@ -165,17 +221,17 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeRead() {
                 const auto error =
                     read ? ErrorCode::FILE_READ_FAIL : read.error();
                 (void)fs_adapter_->CloseFile(*fd);
-                return tl::make_unexpected(error);
+                return fail("read_direct", error, probe_path);
             }
             total_read += *read;
         }
         const auto close = fs_adapter_->CloseFile(*fd);
-        if (!close) return tl::make_unexpected(close.error());
+        if (!close) return fail("close_probe", close.error(), probe_path);
 
         const auto expected =
             BuildDfsReadProbeContents(expected_root_identity_, probe_index);
         if (std::memcmp(buffer.get(), expected.data(), kDfsReadProbeSize) != 0) {
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            return fail("probe_content", ErrorCode::FILE_READ_FAIL, probe_path);
         }
     }
     SetDfsReadTimedOut(false);
@@ -183,8 +239,22 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeRead() {
 }
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite() {
+    const auto fail =
+        [this](const char* stage, ErrorCode error,
+               std::string_view path = {}) -> tl::expected<void, ErrorCode> {
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(WARNING) << "DFS health probe failed: operation=write, stage="
+                         << stage << ", backend=" << this
+                         << ", root=" << root_dir_ << ", path=" << path
+                         << ", error_code=" << toInt(error)
+                         << ", suppressed=" << *suppressed;
+        }
+        return tl::make_unexpected(error);
+    };
     auto initialized = TryEnsureInitialized();
-    if (!initialized) return initialized;
+    if (!initialized)
+        return fail("initialize_or_identity", initialized.error());
     if (UsesObjectStorage()) return {};
 
     std::lock_guard probe_lock(health_probe_write_mutex_);
@@ -199,16 +269,16 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite() {
                               sizeof(kDfsHealthProbePayload) - 1));
     if (!write_result) {
         (void)fs_adapter_->DeleteFile(new_probe_path);
-        return tl::make_unexpected(write_result.error());
+        return fail("write_probe", write_result.error(), new_probe_path);
     }
     if (*write_result != sizeof(kDfsHealthProbePayload) - 1) {
         (void)fs_adapter_->DeleteFile(new_probe_path);
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        return fail("short_write", ErrorCode::FILE_WRITE_FAIL, new_probe_path);
     }
     auto sync_result = fs_adapter_->SyncFile(new_probe_path);
     if (!sync_result) {
         (void)fs_adapter_->DeleteFile(new_probe_path);
-        return sync_result;
+        return fail("sync_probe", sync_result.error(), new_probe_path);
     }
 
     if (!active_health_probe_path_.empty()) {
@@ -216,7 +286,8 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite() {
         if (!delete_result &&
             delete_result.error() != ErrorCode::FILE_NOT_FOUND) {
             (void)fs_adapter_->DeleteFile(new_probe_path);
-            return tl::make_unexpected(delete_result.error());
+            return fail("delete_previous_probe", delete_result.error(),
+                        active_health_probe_path_);
         }
     }
     active_health_probe_path_ = new_probe_path;
@@ -238,7 +309,7 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite() {
                 for (const auto& [_, new_fd] : opened) {
                     (void)fs_adapter_->CloseFile(new_fd);
                 }
-                return tl::make_unexpected(fd.error());
+                return fail("reopen_shard", fd.error(), shard->path);
             }
             opened.emplace_back(shard, *fd);
         }

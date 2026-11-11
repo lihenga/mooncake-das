@@ -158,6 +158,11 @@ DistributedStorageBackend::DistributedStorageBackend(
     }
     health_probe_path_prefix_ = root_dir_ + "/" + kDfsHealthProbeFilePrefix +
                                 UuidToString(generate_uuid());
+    LOG(INFO) << "DFS backend created: backend=" << this
+              << ", root=" << root_dir_
+              << ", object_storage=" << UsesObjectStorage()
+              << ", expected_identity_hex="
+              << DfsRootIdentityForLog(expected_root_identity_);
 }
 
 DistributedStorageBackend::~DistributedStorageBackend() {
@@ -214,13 +219,21 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::InitLocked() {
 
     std::error_code ec;
     if (!std::filesystem::is_directory(root_dir_, ec) || ec) {
-        LOG(ERROR) << "DFS root directory is unavailable: " << root_dir_;
+        LOG(ERROR) << "DFS root directory is unavailable: " << root_dir_
+                   << ", backend=" << this << ", reason=root_not_directory"
+                   << ", error_code="
+                   << toInt(ErrorCode::DFS_SERVICE_UNAVAILABLE)
+                   << ", filesystem_error=" << ec.value()
+                   << ", filesystem_message=" << ec.message();
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
 
     auto init_result = fs_adapter_->Init(root_dir_);
     if (!init_result) {
         const auto error = init_result.error();
+        LOG(ERROR) << "DFS backend initialization failed: stage=adapter_init"
+                   << ", backend=" << this << ", root=" << root_dir_
+                   << ", error_code=" << toInt(error);
         ResetFailedInitializationLocked();
         return tl::make_unexpected(error);
     }
@@ -233,6 +246,19 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::InitLocked() {
         if (identity && !identity->empty() &&
             identity->size() <= kMaxDfsRootIdentitySize) {
             expected_root_identity_ = std::move(*identity);
+            LOG(INFO) << "DFS identity received from master: backend=" << this
+                      << ", root=" << root_dir_ << ", expected_identity_hex="
+                      << DfsRootIdentityForLog(expected_root_identity_);
+        } else {
+            static DfsLogLimiter log_limiter;
+            if (auto suppressed = log_limiter.ShouldLog()) {
+                LOG(WARNING) << "DFS identity fetch failed: backend=" << this
+                             << ", root=" << root_dir_ << ", rpc_error_code="
+                             << (identity ? 0 : toInt(identity.error()))
+                             << ", returned_identity_size="
+                             << (identity ? identity->size() : 0)
+                             << ", suppressed=" << *suppressed;
+            }
         }
     }
     auto identity_result = ValidateRootIdentity();

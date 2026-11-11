@@ -773,6 +773,19 @@ Client::~Client() {
     hot_cache_.reset();
 }
 
+void Client::SetDfsAccessPolicy(bool allow_read, bool allow_write) {
+    const bool old_read = DfsReadAllowed();
+    const bool old_write = DfsWriteAllowed();
+    dfs_read_allowed_.store(allow_read, std::memory_order_release);
+    dfs_write_allowed_.store(allow_write, std::memory_order_release);
+    if (old_read != allow_read || old_write != allow_write) {
+        LOG(INFO) << "DFS access policy changed: client_id="
+                  << UuidToString(client_id_) << ", old_read=" << old_read
+                  << ", old_write=" << old_write << ", new_read=" << allow_read
+                  << ", new_write=" << allow_write;
+    }
+}
+
 ReplicateConfig Client::AttachConfig(const ReplicateConfig& config) const {
     ReplicateConfig client_cfg = config;
     if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs()) {
@@ -786,6 +799,15 @@ ReplicateConfig Client::AttachConfig(const ReplicateConfig& config) const {
         client_cfg.host_id = host_id_;
     }
     if (!DfsWriteAllowed()) {
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(INFO) << "DFS write disabled by client policy: client_id="
+                      << UuidToString(client_id_)
+                      << ", configured_dfs_replicas="
+                      << client_cfg.dfs_replica_num
+                      << ", effective_dfs_replicas=0, suppressed="
+                      << *suppressed;
+        }
         client_cfg.dfs_replica_num = 0;
     } else if (DistributedStorageConfig::IsReplicaEnabledFromEnvironment()) {
         client_cfg.dfs_replica_num = 1;
@@ -4078,6 +4100,8 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
     std::vector<size_t> chunk;
     size_t chunk_bytes = 0;
     uint64_t total_payload_bytes = 0;
+    size_t resolved = 0, no_dfs_allocation = 0, non_dfs_failed = 0;
+    size_t exceeds_chunk_limit = 0, selected = 0;
     const auto flush_chunk = [&]() {
         if (!chunk.empty()) {
             chunks.push_back(std::move(chunk));
@@ -4088,8 +4112,16 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
 
     for (size_t i = 0; i < ops.size(); ++i) {
         auto& op = ops[i];
-        if (op.IsResolved() || op.transfer_summary.allocated_dfs_replicas == 0 ||
-            !NonDfsTransfersSucceeded(op.transfer_summary)) {
+        if (op.IsResolved()) {
+            ++resolved;
+            continue;
+        }
+        if (op.transfer_summary.allocated_dfs_replicas == 0) {
+            ++no_dfs_allocation;
+            continue;
+        }
+        if (!NonDfsTransfersSucceeded(op.transfer_summary)) {
+            ++non_dfs_failed;
             continue;
         }
         size_t object_bytes = 0;
@@ -4102,11 +4134,13 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
             object_bytes += slice.size;
         }
         if (overflow || object_bytes > chunk_limit) {
+            ++exceeds_chunk_limit;
             op.transfer_summary.RecordFailure(ReplicaType::DFS,
                                               ErrorCode::TRANSFER_FAIL);
             op.AppendFailureContext("DFS object exceeds staging chunk limit");
             continue;
         }
+        ++selected;
         if (total_payload_bytes <=
             std::numeric_limits<uint64_t>::max() - object_bytes) {
             total_payload_bytes += object_bytes;
@@ -4121,11 +4155,23 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
     }
     flush_chunk();
 
-    if (dfs_read_trace_enabled()) {
+    static DfsLogLimiter empty_batch_log_limiter;
+    const auto suppressed = total_payload_bytes == 0
+                                ? empty_batch_log_limiter.ShouldLog()
+                                : std::nullopt;
+    if (dfs_read_trace_enabled() || suppressed) {
         LOG(INFO) << "Async DFS write batch: total_payload_bytes="
                   << total_payload_bytes << ", chunks=" << chunks.size()
                   << ", chunk_limit_bytes=" << chunk_limit
-                  << ", timeout_ms=" << timeout_ms;
+                  << ", timeout_ms=" << timeout_ms
+                  << ", client_id=" << UuidToString(client_id_)
+                  << ", dfs_write_allowed=" << DfsWriteAllowed()
+                  << ", ops=" << ops.size() << ", selected=" << selected
+                  << ", resolved=" << resolved
+                  << ", no_dfs_allocation=" << no_dfs_allocation
+                  << ", non_dfs_failed=" << non_dfs_failed
+                  << ", exceeds_chunk_limit=" << exceeds_chunk_limit
+                  << ", suppressed=" << suppressed.value_or(0);
     }
 
     for (size_t chunk_index = 0; chunk_index < chunks.size(); ++chunk_index) {
@@ -5549,6 +5595,9 @@ void Client::SetDfsStorageBackend(
         backend->SetMasterEpochProvider(
             master_client_.MakeDfsMasterEpochProvider());
     }
+    LOG(INFO) << "DFS backend attached: client_id=" << UuidToString(client_id_)
+              << ", backend=" << backend.get()
+              << ", master_root=" << master_dfs_root_dir_;
     dfs_storage_backend_ = std::move(backend);
     EnsureStorageControlPlaneStarted();
 }

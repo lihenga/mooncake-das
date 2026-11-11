@@ -37,6 +37,13 @@ constexpr uint64_t kBucketCapacity = 1024 * 1024;
 const std::string kTestDfsRootIdentity =
     SerializeDfsRootIdentity("dfs_backend_test", UUID{1, 2});
 
+TEST(DfsRootIdentityLogTest, EncodesExactBytesWithoutAddingLogLines) {
+    EXPECT_EQ(DfsRootIdentityForLog(""), "");
+    EXPECT_EQ(DfsRootIdentityForLog("root\ncluster\n"),
+              "726f6f740a636c75737465720a");
+    EXPECT_EQ(DfsRootIdentityForLog(std::string("\0\xff\r", 3)), "00ff0d");
+}
+
 void WriteTestDfsReadProbe(const std::string& root) {
     for (size_t probe_index = 0;
          probe_index < kDfsReadProbeDirectoryNames.size(); ++probe_index) {

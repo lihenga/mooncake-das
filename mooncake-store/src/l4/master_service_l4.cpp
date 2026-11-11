@@ -208,6 +208,11 @@ bool PublishExpectedDfsRootFile(const std::string& root,
 bool EnsureDfsRootIdentity(const std::string& root,
                            const std::string& cluster_id,
                            std::string& identity) {
+    const auto log_identity = [&](const char* source) {
+        LOG(INFO) << "DFS root identity ready: root=" << root
+                  << ", cluster_id=" << cluster_id << ", source=" << source
+                  << ", identity_hex=" << DfsRootIdentityForLog(identity);
+    };
     std::error_code ec;
     if (!std::filesystem::is_directory(root, ec) || ec) {
         static DfsLogLimiter log_limiter;
@@ -227,6 +232,7 @@ bool EnsureDfsRootIdentity(const std::string& root,
         root + "/" + kDfsRootIdentityFileName;
     bool missing = false;
     if (ReadDfsRootIdentity(marker_path, cluster_id, identity, missing)) {
+        log_identity("existing_marker");
         return true;
     }
     if (!missing) {
@@ -265,6 +271,7 @@ bool EnsureDfsRootIdentity(const std::string& root,
         // identity must remain exact and may never adopt a different value.
         if (!restoring_cached_identity &&
             ReadDfsRootIdentity(marker_path, cluster_id, identity, missing)) {
+            log_identity("concurrent_initializer");
             return true;
         }
         static DfsLogLimiter log_limiter;
@@ -275,6 +282,8 @@ bool EnsureDfsRootIdentity(const std::string& root,
         return false;
     }
     identity = std::move(candidate);
+    log_identity(restoring_cached_identity ? "restored_cached_identity"
+                                           : "generated_identity");
     return true;
 }
 
@@ -410,6 +419,10 @@ bool MasterService::InitializeDfsRootGuard(const std::string& root,
     dfs_root_guard_ready_ = true;
     dfs_root_recovery_needed_ = false;
     dfs_root_replacement_lost_data_ = false;
+    LOG(INFO) << "DFS root guard ready: root=" << root
+              << ", device=" << dfs_root_guard_device_
+              << ", inode=" << dfs_root_guard_inode_
+              << ", identity_hex=" << DfsRootIdentityForLog(identity);
     return true;
 }
 
@@ -675,7 +688,9 @@ void MasterService::ReconcileDfsRootFiles() {
         if (auto suppressed = mount_log_limiter.ShouldLog()) {
             LOG(ERROR) << "DFS root is unavailable; waiting for recovery, "
                           "root="
-                       << root
+                       << root << ", errno=" << stat_error
+                       << ", expected_device=" << expected_device
+                       << ", expected_inode=" << expected_inode
                        << ", suppressed=" << *suppressed;
         }
         return;
@@ -699,6 +714,17 @@ void MasterService::ReconcileDfsRootFiles() {
         return;
     }
     if (recovery_needed || actual_inode != expected_inode) {
+        static DfsLogLimiter recovery_log_limiter;
+        if (auto suppressed = recovery_log_limiter.ShouldLog()) {
+            LOG(WARNING) << "DFS root recovery requested: root=" << root
+                         << ", recovery_needed=" << recovery_needed
+                         << ", expected_device=" << expected_device
+                         << ", actual_device=" << actual_device
+                         << ", expected_inode=" << expected_inode
+                         << ", actual_inode=" << actual_inode
+                         << ", identity_hex=" << DfsRootIdentityForLog(identity)
+                         << ", suppressed=" << *suppressed;
+        }
         enable_dfs_.store(false, std::memory_order_release);
         {
             std::lock_guard lock(dfs_root_guard_mutex_);
@@ -1037,8 +1063,10 @@ auto MasterService::GetDfsBucketSnapshot(
                          last_version == snapshot->version;
     if (!response.unchanged) response.bucket_ids = snapshot->bucket_ids;
     LOG(INFO) << "Returned DFS bucket snapshot, version=" << response.version
+              << ", epoch=" << UuidToString(current_epoch)
               << ", unchanged=" << response.unchanged
-              << ", bucket_count=" << response.bucket_ids.size();
+              << ", bucket_count=" << response.bucket_ids.size()
+              << ", allocator_bucket_count=" << snapshot->bucket_ids.size();
     return response;
 }
 

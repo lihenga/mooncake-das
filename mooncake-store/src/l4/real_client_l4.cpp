@@ -32,6 +32,7 @@
 #include "scatter_utils.h"
 #include "registered_pinned_memory.h"
 #include "client_buffer.h"
+#include "storage/distributed/dfs_log_limiter.h"
 #include "replica_selection.h"
 #include "common.h"
 #include "config.h"
@@ -591,14 +592,40 @@ std::vector<int> RealClient::probe_dfs_health() {
 }
 
 int RealClient::probe_dfs_read() {
+    static DfsLogLimiter log_limiter;
+    const auto sampled = log_limiter.ShouldLog();
+    if (sampled) {
+        LOG(INFO) << "DFS health probe started: operation=read, client=" << this
+                  << ", storage_present=" << (file_storage_ != nullptr)
+                  << ", suppressed=" << *sampled;
+    }
     if (!file_storage_) return toInt(ErrorCode::NOT_SUPPORTED);
     const auto result = file_storage_->ProbeDfsRead();
+    if (sampled) {
+        LOG(INFO) << "DFS health probe completed: operation=read, client="
+                  << this
+                  << ", error_code=" << (result ? 0 : toInt(result.error()))
+                  << ", backend_ready=" << file_storage_->IsDfsBackendReady();
+    }
     return result ? 0 : toInt(result.error());
 }
 
 int RealClient::probe_dfs_write() {
+    static DfsLogLimiter log_limiter;
+    const auto sampled = log_limiter.ShouldLog();
+    if (sampled) {
+        LOG(INFO) << "DFS health probe started: operation=write, client="
+                  << this << ", storage_present=" << (file_storage_ != nullptr)
+                  << ", suppressed=" << *sampled;
+    }
     if (!file_storage_) return toInt(ErrorCode::NOT_SUPPORTED);
     const auto result = file_storage_->ProbeDfsWrite();
+    if (sampled) {
+        LOG(INFO) << "DFS health probe completed: operation=write, client="
+                  << this
+                  << ", error_code=" << (result ? 0 : toInt(result.error()))
+                  << ", backend_ready=" << file_storage_->IsDfsBackendReady();
+    }
     return result ? 0 : toInt(result.error());
 }
 

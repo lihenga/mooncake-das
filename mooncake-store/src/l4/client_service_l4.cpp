@@ -478,6 +478,20 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
     const bool timed_out =
         context->deadline != std::chrono::steady_clock::time_point::max() &&
         std::chrono::steady_clock::now() > context->deadline;
+    static DfsLogLimiter write_result_log_limiter;
+    const bool log_result = dfs_read_trace_enabled() ||
+                            write_result_log_limiter.ShouldLog().has_value();
+    if (log_result) {
+        LOG(INFO) << "DFS backend write completed: client_id="
+                  << UuidToString(client_id_) << ", task=" << context.get()
+                  << ", backend=" << context->backend.get()
+                  << ", requests=" << requests.size()
+                  << ", physical_success_keys="
+                  << std::count(outcomes.begin(), outcomes.end(), ErrorCode::OK)
+                  << ", physical_success_bytes=" << successful_bytes
+                  << ", elapsed_seconds=" << write_duration_seconds
+                  << ", publication_timed_out=" << timed_out;
+    }
     if (timed_out) {
         // The foreground has already published any successful memory replica.
         // Do not publish a DFS replica whose write missed its deadline; revoke
@@ -504,6 +518,7 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
     // Report each key individually so one failure cannot revoke its neighbours.
     // The RPCs are idempotent on the master side, so a bounded retry is safe.
     constexpr int kMaxCompletionAttempts = 3;
+    size_t published = 0, revoked = 0, completion_failed = 0;
     for (size_t i = 0; i < outcomes.size(); ++i) {
         const auto& key = context->keys[i];
         const bool succeeded = outcomes[i] == ErrorCode::OK;
@@ -552,12 +567,23 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
             }
         }
         if (!completion) {
+            ++completion_failed;
             LOG(ERROR) << "Failed to finalize async DFS write for key " << key
                        << " (" << (succeeded ? "PutEnd" : "PutRevoke")
                        << "), error=" << toString(completion.error())
                        << "; the master will reclaim the PROCESSING replica via "
                           "its put-start timeout";
+        } else if (succeeded) {
+            ++published;
+        } else {
+            ++revoked;
         }
+    }
+    if (log_result) {
+        LOG(INFO) << "DFS write finalization completed: client_id="
+                  << UuidToString(client_id_) << ", task=" << context.get()
+                  << ", published=" << published << ", revoked=" << revoked
+                  << ", completion_failed=" << completion_failed;
     }
 }
 
