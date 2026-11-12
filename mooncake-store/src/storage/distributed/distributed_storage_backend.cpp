@@ -148,9 +148,11 @@ DistributedStorageBackend::DistributedStorageBackend(
       object_storage_adapter_(std::move(object_storage_adapter)),
       distributed_config_(distributed_config),
       batch_timeout_fixed_ms_(distributed_config.batch_timeout_fixed_ms),
-      expected_root_identity_(std::move(expected_root_identity)),
+      root_binding_(std::make_shared<const DfsRootBinding>(
+          DfsRootBinding{std::move(expected_root_identity), {}})),
       root_dir_(distributed_config.fsdir),
-      descriptor_root_dir_(distributed_config.fsdir) {
+      descriptor_root_dir_(distributed_config.fsdir),
+      bucket_epoch_identity_(root_binding_->identity) {
     CHECK((fs_adapter_ != nullptr) != (object_storage_adapter_ != nullptr))
         << "DistributedStorageBackend: exactly one I/O adapter is required";
     if (object_storage_adapter_) {
@@ -228,11 +230,16 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::InitLocked() {
     // Initialization is serialized and no batch I/O can run until it succeeds.
     // Retry the control plane when DFS was disabled at client startup, without
     // adding RPCs to business I/O or trusting the local marker as authority.
-    if (expected_root_identity_.empty() && root_identity_provider_) {
+    auto binding = std::atomic_load(&root_binding_);
+    if (binding->identity.empty() && root_identity_provider_) {
         auto identity = root_identity_provider_();
         if (identity && !identity->empty() &&
             identity->size() <= kMaxDfsRootIdentitySize) {
-            expected_root_identity_ = std::move(*identity);
+            // A concurrent Ping wins over this legacy initialization fallback.
+            std::atomic_compare_exchange_strong(
+                &root_binding_, &binding,
+                std::make_shared<const DfsRootBinding>(
+                    DfsRootBinding{std::move(*identity), {}}));
         }
     }
     auto identity_result = ValidateRootIdentity();
@@ -576,15 +583,6 @@ DistributedStorageBackend::BatchWriteBlocking(
                        tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
         return results;
     }
-    auto initialized = ValidateRootIdentity();
-    if (!initialized) {
-        LOG(ERROR) << "DistributedStorageBackend is unavailable: "
-                   << initialized.error();
-        results.assign(requests.size(),
-                       tl::make_unexpected(initialized.error()));
-        return results;
-    }
-
     // Build validated entry payloads first, including the reserved zero
     // padding, then issue one write per contiguous bounded-size run. SHARD
     // keeps the original one-request path because its allocator does not
@@ -605,7 +603,18 @@ DistributedStorageBackend::BatchWriteBlocking(
             results.assign(requests.size(), tl::make_unexpected(guard.error()));
             return results;
         }
+        auto validated = ValidateRootIdentity(epoch);
+        if (!validated) {
+            results.assign(requests.size(),
+                           tl::make_unexpected(validated.error()));
+            return results;
+        }
         return BatchWriteBucket(requests);
+    }
+    auto validated = ValidateRootIdentity();
+    if (!validated) {
+        results.assign(requests.size(), tl::make_unexpected(validated.error()));
+        return results;
     }
     return BatchWriteShard(requests);
 }
@@ -901,16 +910,15 @@ DistributedStorageBackend::BatchReadBlocking(
                   tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
         return results;
     }
-    auto initialized = ValidateRootIdentity();
-    if (!initialized) {
-        LOG(ERROR) << "DistributedStorageBackend is unavailable: "
-                   << initialized.error();
-        std::fill(results.begin(), results.end(),
-                  tl::make_unexpected(initialized.error()));
-        return results;
+    if (!IsBucketMode()) {
+        auto validated = ValidateRootIdentity();
+        if (!validated) {
+            std::fill(results.begin(), results.end(),
+                      tl::make_unexpected(validated.error()));
+            return results;
+        }
+        return BatchReadShard(requests);
     }
-
-    if (!IsBucketMode()) return BatchReadShard(requests);
 
     if (requests.empty()) return results;
     const auto epoch = requests.front().descriptor.MasterEpoch();
@@ -930,6 +938,12 @@ DistributedStorageBackend::BatchReadBlocking(
         return results;
     }
 
+    auto validated = ValidateRootIdentity(epoch);
+    if (!validated) {
+        std::fill(results.begin(), results.end(),
+                  tl::make_unexpected(validated.error()));
+        return results;
+    }
     auto tasks = PrepareReadTasks(requests, results);
     const auto prepare_done = std::chrono::steady_clock::now();
     ExecuteReadTasks(tasks, requests, results);

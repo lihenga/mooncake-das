@@ -19,6 +19,7 @@
 #include "fs_adapter.h"
 #include "replica.h"
 #include "storage/distributed/dfs_io_timeout.h"
+#include "storage/distributed/dfs_root_identity.h"
 #include "storage/distributed/object_storage_adapter.h"
 #include "storage/distributed/dfs_allocator_interface.h"
 #include "storage_backend.h"
@@ -106,12 +107,16 @@ class DistributedStorageBackend
     tl::expected<void, ErrorCode> EnsureInitialized();
     tl::expected<void, ErrorCode> TryEnsureInitialized();
 
-    // Configure before initialization/probes start. Only an empty startup
-    // identity is refreshed; an established identity remains pinned.
+    // Legacy startup fallback, configured before initialization/probes start.
     void SetRootIdentityProvider(
         std::function<tl::expected<std::string, ErrorCode>()> provider) {
         root_identity_provider_ = std::move(provider);
     }
+
+    // Publish a ready master's binding from Ping. This performs no filesystem
+    // I/O and never waits for in-flight bucket I/O. Probes still check the
+    // mount.
+    bool UpdateDfsRootBinding(const DfsRootBinding& binding);
 
     // Minimal adapter-level probes used by SGLang's health state machine.
     // These methods never touch business keys.
@@ -339,7 +344,7 @@ class DistributedStorageBackend
     std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
     DistributedStorageConfig distributed_config_;
     std::atomic<uint64_t> batch_timeout_fixed_ms_;
-    std::string expected_root_identity_;
+    std::shared_ptr<const DfsRootBinding> root_binding_;
     std::function<tl::expected<std::string, ErrorCode>()> root_identity_provider_;
     std::string root_dir_;
     std::string descriptor_root_dir_;
@@ -364,6 +369,8 @@ class DistributedStorageBackend
     std::chrono::steady_clock::time_point
         bucket_epoch_confirmation_retry_after_{};
     UUID bucket_epoch_{};
+    // Identity of the generation owning both FD caches, under the epoch guard.
+    std::string bucket_epoch_identity_;
     std::set<UUID> retired_bucket_epochs_;
     std::function<tl::expected<UUID, ErrorCode>()> master_epoch_provider_;
     mutable std::mutex bucket_cache_mutex_;
@@ -378,7 +385,10 @@ class DistributedStorageBackend
 
     tl::expected<void, ErrorCode> InitBucketModeLocked();
     tl::expected<void, ErrorCode> InitLocked();
-    tl::expected<void, ErrorCode> ValidateRootIdentity() const;
+    tl::expected<void, ErrorCode> ValidateRootIdentity(
+        const UUID& guarded_epoch = {}) const;
+    tl::expected<void, ErrorCode> ValidateRootIdentity(
+        const DfsRootBinding& binding) const;
     void ResetFailedInitializationLocked();
 
     mutable std::mutex init_mutex_;

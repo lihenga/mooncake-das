@@ -80,23 +80,68 @@ DistributedStorageBackend::TryEnsureInitialized() {
     return InitLocked();
 }
 
-tl::expected<void, ErrorCode>
-DistributedStorageBackend::ValidateRootIdentity() const {
+tl::expected<void, ErrorCode> DistributedStorageBackend::ValidateRootIdentity(
+    const UUID& guarded_epoch) const {
+    const auto binding = std::atomic_load(&root_binding_);
+    // Called with the shared epoch guard for bucket I/O. A Ping may publish a
+    // new identity while old I/O owns that guard, but it cannot relabel its
+    // FDs.
+    if (guarded_epoch != UUID{} &&
+        bucket_epoch_identity_ != binding->identity) {
+        return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
+    }
+    return ValidateRootIdentity(*binding);
+}
+
+bool DistributedStorageBackend::UpdateDfsRootBinding(
+    const DfsRootBinding& binding) {
+    if (UsesObjectStorage() || !IsBucketMode() || binding.epoch == UUID{} ||
+        binding.identity.size() > kMaxDfsRootIdentitySize) {
+        return false;
+    }
+    const std::string prefix = std::string(kDfsRootIdentityMagic) + "\n";
+    if (!binding.identity.starts_with(prefix)) return false;
+    const auto cluster_end = binding.identity.find('\n', prefix.size());
+    if (cluster_end == std::string::npos) return false;
+    const auto cluster =
+        binding.identity.substr(prefix.size(), cluster_end - prefix.size());
+    std::string parsed;
+    if (!ParseDfsRootIdentity(binding.identity, cluster, parsed)) return false;
+
+    auto previous = std::atomic_load(&root_binding_);
+    const auto next = std::make_shared<const DfsRootBinding>(binding);
+    do {
+        if (!previous->identity.empty() &&
+            !ParseDfsRootIdentity(previous->identity, cluster, parsed)) {
+            return false;
+        }
+        if (previous->epoch == binding.epoch) {
+            return previous->identity == binding.identity;
+        }
+    } while (
+        !std::atomic_compare_exchange_weak(&root_binding_, &previous, next));
+    LOG(INFO) << "Updated DFS root binding from Master, epoch=" << binding.epoch
+              << ", identity_changed="
+              << (previous->identity != binding.identity);
+    return true;
+}
+
+tl::expected<void, ErrorCode> DistributedStorageBackend::ValidateRootIdentity(
+    const DfsRootBinding& binding) const {
     if (UsesObjectStorage()) return {};
-    if (expected_root_identity_.empty() ||
-        expected_root_identity_.size() > kMaxDfsRootIdentitySize ||
+    const auto& identity = binding.identity;
+    if (identity.empty() || identity.size() > kMaxDfsRootIdentitySize ||
         !fs_adapter_) {
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
 
-    std::vector<char> contents(expected_root_identity_.size() + 1);
+    std::vector<char> contents(identity.size() + 1);
     const std::string marker_path =
         root_dir_ + "/" + kDfsRootIdentityFileName;
     auto read_result = fs_adapter_->ReadFile(
         marker_path, contents.data(), contents.size());
-    if (!read_result || *read_result != expected_root_identity_.size() ||
-        std::memcmp(contents.data(), expected_root_identity_.data(),
-                    expected_root_identity_.size()) != 0) {
+    if (!read_result || *read_result != identity.size() ||
+        std::memcmp(contents.data(), identity.data(), identity.size()) != 0) {
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
     return {};
@@ -132,6 +177,10 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeRead() {
     auto initialized = TryEnsureInitialized();
     if (!initialized) return initialized;
     if (UsesObjectStorage()) return {};
+    // Keep one immutable identity throughout both read-probe comparisons.
+    const auto binding = std::atomic_load(&root_binding_);
+    auto validated = ValidateRootIdentity(*binding);
+    if (!validated) return validated;
     void* raw = nullptr;
     if (::posix_memalign(&raw, kDfsReadProbeBlockSize, kDfsReadProbeSize) !=
         0) {
@@ -173,7 +222,7 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeRead() {
         if (!close) return tl::make_unexpected(close.error());
 
         const auto expected =
-            BuildDfsReadProbeContents(expected_root_identity_, probe_index);
+            BuildDfsReadProbeContents(binding->identity, probe_index);
         if (std::memcmp(buffer.get(), expected.data(), kDfsReadProbeSize) != 0) {
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
@@ -343,15 +392,19 @@ DistributedStorageBackend::CleanupBucketFd(int64_t bucket_id) {
 
 tl::expected<std::shared_lock<std::shared_mutex>, ErrorCode>
 DistributedStorageBackend::AcquireBucketEpoch(const UUID& epoch) {
+    const auto binding = std::atomic_load(&root_binding_);
     std::shared_lock read_lock(bucket_epoch_mutex_);
-    if (epoch == bucket_epoch_) {
+    if (epoch == bucket_epoch_ && binding->identity == bucket_epoch_identity_) {
         if (epoch == UUID{} && master_epoch_provider_) {
             return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
         }
         return read_lock;
     }
     if (!master_epoch_provider_ || epoch == UUID{} ||
-        retired_bucket_epochs_.contains(epoch)) {
+        retired_bucket_epochs_.contains(epoch) ||
+        (binding->identity != bucket_epoch_identity_ &&
+         !bucket_epoch_identity_.empty() && binding->epoch != UUID{} &&
+         epoch != binding->epoch)) {
         return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
     }
     read_lock.unlock();
@@ -361,7 +414,8 @@ DistributedStorageBackend::AcquireBucketEpoch(const UUID& epoch) {
     // that a confirmed transition must wait for before clearing the caches.
     std::unique_lock confirmation_lock(bucket_epoch_confirmation_mutex_);
     read_lock.lock();
-    if (epoch == bucket_epoch_) return read_lock;
+    if (epoch == bucket_epoch_ && binding->identity == bucket_epoch_identity_)
+        return read_lock;
     if (retired_bucket_epochs_.contains(epoch)) {
         return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
     }
@@ -393,11 +447,13 @@ DistributedStorageBackend::AcquireBucketEpoch(const UUID& epoch) {
         }
         auto invalidated = InvalidateAllBucketFds();
         if (!invalidated) return tl::make_unexpected(invalidated.error());
-        if (bucket_epoch_ != UUID{})
+        if (bucket_epoch_ != UUID{} && bucket_epoch_ != epoch)
             retired_bucket_epochs_.insert(bucket_epoch_);
         bucket_epoch_ = epoch;
+        bucket_epoch_identity_ = binding->identity;
         LOG(INFO) << "Invalidated " << *invalidated
-                  << " DFS bucket handles before using a changed Master epoch";
+                  << " DFS bucket handles before using a changed Master epoch"
+                     " or root identity";
     }
     read_lock.lock();
     return read_lock;

@@ -5548,6 +5548,9 @@ TEST_F(MasterServiceTest, DfsRootIdentityRetriesAfterRootBecomesAvailable) {
     {
         MasterService service;
         EXPECT_FALSE(service.UsesDfsBucketAllocator());
+        auto unavailable_ping = service.Ping({});
+        ASSERT_TRUE(unavailable_ping);
+        EXPECT_FALSE(unavailable_ping->dfs_root_binding.has_value());
         auto storage = service.GetStorageConfig();
         ASSERT_TRUE(storage.has_value());
         EXPECT_TRUE(storage->dfs_root_identity.empty());
@@ -5565,6 +5568,20 @@ TEST_F(MasterServiceTest, DfsRootIdentityRetriesAfterRootBecomesAvailable) {
         ASSERT_TRUE(service.UsesDfsBucketAllocator());
         EXPECT_EQ(storage->dfs_fsdir, root);
         EXPECT_FALSE(storage->dfs_root_identity.empty());
+        auto ready_ping = service.Ping({});
+        for (int retry = 0;
+             ready_ping && !ready_ping->dfs_root_binding.has_value() &&
+             retry < 100;
+             ++retry) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            ready_ping = service.Ping({});
+        }
+        ASSERT_TRUE(ready_ping);
+        ASSERT_TRUE(ready_ping->dfs_root_binding.has_value());
+        EXPECT_EQ(ready_ping->dfs_root_binding->identity,
+                  storage->dfs_root_identity);
+        EXPECT_EQ(ready_ping->dfs_root_binding->epoch,
+                  service.GetDfsMasterEpoch());
     }
     std::filesystem::remove_all(root);
 }

@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "replica.h"
+#include "rpc_types.h"
 #include "metadata_store.h"
 #include "storage/distributed/bucket_entry_layout.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
@@ -37,7 +38,8 @@ constexpr uint64_t kBucketCapacity = 1024 * 1024;
 const std::string kTestDfsRootIdentity =
     SerializeDfsRootIdentity("dfs_backend_test", UUID{1, 2});
 
-void WriteTestDfsReadProbe(const std::string& root) {
+void WriteTestDfsReadProbe(const std::string& root,
+                           const std::string& identity = kTestDfsRootIdentity) {
     for (size_t probe_index = 0;
          probe_index < kDfsReadProbeDirectoryNames.size(); ++probe_index) {
         const std::filesystem::path directory =
@@ -46,8 +48,7 @@ void WriteTestDfsReadProbe(const std::string& root) {
         std::filesystem::create_directory(directory);
         std::ofstream output(directory / kDfsReadProbeFileName,
                              std::ios::binary | std::ios::trunc);
-        const auto contents =
-            BuildDfsReadProbeContents(kTestDfsRootIdentity, probe_index);
+        const auto contents = BuildDfsReadProbeContents(identity, probe_index);
         output.write(contents.data(), contents.size());
     }
 }
@@ -60,6 +61,33 @@ struct LegacyDfsDescriptor {
     uint64_t aligned_size = 0;
     int shard_idx = 0;
 };
+
+struct LegacyPingResponse {
+    ViewVersionId view_version_id;
+    ClientStatus client_status;
+};
+YLT_REFL(LegacyPingResponse, view_version_id, client_status);
+
+TEST(DfsEpochSerializationTest, PingBindingIsCompatibleWithLegacyPeers) {
+    LegacyPingResponse old{42, ClientStatus::OK};
+    auto current =
+        struct_pack::deserialize<PingResponse>(struct_pack::serialize(old));
+    ASSERT_TRUE(current);
+    EXPECT_EQ(current->view_version_id, 42u);
+    EXPECT_FALSE(current->dfs_root_binding.has_value());
+
+    current->dfs_root_binding = DfsRootBinding{kTestDfsRootIdentity, {3, 4}};
+    const auto bytes = struct_pack::serialize(*current);
+    auto legacy = struct_pack::deserialize<LegacyPingResponse>(bytes);
+    ASSERT_TRUE(legacy);
+    EXPECT_EQ(legacy->view_version_id, old.view_version_id);
+    EXPECT_EQ(legacy->client_status, old.client_status);
+    auto roundtrip = struct_pack::deserialize<PingResponse>(bytes);
+    ASSERT_TRUE(roundtrip);
+    ASSERT_TRUE(roundtrip->dfs_root_binding.has_value());
+    EXPECT_EQ(roundtrip->dfs_root_binding->identity, kTestDfsRootIdentity);
+    EXPECT_EQ(roundtrip->dfs_root_binding->epoch, (UUID{3, 4}));
+}
 struct LegacyReplicaDescriptor {
     ReplicaID id;
     std::variant<MemoryDescriptor, NoFDescriptor, DiskDescriptor,
@@ -370,6 +398,73 @@ TEST_F(DfsBucketBackendTest, WriteThenReadRoundTrip) {
     auto desc = WriteObject(key, value);
     ASSERT_EQ(desc.object_size, value.size());
     EXPECT_EQ(ReadObject(key, desc), value);
+}
+
+TEST_F(DfsBucketBackendTest, HeartbeatBindingKeepsMountAndCachedEpochChecks) {
+    const std::string key = "identity_binding";
+    const std::string value(4096, 'A');
+    auto desc = WriteObject(key, value);
+    UUID epoch{9, 1};
+    backend_->SetMasterEpochProvider(
+        [&]() -> tl::expected<UUID, ErrorCode> { return epoch; });
+    ASSERT_TRUE(backend_->UpdateDfsRootBinding({kTestDfsRootIdentity, epoch}));
+    desc.master_epoch = epoch;
+    EXPECT_EQ(ReadObject(key, desc), value);
+
+    const DfsRootBinding next{
+        SerializeDfsRootIdentity("dfs_backend_test", UUID{5, 6}), {9, 2}};
+    // A stalled bucket operation must not stall the liveness/Ping publisher.
+    auto held = backend_->AcquireBucketEpoch(epoch);
+    ASSERT_TRUE(held);
+    auto publish = std::async(std::launch::async, [&] {
+        return backend_->UpdateDfsRootBinding(next);
+    });
+    const auto status = publish.wait_for(std::chrono::seconds(1));
+    held->unlock();
+    ASSERT_EQ(status, std::future_status::ready);
+    ASSERT_TRUE(publish.get());
+    epoch = next.epoch;
+    EXPECT_FALSE(backend_->ProbeRead());  // Local mount still contains A.
+    EXPECT_FALSE(backend_->ProbeWrite());
+    const int writes = adapter_->WriteCalls();
+    auto stale = backend_->BatchWrite(
+        {{key, desc, {{const_cast<char*>(value.data()), value.size()}}}});
+    ASSERT_FALSE(stale[0]);
+    EXPECT_EQ(stale[0].error(), ErrorCode::DFS_STALE_HANDLE);
+    EXPECT_EQ(adapter_->WriteCalls(), writes);
+
+    const auto wrong_mount =
+        SerializeDfsRootIdentity("dfs_backend_test", UUID{7, 8});
+    WriteTestDfsRootIdentity(tmp_->path(), wrong_mount);
+    WriteTestDfsReadProbe(tmp_->path(), wrong_mount);
+    EXPECT_FALSE(backend_->ProbeRead());
+    EXPECT_FALSE(backend_->ProbeWrite());
+    std::ifstream marker(tmp_->file(kDfsRootIdentityFileName));
+    EXPECT_EQ(std::string(std::istreambuf_iterator<char>(marker), {}),
+              wrong_mount);  // The client must not rewrite an unexpected root.
+
+    WriteTestDfsRootIdentity(tmp_->path(), next.identity);
+    WriteTestDfsReadProbe(tmp_->path(), next.identity);
+    EXPECT_TRUE(backend_->ProbeRead());
+    EXPECT_TRUE(backend_->ProbeWrite());
+    desc.master_epoch = epoch;
+    auto write = backend_->BatchWrite(
+        {{key, desc, {{const_cast<char*>(value.data()), value.size()}}}});
+    ASSERT_TRUE(write[0]);
+    EXPECT_EQ(ReadObject(key, desc), value);
+}
+
+TEST_F(DfsBucketBackendTest, InvalidHeartbeatBindingDoesNotReplaceIdentity) {
+    const UUID epoch{8, 1};
+    ASSERT_TRUE(backend_->UpdateDfsRootBinding({kTestDfsRootIdentity, epoch}));
+    EXPECT_TRUE(backend_->UpdateDfsRootBinding({kTestDfsRootIdentity, epoch}));
+    EXPECT_FALSE(backend_->UpdateDfsRootBinding({"malformed", {8, 2}}));
+    EXPECT_FALSE(backend_->UpdateDfsRootBinding({kTestDfsRootIdentity, {}}));
+    EXPECT_FALSE(backend_->UpdateDfsRootBinding(
+        {SerializeDfsRootIdentity("different_cluster", {3, 4}), {8, 2}}));
+    EXPECT_FALSE(backend_->UpdateDfsRootBinding(
+        {SerializeDfsRootIdentity("dfs_backend_test", {3, 4}), epoch}));
+    EXPECT_TRUE(backend_->ProbeWrite());
 }
 
 TEST_F(DfsBucketBackendTest, RangeReadPreservesSliceBoundariesWithMergeEnabled) {
