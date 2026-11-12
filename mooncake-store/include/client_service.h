@@ -124,6 +124,8 @@ class Client {
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
     int SetServiceEndpoint(const std::string& endpoint);
     void RecordServiceReadFailure(ReplicaType replica_type);
+    // Startup seed for FileStorage construction. Live Ping bindings are
+    // published directly to the registered DFS backend.
     const std::string& GetDfsRootIdentity() const {
         return dfs_root_identity_;
     }
@@ -1458,6 +1460,9 @@ class Client {
     std::shared_ptr<StorageBackend> storage_backend_;
     std::string master_dfs_root_dir_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;
+    // Publish registration atomically to the already-running Ping thread.
+    // The regular data path retains its existing backend reference.
+    std::shared_ptr<DistributedStorageBackend> heartbeat_dfs_backend_;
     // Preserve existing behavior for non-SGLang callers. SGLang explicitly
     // installs memory-only immediately after setup and before warmup.
     std::atomic<bool> dfs_read_allowed_{true};

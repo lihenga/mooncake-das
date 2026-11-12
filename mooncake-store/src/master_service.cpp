@@ -8389,7 +8389,26 @@ auto MasterService::Ping(const UUID& client_id)
         observation_accepted && ok_client_.contains(client_id)
             ? ClientStatus::OK
             : ClientStatus::NEED_REMOUNT;
-    return PingResponse(view_version_, client_status);
+    PingResponse response(view_version_, client_status);
+    lock.unlock();
+    // Never put DFS I/O or recovery waits on the liveness path. Omit the
+    // optional binding until a coherent, ready bucket generation is available.
+    std::shared_lock state_lock(master_state_mutex_, std::try_to_lock);
+    if (!state_lock.owns_lock() ||
+        !enable_dfs_.load(std::memory_order_acquire) ||
+        dfs_root_recovery_in_progress_.load(std::memory_order_acquire)) {
+        return response;
+    }
+    std::unique_lock root_lock(dfs_root_guard_mutex_, std::try_to_lock);
+    if (root_lock.owns_lock() && dfs_root_guard_ready_ &&
+        !dfs_root_recovery_needed_) {
+        const auto epoch = GetDfsMasterEpoch();
+        if (epoch != UUID{} && !dfs_root_guard_identity_.empty()) {
+            response.dfs_root_binding =
+                DfsRootBinding{dfs_root_guard_identity_, epoch};
+        }
+    }
+    return response;
 }
 
 tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
