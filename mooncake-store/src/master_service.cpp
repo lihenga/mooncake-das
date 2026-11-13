@@ -116,14 +116,6 @@ bool IsDfsReplicaFallbackError(ErrorCode error) {
            error == ErrorCode::DFS_SERVICE_UNAVAILABLE;
 }
 
-std::optional<ErrorCode> InitialDfsReplicaFallbackReason(
-    const ReplicateConfig& config, bool dfs_available) {
-    if (config.dfs_replica_num > 0 && !dfs_available) {
-        return ErrorCode::DFS_SERVICE_UNAVAILABLE;
-    }
-    return std::nullopt;
-}
-
 void RecordDfsReplicaFallback(std::string_view key, ErrorCode reason) {
     MasterMetricManager::instance().inc_dfs_replica_skipped_total(
         toString(reason));

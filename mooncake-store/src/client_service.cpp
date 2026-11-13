@@ -3144,7 +3144,6 @@ class PutOperation {
     std::string key;
     std::vector<Slice> slices;
     std::optional<uint64_t> object_checksum;
-    std::vector<std::vector<Slice>> batched_slices;
 
     // Enhanced state tracking
     PutOperationState state = PutOperationState::PENDING;
@@ -4626,117 +4625,6 @@ void Client::StageWriteBuffersForRemoteReplicas(
         op.slices = std::move(*staged_slices);
         VLOG(1) << "Staged write buffers for non-local replica, key=" << op.key;
     }
-}
-
-std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
-    std::vector<PutOperation>& ops, bool is_upsert) {
-    auto t0 = std::chrono::steady_clock::now();
-    std::unordered_map<std::string, PutOperation> seg_to_ops{};
-    for (auto& op : ops) {
-        if (op.IsResolved()) {
-            continue;
-        }
-        if (op.replicas.empty()) {
-            op.SetError(ErrorCode::INTERNAL_ERROR,
-                        "No replicas available for transfer");
-            continue;
-        }
-        auto replica = op.replicas[0];
-        if (!replica.is_memory_replica()) {
-            op.SetError(ErrorCode::INVALID_PARAMS, "only memory is supported.");
-            continue;
-        }
-        auto& memory_descriptor = replica.get_memory_descriptor();
-        if (memory_descriptor.buffer_descriptor.size_ == 0) {
-            op.SetError(ErrorCode::INVALID_PARAMS, "buffer size is 0.");
-            continue;
-        }
-        auto& buffer_descriptor = memory_descriptor.buffer_descriptor;
-        auto seg = buffer_descriptor.transport_endpoint_;
-        if (seg_to_ops.find(seg) == seg_to_ops.end()) {
-            seg_to_ops.emplace(seg, PutOperation(op.key, op.slices));
-        }
-        // multiple replica-slices
-        seg_to_ops.at(seg).batched_slices.emplace_back(op.slices);
-        seg_to_ops.at(seg).replicas.emplace_back(replica);
-    }
-    std::vector<PutOperation> merged_ops;
-    merged_ops.reserve(seg_to_ops.size());
-    for (auto& seg_to_op : seg_to_ops) {
-        auto& op = seg_to_op.second;
-        bool all_transfers_submitted = true;
-        std::string failure_context;
-        merged_ops.emplace_back(op.key, op.slices);
-        auto& merged_op = merged_ops.back();
-        merged_op.replicas = op.replicas;
-        merged_op.transfer_summary.allocated_memory_replicas = 1;
-        auto submit_result = transfer_submitter_->submit_batch(
-            op.replicas, op.batched_slices, TransferRequest::WRITE);
-        if (!submit_result) {
-            failure_context = "Failed to submit batch transfer";
-            all_transfers_submitted = false;
-        } else {
-            merged_op.pending_transfers.emplace_back(
-                ReplicaType::MEMORY, std::move(submit_result.value()));
-        }
-        if (!all_transfers_submitted) {
-            LOG(ERROR) << "Transfer submission failed for key " << op.key
-                       << ": " << failure_context;
-            merged_op.transfer_summary.RecordFailure(ReplicaType::MEMORY,
-                                                     ErrorCode::TRANSFER_FAIL);
-            merged_op.failure_context = failure_context;
-            merged_op.pending_transfers.clear();
-        } else {
-            VLOG(1) << "Successfully submitted "
-                    << merged_op.pending_transfers.size()
-                    << " transfers for key " << merged_ops.back().key;
-        }
-    }
-    WaitForTransfers(merged_ops);
-    for (auto& op : merged_ops) {
-        auto& memory_descriptor = op.replicas[0].get_memory_descriptor();
-        auto& buffer_descriptor = memory_descriptor.buffer_descriptor;
-        auto seg = buffer_descriptor.transport_endpoint_;
-        seg_to_ops.at(seg).transfer_summary = op.transfer_summary;
-        seg_to_ops.at(seg).failure_context = op.failure_context;
-    }
-    for (auto& op : ops) {
-        if (op.IsResolved()) {
-            continue;
-        }
-        auto& memory_descriptor = op.replicas[0].get_memory_descriptor();
-        auto& buffer_descriptor = memory_descriptor.buffer_descriptor;
-        auto seg = buffer_descriptor.transport_endpoint_;
-        op.transfer_summary.successful_memory_transfers =
-            seg_to_ops.at(seg).transfer_summary.successful_memory_transfers > 0
-                ? 1
-                : 0;
-        op.transfer_summary.failed_memory_transfers =
-            seg_to_ops.at(seg).transfer_summary.failed_memory_transfers > 0 ? 1
-                                                                            : 0;
-        op.transfer_summary.first_error =
-            seg_to_ops.at(seg).transfer_summary.first_error;
-        op.failure_context = seg_to_ops.at(seg).failure_context;
-    }
-    // Puts may write asynchronously in bucket mode.
-    SubmitDfsWrites(ops, /*is_upsert=*/false, /*allow_async=*/true);
-    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-                  std::chrono::steady_clock::now() - t0)
-                  .count();
-    if (metrics_) {
-        metrics_->transfer_metric.batch_put_latency_us.observe(us);
-    }
-    RecordBatchServiceDualWriteMetrics(ops);
-    if (is_upsert) {
-        FinalizeBatchUpsert(ops);
-    } else {
-        const bool allow_memory_only_fallback =
-            dfs_storage_backend_ &&
-            dfs_storage_backend_->GetAllocatorType() ==
-                DfsAllocatorType::BUCKET;
-        FinalizeBatchPut(ops, allow_memory_only_fallback);
-    }
-    return CollectResults(ops);
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
@@ -7165,21 +7053,6 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExistByReplicaType(
     }
 
     return response;
-}
-
-ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
-    ReplicateConfig client_cfg = config;
-    if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs()) {
-        // KVCS is represented by one Mooncake DFS descriptor. The adapter
-        // independently handles target placement and provider replicas, so a
-        // Mooncake replica count greater than one must not create a policy the
-        // single target descriptor cannot satisfy.
-        client_cfg.dfs_replica_num = 1;
-    }
-    if (!host_id_.empty()) {
-        client_cfg.host_id = host_id_;
-    }
-    return client_cfg;
 }
 
 void Client::SubmitDfsWriteChunk(
