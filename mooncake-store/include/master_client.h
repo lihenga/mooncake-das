@@ -350,6 +350,30 @@ class MasterClient {
         ReplicaType replica_type = ReplicaType::ALL,
         const UUID& dfs_epoch = {});
 
+    // Generation-fenced completion. A caller may use these at any time; the
+    // client downgrades them to the classic forms when the connected master
+    // did not advertise support, so callers do not branch on capability.
+    [[nodiscard]] tl::expected<void, ErrorCode> PutEndV2(
+        const ObjectMetaV2& object_meta, ReplicaType replica_type,
+        const UUID& dfs_epoch = {});
+    [[nodiscard]] tl::expected<void, ErrorCode> PutRevokeV2(
+        const RevokeObjectMetaV2& object_meta, ReplicaType replica_type,
+        const UUID& dfs_epoch = {});
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutEndV2(
+        const std::vector<ObjectMetaV2>& object_metas,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const UUID& dfs_epoch = {});
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutRevokeV2(
+        const std::vector<RevokeObjectMetaV2>& object_metas,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const UUID& dfs_epoch = {});
+
+    // Whether the connected master may hand back a DFS-only topology. This is
+    // true only when both the fallback and its generation-fenced completion
+    // protocol were advertised; the two capabilities must never be enabled
+    // independently.
+    [[nodiscard]] bool SupportsDfsOnlyFallback() const;
+
     /**
      * @brief Starts an upsert operation (insert or update)
      * @param key Object key
@@ -896,6 +920,19 @@ class MasterClient {
     // The address which is passed to the coro_rpc_client
     std::string client_addr_param_ GUARDED_BY(connect_mutex_);
     std::atomic<bool> ha_connection_policy_enabled_{false};
+
+    // What the connected master advertised, refreshed on every successful
+    // Connect and cleared on failure. Caching it here keeps the rate of the
+    // probe at one per connection rather than one per write. Guarded by
+    // connect_mutex_ for writes; reads are atomic so the put path stays
+    // lock-free.
+    std::atomic<bool> supports_dfs_only_fallback_{false};
+    std::atomic<bool> supports_put_completion_v2_{false};
+
+    // Asks the connected master for its capabilities. Returns the safe default
+    // (nothing supported) on any error, including an older master that does
+    // not implement the method.
+    MasterCapabilities ProbeMasterCapabilities();
 };
 
 }  // namespace mooncake

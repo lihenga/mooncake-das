@@ -1186,7 +1186,8 @@ ImmutableBucketAllocator::ReserveInBucketLocked(BucketState& bucket,
     MarkMetaDirtyLocked(bucket);
 
     auto descriptor = MakeBucketDescriptor(BucketDataPath(bucket.bucket_id),
-                                          *layout, bucket.bucket_id);
+                                          *layout, bucket.bucket_id,
+                                          entry.generation);
     return descriptor;
 }
 
@@ -1260,6 +1261,14 @@ ImmutableBucketAllocator::FindMatchingEntryLocked(
     if (entry.reserved_size != desc.aligned_size)
         return fail("aligned_size_mismatch");
     if (entry.key_size != key.size()) return fail("key_size_mismatch");
+    // Generation is the only field that distinguishes two allocations of the
+    // same key at the same size and offset (the layout repeats exactly when a
+    // key is re-reserved into a reclaimed slot). Callers that predate this
+    // field send 0 and keep the field-only comparison.
+    if (desc.AllocationGeneration() != 0 &&
+        entry.generation != desc.AllocationGeneration()) {
+        return fail("generation_mismatch");
+    }
     auto layout = RebuildBucketEntryLayout(entry.entry_offset, entry.value_size,
                                            alignment_);
     if (!layout) return fail("invalid_entry_layout");

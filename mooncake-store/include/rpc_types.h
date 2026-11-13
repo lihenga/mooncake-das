@@ -24,6 +24,42 @@ struct ObjectMeta {
 };
 YLT_REFL(ObjectMeta, key, object_checksum);
 
+// Completion metadata for the generation-fenced put RPCs (PutEndV2,
+// PutRevokeV2 and their batch forms). Kept separate from ObjectMeta so those
+// RPCs keep their original wire schema: an older client and an older master
+// continue to exchange ObjectMeta unchanged, and only a client that has
+// probed the master's capabilities uses the V2 forms.
+struct ObjectMetaV2 {
+    std::string key;
+    std::optional<uint64_t> object_checksum;
+    // The DFS allocation this completion belongs to, as returned by PutStart.
+    // 0 means "not supplied" and keeps the previous field-only behaviour.
+    uint64_t dfs_generation = 0;
+};
+YLT_REFL(ObjectMetaV2, key, object_checksum, dfs_generation);
+
+// What a master advertises to a client that asks for it. Every field is
+// versioned so a master built with a later layout can answer an earlier
+// client, and a field an older master never sends reads back as the safe
+// default (absent == unsupported).
+struct MasterCapabilities {
+    // The master may degrade a memory-starved write to its DFS replica when
+    // the request declares it can consume such a topology.
+    struct_pack::compatible<bool, 1> supports_dfs_only_fallback;
+    // The master understands the generation-fenced completion RPCs.
+    struct_pack::compatible<bool, 2> supports_put_completion_v2;
+};
+YLT_REFL(MasterCapabilities, supports_dfs_only_fallback,
+         supports_put_completion_v2);
+
+// A revoke request that carries each key's DFS allocation generation. Uses its
+// own type rather than ObjectMetaV2 so the batch shape stays explicit.
+struct RevokeObjectMetaV2 {
+    std::string key;
+    uint64_t dfs_generation = 0;
+};
+YLT_REFL(RevokeObjectMetaV2, key, dfs_generation);
+
 struct DfsMissingBucketReport {
     int64_t bucket_id = -1;
 };

@@ -1013,6 +1013,15 @@ UUID MasterService::GetDfsMasterEpoch() const {
     return dfs_snapshot_epoch_;
 }
 
+bool MasterService::DfsOnlyFallbackSupported() const {
+    // Both the DFS-enabled state and the bucket allocator are needed: the
+    // allocator is what stamps an allocation generation on the descriptor, so
+    // without it a degraded object could not be safely completed.
+    return use_kvcs_ == false &&
+           enable_dfs_.load(std::memory_order_acquire) &&
+           bucket_allocator_ != nullptr;
+}
+
 auto MasterService::GetDfsBucketSnapshot(
     const UUID& client_id, const UUID& last_epoch, uint64_t last_version)
     -> tl::expected<DfsBucketSnapshotResponse, ErrorCode> {
