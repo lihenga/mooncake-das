@@ -5,6 +5,7 @@
 #include <async_simple/coro/SyncAwait.h>
 
 #include <csignal>
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include <ylt/coro_rpc/impl/coro_rpc_client.hpp>
@@ -834,6 +835,20 @@ MasterClient::BatchPutStart(
     const ReplicateConfig& config) {
     ScopedVLogTimer timer(1, "MasterClient::BatchPutStart");
     timer.LogRequest("keys_count=", keys.size());
+
+    // Debug stub: set MC_STUB_BATCH_PUT_START=RPC_TIMEOUT to make every key
+    // fail with RPC_TIMEOUT without touching the master, so client-side
+    // timeout handling can be exercised in isolation.
+    if (const char* stub = std::getenv("MC_STUB_BATCH_PUT_START")) {
+        if (std::string(stub) == "RPC_TIMEOUT") {
+            LOG(WARNING) << "BatchPutStart stubbed with RPC_TIMEOUT for "
+                         << keys.size() << " key(s)";
+            timer.LogResponse("result=stubbed RPC_TIMEOUT");
+            return std::vector<tl::expected<std::vector<Replica::Descriptor>,
+                                            ErrorCode>>(
+                keys.size(), tl::make_unexpected(ErrorCode::RPC_TIMEOUT));
+        }
+    }
 
     std::vector<uint64_t> total_slice_lengths;
     total_slice_lengths.reserve(slice_lengths.size());
