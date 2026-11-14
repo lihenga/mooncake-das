@@ -1850,7 +1850,8 @@ ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
             candidate.shard_idx = static_cast<int>(bucket_id);
             candidate.offset = layout->offset;
             candidate.descriptor =
-                MakeBucketDescriptor(BucketDataPath(bucket_id), *layout, bucket_id);
+                MakeBucketDescriptor(BucketDataPath(bucket_id), *layout,
+                                     bucket_id, entry.generation);
             candidates.push_back(std::move(candidate));
         }
 
@@ -1960,7 +1961,7 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
             // match replica metadata field by field.
             candidate.descriptor =
                 MakeBucketDescriptor(BucketDataPath(victim->bucket_id), *layout,
-                                     victim->bucket_id);
+                                     victim->bucket_id, entry.generation);
             candidates.push_back(std::move(candidate));
         }
 
@@ -2396,9 +2397,15 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
             auto layout = RebuildBucketEntryLayout(
                 entry.entry_offset, entry.value_size, alignment_);
             if (!layout) continue;
+            // Carry the recovered generation too. Without it a recovered
+            // descriptor would read back as generation 0, which
+            // FindMatchingEntryLocked treats as "not supplied" and matches on
+            // the layout fields alone, so a later Free or MarkCommitted built
+            // from it could address a different allocation of the same key in
+            // the same slot.
             recovered_replicas_.push_back(RecoveredReplica{
                 key, MakeBucketDescriptor(BucketDataPath(bucket_id), *layout,
-                                          bucket_id)});
+                                          bucket_id, entry.generation)});
         }
     }
 
