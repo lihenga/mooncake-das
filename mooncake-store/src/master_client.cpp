@@ -118,6 +118,31 @@ struct RpcNameTraits<&WrappedMasterService::BatchPutRevoke> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::PutEndV2> {
+    static constexpr const char* value = "PutEndV2";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::PutRevokeV2> {
+    static constexpr const char* value = "PutRevokeV2";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchPutEndV2> {
+    static constexpr const char* value = "BatchPutEndV2";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchPutRevokeV2> {
+    static constexpr const char* value = "BatchPutRevokeV2";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::GetMasterCapabilities> {
+    static constexpr const char* value = "GetMasterCapabilities";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::UpsertStart> {
     static constexpr const char* value = "UpsertStart";
 };
@@ -585,6 +610,11 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
     timer.LogRequest("master_addr=", master_addr);
 
     MutexLocker lock(&connect_mutex_);
+    // Capabilities are connection-scoped. Clear them before every attempt so
+    // a failed reconnect can never leave a caller using the previous master's
+    // feature set.
+    supports_dfs_only_fallback_.store(false, std::memory_order_release);
+    supports_put_completion_v2_.store(false, std::memory_order_release);
     const bool use_ha_control_pool =
         ha_connection_policy_enabled_.load(std::memory_order_acquire);
     if (use_ha_control_pool) {
@@ -620,8 +650,50 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
         ha_control_client_accessor_.GetOrCreateClientPool(master_addr);
     }
     client_addr_param_ = master_addr;
+    // The version handshake above already rejects an incompatible binary, so
+    // reaching this point means the master speaks our protocol. Probe what it
+    // offers and cache the answer for the life of this connection; any failure
+    // leaves both flags false, which is the strict behaviour.
+    const MasterCapabilities capabilities = ProbeMasterCapabilities();
+    supports_dfs_only_fallback_.store(
+        capabilities.supports_dfs_only_fallback.value_or(false),
+        std::memory_order_release);
+    supports_put_completion_v2_.store(
+        capabilities.supports_put_completion_v2.value_or(false),
+        std::memory_order_release);
+    LOG(INFO) << "Master capabilities: dfs_only_fallback="
+              << supports_dfs_only_fallback_.load(std::memory_order_relaxed)
+              << " put_completion_v2="
+              << supports_put_completion_v2_.load(std::memory_order_relaxed);
     timer.LogResponse("error_code=", ErrorCode::OK);
     return ErrorCode::OK;
+}
+
+MasterCapabilities MasterClient::ProbeMasterCapabilities() {
+    tl::expected<MasterCapabilities, ErrorCode> result;
+    if (ha_connection_policy_enabled_.load(std::memory_order_acquire)) {
+        result =
+            invoke_rpc_with_pool<&WrappedMasterService::GetMasterCapabilities,
+                                 MasterCapabilities>(ha_probe_client_accessor_);
+    } else {
+        result =
+            invoke_rpc_with_pool<&WrappedMasterService::GetMasterCapabilities,
+                                 MasterCapabilities>(*client_accessor_);
+    }
+    if (!result.has_value()) {
+        // An older master does not implement the method, so the call fails
+        // like any other RPC error. Either way the answer is "nothing extra".
+        LOG(INFO) << "Master did not advertise capabilities ("
+                  << toString(result.error())
+                  << "); using the strict put behaviour";
+        return {};
+    }
+    return result.value();
+}
+
+bool MasterClient::SupportsDfsOnlyFallback() const {
+    return supports_dfs_only_fallback_.load(std::memory_order_acquire) &&
+           supports_put_completion_v2_.load(std::memory_order_acquire);
 }
 
 tl::expected<bool, ErrorCode> MasterClient::ExistKey(
@@ -902,6 +974,109 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
+
+// === generation-fenced completion (V2) ===
+//
+// Each of these sends the V2 RPC carrying the DFS allocation generation, and
+// falls back to the classic RPC when the connected master did not advertise
+// support. The fallback keeps a caller from having to branch on capability: a
+// cluster without the feature behaves exactly as it did before.
+
+tl::expected<void, ErrorCode> MasterClient::PutEndV2(
+    const ObjectMetaV2& object_meta, ReplicaType replica_type,
+    const UUID& dfs_epoch) {
+    if (object_meta.dfs_generation == 0 &&
+        !supports_put_completion_v2_.load(std::memory_order_acquire)) {
+        return PutEnd(ObjectMeta{object_meta.key, object_meta.object_checksum},
+                      replica_type, dfs_epoch);
+    }
+    ScopedVLogTimer timer(1, "MasterClient::PutEndV2");
+    timer.LogRequest("key=", object_meta.key,
+                     ", dfs_generation=", object_meta.dfs_generation);
+
+    auto result = invoke_rpc<&WrappedMasterService::PutEndV2, void>(
+        client_id_, object_meta, replica_type, tenant_id_.value(), dfs_epoch);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::PutRevokeV2(
+    const RevokeObjectMetaV2& object_meta, ReplicaType replica_type,
+    const UUID& dfs_epoch) {
+    if (object_meta.dfs_generation == 0 &&
+        !supports_put_completion_v2_.load(std::memory_order_acquire)) {
+        return PutRevoke(object_meta.key, replica_type, dfs_epoch);
+    }
+    ScopedVLogTimer timer(1, "MasterClient::PutRevokeV2");
+    timer.LogRequest("key=", object_meta.key,
+                     ", dfs_generation=", object_meta.dfs_generation);
+
+    auto result = invoke_rpc<&WrappedMasterService::PutRevokeV2, void>(
+        client_id_, object_meta, replica_type, tenant_id_.value(), dfs_epoch);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEndV2(
+    const std::vector<ObjectMetaV2>& object_metas, ReplicaType replica_type,
+    const UUID& dfs_epoch) {
+    if (!supports_put_completion_v2_.load(std::memory_order_acquire)) {
+        bool has_generation = false;
+        for (const auto& object_meta : object_metas) {
+            has_generation = has_generation || object_meta.dfs_generation != 0;
+        }
+        if (has_generation) {
+            return std::vector<tl::expected<void, ErrorCode>>(
+                object_metas.size(), tl::make_unexpected(ErrorCode::RPC_FAIL));
+        }
+        std::vector<ObjectMeta> classic;
+        classic.reserve(object_metas.size());
+        for (const auto& object_meta : object_metas) {
+            classic.emplace_back(
+                ObjectMeta{object_meta.key, object_meta.object_checksum});
+        }
+        return BatchPutEnd(classic, replica_type, dfs_epoch);
+    }
+    ScopedVLogTimer timer(1, "MasterClient::BatchPutEndV2");
+    timer.LogRequest("keys_count=", object_metas.size());
+
+    auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutEndV2, void>(
+        object_metas.size(), client_id_, object_metas, replica_type,
+        tenant_id_.value(), dfs_epoch);
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
+std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevokeV2(
+    const std::vector<RevokeObjectMetaV2>& object_metas,
+    ReplicaType replica_type, const UUID& dfs_epoch) {
+    if (!supports_put_completion_v2_.load(std::memory_order_acquire)) {
+        bool has_generation = false;
+        for (const auto& object_meta : object_metas) {
+            has_generation = has_generation || object_meta.dfs_generation != 0;
+        }
+        if (has_generation) {
+            return std::vector<tl::expected<void, ErrorCode>>(
+                object_metas.size(), tl::make_unexpected(ErrorCode::RPC_FAIL));
+        }
+        std::vector<std::string> keys;
+        keys.reserve(object_metas.size());
+        for (const auto& object_meta : object_metas) {
+            keys.push_back(object_meta.key);
+        }
+        return BatchPutRevoke(keys, replica_type, dfs_epoch);
+    }
+    ScopedVLogTimer timer(1, "MasterClient::BatchPutRevokeV2");
+    timer.LogRequest("keys_count=", object_metas.size());
+
+    auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutRevokeV2,
+                                   void>(
+        object_metas.size(), client_id_, object_metas, replica_type,
+        tenant_id_.value(), dfs_epoch);
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 MasterClient::UpsertStart(const std::string& key,

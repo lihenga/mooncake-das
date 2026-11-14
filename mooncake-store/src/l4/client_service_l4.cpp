@@ -520,25 +520,35 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
         tl::expected<void, ErrorCode> completion =
             tl::make_unexpected(ErrorCode::RPC_FAIL);
         const auto object_checksum = context->object_checksums[i];
+        // Echo the allocation this write owns. If the key was rewritten while
+        // the data was in flight, the master answers INVALID_WRITE and this
+        // task stops instead of committing or revoking its successor. The
+        // client downgrades the V2 call to the classic one on a master that
+        // did not advertise support, so the generation is simply ignored
+        // there.
+        const auto& dfs_descriptor = context->descriptors[i];
+        const uint64_t dfs_generation = dfs_descriptor.AllocationGeneration();
         for (int attempt = 0; attempt < kMaxCompletionAttempts; ++attempt) {
             if (succeeded) {
                 completion = context->is_upsert
                                  ? master_client_.UpsertEnd(
                                        ObjectMeta{key, object_checksum},
                                        ReplicaType::DFS,
-                                       context->descriptors[i].MasterEpoch())
-                                 : master_client_.PutEnd(
-                                       ObjectMeta{key, object_checksum},
+                                       dfs_descriptor.MasterEpoch())
+                                 : master_client_.PutEndV2(
+                                       ObjectMetaV2{key, object_checksum,
+                                                    dfs_generation},
                                        ReplicaType::DFS,
-                                       context->descriptors[i].MasterEpoch());
+                                       dfs_descriptor.MasterEpoch());
             } else {
-                completion = context->is_upsert
-                                 ? master_client_.UpsertRevoke(
-                                       key, ReplicaType::DFS,
-                                       context->descriptors[i].MasterEpoch())
-                                 : master_client_.PutRevoke(
-                                       key, ReplicaType::DFS,
-                                       context->descriptors[i].MasterEpoch());
+                completion =
+                    context->is_upsert
+                        ? master_client_.UpsertRevoke(
+                              key, ReplicaType::DFS,
+                              dfs_descriptor.MasterEpoch())
+                        : master_client_.PutRevokeV2(
+                              RevokeObjectMetaV2{key, dfs_generation},
+                              ReplicaType::DFS, dfs_descriptor.MasterEpoch());
             }
             if (completion) break;
             // OBJECT_NOT_FOUND / INVALID_WRITE mean the object already moved on

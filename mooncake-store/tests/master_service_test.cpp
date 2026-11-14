@@ -1533,6 +1533,9 @@ TEST_F(MasterServiceTest, DfsBucketMemoryAllocationFailurePreservesBuckets) {
         ReplicateConfig config;
         config.replica_num = 1;
         config.dfs_replica_num = 1;
+        // A real client sets this in AttachConfig; the master only degrades a
+        // write that declared it can consume a DFS-only topology.
+        config.supports_dfs_only_fallback = true;
 
         for (const char* key : {"memory_full_a", "memory_full_b"}) {
             auto start = service.PutStart(context.client_id, key,
@@ -1548,16 +1551,25 @@ TEST_F(MasterServiceTest, DfsBucketMemoryAllocationFailurePreservesBuckets) {
             service.UnmountSegment(context.segment_id, context.client_id)
                 .has_value());
 
-        auto failed = service.PutStart(context.client_id, "memory_full_c",
-                                       TenantId::Default(), 4096, config);
-        ASSERT_FALSE(failed.has_value());
-        EXPECT_EQ(failed.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+        // Memory is exhausted, so the write degrades to its DFS replica
+        // instead of failing outright.
+        auto degraded = service.PutStart(context.client_id, "memory_full_c",
+                                         TenantId::Default(), 4096, config);
+        ASSERT_TRUE(degraded.has_value())
+            << "expected DFS-only fallback, got " << degraded.error();
+        EXPECT_EQ(degraded->size(), 1u);
+        EXPECT_TRUE(degraded->front().is_dfs_replica());
+        ASSERT_TRUE(service
+                        .PutEnd(context.client_id, "memory_full_c",
+                                TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
 
-        for (const char* key : {"memory_full_a", "memory_full_b"}) {
+        for (const char* key : {"memory_full_a", "memory_full_b",
+                                "memory_full_c"}) {
             auto query = service.GetReplicaList(key, TenantId::Default());
             ASSERT_TRUE(query.has_value()) << key;
-            ASSERT_EQ(query->replicas.size(), 1u);
-            EXPECT_TRUE(query->replicas.front().is_dfs_replica());
+            ASSERT_EQ(query->replicas.size(), 1u) << key;
+            EXPECT_TRUE(query->replicas.front().is_dfs_replica()) << key;
         }
     }
 

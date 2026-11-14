@@ -139,6 +139,34 @@ class WrappedMasterService {
         ReplicaType replica_type = ReplicaType::ALL,
         const std::string& tenant_id = "default", const UUID& dfs_epoch = {});
 
+    // Generation-fenced completion RPCs. A client uses these only after the
+    // master advertised supports_put_completion_v2, so an older master never
+    // sees them and an older client never sends them.
+    tl::expected<void, ErrorCode> PutEndV2(
+        const UUID& client_id, const ObjectMetaV2& object_meta,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default", const UUID& dfs_epoch = {});
+
+    tl::expected<void, ErrorCode> PutRevokeV2(
+        const UUID& client_id, const RevokeObjectMetaV2& object_meta,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default", const UUID& dfs_epoch = {});
+
+    std::vector<tl::expected<void, ErrorCode>> BatchPutEndV2(
+        const UUID& client_id, const std::vector<ObjectMetaV2>& object_metas,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default", const UUID& dfs_epoch = {});
+
+    std::vector<tl::expected<void, ErrorCode>> BatchPutRevokeV2(
+        const UUID& client_id,
+        const std::vector<RevokeObjectMetaV2>& object_metas,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default", const UUID& dfs_epoch = {});
+
+    // Advertises what this master can do. A client that predates the method
+    // gets an RPC error and falls back to the strict behaviour.
+    tl::expected<MasterCapabilities, ErrorCode> GetMasterCapabilities();
+
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> UpsertStart(
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config,
