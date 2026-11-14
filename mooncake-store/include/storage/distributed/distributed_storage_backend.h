@@ -374,6 +374,9 @@ class DistributedStorageBackend
         bucket_id_cache_;
     std::unordered_map<int64_t, std::shared_ptr<OpenFileHandle>>
         bucket_id_direct_cache_;
+    // Cache ownership only; evicted handles stay alive in in-flight operations.
+    void TrimBucketFdCacheLocked();
+    size_t bucket_fd_cache_limit_{1024};
     std::unique_ptr<ThreadPool> batch_read_pool_;
 
     tl::expected<void, ErrorCode> InitBucketModeLocked();

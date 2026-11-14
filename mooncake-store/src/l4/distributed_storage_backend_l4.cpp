@@ -299,7 +299,22 @@ DistributedStorageBackend::GetOrOpenBucket(int64_t bucket_id,
     // the winner and let our handle close its own fd on destruction.
     auto [it, inserted] = bucket_id_cache_.emplace(bucket_id, handle);
     (void)inserted;
-    return it->second;
+    auto selected = it->second;
+    TrimBucketFdCacheLocked();
+    return selected;
+}
+
+void DistributedStorageBackend::TrimBucketFdCacheLocked() {
+    // This is a capacity bound, not an LRU: avoid per-hit list/clock overhead.
+    // A reader owns its shared_ptr independently of these lookup maps.
+    while (bucket_id_cache_.size() + bucket_id_direct_cache_.size() >
+           bucket_fd_cache_limit_) {
+        if (bucket_id_cache_.size() >= bucket_id_direct_cache_.size()) {
+            bucket_id_cache_.erase(bucket_id_cache_.begin());
+        } else {
+            bucket_id_direct_cache_.erase(bucket_id_direct_cache_.begin());
+        }
+    }
 }
 
 tl::expected<bool, ErrorCode>
@@ -522,7 +537,9 @@ DistributedStorageBackend::GetOrOpenBucketDirect(int64_t bucket_id,
     // the winner and let our handle close its own fd on destruction.
     auto [it, inserted] = bucket_id_direct_cache_.emplace(bucket_id, handle);
     (void)inserted;
-    return it->second;
+    auto selected = it->second;
+    TrimBucketFdCacheLocked();
+    return selected;
 }
 
 std::vector<tl::expected<void, ErrorCode>>

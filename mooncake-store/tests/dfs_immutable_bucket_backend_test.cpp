@@ -372,7 +372,43 @@ TEST_F(DfsBucketBackendTest, WriteThenReadRoundTrip) {
     EXPECT_EQ(ReadObject(key, desc), value);
 }
 
-TEST_F(DfsBucketBackendTest, RangeReadPreservesSliceBoundariesWithMergeEnabled) {
+TEST_F(DfsBucketBackendTest, CapacityEvictionPreservesConcurrentReads) {
+    ASSERT_EQ(::setenv("MOONCAKE_DFS_BUCKET_FD_CACHE_LIMIT", "1", 1), 0);
+    FileStorageConfig file_config;
+    auto backend = MakeTestBackend(file_config, config_,
+                                   std::make_unique<PosixFsAdapter>());
+    ::unsetenv("MOONCAKE_DFS_BUCKET_FD_CACHE_LIMIT");
+    ASSERT_TRUE(backend->Init());
+    const std::string payload(kBucketCapacity * 3 / 4, 'B');
+    auto first = WriteObject("fd_capacity_first", payload);
+    auto second = WriteObject("fd_capacity_second", payload);
+    ASSERT_NE(first.shard_idx, second.shard_idx);
+
+    std::vector<std::future<bool>> readers;
+    for (int i = 0; i < 8; ++i) {
+        readers.push_back(std::async(std::launch::async, [&, i] {
+            for (int repeat = 0; repeat < 20; ++repeat) {
+                const bool use_first = (i + repeat) % 2 == 0;
+                std::string bytes(payload.size(), '?');
+                auto read = backend->BatchRead(
+                    {{use_first ? "fd_capacity_first" : "fd_capacity_second",
+                      use_first ? first : second,
+                      {{bytes.data(), bytes.size()}}}});
+                if (read.size() != 1 || !read[0] || bytes != payload) {
+                    return false;
+                }
+            }
+            return true;
+        }));
+    }
+    for (auto& reader : readers) EXPECT_TRUE(reader.get());
+    auto remaining = backend->InvalidateAllBucketFds();
+    ASSERT_TRUE(remaining);
+    EXPECT_LE(*remaining, 1u);
+}
+
+TEST_F(DfsBucketBackendTest,
+       RangeReadPreservesSliceBoundariesWithMergeEnabled) {
     const std::string key = "range_window";
     const std::string value = "0123456789abcdef";
     const auto desc = WriteObject(key, value);

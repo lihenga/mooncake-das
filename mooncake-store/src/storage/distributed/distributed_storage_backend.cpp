@@ -68,7 +68,6 @@ std::optional<int> ParseShardFileName(std::string_view name) {
     return index;
 }
 
-
 constexpr char kDfsHealthProbeFilePrefix[] = ".mooncake_dfs_health_probe_";
 
 using l4::kBucketFilePrefix;
@@ -151,6 +150,10 @@ DistributedStorageBackend::DistributedStorageBackend(
       expected_root_identity_(std::move(expected_root_identity)),
       root_dir_(distributed_config.fsdir),
       descriptor_root_dir_(distributed_config.fsdir) {
+    const auto fd_limit =
+        GetEnvOr<int64_t>("MOONCAKE_DFS_BUCKET_FD_CACHE_LIMIT", 1024);
+    CHECK_GT(fd_limit, 0);
+    bucket_fd_cache_limit_ = static_cast<size_t>(fd_limit);
     CHECK((fs_adapter_ != nullptr) != (object_storage_adapter_ != nullptr))
         << "DistributedStorageBackend: exactly one I/O adapter is required";
     if (object_storage_adapter_) {
@@ -246,7 +249,8 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::InitLocked() {
         return InitBucketModeLocked();
     }
 
-    // Published descriptors alone identify shards; never create or preopen them.
+    // Published descriptors alone identify shards; never create or preopen
+    // them.
     initialized_.store(true, std::memory_order_release);
     return {};
 }
