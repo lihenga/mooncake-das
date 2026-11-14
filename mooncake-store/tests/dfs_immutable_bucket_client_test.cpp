@@ -1633,6 +1633,19 @@ TEST_F(DfsBucketClientTest, ChecksumRejectsNullSliceBeforeTransfers) {
     EXPECT_EQ(adapter_->WriteCalls(), 0);
 }
 
+TEST_F(DfsBucketClientTest, MemoryOnlySessionRejectsEnvironmentDfsReservation) {
+    SetEnv("MOONCAKE_DFS_FORCE_ONE_REPLICA", "true");
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.dfs_replica_num = 0;
+    auto results = writer_->StartBatchPutForSizes(
+        {"memory_only_dfs_policy"}, {4096}, config, /*memory_only=*/true);
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_FALSE(results[0]);
+    EXPECT_EQ(results[0].error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_FALSE(writer_->Query("memory_only_dfs_policy"));
+}
+
 TEST_F(DfsBucketClientTest, ChecksumSurvivesEitherEndOrderAndRetries) {
     for (const bool dfs_first : {false, true}) {
         const std::string key =

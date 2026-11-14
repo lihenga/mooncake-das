@@ -8403,7 +8403,8 @@ std::vector<int> RealClient::batch_put_session_start(
     ReplicateConfig start_config = config.ForKeySubset(start_indices);
 
     auto start_responses =
-        client_->StartBatchPutForSizes(start_keys, start_sizes, start_config);
+        client_->StartBatchPutForSizes(start_keys, start_sizes, start_config,
+                                       /*memory_only=*/true);
     std::vector<std::string> keys_to_revoke;
     std::vector<UUID> revoke_epochs;
     std::vector<std::string> hot_keys_to_remove;

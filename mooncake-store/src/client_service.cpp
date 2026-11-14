@@ -4868,7 +4868,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
 Client::StartBatchPutForSizes(const std::vector<std::string>& keys,
                               const std::vector<uint64_t>& object_sizes,
-                              const ReplicateConfig& config) {
+                              const ReplicateConfig& config, bool memory_only) {
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
         results(keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     if (!config.ValidSessionIds(keys.size()) ||
@@ -4882,6 +4882,12 @@ Client::StartBatchPutForSizes(const std::vector<std::string>& keys,
     }
 
     ReplicateConfig client_cfg = AttachConfig(config);
+    // Ranged sessions finalize MEMORY only. Environment policy must not create
+    // an unwritten DFS reservation after the public API validated the config.
+    if (memory_only && client_cfg.dfs_replica_num > 0) {
+        LOG(ERROR) << "StartBatchPutForSizes cannot finalize DFS replicas";
+        return results;
+    }
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
