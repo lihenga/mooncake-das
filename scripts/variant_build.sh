@@ -216,18 +216,6 @@ build_variant() {
     esac
     cmake_args+=(-DUSE_SHCA="${use_shca}" -DUSE_HYLINK="${USE_HYLINK}"
                  -DUSE_HIP="${USE_HIP}" -DUSE_HYGON="${USE_HIP}" -DUSE_FAKE_HIP_RPC="${USE_HIP}" -DUSE_CUDA="${USE_CUDA}")
-    if [ "${USE_HIP}" = ON ]; then
-        # Older DTK SDKs cannot compile the optional fabric RPC implementation.
-        local hip_root="${HIP_PATH:-/opt/dtk}"
-        if [ ! -f "${hip_root}/include/hip/hip_hsa_ext.h" ]; then
-            echo "HIP fabric RPC header unavailable; enabling IPC-compatible stubs."
-            cmake_args+=(-DUSE_FAKE_HIP_RPC=ON)
-        else
-            cmake_args+=(-DUSE_FAKE_HIP_RPC=OFF)
-        fi
-    else
-        cmake_args+=(-DUSE_FAKE_HIP_RPC=OFF)
-    fi
 
     if [ "${DRY_RUN}" -eq 0 ] && \
         { [ "${nic_type}" != standard ] || [ "${GPU_BACKEND}" != hylink ]; }; then
