@@ -649,16 +649,6 @@ tl::expected<QueryResult, ErrorCode> ApplyDfsReadVisibility(
                        query_result->resolved_tenant_id);
 }
 
-
-inline bool HasMemoryReplica(const std::vector<Replica::Descriptor> &replicas) {
-    for (const auto &r : replicas) {
-        if (r.is_memory_replica()) {
-            return true;
-        }
-    }
-    return false;
-}
-
 size_t DfsH2dStreamCount() {
     constexpr size_t kDefaultStreams = 4;
     const char *value = std::getenv("MC_STORE_DFS_H2D_STREAMS");

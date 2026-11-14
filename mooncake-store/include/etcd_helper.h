@@ -113,9 +113,6 @@ class EtcdHelper {
      */
     static ErrorCode TxnCompareAndPut(const std::vector<TxnCompare>& compares,
                                       const std::vector<TxnPut>& puts);
-    static ErrorCode TxnCompareAndPutWithLease(
-        const std::vector<TxnCompare>& compares,
-        const std::vector<TxnPut>& puts, EtcdLeaseId lease_id);
 
     /*
      * @brief Grant a lease from the etcd.

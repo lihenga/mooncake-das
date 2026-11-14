@@ -42,8 +42,6 @@ T GetEnvOr(const char* name, T default_value) {
 
 std::string GetEnvStringOr(const char* name, const std::string& default_value);
 
-std::string ResolveMooncakeHostId(const std::string& local_hostname);
-
 inline std::string ResolvePathFromKey(const std::string& key,
                                       const std::string& root_dir,
                                       const std::string& fsdir) {
