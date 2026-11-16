@@ -1043,7 +1043,8 @@ class Client {
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     StartBatchPutForSizes(const std::vector<std::string>& keys,
                           const std::vector<uint64_t>& object_sizes,
-                          const ReplicateConfig& config);
+                          const ReplicateConfig& config,
+                          bool memory_only = false);
 
     // Finalize/revoke a put session for a batch of keys. Thin wrappers over
     // the master client, exposed so RealClient put sessions can end/revoke
