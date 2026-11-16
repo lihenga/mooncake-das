@@ -7,6 +7,8 @@
 
 #include "cuda_alike.h"
 
+#include <vector>
+
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
     defined(USE_COREX) || defined(USE_SUPA) || \
     (defined(USE_HYGON) && !defined(USE_HIP))
@@ -79,6 +81,40 @@ class CudaLikeAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
                                static_cast<cudaStream_t>(stream)) ==
                cudaSuccess;
     }
+
+#if defined(USE_CUDA) && CUDART_VERSION >= 13000
+    bool CopyFromHostBatchAsync(
+        std::span<const HostCopyRange> ranges, void* stream,
+        bool* used_batch_kernel = nullptr) const override {
+        // This is a runtime batch copy, not the mapped-host scatter kernel.
+        if (used_batch_kernel) *used_batch_kernel = false;
+        if (ranges.size() < 32) {
+            return AcceleratorDevice::CopyFromHostBatchAsync(ranges, stream);
+        }
+
+        std::vector<void*> destinations;
+        std::vector<const void*> sources;
+        std::vector<size_t> sizes;
+        destinations.reserve(ranges.size());
+        sources.reserve(ranges.size());
+        sizes.reserve(ranges.size());
+        for (const auto& range : ranges) {
+            destinations.push_back(range.dst);
+            sources.push_back(range.src);
+            sizes.push_back(range.size);
+        }
+
+        cudaMemcpyAttributes attributes{};
+        attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+        size_t attributes_index = 0;
+        // A failed batch may already have submitted copies. The caller must
+        // synchronize before releasing buffers; do not resubmit it as DMA.
+        return cudaMemcpyBatchAsync(
+                   destinations.data(), sources.data(), sizes.data(),
+                   ranges.size(), &attributes, &attributes_index, 1,
+                   static_cast<cudaStream_t>(stream)) == cudaSuccess;
+    }
+#endif
 
     bool CreateStream(void** stream) const override {
         cudaStream_t cuda_stream = nullptr;
