@@ -15,6 +15,7 @@ DRY_RUN=0
 BUILD_VARIANT="standard"
 USE_HYLINK=OFF
 USE_HIP=OFF
+USE_CUDA=OFF
 USE_ETCD=OFF
 PYPROJECT_BACKUP=""
 BUILD_TYPE="Release"
@@ -23,17 +24,18 @@ usage() {
     cat <<'EOF'
 Usage: ./scripts/variant_build.sh [options]
 
-Without feature flags, build for a normal RDMA NIC with HIP and HyLink disabled.
+Without feature flags, build for a normal RDMA NIC with GPU backends disabled.
 HyLink depends on HIP, so --hylink also enables USE_HIP.
 HIP also enables USE_HYGON to build and use the Store H2D scatter kernel.
 
 USE_ETCD and STORE_USE_ETCD default to OFF; --etcd enables both.
-HIP or HyLink additionally enables ENABLE_MULTI_PROTOCOL.
+HIP, HyLink or CUDA additionally enables ENABLE_MULTI_PROTOCOL.
 
 Options:
   --shca        Enable USE_SHCA for TianLong SHCA NICs
   --hylink      Enable USE_HYLINK (also enables USE_HIP)
   --hip         Enable USE_HIP and USE_HYGON without requiring HyLink
+  --cuda        Enable NVIDIA CUDA (mutually exclusive with HIP/HyLink)
   --etcd        Enable USE_ETCD and STORE_USE_ETCD together
   --skip-deps   Skip `bash dependencies.sh`
   --dry-run     Print commands without executing them
@@ -51,6 +53,7 @@ Examples:
   bash scripts/variant_build.sh --hylink
   bash scripts/variant_build.sh --shca --hylink
   bash scripts/variant_build.sh --hip
+  bash scripts/variant_build.sh --cuda --etcd
   bash scripts/variant_build.sh --shca --hip
   bash scripts/variant_build.sh --shca --hip --etcd
   bash scripts/variant_build.sh --hylink --etcd
@@ -173,10 +176,14 @@ build_variant() {
     local nic_description="standard RDMA"
     local gpu_description=""
     local use_shca=OFF
-    # HIP/HyLink share the segment with RDMA and need multi-protocol routing.
+    # Device transports share the segment with RDMA.
+    local multi_protocol=OFF
+    if [ "${USE_HIP}" = ON ] || [ "${USE_CUDA}" = ON ]; then
+        multi_protocol=ON
+    fi
     local -a cmake_args=(-DUSE_ETCD="${USE_ETCD}" -DSTORE_USE_ETCD="${USE_ETCD}"
                          -DBUILD_UNIT_TESTS=OFF
-                         -DENABLE_MULTI_PROTOCOL="${USE_HIP}")
+                         -DENABLE_MULTI_PROTOCOL="${multi_protocol}")
 
     case "${nic_type}" in
         standard)
@@ -200,12 +207,15 @@ build_variant() {
         hip)
             gpu_description="HIP"
             ;;
+        cuda)
+            gpu_description="CUDA"
+            ;;
         none)
             gpu_description="HIP/HyLink disabled"
             ;;
     esac
     cmake_args+=(-DUSE_SHCA="${use_shca}" -DUSE_HYLINK="${USE_HYLINK}"
-                 -DUSE_HIP="${USE_HIP}" -DUSE_HYGON="${USE_HIP}" -DUSE_FAKE_HIP_RPC="${USE_HIP}" -DUSE_CUDA=OFF)
+                 -DUSE_HIP="${USE_HIP}" -DUSE_HYGON="${USE_HIP}" -DUSE_FAKE_HIP_RPC="${USE_HIP}" -DUSE_CUDA="${USE_CUDA}")
 
     if [ "${DRY_RUN}" -eq 0 ] && \
         { [ "${nic_type}" != standard ] || [ "${GPU_BACKEND}" != hylink ]; }; then
@@ -238,6 +248,9 @@ while [ $# -gt 0 ]; do
             ;;
         --hip)
             USE_HIP=ON
+            ;;
+        --cuda)
+            USE_CUDA=ON
             ;;
         --etcd)
             USE_ETCD=ON
@@ -275,11 +288,17 @@ if ! [[ "${JOBS}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 GPU_BACKEND="none"
+if [ "${USE_CUDA}" = ON ] && { [ "${USE_HIP}" = ON ] || [ "${USE_HYLINK}" = ON ]; }; then
+    echo "Error: --cuda cannot be combined with --hip or --hylink." >&2
+    exit 1
+fi
 if [ "${USE_HYLINK}" = ON ]; then
     USE_HIP=ON
     GPU_BACKEND="hylink"
 elif [ "${USE_HIP}" = ON ]; then
     GPU_BACKEND="hip"
+elif [ "${USE_CUDA}" = ON ]; then
+    GPU_BACKEND="cuda"
 fi
 
 trap restore_pyproject EXIT
