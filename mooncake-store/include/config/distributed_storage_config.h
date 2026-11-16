@@ -36,8 +36,7 @@ struct DistributedStorageConfig {
     DfsAllocatorType allocator_type = DfsAllocatorType::SHARD;
     // BUCKET mode only: size of each append-only bucket data file.
     uint64_t bucket_capacity = 256ULL * 1024 * 1024;
-    // When false, retain old bucket files without recovering their replicas.
-    // max_bucket_count then budgets only buckets created by this process.
+    // When false, delete scanned legacy bucket files without recovering them.
     bool bucket_recovery_enabled = false;
     // BUCKET mode only: upper bound on live buckets. Also the fixed
     // denominator for eviction watermarks, so it must be > 0.

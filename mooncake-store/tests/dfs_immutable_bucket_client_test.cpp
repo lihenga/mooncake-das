@@ -642,15 +642,21 @@ class DfsBucketClientTest : public ::testing::Test {
     }
 
     std::shared_ptr<Client> CreateClient(const std::string& hostname) {
-        auto client = Client::Create(hostname, "P2PHANDSHAKE", "tcp",
-                                     std::nullopt, master_.master_address());
-        if (!client || !*client) return nullptr;
-        // Every client created by this fixture needs a unified DFS buffer:
-        // tests recreate writer_ after SetUp() for per-case timeout settings.
-        (*client)->SetUnifiedDfsBuffer(
-            ClientBufferAllocator::create(UnifiedBufferSize()),
-            UnifiedBufferSize());
-        return *client;
+        // Consecutive in-process masters can reuse a port whose pooled socket
+        // still belongs to the previous server. Retry only fixture startup.
+        for (int attempt = 0; attempt < 5; ++attempt) {
+            auto client =
+                Client::Create(hostname, "P2PHANDSHAKE", "tcp", std::nullopt,
+                               master_.master_address());
+            if (client && *client) {
+                (*client)->SetUnifiedDfsBuffer(
+                    ClientBufferAllocator::create(UnifiedBufferSize()),
+                    UnifiedBufferSize());
+                return *client;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return nullptr;
     }
 
 #ifdef MOONCAKE_ENABLE_TEST_FAILPOINTS
@@ -702,14 +708,14 @@ class DfsBucketClientTest : public ::testing::Test {
             return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
         }
         return QueryResult(std::move(replicas), query->lease_timeout,
-                           query->object_checksum);
+                           query->object_checksum, query->resolved_tenant_id);
     }
 
     // The DFS write is asynchronous in bucket mode, so wait for the replica to
     // become visible instead of assuming it already is.
-    bool WaitForDfsReplica(const std::string& key,
-                           std::chrono::milliseconds timeout =
-                               std::chrono::seconds(5)) {
+    bool WaitForDfsReplica(
+        const std::string& key,
+        std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
         const auto deadline = std::chrono::steady_clock::now() + timeout;
         while (std::chrono::steady_clock::now() < deadline) {
             auto query = QueryDfsOnly(key);
@@ -1105,7 +1111,7 @@ TEST_F(DfsBucketClientTest, StaleDfsReadRetryAllowsExistenceFilteredDfs) {
     replicas[0].get_dfs_descriptor().master_epoch = UUID{};
     std::vector<QueryResult> queries;
     queries.emplace_back(std::move(replicas), query->lease_timeout,
-                         query->object_checksum);
+                         query->object_checksum, query->resolved_tenant_id);
 
     ASSERT_TRUE(master_.service()->SetDfsFilterMode(1));
     std::string output(value.size(), '?');
@@ -2158,7 +2164,8 @@ TEST_F(DfsBucketClientTest, RemoveFreesBucketSpaceAndKeyBecomesReusable) {
     auto removed = writer_->Query(key);
     ASSERT_FALSE(removed.has_value());
 
-    // The key must be reusable, at a different offset (buckets are append-only).
+    // The key must be reusable, at a different offset (buckets are
+    // append-only).
     std::string second(4096, 'S');
     std::vector<Slice> second_slices{{second.data(), second.size()}};
     ASSERT_TRUE(writer_->Put(key, second_slices, DfsConfig()).has_value());
@@ -2177,6 +2184,10 @@ TEST_F(DfsBucketClientTest, UpsertKeepsSynchronousDfsSemantics) {
     ASSERT_TRUE(initial_query.has_value());
     const auto initial_descriptor =
         initial_query->replicas[0].get_dfs_descriptor();
+    // The checks above acquired read leases. Upsert must not overwrite their
+    // live view; wait for that contract rather than weakening production locks.
+    std::this_thread::sleep_until(initial_query->lease_timeout +
+                                  std::chrono::milliseconds(1));
 
     // Upsert stays synchronous, so the new value is readable as soon as it
     // returns, but it must use a newly appended range.
@@ -2204,6 +2215,14 @@ TEST_F(DfsBucketClientTest, BatchUpsertKeepsSynchronousDfsSemantics) {
 
     std::vector<std::string> updated{std::string(4096, 'E'),
                                      std::string(4096, 'F')};
+    auto lease_deadline = std::chrono::steady_clock::now();
+    for (const auto& key : keys) {
+        auto query = QueryDfsOnly(key);
+        ASSERT_TRUE(query);
+        lease_deadline = std::max(lease_deadline, query->lease_timeout);
+    }
+    std::this_thread::sleep_until(lease_deadline +
+                                  std::chrono::milliseconds(1));
     auto updated_slices = MakeSlices(updated);
     auto upsert_results =
         writer_->BatchUpsert(keys, updated_slices, DfsConfig());

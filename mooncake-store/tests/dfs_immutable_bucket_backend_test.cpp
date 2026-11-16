@@ -1425,6 +1425,7 @@ TEST_F(DfsBucketBackendTest, ReadAfterAllocatorRecoveryReturnsSameBytes) {
     // bookkeeping.
     BucketTempDir dir("dfs_bucket_recover_io");
     auto config = MakeBucketConfig(dir.path());
+    config.bucket_recovery_enabled = true;
 
     std::vector<std::string> keys{"rec_a", "rec_b"};
     std::vector<std::string> values{std::string(300, 'p'),
