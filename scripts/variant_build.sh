@@ -19,6 +19,10 @@ USE_CUDA=OFF
 USE_ETCD=OFF
 PYPROJECT_BACKUP=""
 BUILD_TYPE="Release"
+B300_BUILD=0
+EXTRA_CMAKE_ARGS=()
+DEPENDENCY_PREFIX=""
+YLT_SOURCE=""
 
 usage() {
     cat <<'EOF'
@@ -36,14 +40,19 @@ Options:
   --hylink      Enable USE_HYLINK (also enables USE_HIP)
   --hip         Enable USE_HIP without requiring HyLink
   --cuda        Enable NVIDIA CUDA (mutually exclusive with HIP/HyLink)
+  --b300        Build CUDA Store/TE for B300, with standard NIC and no Rust
   --etcd        Enable USE_ETCD and STORE_USE_ETCD together
   --skip-deps   Skip `bash dependencies.sh`
   --dry-run     Print commands without executing them
   --jobs N      Override build parallelism
+  --cmake-arg X Pass one additional CMake argument (repeatable)
+  --dependency-prefix DIR  Use dependencies installed under DIR
+  --ylt-source DIR         Use an existing yalantinglibs source (offline builds)
   -h, --help    Show this help
 
-Build directory: build (shared by all configurations)
+Build directory: build (build-b300 for --b300)
 Wheel output: mooncake-wheel/dist
+SKIP_WHEEL_DEPS=1 uses preinstalled wheel tools without pip upgrades/downloads.
 Package names depend only on the NIC: mooncake-transfer-engine for standard,
 mooncake-transfer-engine-shca for SHCA, regardless of HIP/HyLink/etcd flags.
 
@@ -54,6 +63,7 @@ Examples:
   bash scripts/variant_build.sh --shca --hylink
   bash scripts/variant_build.sh --hip
   bash scripts/variant_build.sh --cuda --etcd
+  bash scripts/variant_build.sh --b300 --skip-deps --jobs 32
   bash scripts/variant_build.sh --shca --hip
   bash scripts/variant_build.sh --shca --hip --etcd
   bash scripts/variant_build.sh --hylink --etcd
@@ -176,6 +186,8 @@ build_variant() {
     local nic_description="standard RDMA"
     local gpu_description=""
     local use_shca=OFF
+    local shared_libraries=ON
+    local use_jemalloc=ON
     # Device transports share the segment with RDMA.
     local multi_protocol=OFF
     if [ "${USE_HIP}" = ON ] || [ "${USE_CUDA}" = ON ]; then
@@ -216,6 +228,23 @@ build_variant() {
     esac
     cmake_args+=(-DUSE_SHCA="${use_shca}" -DUSE_HYLINK="${USE_HYLINK}"
                  -DUSE_HIP="${USE_HIP}" -DUSE_CUDA="${USE_CUDA}")
+    if [ "${B300_BUILD}" -eq 1 ]; then
+        shared_libraries=OFF
+        use_jemalloc=OFF
+        cmake_args+=(-DWITH_TE=ON -DWITH_STORE=ON -DWITH_METRICS=ON
+                     -DUSE_TCP=ON -DUSE_HTTP=ON -DUSE_MLX5DV=OFF
+                     -DWITH_STORE_RUST=OFF -DWITH_STORE_RS=OFF
+                     -DWITH_STORE_GO=OFF -DWITH_STORE_C_SHARED=OFF
+                     -DWITH_RUST_EXAMPLE=OFF -DWITH_CONDUCTOR=OFF
+                     -DWITH_CONDUCTOR_RUST=OFF -DWITH_EP=OFF
+                     -DSTORE_USE_K8S_LEASE=OFF
+                     -DBUILD_EXAMPLES=ON -DBUILD_BENCHMARK=OFF)
+        if [ ! -f "${REPO_ROOT}/extern/pybind11/CMakeLists.txt" ]; then
+            local pybind11_dir
+            pybind11_dir="$(python -m pybind11 --cmakedir)"
+            cmake_args+=(-DSKBUILD=ON -Dpybind11_DIR="${pybind11_dir}")
+        fi
+    fi
 
     if [ "${DRY_RUN}" -eq 0 ] && \
         { [ "${nic_type}" != standard ] || [ "${GPU_BACKEND}" != hylink ]; }; then
@@ -228,13 +257,31 @@ build_variant() {
     echo "==> Building ${package_name} (${nic_description}, ${gpu_description})"
     echo "==> Wheel output: ${FINAL_DIST_DIR}"
     run_cmd mkdir -p "${REPO_ROOT}/${BUILD_DIR}" "${FINAL_DIST_DIR}"
+    local cache_file="${REPO_ROOT}/${BUILD_DIR}/CMakeCache.txt"
+    if [ -f "${cache_file}" ]; then
+        local cached_source cached_build
+        cached_source=$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "${cache_file}")
+        cached_build=$(sed -n 's/^CMAKE_CACHEFILE_DIR:INTERNAL=//p' "${cache_file}")
+        if [ "${cached_source}" != "${REPO_ROOT}" ] || \
+           [ "${cached_build}" != "${REPO_ROOT}/${BUILD_DIR}" ]; then
+            echo "==> Mount path changed; refreshing generated CMake configuration"
+            run_cmd rm -f "${cache_file}"
+            run_cmd rm -rf "${REPO_ROOT}/${BUILD_DIR}/CMakeFiles"
+        fi
+    fi
     unset VERBOSE || true
     run_cmd cmake -S "${REPO_ROOT}" -B "${REPO_ROOT}/${BUILD_DIR}" "${cmake_args[@]}" \
-        -DSTORE_USE_JEMALLOC=ON \
-        -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" -DBUILD_SHARED_LIBS=ON \
+        -DSTORE_USE_JEMALLOC="${use_jemalloc}" \
+        -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" -DBUILD_SHARED_LIBS="${shared_libraries}" \
         -DCMAKE_VERBOSE_MAKEFILE=OFF -DCMAKE_CXX_FLAGS="" \
-        -DCMAKE_IGNORE_PREFIX_PATH="${CONDA_PREFIX:-/opt/hyhal/hbm/Miniconda3}"
-    run_cmd cmake --build "${REPO_ROOT}/${BUILD_DIR}" -j"${JOBS}"
+        -DCMAKE_IGNORE_PREFIX_PATH="${CONDA_PREFIX:-}" \
+        "${EXTRA_CMAKE_ARGS[@]}"
+    if [ "${B300_BUILD}" -eq 1 ]; then
+        run_cmd cmake --build "${REPO_ROOT}/${BUILD_DIR}" -j"${JOBS}" \
+            --target engine store mooncake_master mooncake_client transfer_engine_bench
+    else
+        run_cmd cmake --build "${REPO_ROOT}/${BUILD_DIR}" -j"${JOBS}"
+    fi
     run_wheel_build
 }
 
@@ -252,6 +299,11 @@ while [ $# -gt 0 ]; do
         --cuda)
             USE_CUDA=ON
             ;;
+        --b300)
+            B300_BUILD=1
+            USE_CUDA=ON
+            BUILD_DIR="build-b300"
+            ;;
         --etcd)
             USE_ETCD=ON
             ;;
@@ -267,6 +319,26 @@ while [ $# -gt 0 ]; do
                 exit 1
             fi
             JOBS="$2"
+            shift
+            ;;
+        --cmake-arg)
+            if [ $# -lt 2 ]; then
+                echo "Error: --cmake-arg requires a CMake argument." >&2
+                exit 1
+            fi
+            EXTRA_CMAKE_ARGS+=("$2")
+            shift
+            ;;
+        --dependency-prefix|--ylt-source)
+            if [ $# -lt 2 ] || [ ! -d "$2" ]; then
+                echo "Error: $1 requires an existing directory." >&2
+                exit 1
+            fi
+            if [ "$1" = --dependency-prefix ]; then
+                DEPENDENCY_PREFIX="$(cd "$2" && pwd)"
+            else
+                YLT_SOURCE="$(cd "$2" && pwd)"
+            fi
             shift
             ;;
         -h|--help)
@@ -292,6 +364,13 @@ if [ "${USE_CUDA}" = ON ] && { [ "${USE_HIP}" = ON ] || [ "${USE_HYLINK}" = ON ]
     echo "Error: --cuda cannot be combined with --hip or --hylink." >&2
     exit 1
 fi
+if [ "${B300_BUILD}" -eq 1 ] && [ "${BUILD_VARIANT}" != standard ]; then
+    echo "Error: --b300 uses standard NICs and cannot be combined with --shca." >&2
+    exit 1
+fi
+if [ "${B300_BUILD}" -eq 1 ] && [ "${USE_ETCD}" = ON ]; then
+    BUILD_DIR="build-b300-etcd"
+fi
 if [ "${USE_HYLINK}" = ON ]; then
     USE_HIP=ON
     GPU_BACKEND="hylink"
@@ -302,6 +381,20 @@ elif [ "${USE_CUDA}" = ON ]; then
 fi
 
 trap restore_pyproject EXIT
+
+if [ -n "${DEPENDENCY_PREFIX}" ]; then
+    EXTRA_CMAKE_ARGS+=(-DCMAKE_PREFIX_PATH="${DEPENDENCY_PREFIX};${CMAKE_PREFIX_PATH:-}")
+    export CPATH="${DEPENDENCY_PREFIX}/include${CPATH:+:${CPATH}}"
+    for lib_dir in "${DEPENDENCY_PREFIX}/lib" "${DEPENDENCY_PREFIX}/lib64" \
+                   "${DEPENDENCY_PREFIX}"/lib/*-linux-gnu; do
+        [ -d "${lib_dir}" ] || continue
+        export LIBRARY_PATH="${lib_dir}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
+        export LD_LIBRARY_PATH="${lib_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    done
+fi
+if [ -n "${YLT_SOURCE}" ]; then
+    EXTRA_CMAKE_ARGS+=(-DFETCHCONTENT_SOURCE_DIR_YALANTINGLIBS="${YLT_SOURCE}")
+fi
 
 run_cmd mkdir -p "${FINAL_DIST_DIR}"
 

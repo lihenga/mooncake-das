@@ -18,7 +18,7 @@ OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
 # under ${BUILD_DIR}/ep_pg_staging. Host extensions are copied directly from
 # their normal CMake output paths before auditwheel, like the PG core library.
 BUILD_DIR="${BUILD_DIR:-build}"
-BUILD_DIR_ABS="$(pwd)/${BUILD_DIR}"
+BUILD_DIR_ABS="$(cd "${BUILD_DIR}" && pwd)"
 echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT_DIR}"
 
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
@@ -481,6 +481,10 @@ if [ "$NPU_BUILD" = "1" ]; then
         echo "Error: pip install failed after $max_attempts attempts"
         exit 1
     fi
+elif [ "${SKIP_WHEEL_DEPS:-0}" = "1" ]; then
+    # Offline builds prepare these tools beforehand; never upgrade the runtime.
+    python${PYTHON_VERSION} -c 'import build, setuptools, wheel, auditwheel, numpy'
+    command -v patchelf >/dev/null
 elif command -v pip &>/dev/null; then
     python${PYTHON_VERSION} -m pip install --upgrade pip build setuptools wheel auditwheel patchelf
 elif command -v uv &>/dev/null; then
@@ -575,8 +579,12 @@ if [ "$NPU_BUILD" = "1" ]; then
     python${PYTHON_VERSION} -m build --wheel --no-isolation --outdir ${OUTPUT_DIR}
     AUDITWHEEL_CMD="python${PYTHON_VERSION} -m auditwheel"
 else
-    python${PYTHON_VERSION} -m build --wheel --outdir ${OUTPUT_DIR}
-    AUDITWHEEL_CMD="auditwheel"
+    if [ "${SKIP_WHEEL_DEPS:-0}" = "1" ]; then
+        python${PYTHON_VERSION} -m build --wheel --no-isolation --outdir ${OUTPUT_DIR}
+    else
+        python${PYTHON_VERSION} -m build --wheel --outdir ${OUTPUT_DIR}
+    fi
+    AUDITWHEEL_CMD="python${PYTHON_VERSION} -m auditwheel"
 fi
 
 # Bundle OpenSSL when required: the OSS adapter links libcrypto directly, and

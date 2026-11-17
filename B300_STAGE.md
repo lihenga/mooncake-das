@@ -84,6 +84,22 @@ memlock. Its default security policy denied NUMA queries, so topology fallback
 was exercised; allow the required NUMA syscalls before evaluating placement-
 sensitive performance. The existing user container was not recreated for this.
 
+## Reproducible B300 wheel entry point
+
+Use `bash scripts/variant_build.sh --b300 --skip-deps --jobs 32` for CUDA
+Store/TE, Master and Client, followed by the existing wheel dependency repair
+and relative RPATH handling. Add `--etcd` to enable both Transfer Engine etcd
+metadata and Store etcd HA support; this requires Go and its module cache.
+P2PHANDSHAKE single-host serving does not require etcd. HIP and SHCA are not
+enabled by the B300 preset. Existing SHCA/HIP variants remain available.
+
+The script resolves paths from its own source directory. Optional
+`--dependency-prefix DIR` and `--ylt-source DIR` accept dependencies at the
+current container's paths, rather than depending on an old mount layout.
+`SKIP_WHEEL_DEPS=1` uses preinstalled Python build tools without upgrades or
+build isolation. It does not remove CUDA, system development library or Go
+requirements. Final repaired wheels are under `mooncake-wheel/dist/`.
+
 Historical DCU/POSIX validation is recorded separately in the earlier stage
 artifacts. It does not establish NVIDIA GDR, target RoCE, Kimi L4 restoration,
 DCP support, cross-node inference or capacity at scale. The single-host CUDA
