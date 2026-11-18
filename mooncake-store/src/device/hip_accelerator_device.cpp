@@ -3,11 +3,24 @@
 
 #include "cuda_alike.h"
 
+#if defined(USE_HYGON)
+#include <glog/logging.h>
+#include <linux/mempolicy.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#include <cctype>
+
+#include "shared_segment/host_memfd.h"
+#endif
+
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -43,6 +56,61 @@ void FreeHipPinnedHost(void *addr) {
 }
 
 void FreeHipPinnedHostBuffer(void *addr) { FreeHipPinnedHost(addr); }
+
+#if defined(USE_HYGON)
+// Mapped length of each buffer AllocateMappedPinnedHost registered; the
+// deleter only receives the address. Guarded by HipRuntimeStateMutex() and,
+// like it, never destroyed so that teardown-time deleters stay valid.
+std::unordered_map<void *, size_t> &RegisteredHostSpans() {
+    static auto *spans = new std::unordered_map<void *, size_t>();
+    return *spans;
+}
+
+void FreeHipRegisteredHostBuffer(void *addr) {
+    size_t span = 0;
+    {
+        std::unique_lock<std::shared_mutex> lock(HipRuntimeStateMutex());
+        auto it = RegisteredHostSpans().find(addr);
+        if (it == RegisteredHostSpans().end()) return;
+        const hipError_t rc = hipHostUnregister(addr);
+        if (rc != hipSuccess) {
+            // Unmapping pages the device may still map is worse than a leak.
+            LOG(ERROR) << "hipHostUnregister failed, leaking " << it->second
+                       << " bytes at " << addr << ": "
+                       << hipGetErrorString(rc);
+            (void)hipGetLastError();
+            return;
+        }
+        span = it->second;
+        RegisteredHostSpans().erase(it);
+    }
+    if (munmap(addr, span) != 0) {
+        PLOG(WARNING) << "munmap of " << span << " unregistered bytes at "
+                      << addr << " failed";
+    }
+}
+
+// NUMA node of the current device, or -1 when sysfs does not report one.
+int CurrentDeviceNumaNode() {
+    int device = -1;
+    char bus_id[32] = {};
+    if (hipGetDevice(&device) != hipSuccess ||
+        hipDeviceGetPCIBusId(bus_id, sizeof(bus_id), device) != hipSuccess) {
+        (void)hipGetLastError();
+        return -1;
+    }
+    for (char *c = bus_id; *c; ++c) {
+        *c = static_cast<char>(std::tolower(static_cast<unsigned char>(*c)));
+    }
+    int node = -1;
+    if (!(std::ifstream(std::string("/sys/bus/pci/devices/") + bus_id +
+                        "/numa_node") >>
+          node)) {
+        return -1;
+    }
+    return node;
+}
+#endif
 
 class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
    public:
@@ -241,21 +309,97 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
     }
 
 #if defined(USE_HYGON)
+    // Ordinary anonymous memory registered with hipHostRegister instead of
+    // hipHostMalloc. Upstream KFD does not charge a registration (a userptr
+    // BO, or an SVM range on kernels with the SVM API) to the TTM limit.
+    // hipHostMalloc becomes a GTT BO, charged to the TTM limit (half of RAM
+    // by default), once the process sets HSA_USERPTR_FOR_PAGED_MEM=0, as the
+    // DeepSeek-V4.1 engram shared host table requires. Before the first touch
+    // the mapping gets, best effort as libhsakmt gives a paged hipHostMalloc,
+    // a preferred NUMA policy for the device's node, huge-page advice and
+    // MADV_DONTFORK. Its base is aligned to the THP size unless the aligned
+    // reservation fails.
     PinnedHostBuffer AllocateMappedPinnedHost(size_t size) const override {
-        void *addr = nullptr;
-        if (AllocateHipPinnedHost(&addr, size, hipHostMallocMapped) !=
-            hipSuccess) {
-            hipGetLastError();
+        const size_t granularity = host_memfd::Granularity();
+        // ReserveAlignedWindow adds one more granularity to the rounded span.
+        if (size == 0 || size > SIZE_MAX - 2 * granularity) {
+            return PinnedHostBuffer();
+        }
+        const size_t span =
+            (size + granularity - 1) / granularity * granularity;
+        // Both may allocate (the mutex on first use), so they run before
+        // there is a mapping to lose.
+        std::shared_mutex &runtime_mutex = HipRuntimeStateMutex();
+        const int node = CurrentDeviceNumaNode();
+        void *addr = host_memfd::ReserveAlignedWindow(span, granularity);
+        if (addr == MAP_FAILED) {
+            PLOG(ERROR) << "Mapped pinned host: reserving " << span
+                        << " bytes failed";
+            return PinnedHostBuffer();
+        }
+        // Make the reservation itself writable: on failure it is still ours
+        // to unmap, unlike a MAP_FIXED replacement that may already have
+        // dropped it.
+        if (mprotect(addr, span, PROT_READ | PROT_WRITE) != 0) {
+            PLOG(ERROR) << "Mapped pinned host: mprotect of " << span
+                        << " bytes failed";
+            munmap(addr, span);
+            return PinnedHostBuffer();
+        }
+        int preferred_node = -1;
+        if (node >= 0 && node < 64) {
+            const unsigned long mask = 1UL << node;
+            if (syscall(SYS_mbind, addr, span, MPOL_PREFERRED, &mask,
+                        sizeof(mask) * 8 + 1, 0) == 0) {
+                preferred_node = node;
+            } else {
+                PLOG(WARNING) << "Mapped pinned host: mbind to NUMA node "
+                              << node << " failed";
+            }
+        }
+        host_memfd::AdviseTransparentHugePages(addr, span);
+        host_memfd::AdviseDontFork(addr, span);
+        host_memfd::PrefaultRange(addr, span, host_memfd::kPrefaultStride);
+
+        // The span is recorded before registering, so a failed insert leaves
+        // nothing registered and a registered span is never unrecorded.
+        bool recorded = false;
+        hipError_t rc = hipSuccess;
+        {
+            std::unique_lock<std::shared_mutex> lock(runtime_mutex);
+            try {
+                recorded = RegisteredHostSpans().emplace(addr, span).second;
+            } catch (const std::bad_alloc &) {
+            }
+            if (recorded) {
+                rc = hipHostRegister(addr, span, hipHostRegisterMapped);
+                if (rc != hipSuccess) RegisteredHostSpans().erase(addr);
+            }
+        }
+        if (!recorded || rc != hipSuccess) {
+            LOG(ERROR) << "Mapped pinned host: registering " << span
+                       << " bytes failed: "
+                       << (recorded ? hipGetErrorString(rc)
+                                    : "cannot record the span");
+            (void)hipGetLastError();
+            munmap(addr, span);
             return PinnedHostBuffer();
         }
 
         void *device_addr = nullptr;
-        if (GetHipHostDevicePointer(&device_addr, addr) != hipSuccess) {
-            hipGetLastError();
-            FreeHipPinnedHost(addr);
+        rc = GetHipHostDevicePointer(&device_addr, addr);
+        if (rc != hipSuccess) {
+            LOG(ERROR) << "Mapped pinned host: hipHostGetDevicePointer "
+                          "failed: "
+                       << hipGetErrorString(rc);
+            (void)hipGetLastError();
+            FreeHipRegisteredHostBuffer(addr);
             return PinnedHostBuffer();
         }
-        return PinnedHostBuffer(addr, size, FreeHipPinnedHostBuffer,
+        LOG(INFO) << "Mapped pinned host: registered " << span << " bytes at "
+                  << addr << ", device alias " << device_addr
+                  << ", preferred NUMA node " << preferred_node;
+        return PinnedHostBuffer(addr, size, FreeHipRegisteredHostBuffer,
                                 device_addr);
     }
 #endif
