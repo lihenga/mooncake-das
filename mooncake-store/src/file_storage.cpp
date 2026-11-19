@@ -1861,6 +1861,16 @@ void FileStorage::DfsHeartbeatThreadFunc() {
                                       << " stale bucket handles";
                         }
                     }
+                    // Local mounts can change while the Master's snapshot is
+                    // unchanged.
+                    epoch_guard->unlock();
+                    auto refreshed =
+                        distributed_backend_->RefreshBucketRootDirectory(
+                            snapshot->epoch);
+                    if (!refreshed) {
+                        LOG(WARNING) << "DFS root directory refresh failed: "
+                                     << refreshed.error();
+                    }
                 }
             }
         }

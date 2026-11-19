@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <limits>
 #include <mutex>
@@ -47,6 +48,20 @@ struct MergedReadScratch {
 
 thread_local MergedReadScratch merged_read_scratch;
 
+bool ReadBucketRootDirectoryMetadata(DfsRootDirectory& directory) {
+    struct stat st{};
+    if (::fstat(directory.fd, &st) != 0) return false;
+    directory.inode = static_cast<uint64_t>(st.st_ino);
+    std::ifstream fdinfo("/proc/self/fdinfo/" + std::to_string(directory.fd));
+    std::string line;
+    while (std::getline(fdinfo, line)) {
+        if (line.starts_with("mnt_id:")) {
+            std::istringstream field(line.substr(7));
+            return bool(field >> directory.mount_id) && directory.mount_id != 0;
+        }
+    }
+    return false;
+}
 
 }  // namespace
 
@@ -444,6 +459,9 @@ DistributedStorageBackend::AcquireBucketEpoch(const UUID& epoch) {
     if (directory->fd < 0) {
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
+    if (!ReadBucketRootDirectoryMetadata(*directory)) {
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
     auto validated = ValidateRootIdentity(*binding, directory->PinnedPath());
     if (!validated) return tl::make_unexpected(validated.error());
     {
@@ -465,6 +483,52 @@ DistributedStorageBackend::AcquireBucketEpoch(const UUID& epoch) {
     }
     read_lock.lock();
     return read_lock;
+}
+
+tl::expected<bool, ErrorCode>
+DistributedStorageBackend::RefreshBucketRootDirectory(const UUID& epoch) {
+    if (UsesObjectStorage() || !IsBucketMode()) return false;
+    // Avoid waiting for an epoch transition or an active bucket I/O guard.
+    std::unique_lock confirmation_lock(bucket_epoch_confirmation_mutex_,
+                                       std::try_to_lock);
+    if (!confirmation_lock.owns_lock()) {
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
+    std::shared_lock read_lock(bucket_epoch_mutex_, std::try_to_lock);
+    if (!read_lock.owns_lock()) {
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
+    auto binding = std::atomic_load(&root_binding_);
+    if (!initialized_.load(std::memory_order_acquire) ||
+        !bucket_root_directory_ || bucket_epoch_ != epoch ||
+        bucket_epoch_identity_ != binding->identity) {
+        return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
+    }
+    const auto previous_directory = bucket_root_directory_;
+    read_lock.unlock();
+
+    auto directory = std::make_shared<DfsRootDirectory>(root_dir_);
+    if (directory->fd < 0 || !ReadBucketRootDirectoryMetadata(*directory)) {
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
+    if (previous_directory->SameDirectory(*directory)) return false;
+    auto validated = ValidateRootIdentity(*binding, directory->PinnedPath());
+    if (!validated) return tl::make_unexpected(validated.error());
+
+    std::unique_lock write_lock(bucket_epoch_mutex_, std::try_to_lock);
+    if (!write_lock.owns_lock()) {
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
+    if (std::atomic_load(&root_binding_) != binding || bucket_epoch_ != epoch ||
+        bucket_root_directory_ != previous_directory) {
+        return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
+    }
+    auto invalidated = InvalidateAllBucketFds();
+    if (!invalidated) return tl::make_unexpected(invalidated.error());
+    bucket_root_directory_ = std::move(directory);
+    LOG(INFO) << "Refreshed local DFS root directory without changing epoch="
+              << epoch << ", invalidated_bucket_handles=" << *invalidated;
+    return true;
 }
 
 tl::expected<size_t, ErrorCode>
@@ -1168,6 +1232,10 @@ DistributedStorageBackend::InitBucketModeLocked() {
         LOG(ERROR) << "Failed to open DFS root directory " << root_dir_;
         ResetFailedInitializationLocked();
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    if (!ReadBucketRootDirectoryMetadata(*directory)) {
+        ResetFailedInitializationLocked();
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
     // Bucket data files are created by the master's allocator and opened
     // on demand here, so there is no fixed shard table to preopen.

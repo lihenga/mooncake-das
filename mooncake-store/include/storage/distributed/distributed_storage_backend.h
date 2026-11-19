@@ -195,6 +195,10 @@ class DistributedStorageBackend
     // keeps a heartbeat or another request from changing epochs during I/O.
     tl::expected<std::shared_lock<std::shared_mutex>, ErrorCode>
     AcquireBucketEpoch(const UUID& epoch);
+    // Low-frequency heartbeat check, called without a bucket I/O guard.
+    // True means rebound, false means unchanged; busy locks return an error
+    // for the next heartbeat to retry.
+    tl::expected<bool, ErrorCode> RefreshBucketRootDirectory(const UUID& epoch);
     tl::expected<size_t, ErrorCode> CleanupStaleBucketFds(
         const std::vector<int64_t>& active_bucket_ids);
     tl::expected<bool, ErrorCode> CleanupBucketFd(int64_t bucket_id);

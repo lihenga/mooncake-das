@@ -600,6 +600,87 @@ TEST_F(DfsBucketBackendTest, EpochInvalidationReopensReusedBucketPath) {
     EXPECT_EQ(ReadObject("epoch_reuse", desc), new_value);
 }
 
+TEST_F(DfsBucketBackendTest, HeartbeatRefreshesLocalRootWithoutChangingEpoch) {
+    const std::string key = "local_root_refresh";
+    const std::string old_value(4096, 'O');
+    const std::string new_value(4096, 'N');
+    auto desc = WriteObject(key, old_value);
+    const UUID epoch{8, 1};
+    std::atomic<int> confirmations{0};
+    backend_->SetMasterEpochProvider([&]() -> tl::expected<UUID, ErrorCode> {
+        ++confirmations;
+        return epoch;
+    });
+    ASSERT_TRUE(backend_->UpdateDfsRootBinding({kTestDfsRootIdentity, epoch}));
+    desc.master_epoch = epoch;
+    EXPECT_EQ(ReadObject(key, desc), old_value);
+    ASSERT_GT(adapter_->DirectReadCalls(), 0);
+    auto cached_write = backend_->BatchWrite(
+        {{key,
+          desc,
+          {{const_cast<char*>(old_value.data()), old_value.size()}}}});
+    ASSERT_EQ(cached_write.size(), 1u);
+    ASSERT_TRUE(cached_write[0]);
+    const int confirmed_before_refresh = confirmations.load();
+    auto unchanged = backend_->RefreshBucketRootDirectory(epoch);
+    ASSERT_TRUE(unchanged);
+    EXPECT_FALSE(*unchanged);
+    EXPECT_EQ(confirmations.load(), confirmed_before_refresh);
+    allocator_.reset();
+
+    BucketTempDir saved("dfs_bucket_backend_saved");
+    const auto saved_root = saved.file("root");
+    std::filesystem::rename(tmp_->path(), saved_root);
+    std::filesystem::copy(saved_root, tmp_->path(),
+                          std::filesystem::copy_options::recursive);
+    WriteTestDfsReadProbe(tmp_->path());
+    ASSERT_TRUE(backend_->ProbeRead());
+    ASSERT_TRUE(backend_->ProbeWrite());
+
+    WriteTestDfsRootIdentity(
+        tmp_->path(), SerializeDfsRootIdentity("dfs_backend_test", UUID{8, 2}));
+    auto rejected = backend_->RefreshBucketRootDirectory(epoch);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    WriteTestDfsRootIdentity(tmp_->path());
+
+    auto held = backend_->AcquireBucketEpoch(epoch);
+    ASSERT_TRUE(held);
+    auto busy = std::async(std::launch::async, [&] {
+        return backend_->RefreshBucketRootDirectory(epoch);
+    });
+    const auto busy_status = busy.wait_for(std::chrono::seconds(1));
+    held->unlock();
+    ASSERT_EQ(busy_status, std::future_status::ready);
+    ASSERT_FALSE(busy.get());
+
+    // Both cached bucket handles and the root FD still name the old directory.
+    EXPECT_EQ(ReadObject(key, desc), old_value);
+    auto refreshed = backend_->RefreshBucketRootDirectory(epoch);
+    ASSERT_TRUE(refreshed);
+    EXPECT_TRUE(*refreshed);
+    EXPECT_EQ(confirmations.load(), confirmed_before_refresh);
+    auto already_refreshed = backend_->RefreshBucketRootDirectory(epoch);
+    ASSERT_TRUE(already_refreshed);
+    EXPECT_FALSE(*already_refreshed);
+    auto writes = backend_->BatchWrite(
+        {{key,
+          desc,
+          {{const_cast<char*>(new_value.data()), new_value.size()}}}});
+    ASSERT_EQ(writes.size(), 1u);
+    ASSERT_TRUE(writes[0]);
+    EXPECT_EQ(ReadObject(key, desc), new_value);
+    std::ifstream old_bucket(
+        std::filesystem::path(saved_root) /
+            std::filesystem::path(desc.file_path).filename(),
+        std::ios::binary);
+    old_bucket.seekg(static_cast<std::streamoff>(desc.offset));
+    std::string old_bytes(old_value.size(), '\0');
+    old_bucket.read(old_bytes.data(), old_bytes.size());
+    ASSERT_TRUE(old_bucket.good());
+    EXPECT_EQ(old_bytes, old_value);
+}
+
 TEST_F(DfsBucketBackendTest, MasterEpochReopensReusedBucketBeforeReadAndWrite) {
     const std::string key = "epoch_trigger";
     const std::string old_value(4096, 'O');

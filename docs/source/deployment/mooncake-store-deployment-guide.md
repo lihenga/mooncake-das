@@ -1017,6 +1017,14 @@ and epoch. A missing identity, marker, or nonempty bucket triggers a fresh
 allocator generation and invalidates the old DFS replica references. These
 online checks work with bucket recovery disabled.
 
+Clients also check their local bucket root's mount ID and inode during the
+existing DFS bucket heartbeat, including unchanged Master snapshots. The
+interval defaults to 30 seconds and follows the value supplied by the Master.
+When the local directory changes with the same epoch and identity, the client
+validates the new directory's identity and replaces its root FD and both bucket
+FD caches. A busy epoch lock defers the refresh to a later heartbeat. The check
+adds no periodic RPC and reads no bucket metadata.
+
 #### Restarting without recovering old DFS bucket replicas
 
 For `MOONCAKE_DFS_ALLOCATOR_TYPE=bucket`, the master normally recovers bucket
