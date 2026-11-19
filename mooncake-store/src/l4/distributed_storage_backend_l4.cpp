@@ -275,7 +275,6 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite(
     double init_ms = -1;
     double root_identity_ms = -1;
     double lock_wait_ms = -1;
-    double shard_reopen_ms = -1;
     double sync_ms = -1;
     double delete_ms = -1;
     size_t delete_calls = 0;
@@ -384,56 +383,11 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite(
             return tl::make_unexpected(cleanup_error);
         }
 
-        if (!IsBucketMode()) {
-            ProbeStageTimer timer(shard_reopen_ms);
-            std::vector<ShardFile*> shards;
-            {
-                std::lock_guard cache_lock(shard_files_mutex_);
-                for (const auto& [_, shard] : shard_files_) {
-                    shards.push_back(shard.get());
-                }
-            }
-            std::vector<std::pair<ShardFile*, std::string>> reopen;
-            for (auto* shard : shards) {
-                if (shard->write_fd.load() >= 0) continue;
-                // Business I/O may hold this mutex while blocked in the kernel.
-                // A health probe must not queue behind it or perform I/O under it.
-                std::unique_lock shard_lock(shard->mutex, std::try_to_lock);
-                if (!shard_lock.owns_lock()) {
-                    return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
-                }
-                if (shard->path.empty() || shard->write_fd.load() >= 0) continue;
-                reopen.emplace_back(shard, shard->path);
-            }
-            std::vector<std::pair<ShardFile*, int>> opened;
-            for (const auto& [shard, path] : reopen) {
-                auto fd = ValidateAndOpenShardFile(path);
-                if (!fd) {
-                    for (const auto& [_, new_fd] : opened) {
-                        (void)fs_adapter_->CloseFile(new_fd);
-                    }
-                    return tl::make_unexpected(fd.error());
-                }
-                opened.emplace_back(shard, *fd);
-            }
-            bool install_failed = false;
-            for (size_t i = 0; i < opened.size(); ++i) {
-                auto& [shard, fd] = opened[i];
-                std::unique_lock shard_lock(shard->mutex, std::try_to_lock);
-                if (!shard_lock.owns_lock() || shard->path != reopen[i].second) {
-                    install_failed = true;
-                } else if (shard->write_fd.load() < 0) {
-                    shard->write_fd.store(fd);
-                    fd = -1;  // Ownership transferred to the shard.
-                }
-            }
-            for (const auto& [_, fd] : opened) {
-                if (fd >= 0) (void)fs_adapter_->CloseFile(fd);
-            }
-            if (install_failed) {
-                return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
-            }
-        }
+        // Probe only the dedicated health file in both allocator modes.
+        // single_tenant=true does not exclude SHARD allocation, but
+        // GetOrOpenShard/ExecuteSingleIo already recover fds on demand, so
+        // probing must not traverse cached shards, acquire their I/O locks, or
+        // eagerly reopen files and couple root health to a busy/broken shard.
         return {};
     }();
     const auto finished_at = std::chrono::steady_clock::now();
@@ -452,7 +406,6 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite(
                      << " init_ms=" << init_ms
                      << " root_identity_ms=" << root_identity_ms
                      << " lock_wait_ms=" << lock_wait_ms
-                     << " shard_reopen_ms=" << shard_reopen_ms
                      << " create_ms=" << write_timings.create_ms
                      << " write_ms=" << write_timings.write_ms
                      << " write_total_ms=" << write_timings.write_total_ms

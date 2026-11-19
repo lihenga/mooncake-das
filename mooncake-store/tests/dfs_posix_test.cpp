@@ -1901,7 +1901,7 @@ TEST_F(DfsBackendTest, ZeroBudgetLogsPreserveReadAndWriteResults) {
     EXPECT_NE(write_log.find(" delete_calls=1 probe_suffix=_2 deleted_probe_suffixes=_1"),
               std::string::npos);
     for (const auto& field : {"init_ms", "root_identity_ms", "lock_wait_ms",
-                              "shard_reopen_ms", "create_ms", "write_ms",
+                              "create_ms", "write_ms",
                               "write_total_ms", "sync_ms", "delete_ms"}) {
         ExpectProbeTiming(write_log, field);
     }
@@ -2148,7 +2148,6 @@ TEST_F(DfsBackendTest, ZeroBudgetLogsWriteFailureCleanupOrder) {
     EXPECT_EQ(logged_sync_failure.error(), sync_failure.error());
     EXPECT_NE(logs.Last().find(" delete_calls=1 probe_suffix=_3 deleted_probe_suffixes=_3"),
               std::string::npos);
-    EXPECT_NE(logs.Last().find(" shard_reopen_ms=-1"), std::string::npos);
 
     adapter->FailNextDelete();
     const auto delete_failure = backend->ProbeWrite();
@@ -2204,15 +2203,11 @@ class ProbeIoGate {
     std::shared_future<void> released_{release_signal_.get_future().share()};
 };
 
-struct ReleaseProbeIoGates {
+struct ReleaseProbeIoGate {
     // Declare this guard after async futures so failure unwinding releases I/O
     // before the futures join and before the backend is destroyed.
-    std::shared_ptr<ProbeIoGate> first;
-    std::shared_ptr<ProbeIoGate> second;
-    ~ReleaseProbeIoGates() {
-        first->Release();
-        if (second) second->Release();
-    }
+    std::shared_ptr<ProbeIoGate> gate;
+    ~ReleaseProbeIoGate() { gate->Release(); }
 };
 
 class ConcurrentProbeFsAdapter : public PosixFsAdapter {
@@ -2287,7 +2282,7 @@ TEST_F(DfsBackendTest, BlockedProbeFileIoDoesNotBlockReplacement) {
                     if (operation == "delete") gate->BlockOnce();
                 }
             };
-        ReleaseProbeIoGates release{gate, nullptr};
+        ReleaseProbeIoGate release{gate};
         ASSERT_TRUE(backend->ProbeWrite());  // Retain _1 before creating _2.
         first = std::async(std::launch::async,
                            [&] { return backend->ProbeWrite().has_value(); });
@@ -2321,7 +2316,7 @@ TEST_F(DfsBackendTest, BlockedProbeFileIoDoesNotBlockReplacement) {
     }
 }
 
-TEST_F(DfsBackendTest, ProbeShardOpenAndCloseDoNotBlockSameShardIo) {
+TEST_F(DfsBackendTest, ProbeDoesNotEagerlyOpenCachedReadOnlyShard) {
     auto adapter = std::make_unique<ConcurrentProbeFsAdapter>();
     auto* controlled = adapter.get();
     auto backend = MakeConcurrentProbeBackend(tmp_->path(), std::move(adapter));
@@ -2334,35 +2329,25 @@ TEST_F(DfsBackendTest, ProbeShardOpenAndCloseDoNotBlockSameShardIo) {
         return reads.size() == 1 && reads[0] && output == std::string(4096, '\0');
     };
     ASSERT_TRUE(read_shard());  // Cached read fd, missing write fd.
-    std::future<bool> first, replacement, third;
-    auto open_gate = std::make_shared<ProbeIoGate>();
-    auto close_gate = std::make_shared<ProbeIoGate>();
-    controlled->before_open =
-        [open_gate, path_to_block = ShardPath(0)](const std::string& path) {
-            if (path == path_to_block) open_gate->BlockOnce();
-        };
-    controlled->before_close = [close_gate](int) { close_gate->BlockOnce(); };
-    ReleaseProbeIoGates release{open_gate, close_gate};
-    first = std::async(std::launch::async,
-                       [&] { return backend->ProbeWrite().has_value(); });
-    ASSERT_TRUE(open_gate->WaitUntilBlocked());
-    replacement = std::async(std::launch::async, [&] {
-        return read_shard() && backend->ProbeWrite().has_value();
-    });
-    ASSERT_EQ(replacement.wait_for(std::chrono::seconds(5)),
-              std::future_status::ready);
-    EXPECT_TRUE(replacement.get());
-    open_gate->Release();
-    // The replacement installed a write fd; the older probe must close its
-    // unused fd without holding either the health mutex or the shard mutex.
-    ASSERT_TRUE(close_gate->WaitUntilBlocked());
-    third = std::async(std::launch::async, [&] {
-        return read_shard() && backend->ProbeWrite().has_value();
-    });
-    ASSERT_EQ(third.wait_for(std::chrono::seconds(5)), std::future_status::ready);
-    EXPECT_TRUE(third.get());
-    close_gate->Release();
-    EXPECT_TRUE(first.get());
+    // Capture by value so teardown remains safe even if an assertion fails.
+    auto opens = std::make_shared<std::atomic<int>>(0);
+    auto closes = std::make_shared<std::atomic<int>>(0);
+    controlled->before_open = [opens](const std::string&) { ++*opens; };
+    controlled->before_close = [closes](int) { ++*closes; };
+    ASSERT_TRUE(backend->ProbeWrite());
+    ASSERT_TRUE(backend->ProbeWrite());
+    EXPECT_TRUE(read_shard());
+    EXPECT_EQ(opens->load(), 0);
+    EXPECT_EQ(closes->load(), 0);
+
+    // A business write still opens the missing write fd on demand.
+    std::string input(4096, 'W');
+    auto writes = backend->BatchWrite(
+        {{"write", {ShardPath(0), 0, 4096, 4096, 0},
+          {{input.data(), input.size()}}}});
+    ASSERT_EQ(writes.size(), 1u);
+    ASSERT_TRUE(writes[0]);
+    EXPECT_EQ(opens->load(), 1);
     controlled->before_open = {};
     controlled->before_close = {};
 }
@@ -2410,14 +2395,13 @@ TEST_F(DfsBackendTest, ProbeDoesNotWaitForShardLockHeldByBusinessRead) {
     std::future<tl::expected<void, ErrorCode>> probe;
     auto gate = std::make_shared<ProbeIoGate>();
     controlled->before_read = [gate] { gate->BlockOnce(); };
-    ReleaseProbeIoGates release{gate, nullptr};
+    ReleaseProbeIoGate release{gate};
     business = std::async(std::launch::async, read_shard);
     ASSERT_TRUE(gate->WaitUntilBlocked());
     probe = std::async(std::launch::async, [&] { return backend->ProbeWrite(); });
     ASSERT_EQ(probe.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     const auto result = probe.get();
-    ASSERT_FALSE(result);
-    EXPECT_EQ(result.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    ASSERT_TRUE(result);
     gate->Release();
     EXPECT_TRUE(business.get());
     ASSERT_TRUE(backend->ProbeWrite());
@@ -3234,6 +3218,11 @@ TEST_F(DfsBackendTest, ReopenOpenFailureLeavesShardReopenable) {
     ASSERT_EQ(first.size(), 1);
     ASSERT_FALSE(first[0].has_value());
     EXPECT_EQ(first[0].error(), ErrorCode::FILE_WRITE_FAIL);
+
+    // Root health is independent of a failed cached shard reopen. A successful
+    // probe leaves recovery to the next business request (the third open).
+    ASSERT_TRUE(backend->ProbeWrite());
+    EXPECT_EQ(controlled->OpenCallCount(), 2);
 
     // The reopen failure left fd == -1; the next write re-initializes the shard
     // (3rd open) and succeeds because both the write-fail and open-fail
