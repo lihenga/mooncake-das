@@ -9,6 +9,7 @@
 #include "service_metrics.h"
 #include "replica.h"
 #include "storage/distributed/dfs_io_timeout.h"
+#include "storage/distributed/dfs_root_identity.h"
 #include "task_manager.h"
 #include "weight_management.h"
 
@@ -83,6 +84,7 @@ YLT_REFL(ReplicaActionLease, proposal_id, lease_id, action, tenant_id, key,
 struct PingResponse {
     ViewVersionId view_version_id;
     ClientStatus client_status;
+    struct_pack::compatible<DfsRootBinding, 1> dfs_root_binding;
 
     PingResponse() = default;
     PingResponse(ViewVersionId view_version, ClientStatus status)
@@ -95,7 +97,7 @@ struct PingResponse {
                   << ", client_status: " << response.client_status << " }";
     }
 };
-YLT_REFL(PingResponse, view_version_id, client_status);
+YLT_REFL(PingResponse, view_version_id, client_status, dfs_root_binding);
 
 YLT_REFL(ServiceL4Metrics, read_operations, read_bytes, read_duration_us,
          read_duration_buckets, restore_ranges, restore_bytes);

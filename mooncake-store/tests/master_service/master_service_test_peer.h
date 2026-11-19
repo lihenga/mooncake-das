@@ -3,6 +3,7 @@
 #include <utility>
 
 #include "master_service.h"
+#include "rpc_service.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
 
 namespace mooncake::test {
@@ -13,6 +14,16 @@ namespace mooncake::test {
 // lock order; synchronous drivers must not race their background workers.
 class MasterServiceTestPeer {
    public:
+    static MasterService& Master(WrappedMasterService& service) {
+        return service.master_service_;
+    }
+
+    static void AdvanceDfsEpoch(MasterService& service) {
+        std::unique_lock state_lock(service.master_state_mutex_);
+        std::lock_guard epoch_lock(service.dfs_epoch_mutex_);
+        ++service.dfs_snapshot_epoch_.second;
+    }
+
     static void SetDfsAllocator(MasterService& service,
                          DfsAllocatorInterface* allocator) {
         service.dfs_allocator_.store(allocator);

@@ -990,6 +990,22 @@ The `hf3fs` adapter requires Mooncake to be built with `USE_3FS=ON`. Use
 `MOONCAKE_DFS_FS_ADAPTER=posix` for development and integration testing on a
 regular shared filesystem.
 
+#### Filesystem checks for bucket storage
+
+For filesystem bucket storage, the Master checks the filesystem mounted at
+`MOONCAKE_DFS_ROOT_DIR` during initialization and when it detects a changed
+mount or directory. Set `MOONCAKE_DFS_ALLOWED_FS_TYPES` to a comma-separated
+list of exact Linux filesystem types. The default is `storage,kingstorage`.
+A configured list replaces the default; use `findmnt -n -T <path> -o FSTYPE`
+to identify the type in the Master's mount namespace. For local development
+or tests, explicitly allow the filesystem used by the test root.
+
+When a verified bucket root is initialized with a new identity, an upgraded
+Master publishes the identity and bucket epoch through the regular heartbeat.
+Upgraded clients resume DFS access once their local root exposes the same
+identity. Replacing the mount or directory starts a new allocator generation
+and invalidates references to the old DFS replicas.
+
 #### Restarting without recovering old DFS bucket replicas
 
 For `MOONCAKE_DFS_ALLOCATOR_TYPE=bucket`, the master normally recovers bucket

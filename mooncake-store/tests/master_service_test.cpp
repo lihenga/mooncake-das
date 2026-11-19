@@ -132,6 +132,48 @@ class ScopedDfsFallbackLogCapture : public google::LogSink {
     std::vector<std::string> errors_;
 };
 
+// RPC request/response logging brackets the old unlocked epoch checks/stamps.
+// WaitTillSent runs outside glog's lock, so the transition can take state
+// locks.
+class ScopedDfsEpochChange : public google::LogSink {
+   public:
+    ScopedDfsEpochChange(MasterService& service, std::string message)
+        : service_(service),
+          message_(std::move(message)),
+          old_v_(FLAGS_v),
+          thread_(std::this_thread::get_id()) {
+        FLAGS_v = 1;
+        google::AddLogSink(this);
+    }
+    ~ScopedDfsEpochChange() override {
+        google::RemoveLogSink(this);
+        FLAGS_v = old_v_;
+    }
+    void send(google::LogSeverity, const char*, const char*, int,
+              const struct ::tm*, const char* message, size_t length) override {
+        if (std::this_thread::get_id() == thread_ &&
+            std::string_view(message, length).starts_with(message_)) {
+            pending_ = true;
+        }
+    }
+    void WaitTillSent() override {
+        if (std::this_thread::get_id() == thread_ && pending_ && !changed_) {
+            pending_ = false;
+            changed_ = true;
+            MasterServiceTestPeer::AdvanceDfsEpoch(service_);
+        }
+    }
+    bool changed() const { return changed_; }
+
+   private:
+    MasterService& service_;
+    std::string message_;
+    int old_v_;
+    std::thread::id thread_;
+    bool pending_{false};
+    bool changed_{false};
+};
+
 namespace {
 
 class BlockingDfsAllocator : public DfsAllocatorInterface {
@@ -5442,6 +5484,161 @@ TEST_F(MasterServiceTest, DfsReplicaRemovalDecrementsStatusGaugeOnce) {
     EXPECT_EQ(after_destruction.complete, baseline.complete);
 }
 
+TEST_F(MasterServiceTest,
+       DfsRpcResponseRetainsDescriptorEpochAcrossTransition) {
+    const auto root = MakeDfsTestRoot("rpc_epoch_stamp");
+    ScopedBucketDfsEnv env(root, "1048576", "16");
+    {
+        WrappedMasterServiceConfig rpc_config;
+        rpc_config.default_kv_lease_ttl = 0;
+        rpc_config.enable_metric_reporting = false;
+        WrappedMasterService rpc{rpc_config};
+        auto& service = MasterServiceTestPeer::Master(rpc);
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+        const auto old_epoch = service.GetDfsMasterEpoch();
+        ASSERT_NE(old_epoch, UUID{});
+        {
+            ScopedDfsEpochChange transition(service, "PutStart response:");
+            auto start = rpc.PutStart(context.client_id, "epoch_response", 4096,
+                                      config, "default");
+            ASSERT_TRUE(start);
+            ASSERT_NE(FindDfsDescriptor(*start), nullptr);
+            EXPECT_TRUE(transition.changed());
+            EXPECT_EQ(
+                FindDfsDescriptor(*start)->get_dfs_descriptor().MasterEpoch(),
+                old_epoch);
+        }
+        ASSERT_TRUE(rpc.PutEnd(
+            context.client_id, ObjectMeta{"epoch_response", std::nullopt},
+            ReplicaType::ALL, "default", service.GetDfsMasterEpoch()));
+        const auto read_epoch = service.GetDfsMasterEpoch();
+        {
+            ScopedDfsEpochChange transition(service,
+                                            "GetReplicaList response:");
+            auto read = rpc.GetReplicaList("epoch_response", "default");
+            ASSERT_TRUE(read);
+            ASSERT_NE(FindDfsDescriptor(read->replicas), nullptr);
+            EXPECT_TRUE(transition.changed());
+            EXPECT_EQ(FindDfsDescriptor(read->replicas)
+                          ->get_dfs_descriptor()
+                          .MasterEpoch(),
+                      read_epoch);
+        }
+        auto batch = rpc.BatchGetReplicaList({"epoch_response"}, "default");
+        ASSERT_EQ(batch.size(), 1u);
+        ASSERT_TRUE(batch[0]);
+        EXPECT_EQ(FindDfsDescriptor(batch[0]->replicas)
+                      ->get_dfs_descriptor()
+                      .MasterEpoch(),
+                  service.GetDfsMasterEpoch());
+    }
+    std::filesystem::remove_all(root);
+}
+
+TEST_F(MasterServiceTest,
+       DfsBatchReservationRejectsChangedEpochOnSameAllocator) {
+    const auto root = MakeDfsTestRoot("batch_same_allocator_epoch");
+    ScopedBucketDfsEnv env(root, "1048576", "16");
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        const auto old_epoch = service.GetDfsMasterEpoch();
+        ASSERT_NE(old_epoch, UUID{});
+        MasterServiceTestPeer::SetDfsBatchReservationHook(
+            service, [&] { MasterServiceTestPeer::AdvanceDfsEpoch(service); });
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+        auto start =
+            service.BatchPutStart(context.client_id, {"old_reservation"},
+                                  TenantId::Default(), {4096}, config);
+        MasterServiceTestPeer::SetDfsBatchReservationHook(service, {});
+        ASSERT_EQ(start.size(), 1u);
+        ASSERT_TRUE(start[0]);
+        EXPECT_EQ(FindDfsDescriptor(*start[0]), nullptr);
+        EXPECT_NE(service.GetDfsMasterEpoch(), old_epoch);
+    }
+    std::filesystem::remove_all(root);
+}
+
+TEST_F(MasterServiceTest, DfsRpcEndAndRevokeValidateEpochAtMutation) {
+    const auto root = MakeDfsTestRoot("rpc_epoch_commit");
+    ScopedBucketDfsEnv env(root, "1048576", "16");
+    {
+        WrappedMasterServiceConfig rpc_config;
+        rpc_config.default_kv_lease_ttl = 0;
+        rpc_config.enable_metric_reporting = false;
+        WrappedMasterService rpc{rpc_config};
+        auto& service = MasterServiceTestPeer::Master(rpc);
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+        for (const std::string operation :
+             {"PutEnd", "UpsertEnd", "PutRevoke", "UpsertRevoke", "BatchPutEnd",
+              "BatchUpsertEnd", "BatchPutRevoke", "BatchUpsertRevoke"}) {
+            SCOPED_TRACE(operation);
+            const auto key = "epoch_" + operation;
+            ASSERT_TRUE(service.PutStart(context.client_id, key,
+                                         TenantId::Default(), 4096, config));
+            const ObjectMeta meta{key, std::nullopt};
+            const auto call =
+                [&](const UUID& epoch) -> tl::expected<void, ErrorCode> {
+                if (operation == "PutEnd")
+                    return rpc.PutEnd(context.client_id, meta, ReplicaType::ALL,
+                                      "default", epoch);
+                if (operation == "UpsertEnd")
+                    return rpc.UpsertEnd(context.client_id, meta,
+                                         ReplicaType::ALL, "default", epoch);
+                if (operation == "PutRevoke")
+                    return rpc.PutRevoke(context.client_id, key,
+                                         ReplicaType::ALL, "default", epoch);
+                if (operation == "UpsertRevoke")
+                    return rpc.UpsertRevoke(context.client_id, key,
+                                            ReplicaType::ALL, "default", epoch);
+                std::vector<tl::expected<void, ErrorCode>> results;
+                if (operation == "BatchPutEnd")
+                    results =
+                        rpc.BatchPutEnd(context.client_id, {meta},
+                                        ReplicaType::ALL, "default", epoch);
+                else if (operation == "BatchUpsertEnd")
+                    results = rpc.BatchUpsertEnd(context.client_id, {meta},
+                                                 "default", epoch);
+                else if (operation == "BatchPutRevoke")
+                    results =
+                        rpc.BatchPutRevoke(context.client_id, {key},
+                                           ReplicaType::ALL, "default", epoch);
+                else
+                    results = rpc.BatchUpsertRevoke(context.client_id, {key},
+                                                    "default", epoch);
+                EXPECT_EQ(results.size(), 1u);
+                return results.empty()
+                           ? tl::expected<void, ErrorCode>(
+                                 tl::make_unexpected(ErrorCode::INTERNAL_ERROR))
+                           : results.front();
+            };
+            const auto old_epoch = service.GetDfsMasterEpoch();
+            ASSERT_NE(old_epoch, UUID{});
+            {
+                ScopedDfsEpochChange transition(service,
+                                                operation + " request:");
+                auto stale = call(old_epoch);
+                EXPECT_TRUE(transition.changed());
+                ASSERT_FALSE(stale);
+                EXPECT_EQ(stale.error(), ErrorCode::INVALID_WRITE);
+            }
+            auto pending = service.GetReplicaList(key, TenantId::Default());
+            ASSERT_FALSE(pending);
+            EXPECT_EQ(pending.error(), ErrorCode::REPLICA_IS_NOT_READY);
+            EXPECT_TRUE(call(service.GetDfsMasterEpoch()));
+        }
+    }
+    std::filesystem::remove_all(root);
+}
+
 TEST_F(MasterServiceTest, DfsBucketModeSupportsPutEndAndQuery) {
     const auto root = MakeDfsTestRoot("put_end");
     ScopedBucketDfsEnv env(root, "1048576", "16");
@@ -5542,6 +5739,22 @@ TEST_F(MasterServiceTest, DfsBucketSnapshotTracksVersionEpochAndHeartbeatInterva
     std::filesystem::remove_all(root);
 }
 
+TEST_F(MasterServiceTest, DfsRootRejectsUnlistedFilesystemBeforeWriting) {
+    const auto root = MakeDfsTestRoot("disallowed_filesystem");
+    ScopedBucketDfsEnv env(root, "1048576", "16");
+    ScopedEnvVar allowed("MOONCAKE_DFS_ALLOWED_FS_TYPES",
+                         "not_a_linux_filesystem");
+    {
+        MasterService service;
+        EXPECT_FALSE(service.UsesDfsBucketAllocator());
+        const auto ping = service.Ping({});
+        ASSERT_TRUE(ping);
+        EXPECT_FALSE(ping->dfs_root_binding.has_value());
+        EXPECT_TRUE(std::filesystem::is_empty(root));
+    }
+    std::filesystem::remove(root);
+}
+
 TEST_F(MasterServiceTest, DfsRootIdentityRetriesAfterRootBecomesAvailable) {
     const auto root = MakeDfsTestRoot("identity_retry_after_recovery");
     ScopedBucketDfsEnv env(root, "1048576", "16");
@@ -5553,6 +5766,9 @@ TEST_F(MasterServiceTest, DfsRootIdentityRetriesAfterRootBecomesAvailable) {
     {
         MasterService service;
         EXPECT_FALSE(service.UsesDfsBucketAllocator());
+        auto unavailable_ping = service.Ping({});
+        ASSERT_TRUE(unavailable_ping);
+        EXPECT_FALSE(unavailable_ping->dfs_root_binding.has_value());
         auto storage = service.GetStorageConfig();
         ASSERT_TRUE(storage.has_value());
         EXPECT_TRUE(storage->dfs_root_identity.empty());
@@ -5570,6 +5786,20 @@ TEST_F(MasterServiceTest, DfsRootIdentityRetriesAfterRootBecomesAvailable) {
         ASSERT_TRUE(service.UsesDfsBucketAllocator());
         EXPECT_EQ(storage->dfs_fsdir, root);
         EXPECT_FALSE(storage->dfs_root_identity.empty());
+        auto ready_ping = service.Ping({});
+        for (int retry = 0;
+             ready_ping && !ready_ping->dfs_root_binding.has_value() &&
+             retry < 100;
+             ++retry) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            ready_ping = service.Ping({});
+        }
+        ASSERT_TRUE(ready_ping);
+        ASSERT_TRUE(ready_ping->dfs_root_binding.has_value());
+        EXPECT_EQ(ready_ping->dfs_root_binding->identity,
+                  storage->dfs_root_identity);
+        EXPECT_EQ(ready_ping->dfs_root_binding->epoch,
+                  service.GetDfsMasterEpoch());
     }
     std::filesystem::remove_all(root);
 }

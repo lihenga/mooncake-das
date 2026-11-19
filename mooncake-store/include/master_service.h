@@ -81,6 +81,7 @@ struct DistributedStorageConfig;
 class ShardAllocator;
 class DfsAllocatorInterface;
 class ImmutableBucketAllocator;
+struct DfsRootDirectory;
 class KvcsCapacityProvider;
 
 // Forward declarations
@@ -516,12 +517,12 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     auto PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
-                const TenantId& tenant_id, ReplicaType replica_type)
-        -> tl::expected<void, ErrorCode>;
+                const TenantId& tenant_id, ReplicaType replica_type,
+                const UUID& dfs_epoch = {}) -> tl::expected<void, ErrorCode>;
 
     auto PutEnd(const UUID& client_id, const std::string& key,
-                const TenantId& tenant_id, ReplicaType replica_type)
-        -> tl::expected<void, ErrorCode>;
+                const TenantId& tenant_id, ReplicaType replica_type,
+                const UUID& dfs_epoch = {}) -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Adds a replica instance associated with the given client and key.
@@ -537,8 +538,8 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     auto PutRevoke(const UUID& client_id, const std::string& key,
-                   const TenantId& tenant_id, ReplicaType replica_type)
-        -> tl::expected<void, ErrorCode>;
+                   const TenantId& tenant_id, ReplicaType replica_type,
+                   const UUID& dfs_epoch = {}) -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Complete a batch of put operations
@@ -547,7 +548,8 @@ class MasterService {
      */
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
-        const TenantId& tenant_id, ReplicaType replica_type = ReplicaType::ALL);
+        const TenantId& tenant_id, ReplicaType replica_type = ReplicaType::ALL,
+        const UUID& dfs_epoch = {});
 
     /**
      * @brief Revoke a batch of put operations
@@ -556,7 +558,8 @@ class MasterService {
      */
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,
-        const TenantId& tenant_id, ReplicaType replica_type = ReplicaType::ALL);
+        const TenantId& tenant_id, ReplicaType replica_type = ReplicaType::ALL,
+        const UUID& dfs_epoch = {});
 
     /**
      * @brief Start an upsert operation. If the key does not exist, behaves
@@ -576,18 +579,19 @@ class MasterService {
      * @brief Complete an upsert operation. Delegates to PutEnd.
      */
     auto UpsertEnd(const UUID& client_id, const ObjectMeta& object_meta,
-                   const TenantId& tenant_id, ReplicaType replica_type)
-        -> tl::expected<void, ErrorCode>;
+                   const TenantId& tenant_id, ReplicaType replica_type,
+                   const UUID& dfs_epoch = {}) -> tl::expected<void, ErrorCode>;
 
     auto UpsertEnd(const UUID& client_id, const std::string& key,
-                   const TenantId& tenant_id, ReplicaType replica_type)
-        -> tl::expected<void, ErrorCode>;
+                   const TenantId& tenant_id, ReplicaType replica_type,
+                   const UUID& dfs_epoch = {}) -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Revoke an upsert operation. Delegates to PutRevoke.
      */
     auto UpsertRevoke(const UUID& client_id, const std::string& key,
-                      const TenantId& tenant_id, ReplicaType replica_type)
+                      const TenantId& tenant_id, ReplicaType replica_type,
+                      const UUID& dfs_epoch = {})
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -605,14 +609,14 @@ class MasterService {
      */
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
         const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
-        const TenantId& tenant_id);
+        const TenantId& tenant_id, const UUID& dfs_epoch = {});
 
     /**
      * @brief Revoke a batch of upsert operations. Delegates to BatchPutRevoke.
      */
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,
-        const TenantId& tenant_id);
+        const TenantId& tenant_id, const UUID& dfs_epoch = {});
 
     /**
      * @brief Evict a disk replica for a key (triggered by client-side disk
@@ -1163,6 +1167,7 @@ class MasterService {
         // Allocator generations are retained in retired_dfs_allocators_, so
         // this borrowed pointer remains valid until MasterService teardown.
         DfsAllocatorInterface* source_allocator{nullptr};
+        UUID epoch{};
     };
 
     auto PutStartInternal(
@@ -1683,15 +1688,21 @@ class MasterService {
     // including retry initialization and snapshot mode, because allocator
     // state is required before allocation, free, or eviction can proceed.
     void RestoreRecoveredDfsReplicas(bool rebuild_metadata);
-    bool PrepareDfsRootForInitialization(
+    std::shared_ptr<const DfsRootDirectory> PrepareDfsRootForInitialization(
         const DistributedStorageConfig& dfs_config);
+    std::shared_ptr<const DfsRootDirectory> OpenDfsRootDirectory(
+        const std::string& root, bool require_allowed_type, int& error) const;
     DfsInitResult InitDfsAllocatorFromEnvironment(
         const MasterServiceConfig& config);
     void DfsAllocatorRetryThreadFunc();
-    bool InitializeDfsRootGuard(const std::string& root,
-                                const std::string& identity);
-    bool RecoverDfsRootAfterReplacement(const std::string& root,
-                                        const std::string& identity);
+    bool InitializeDfsRootGuard(
+        const std::string& root, const std::string& identity,
+        std::shared_ptr<const DfsRootDirectory> directory,
+        bool require_allowed_type);
+    bool RecoverDfsRootAfterReplacement(
+        const std::string& root, const std::string& identity,
+        std::shared_ptr<const DfsRootDirectory> directory,
+        bool directory_changed);
     size_t DropDfsReplicasAfterRootReplacement();
     void ReconcileDfsRootFiles();
     void InitKvcsDfsEviction();
@@ -2269,8 +2280,9 @@ class MasterService {
     std::mutex dfs_root_guard_mutex_;
     std::string dfs_root_guard_path_;
     std::string dfs_root_guard_identity_;
-    uint64_t dfs_root_guard_device_{0};
-    uint64_t dfs_root_guard_inode_{0};
+    std::shared_ptr<const DfsRootDirectory> dfs_root_guard_directory_;
+    bool dfs_root_guard_require_allowed_type_{false};
+    std::string dfs_allowed_fs_types_;
     bool dfs_root_guard_ready_{false};
     bool dfs_root_recovery_needed_{false};
     bool dfs_root_replacement_lost_data_{false};
@@ -2588,6 +2600,9 @@ class MasterService {
     // True while the replica sits on an endpoint in
     // invalid_replica_endpoints_. The read path asks only this, never the set.
     bool IsAwaitingRemount(const Replica& replica) const;
+    // Caller holds master_state_mutex_; epoch publication takes it exclusively.
+    UUID GetDfsMasterEpochLocked() const;
+    void StampDfsEpochLocked(Replica::Descriptor& descriptor) const;
     bool TryGetReadableReplicaDescriptor(const Replica& replica,
                                          Replica::Descriptor& descriptor) const;
     std::vector<Replica::Descriptor> GetReadableReplicaDescriptors(

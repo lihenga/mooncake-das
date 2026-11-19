@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <string>
 #include <string_view>
+#include <ylt/reflection/user_reflect_macro.hpp>
 
 #include "types.h"
 
@@ -13,6 +14,14 @@ inline constexpr char kDfsRootIdentityFileName[] =
 inline constexpr std::string_view kDfsRootIdentityMagic =
     "mooncake-dfs-root-identity-v1";
 inline constexpr size_t kMaxDfsRootIdentitySize = 256;
+
+// A ready master's authority for one DFS root generation. The epoch fences
+// cached bucket handles; the identity must still match the client's mount.
+struct DfsRootBinding {
+    std::string identity;
+    UUID epoch{};
+};
+YLT_REFL(DfsRootBinding, identity, epoch);
 
 inline std::string SerializeDfsRootIdentity(const std::string& cluster_id,
                                             const UUID& token) {

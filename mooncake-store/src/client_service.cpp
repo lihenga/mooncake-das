@@ -99,6 +99,12 @@ std::vector<tl::expected<void, ErrorCode>> FinalizeSessionsByEpoch(
     const std::vector<Item>& items, const std::vector<UUID>& epochs,
     Rpc&& rpc) {
     if (epochs.empty()) return rpc(items, UUID{});
+    if (epochs.size() == items.size() &&
+        std::all_of(epochs.begin(), epochs.end(), [&](const UUID& epoch) {
+            return epoch == epochs.front();
+        })) {
+        return rpc(items, epochs.front());
+    }
     std::vector<tl::expected<void, ErrorCode>> results(
         items.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     if (epochs.size() != items.size()) return results;
@@ -4183,17 +4189,6 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
 
 void Client::FinalizeBatchPut(std::vector<PutOperation>& ops,
                               bool allow_memory_only_fallback) {
-    // All allocations in this Start batch came from the same master. Fence
-    // finalization even when a group contains memory-only objects as well.
-    UUID dfs_epoch{};
-    for (const auto& op : ops) {
-        const auto epoch = DfsWriteEpoch(op.replicas);
-        if (epoch != UUID{}) {
-            dfs_epoch = epoch;
-            break;
-        }
-    }
-
     struct BatchFinalizeGroup {
         std::vector<std::string> keys;
         std::vector<size_t> indices;
@@ -4295,12 +4290,14 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops,
         }
         std::vector<ObjectMeta> object_metas;
         object_metas.reserve(group.indices.size());
+        std::vector<UUID> epochs;
+        epochs.reserve(group.indices.size());
         for (size_t i = 0; i < group.indices.size(); ++i) {
             object_metas.emplace_back(ObjectMeta{
                 group.keys[i], ops[group.indices[i]].object_checksum});
+            epochs.push_back(DfsWriteEpoch(ops[group.indices[i]].replicas));
         }
-        auto responses =
-            master_client_.BatchPutEnd(object_metas, replica_type, dfs_epoch);
+        auto responses = BatchPutEnd(object_metas, replica_type, epochs);
         if (responses.size() != group.keys.size()) {
             for (size_t idx : group.indices) {
                 finalize_rpc_errors[idx] = ErrorCode::RPC_FAIL;
@@ -4327,8 +4324,12 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops,
         if (group.keys.empty()) {
             return;
         }
-        auto responses =
-            master_client_.BatchPutRevoke(group.keys, replica_type, dfs_epoch);
+        std::vector<UUID> epochs;
+        epochs.reserve(group.indices.size());
+        for (auto index : group.indices) {
+            epochs.push_back(DfsWriteEpoch(ops[index].replicas));
+        }
+        auto responses = BatchPutRevoke(group.keys, replica_type, epochs);
         if (responses.size() != group.keys.size()) {
             for (size_t idx : group.indices) {
                 if (!best_effort) {
@@ -4417,22 +4418,15 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops,
 }
 
 void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
-    // All allocations in this Start batch came from the same master. Fence
-    // finalization even when a group contains memory-only objects as well.
-    UUID dfs_epoch{};
-    for (const auto& op : ops) {
-        const auto epoch = DfsWriteEpoch(op.replicas);
-        if (epoch != UUID{}) {
-            dfs_epoch = epoch;
-            break;
-        }
-    }
-
     std::vector<ObjectMeta> successful_object_metas;
     std::vector<size_t> successful_indices;
     std::vector<std::string> failed_keys;
     std::vector<size_t> failed_indices;
+    std::vector<UUID> successful_epochs;
+    std::vector<UUID> failed_epochs;
 
+    successful_epochs.reserve(ops.size());
+    failed_epochs.reserve(ops.size());
     successful_object_metas.reserve(ops.size());
     successful_indices.reserve(ops.size());
     failed_keys.reserve(ops.size());
@@ -4447,6 +4441,7 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
             successful_object_metas.emplace_back(
                 ObjectMeta{op.key, op.object_checksum});
             successful_indices.emplace_back(i);
+            successful_epochs.push_back(DfsWriteEpoch(op.replicas));
             continue;
         }
 
@@ -4462,6 +4457,7 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
         if (!op.IsSuccessful() && !op.replicas.empty()) {
             failed_keys.emplace_back(op.key);
             failed_indices.emplace_back(i);
+            failed_epochs.push_back(DfsWriteEpoch(op.replicas));
         }
     }
 
@@ -4469,8 +4465,11 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
     std::vector<std::string> finalized_keys;
     if (!successful_object_metas.empty()) {
         finalized_keys.reserve(successful_object_metas.size());
-        auto end_responses =
-            master_client_.BatchUpsertEnd(successful_object_metas, dfs_epoch);
+        auto end_responses = FinalizeSessionsByEpoch(
+            successful_object_metas, successful_epochs,
+            [&](const auto& group, const UUID& epoch) {
+                return master_client_.BatchUpsertEnd(group, epoch);
+            });
         if (end_responses.size() != successful_object_metas.size()) {
             LOG(ERROR) << "BatchUpsertEnd response size mismatch: expected "
                        << successful_object_metas.size() << ", got "
@@ -4509,8 +4508,11 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
 
     // Process failed operations that need cleanup
     if (!failed_keys.empty()) {
-        auto revoke_responses =
-            master_client_.BatchUpsertRevoke(failed_keys, dfs_epoch);
+        auto revoke_responses = FinalizeSessionsByEpoch(
+            failed_keys, failed_epochs,
+            [&](const auto& group, const UUID& epoch) {
+                return master_client_.BatchUpsertRevoke(group, epoch);
+            });
         if (revoke_responses.size() != failed_keys.size()) {
             LOG(ERROR) << "BatchUpsertRevoke response size mismatch: expected "
                        << failed_keys.size() << ", got "
@@ -5584,6 +5586,8 @@ void Client::SetDfsStorageBackend(
                 });
         }
     }
+    std::atomic_store_explicit(&heartbeat_dfs_backend_, backend,
+                               std::memory_order_release);
     dfs_storage_backend_ = std::move(backend);
     EnsureStorageControlPlaneStarted();
 }
@@ -6834,6 +6838,15 @@ void Client::StorageHeartbeatThreadMain() {
             ping_fail_count = 0;
             last_ping_success_.store(true);
             auto& ping_response = ping_result.value();
+            if (ping_response.dfs_root_binding.has_value()) {
+                if (auto backend = std::atomic_load_explicit(
+                        &heartbeat_dfs_backend_, std::memory_order_acquire)) {
+                    if (!backend->UpdateDfsRootBinding(
+                            *ping_response.dfs_root_binding)) {
+                        LOG(WARNING) << "Rejected DFS root binding from Ping";
+                    }
+                }
+            }
             if (ping_response.client_status == ClientStatus::NEED_REMOUNT &&
                 !remount_segment_future.valid()) {
                 // Ensure at most one remount segment thread is running

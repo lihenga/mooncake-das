@@ -579,6 +579,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
                   std::move(writer_config), std::move(write_batch));
           }) {
     dfs_snapshot_epoch_ = generate_uuid();
+    const char* dfs_allowed_fs_types =
+        std::getenv("MOONCAKE_DFS_ALLOWED_FS_TYPES");
+    dfs_allowed_fs_types_ =
+        dfs_allowed_fs_types ? dfs_allowed_fs_types : "storage,kingstorage";
     dfs_heartbeat_interval_seconds_.store(
         std::max<uint32_t>(
             Environ::ReadOr(
@@ -1006,7 +1010,8 @@ MasterService::DfsInitResult MasterService::InitDfsAllocatorFromEnvironment(
         dfs_retry_needed_.store(false, std::memory_order_release);
         return DfsInitResult::kPermanentFailure;
     }
-    if (!PrepareDfsRootForInitialization(dfs_config)) {
+    auto root_directory = PrepareDfsRootForInitialization(dfs_config);
+    if (!root_directory) {
         return DfsInitResult::kRetryableFailure;
     }
 
@@ -1023,7 +1028,9 @@ MasterService::DfsInitResult MasterService::InitDfsAllocatorFromEnvironment(
         allocator = std::move(shard_owner);
     }
 
-    auto init_result = allocator->Init(dfs_config);
+    auto init_result = bucket_allocator
+                           ? bucket_allocator->Init(dfs_config, root_directory)
+                           : allocator->Init(dfs_config);
     if (!init_result) {
         static DfsLogLimiter init_log_limiter;
         if (auto suppressed = init_log_limiter.ShouldLog()) {
@@ -1041,7 +1048,9 @@ MasterService::DfsInitResult MasterService::InitDfsAllocatorFromEnvironment(
                          : DfsInitResult::kRetryableFailure;
     }
 
-    if (!InitializeDfsRootGuard(dfs_config.fsdir, dfs_root_identity_)) {
+    if (!InitializeDfsRootGuard(dfs_config.fsdir, dfs_root_identity_,
+                                std::move(root_directory),
+                                bucket_allocator != nullptr)) {
         static DfsLogLimiter guard_log_limiter;
         if (auto suppressed = guard_log_limiter.ShouldLog()) {
             LOG(ERROR) << "Failed to initialize DFS root file guard for "
@@ -4864,8 +4873,11 @@ bool MasterService::IsAwaitingRemount(const Replica& replica) const {
 
 bool MasterService::TryGetReadableReplicaDescriptor(
     const Replica& replica, Replica::Descriptor& descriptor) const {
-    return IsReplicaReadableForGet(replica) &&
-           replica.getDescriptorIfAvailable(descriptor);
+    if (!IsReplicaReadableForGet(replica) ||
+        !replica.getDescriptorIfAvailable(descriptor))
+        return false;
+    StampDfsEpochLocked(descriptor);
+    return true;
 }
 
 std::vector<Replica::Descriptor> MasterService::GetReadableReplicaDescriptors(
@@ -5314,6 +5326,12 @@ auto MasterService::AllocateReplicas(const std::string& key,
     }
 
     if (config.dfs_replica_num > 0 && !skip_dfs_replica) {
+        if (!use_kvcs_ &&
+            (!enable_dfs_.load(std::memory_order_acquire) ||
+             dfs_root_recovery_in_progress_.load(std::memory_order_acquire))) {
+            if (dfs_allocation_failed) *dfs_allocation_failed = true;
+            return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+        }
         if (use_kvcs_) {
             DistributedFSDescriptor descriptor;
             descriptor.object_size = value_length;
@@ -5378,7 +5396,8 @@ auto MasterService::InsertMetadata(
     VLOG(1) << "PutStart, create replicas: client_id=" << client_id
             << ", key=" << key << ", value_length=" << value_length;
     for (const auto& replica : replicas) {
-        const auto desc = replica.get_descriptor();
+        auto desc = replica.get_descriptor();
+        StampDfsEpochLocked(desc);
         replica_list.emplace_back(desc);
         eligible_replica_ids.insert(replica.id());
 
@@ -5609,10 +5628,14 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 }
 
 auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
-                           const TenantId& tenant_id, ReplicaType replica_type)
+                           const TenantId& tenant_id, ReplicaType replica_type,
+                           const UUID& dfs_epoch)
     -> tl::expected<void, ErrorCode> {
     const auto& key = object_meta.key;
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    if (dfs_epoch != UUID{} && dfs_epoch != GetDfsMasterEpochLocked()) {
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
@@ -5924,9 +5947,12 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
 
 auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                               const TenantId& tenant_id,
-                              ReplicaType replica_type)
+                              ReplicaType replica_type, const UUID& dfs_epoch)
     -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    if (dfs_epoch != UUID{} && dfs_epoch != GetDfsMasterEpochLocked()) {
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
@@ -6036,34 +6062,37 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
 }
 
 auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
-                           const TenantId& tenant_id, ReplicaType replica_type)
+                           const TenantId& tenant_id, ReplicaType replica_type,
+                           const UUID& dfs_epoch)
     -> tl::expected<void, ErrorCode> {
     return PutEnd(client_id, ObjectMeta{key, std::nullopt}, tenant_id,
-                  replica_type);
+                  replica_type, dfs_epoch);
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
     const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
-    const TenantId& tenant_id, ReplicaType replica_type) {
+    const TenantId& tenant_id, ReplicaType replica_type,
+    const UUID& dfs_epoch) {
     assert(tenant_id.IsValid());
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(object_metas.size());
     for (const auto& object_meta : object_metas) {
         results.emplace_back(
-            PutEnd(client_id, object_meta, tenant_id, replica_type));
+            PutEnd(client_id, object_meta, tenant_id, replica_type, dfs_epoch));
     }
     return results;
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
     const UUID& client_id, const std::vector<std::string>& keys,
-    const TenantId& tenant_id, ReplicaType replica_type) {
+    const TenantId& tenant_id, ReplicaType replica_type,
+    const UUID& dfs_epoch) {
     assert(tenant_id.IsValid());
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
     for (const auto& key : keys) {
         results.emplace_back(
-            PutRevoke(client_id, key, tenant_id, replica_type));
+            PutRevoke(client_id, key, tenant_id, replica_type, dfs_epoch));
     }
     return results;
 }
@@ -6512,24 +6541,25 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 auto MasterService::UpsertEnd(const UUID& client_id,
                               const ObjectMeta& object_meta,
                               const TenantId& tenant_id,
-                              ReplicaType replica_type)
+                              ReplicaType replica_type, const UUID& dfs_epoch)
     -> tl::expected<void, ErrorCode> {
-    return PutEnd(client_id, object_meta, tenant_id, replica_type);
+    return PutEnd(client_id, object_meta, tenant_id, replica_type, dfs_epoch);
 }
 
 auto MasterService::UpsertEnd(const UUID& client_id, const std::string& key,
                               const TenantId& tenant_id,
-                              ReplicaType replica_type)
+                              ReplicaType replica_type, const UUID& dfs_epoch)
     -> tl::expected<void, ErrorCode> {
     return UpsertEnd(client_id, ObjectMeta{key, std::nullopt}, tenant_id,
-                     replica_type);
+                     replica_type, dfs_epoch);
 }
 
 auto MasterService::UpsertRevoke(const UUID& client_id, const std::string& key,
                                  const TenantId& tenant_id,
-                                 ReplicaType replica_type)
+                                 ReplicaType replica_type,
+                                 const UUID& dfs_epoch)
     -> tl::expected<void, ErrorCode> {
-    return PutRevoke(client_id, key, tenant_id, replica_type);
+    return PutRevoke(client_id, key, tenant_id, replica_type, dfs_epoch);
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
@@ -6570,14 +6600,16 @@ MasterService::BatchUpsertStart(const UUID& client_id,
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertEnd(
     const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
-    const TenantId& tenant_id) {
-    return BatchPutEnd(client_id, object_metas, tenant_id, ReplicaType::ALL);
+    const TenantId& tenant_id, const UUID& dfs_epoch) {
+    return BatchPutEnd(client_id, object_metas, tenant_id, ReplicaType::ALL,
+                       dfs_epoch);
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertRevoke(
     const UUID& client_id, const std::vector<std::string>& keys,
-    const TenantId& tenant_id) {
-    return BatchPutRevoke(client_id, keys, tenant_id);
+    const TenantId& tenant_id, const UUID& dfs_epoch) {
+    return BatchPutRevoke(client_id, keys, tenant_id, ReplicaType::ALL,
+                          dfs_epoch);
 }
 
 auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
@@ -8467,7 +8499,26 @@ auto MasterService::Ping(const UUID& client_id)
         observation_accepted && ok_client_.contains(client_id)
             ? ClientStatus::OK
             : ClientStatus::NEED_REMOUNT;
-    return PingResponse(view_version_, client_status);
+    PingResponse response(view_version_, client_status);
+    lock.unlock();
+    // Never put DFS I/O or recovery waits on the liveness path. Omit the
+    // optional binding until a coherent, ready bucket generation is available.
+    std::shared_lock state_lock(master_state_mutex_, std::try_to_lock);
+    if (!state_lock.owns_lock() ||
+        !enable_dfs_.load(std::memory_order_acquire) ||
+        dfs_root_recovery_in_progress_.load(std::memory_order_acquire)) {
+        return response;
+    }
+    std::unique_lock root_lock(dfs_root_guard_mutex_, std::try_to_lock);
+    if (root_lock.owns_lock() && dfs_root_guard_ready_ &&
+        !dfs_root_recovery_needed_) {
+        const auto epoch = GetDfsMasterEpoch();
+        if (epoch != UUID{} && !dfs_root_guard_identity_.empty()) {
+            response.dfs_root_binding =
+                DfsRootBinding{dfs_root_guard_identity_, epoch};
+        }
+    }
+    return response;
 }
 
 tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
@@ -12487,7 +12538,12 @@ auto MasterService::PutStartInternal(const UUID& client_id, const std::string& k
             (skip_dfs_replica || !dfs_allocation_allowed_snapshot.value_or(
                 (dfs_filter_mode_.load(std::memory_order_acquire) & 1) == 0 &&
                 !dfs_root_recovery_in_progress_.load(std::memory_order_acquire)));
-        if (preallocated_dfs && preallocated_dfs->source_allocator != dfs_allocator_.get()) {
+        if (config.dfs_replica_num > 0 && !use_kvcs_ &&
+            (!enable_dfs_.load(std::memory_order_acquire) ||
+             dfs_root_recovery_in_progress_.load(std::memory_order_acquire) ||
+             (preallocated_dfs &&
+              (preallocated_dfs->source_allocator != dfs_allocator_.get() ||
+               preallocated_dfs->epoch != GetDfsMasterEpochLocked())))) {
             skip = true;
             dfs_fallback_reason = ErrorCode::DFS_SERVICE_UNAVAILABLE;
         }

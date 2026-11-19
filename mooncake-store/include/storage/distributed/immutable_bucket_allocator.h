@@ -26,6 +26,8 @@
 
 namespace mooncake {
 
+struct DfsRootDirectory;
+
 struct DistributedStorageConfig;
 
 /**
@@ -150,6 +152,9 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
 
     tl::expected<void, ErrorCode> Init(
         const DistributedStorageConfig& config) override;
+    tl::expected<void, ErrorCode> Init(
+        const DistributedStorageConfig& config,
+        std::shared_ptr<const DfsRootDirectory> root);
 
     // Stop this allocator after the configured DFS root was replaced and
     // return a fresh, uninitialized allocator whose bucket ids and entry
@@ -444,6 +449,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     // --- helpers, called with mutex_ held only where the name says Locked ---
 
     std::string BucketDataPath(int64_t bucket_id) const;
+    std::string BucketDescriptorPath(int64_t bucket_id) const;
     std::string BucketMetaPath(int64_t bucket_id) const;
 
     // Serializes `bucket` into a PersistedBucketMetadata snapshot. Taken under
@@ -520,7 +526,9 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
 
     uint64_t UsedBytesLocked() const;
 
+    std::shared_ptr<const DfsRootDirectory> root_directory_;
     std::string fsdir_;
+    std::string descriptor_fsdir_;
     std::string fs_adapter_type_;
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
 

@@ -834,12 +834,22 @@ TEST_F(DfsBucketClientTest, PutThenGetRoundTrip) {
 
 class DfsBucketEpochClientTest : public DfsBucketClientTest {
    protected:
+    void TearDown() override {
+        DfsBucketClientTest::TearDown();
+        std::error_code ec;
+        std::filesystem::remove_all(root_ + "_saved", ec);
+    }
+
     bool RestartMasterAndReconnect() {
         const int port = master_.rpc_port();
         master_.Stop();
         if (!master_.Start(
                 InProcMasterConfigBuilder().set_rpc_port(port).build()))
             return false;
+        return ReconnectClients();
+    }
+
+    bool ReconnectClients() {
         for (const auto& client : {writer_, provider_}) {
             const auto deadline =
                 std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -866,7 +876,54 @@ class DfsBucketEpochClientTest : public DfsBucketClientTest {
 };
 
 TEST_F(DfsBucketEpochClientTest,
-       MasterRestartReusesBucketWithoutWaitingForHeartbeat) {
+       HeartbeatRefreshesIdentityAfterRootReplacementAndMasterRestart) {
+    const std::string old_key = "before_identity_recovery";
+    std::string old_value(4096, 'O');
+    std::vector<Slice> old_slices{{old_value.data(), old_value.size()}};
+    ASSERT_TRUE(writer_->Put(old_key, old_slices, DfsConfig()));
+    ASSERT_TRUE(WaitForDfsReplica(old_key));
+    auto old_query = QueryDfsOnly(old_key);
+    ASSERT_TRUE(old_query);
+    const auto old_desc = old_query->replicas[0].get_dfs_descriptor();
+    ExpectDfsValue(old_key, old_value);  // Prime both bucket FD caches.
+    const std::string old_identity = writer_->GetDfsRootIdentity();
+    const int port = master_.rpc_port();
+    ASSERT_TRUE(provider_->UnmountSegment(segment_, segment_size_));
+    master_.Stop();
+    // Retain the clients and backend, but start the master on a fresh DFS root.
+    std::filesystem::rename(root_, root_ + "_saved");
+    std::filesystem::create_directories(root_);
+    ASSERT_TRUE(
+        master_.Start(InProcMasterConfigBuilder().set_rpc_port(port).build()));
+    ASSERT_TRUE(ReconnectClients());
+    auto identity = writer_->FetchDfsRootIdentity();
+    ASSERT_TRUE(identity);
+    ASSERT_NE(old_identity, *identity);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    bool recovered = false;
+    do {
+        recovered = backend_->ProbeRead().has_value() &&
+                    backend_->ProbeWrite().has_value();
+        if (recovered) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    } while (std::chrono::steady_clock::now() < deadline);
+    ASSERT_TRUE(recovered)
+        << "live client must adopt the ready master's identity";
+    ASSERT_TRUE(provider_->MountSegment(segment_, segment_size_, "tcp"));
+    const std::string key = "heartbeat_identity_recovery";
+    std::string value(4096, 'H');
+    std::vector<Slice> slices{{value.data(), value.size()}};
+    ASSERT_TRUE(writer_->Put(key, slices, DfsConfig()));
+    ASSERT_TRUE(WaitForDfsReplica(key));
+    ExpectDfsValue(key, value);
+    auto stale = backend_->BatchRead(
+        {{old_key, old_desc, {{old_value.data(), old_value.size()}}}});
+    ASSERT_FALSE(stale[0]);
+    EXPECT_EQ(stale[0].error(), ErrorCode::DFS_STALE_HANDLE);
+}
+
+TEST_F(DfsBucketEpochClientTest, MasterRestartReusesBucketAfterEpochBinding) {
     const std::string key = "restart_reused_bucket";
     std::string old_value(4096, 'O');
     std::string new_value(4096, 'N');
@@ -909,6 +966,18 @@ TEST_F(DfsBucketEpochClientTest,
         ASSERT_TRUE(connected);
     }
     ASSERT_TRUE(provider_->MountSegment(segment_, segment_size_, "tcp"));
+    auto snapshot = writer_->GetDfsBucketSnapshot({}, 0);
+    ASSERT_TRUE(snapshot);
+    const auto binding_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    auto epoch_guard = backend_->AcquireBucketEpoch(snapshot->epoch);
+    while (!epoch_guard &&
+           std::chrono::steady_clock::now() < binding_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        epoch_guard = backend_->AcquireBucketEpoch(snapshot->epoch);
+    }
+    ASSERT_TRUE(epoch_guard);
+    epoch_guard->unlock();
     std::vector<std::vector<Slice>> new_slices{
         {{new_value.data(), new_value.size()}}};
     auto puts = writer_->BatchPut({key}, new_slices, DfsConfig());
@@ -1207,6 +1276,37 @@ TEST_F(DfsBucketClientTest, BatchReadCrossesLeaseDeadlineAfterValidation) {
     results = writer_->BatchGet({key}, {expiring}, batch);
     ASSERT_FALSE(results[0]);
     EXPECT_EQ(results[0].error(), ErrorCode::FILE_READ_FAIL);
+}
+
+TEST_F(DfsBucketClientTest, BatchFinalizationKeepsEachKeysEpoch) {
+    const UUID stale_epoch{0, 1};
+    for (bool revoke : {false, true}) {
+        const std::vector<std::string> keys =
+            revoke ? std::vector<std::string>{"old_revoke", "new_revoke"}
+                   : std::vector<std::string>{"old_end", "new_end"};
+        auto starts =
+            writer_->StartBatchPutForSizes(keys, {4096, 4096}, DfsConfig());
+        ASSERT_EQ(starts.size(), 2u);
+        ASSERT_TRUE(starts[0]);
+        ASSERT_TRUE(starts[1]);
+        UUID current_epoch{};
+        for (const auto& replica : *starts[1]) {
+            if (replica.is_dfs_replica())
+                current_epoch = replica.get_dfs_descriptor().MasterEpoch();
+        }
+        ASSERT_NE(current_epoch, UUID{});
+        ASSERT_NE(current_epoch, stale_epoch);
+        const std::vector<UUID> epochs{stale_epoch, current_epoch};
+        auto results =
+            revoke ? writer_->BatchPutRevoke(keys, ReplicaType::ALL, epochs)
+                   : writer_->BatchPutEnd(
+                         {{keys[0], std::nullopt}, {keys[1], std::nullopt}},
+                         ReplicaType::ALL, epochs);
+        ASSERT_EQ(results.size(), 2u);
+        ASSERT_FALSE(results[0]);
+        EXPECT_EQ(results[0].error(), ErrorCode::INVALID_WRITE);
+        EXPECT_TRUE(results[1]);
+    }
 }
 
 TEST_F(DfsBucketClientTest, AllFinalizationRpcsRejectStaleMasterEpoch) {

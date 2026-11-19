@@ -468,6 +468,7 @@ class WrappedMasterService {
     KvEventPublisher::Stats GetKvEventStats() const;
 
    private:
+    friend class test::MasterServiceTestPeer;
     MasterService master_service_;
 };
 

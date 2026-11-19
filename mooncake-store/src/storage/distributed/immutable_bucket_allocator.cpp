@@ -1,3 +1,4 @@
+#include "storage/distributed/dfs_root_directory.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
 #include "storage/distributed/dfs_log_limiter.h"
 
@@ -166,6 +167,12 @@ std::string ImmutableBucketAllocator::BucketDataPath(int64_t bucket_id) const {
            kBucketDataSuffix;
 }
 
+std::string ImmutableBucketAllocator::BucketDescriptorPath(
+    int64_t bucket_id) const {
+    return descriptor_fsdir_ + "/" + kBucketFilePrefix +
+           FormatBucketId(bucket_id) + kBucketDataSuffix;
+}
+
 std::string ImmutableBucketAllocator::BucketMetaPath(int64_t bucket_id) const {
     return fsdir_ + "/" + kBucketFilePrefix + FormatBucketId(bucket_id) +
            kBucketMetaSuffix;
@@ -173,6 +180,12 @@ std::string ImmutableBucketAllocator::BucketMetaPath(int64_t bucket_id) const {
 
 tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     const DistributedStorageConfig& config) {
+    return Init(config, nullptr);
+}
+
+tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
+    const DistributedStorageConfig& config,
+    std::shared_ptr<const DfsRootDirectory> root) {
     if (initialized_.load(std::memory_order_acquire)) return {};
 
     if (!config.ValidateForAllocator()) {
@@ -184,7 +197,9 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    fsdir_ = config.fsdir;
+    descriptor_fsdir_ = config.fsdir;
+    root_directory_ = std::move(root);
+    fsdir_ = root_directory_ ? root_directory_->PinnedPath() : config.fsdir;
     fs_adapter_type_ = config.fs_adapter_type;
     bucket_capacity_ = config.bucket_capacity;
     alignment_ = config.alignment;
@@ -220,7 +235,7 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto adapter_init = fs_adapter_->Init(fsdir_);
+    auto adapter_init = fs_adapter_->Init(config.fsdir);
     if (!adapter_init) {
         LOG(ERROR) << "Failed to initialize DFS fs adapter "
                    << config.fs_adapter_type << " for fsdir=" << fsdir_
@@ -392,9 +407,8 @@ ImmutableBucketAllocator::RetireAndCreateReplacementAllocator() {
         recovered_replicas_.clear();
         active_bucket_id_ = -1;
         // Keep bucket ids and entry generations monotonic across recovery.
-        // An RPC that completed against the old allocator immediately before
-        // the master's exclusive recovery barrier may be stamped with the new
-        // epoch by its wrapper. Never let that stale path alias a new bucket.
+        // In-flight operations may retain old paths until epoch propagation
+        // completes. Never let those stale paths alias a new bucket.
         eviction_active_ = false;
         PublishBucketIdSnapshotLocked();
         UpdateBucketPoolMetricsLocked();
@@ -1185,8 +1199,8 @@ ImmutableBucketAllocator::ReserveInBucketLocked(BucketState& bucket,
     // marking it keeps the invariant local instead of implicit.
     MarkMetaDirtyLocked(bucket);
 
-    auto descriptor = MakeBucketDescriptor(BucketDataPath(bucket.bucket_id),
-                                          *layout, bucket.bucket_id);
+    auto descriptor = MakeBucketDescriptor(
+        BucketDescriptorPath(bucket.bucket_id), *layout, bucket.bucket_id);
     return descriptor;
 }
 
@@ -1840,8 +1854,8 @@ ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
             candidate.key = key;
             candidate.shard_idx = static_cast<int>(bucket_id);
             candidate.offset = layout->offset;
-            candidate.descriptor =
-                MakeBucketDescriptor(BucketDataPath(bucket_id), *layout, bucket_id);
+            candidate.descriptor = MakeBucketDescriptor(
+                BucketDescriptorPath(bucket_id), *layout, bucket_id);
             candidates.push_back(std::move(candidate));
         }
 
@@ -1950,8 +1964,8 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
             // Byte-identical to what Allocate handed out, so the master can
             // match replica metadata field by field.
             candidate.descriptor =
-                MakeBucketDescriptor(BucketDataPath(victim->bucket_id), *layout,
-                                     victim->bucket_id);
+                MakeBucketDescriptor(BucketDescriptorPath(victim->bucket_id),
+                                     *layout, victim->bucket_id);
             candidates.push_back(std::move(candidate));
         }
 
@@ -2388,8 +2402,8 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
                 entry.entry_offset, entry.value_size, alignment_);
             if (!layout) continue;
             recovered_replicas_.push_back(RecoveredReplica{
-                key, MakeBucketDescriptor(BucketDataPath(bucket_id), *layout,
-                                          bucket_id)});
+                key, MakeBucketDescriptor(BucketDescriptorPath(bucket_id),
+                                          *layout, bucket_id)});
         }
     }
 
