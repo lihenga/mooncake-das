@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
@@ -26,8 +27,8 @@ class FileStorage {
 
     tl::expected<void, ErrorCode> Init();
 
-    tl::expected<void, ErrorCode> ProbeDfsRead();
-    tl::expected<void, ErrorCode> ProbeDfsWrite();
+    tl::expected<void, ErrorCode> ProbeDfsRead(uint64_t timeout_ms = 25000);
+    tl::expected<void, ErrorCode> ProbeDfsWrite(uint64_t timeout_ms = 25000);
     [[nodiscard]] bool IsDfsBackendReady() const;
 
     void RemoveAll();

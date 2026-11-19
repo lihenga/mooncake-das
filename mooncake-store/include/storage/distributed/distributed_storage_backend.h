@@ -122,8 +122,9 @@ class DistributedStorageBackend
 
     // Minimal adapter-level probes used by SGLang's health state machine.
     // These methods never touch business keys.
-    tl::expected<void, ErrorCode> ProbeRead();
-    tl::expected<void, ErrorCode> ProbeWrite();
+    // Log native execution exceeding this budget, without cancelling I/O.
+    tl::expected<void, ErrorCode> ProbeRead(uint64_t timeout_ms = 25000);
+    tl::expected<void, ErrorCode> ProbeWrite(uint64_t timeout_ms = 25000);
 
     [[nodiscard]] bool IsInitialized() const {
         return initialized_.load(std::memory_order_acquire);

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -128,130 +129,208 @@ void DistributedStorageBackend::ResetFailedInitializationLocked() {
     initialized_.store(false, std::memory_order_release);
 }
 
-tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeRead() {
-    auto initialized = TryEnsureInitialized();
-    if (!initialized) return initialized;
-    if (UsesObjectStorage()) return {};
-    void* raw = nullptr;
-    if (::posix_memalign(&raw, kDfsReadProbeBlockSize, kDfsReadProbeSize) !=
-        0) {
-        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-    }
-    std::unique_ptr<void, decltype(&::free)> buffer(raw, &::free);
-
-    for (size_t probe_index = 0;
-         probe_index < kDfsReadProbeDirectoryNames.size(); ++probe_index) {
-        const std::string probe_path =
-            root_dir_ + "/" +
-            std::string(kDfsReadProbeDirectoryNames[probe_index]) + "/" +
-            kDfsReadProbeFileName;
-        auto size = fs_adapter_->GetFileSize(probe_path);
-        if (!size) return tl::make_unexpected(size.error());
-        if (*size != kDfsReadProbeSize) {
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeRead(
+    uint64_t timeout_ms) {
+    const auto started_at = std::chrono::steady_clock::now();
+    const auto started_at_unix_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    // Collect early error returns as well as success through one timing check.
+    auto result = [&]() -> tl::expected<void, ErrorCode> {
+        auto initialized = TryEnsureInitialized();
+        if (!initialized) return initialized;
+        if (UsesObjectStorage()) return {};
+        void* raw = nullptr;
+        if (::posix_memalign(&raw, kDfsReadProbeBlockSize, kDfsReadProbeSize) !=
+            0) {
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
+        std::unique_ptr<void, decltype(&::free)> buffer(raw, &::free);
 
-        // Open and close on every probe. Strict open has no buffered fallback
-        // and PosixFsAdapter uses O_RDONLY|O_DIRECT|O_CLOEXEC|O_NOFOLLOW.
-        auto fd = fs_adapter_->OpenFileDirectStrict(probe_path);
-        if (!fd) return tl::make_unexpected(fd.error());
-        size_t total_read = 0;
-        while (total_read < kDfsReadProbeSize) {
-            iovec iov{static_cast<char*>(buffer.get()) + total_read,
-                      kDfsReadProbeSize - total_read};
-            auto read = fs_adapter_->DirectReadAt(
-                *fd, &iov, 1, static_cast<int64_t>(total_read));
-            if (!read || *read == 0) {
-                const auto error =
-                    read ? ErrorCode::FILE_READ_FAIL : read.error();
-                (void)fs_adapter_->CloseFile(*fd);
-                return tl::make_unexpected(error);
+        for (size_t probe_index = 0;
+             probe_index < kDfsReadProbeDirectoryNames.size(); ++probe_index) {
+            const std::string probe_path =
+                root_dir_ + "/" +
+                std::string(kDfsReadProbeDirectoryNames[probe_index]) + "/" +
+                kDfsReadProbeFileName;
+            auto size = fs_adapter_->GetFileSize(probe_path);
+            if (!size) return tl::make_unexpected(size.error());
+            if (*size != kDfsReadProbeSize) {
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
             }
-            total_read += *read;
-        }
-        const auto close = fs_adapter_->CloseFile(*fd);
-        if (!close) return tl::make_unexpected(close.error());
 
-        const auto expected =
-            BuildDfsReadProbeContents(expected_root_identity_, probe_index);
-        if (std::memcmp(buffer.get(), expected.data(), kDfsReadProbeSize) != 0) {
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            // Open and close on every probe. Strict open has no buffered fallback
+            // and PosixFsAdapter uses O_RDONLY|O_DIRECT|O_CLOEXEC|O_NOFOLLOW.
+            auto fd = fs_adapter_->OpenFileDirectStrict(probe_path);
+            if (!fd) return tl::make_unexpected(fd.error());
+            size_t total_read = 0;
+            while (total_read < kDfsReadProbeSize) {
+                iovec iov{static_cast<char*>(buffer.get()) + total_read,
+                          kDfsReadProbeSize - total_read};
+                auto read = fs_adapter_->DirectReadAt(
+                    *fd, &iov, 1, static_cast<int64_t>(total_read));
+                if (!read || *read == 0) {
+                    const auto error =
+                        read ? ErrorCode::FILE_READ_FAIL : read.error();
+                    (void)fs_adapter_->CloseFile(*fd);
+                    return tl::make_unexpected(error);
+                }
+                total_read += *read;
+            }
+            const auto close = fs_adapter_->CloseFile(*fd);
+            if (!close) return tl::make_unexpected(close.error());
+
+            const auto expected =
+                BuildDfsReadProbeContents(expected_root_identity_, probe_index);
+            if (std::memcmp(buffer.get(), expected.data(), kDfsReadProbeSize) != 0) {
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
         }
+        SetDfsReadTimedOut(false);
+        return {};
+    }();
+    const auto finished_at = std::chrono::steady_clock::now();
+    const auto finished_at_unix_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto elapsed_ms = std::chrono::duration<double, std::milli>(
+        finished_at - started_at).count();
+    if (elapsed_ms >= timeout_ms) {
+        LOG(WARNING) << "Mooncake DFS native probe timed out: capability=read"
+                     << " timeout_ms=" << timeout_ms
+                     << " started_at_unix_ms=" << started_at_unix_ms
+                     << " finished_at_unix_ms=" << finished_at_unix_ms
+                     << " elapsed_ms=" << elapsed_ms
+                     << " error=" << (result ? 0 : toInt(result.error()))
+                     << " root=" << root_dir_;
     }
-    SetDfsReadTimedOut(false);
-    return {};
+    return result;
 }
 
-tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite() {
-    auto initialized = TryEnsureInitialized();
-    if (!initialized) return initialized;
-    if (UsesObjectStorage()) return {};
+tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite(
+    uint64_t timeout_ms) {
+    const auto started_at = std::chrono::steady_clock::now();
+    const auto started_at_unix_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    FileWriteTimings write_timings;
+    double sync_ms = -1;
+    double delete_ms = -1;
+    size_t delete_calls = 0;
+    std::string probe_suffix = "none";
+    std::string deleted_probe_suffixes;
+    auto delete_probe = [&](const std::string& path) {
+        const auto delete_started = std::chrono::steady_clock::now();
+        auto deleted = fs_adapter_->DeleteFile(path);
+        const auto duration_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - delete_started).count();
+        if (delete_ms < 0) delete_ms = 0;
+        delete_ms += duration_ms;
+        if (delete_calls++ > 0) deleted_probe_suffixes += ",";
+        deleted_probe_suffixes += path.substr(health_probe_path_prefix_.size());
+        return deleted;
+    };
+    // Collect early error returns as well as success through one timing check.
+    auto result = [&]() -> tl::expected<void, ErrorCode> {
+        auto initialized = TryEnsureInitialized();
+        if (!initialized) return initialized;
+        if (UsesObjectStorage()) return {};
 
-    std::lock_guard probe_lock(health_probe_write_mutex_);
-    // Use a new path each round: deleting the previous file first could free
-    // just enough space for the probe to pass on an otherwise full filesystem.
-    const std::string new_probe_path =
-        health_probe_path_prefix_ + "_" +
-        std::to_string(++health_probe_generation_);
-    auto write_result = fs_adapter_->WriteFile(
-        new_probe_path,
-        std::span<const char>(kDfsHealthProbePayload,
-                              sizeof(kDfsHealthProbePayload) - 1));
-    if (!write_result) {
-        (void)fs_adapter_->DeleteFile(new_probe_path);
-        return tl::make_unexpected(write_result.error());
-    }
-    if (*write_result != sizeof(kDfsHealthProbePayload) - 1) {
-        (void)fs_adapter_->DeleteFile(new_probe_path);
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-    }
-    auto sync_result = fs_adapter_->SyncFile(new_probe_path);
-    if (!sync_result) {
-        (void)fs_adapter_->DeleteFile(new_probe_path);
-        return sync_result;
-    }
-
-    if (!active_health_probe_path_.empty()) {
-        auto delete_result = fs_adapter_->DeleteFile(active_health_probe_path_);
-        if (!delete_result &&
-            delete_result.error() != ErrorCode::FILE_NOT_FOUND) {
-            (void)fs_adapter_->DeleteFile(new_probe_path);
-            return tl::make_unexpected(delete_result.error());
+        std::lock_guard probe_lock(health_probe_write_mutex_);
+        // Use a new path each round: deleting the previous file first could free
+        // just enough space for the probe to pass on an otherwise full filesystem.
+        probe_suffix = "_" + std::to_string(++health_probe_generation_);
+        const std::string new_probe_path = health_probe_path_prefix_ + probe_suffix;
+        auto write_result = fs_adapter_->WriteFile(
+            new_probe_path,
+            std::span<const char>(kDfsHealthProbePayload,
+                                  sizeof(kDfsHealthProbePayload) - 1),
+            &write_timings);
+        if (!write_result) {
+            (void)delete_probe(new_probe_path);
+            return tl::make_unexpected(write_result.error());
         }
-    }
-    active_health_probe_path_ = new_probe_path;
+        if (*write_result != sizeof(kDfsHealthProbePayload) - 1) {
+            (void)delete_probe(new_probe_path);
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        const auto sync_started = std::chrono::steady_clock::now();
+        auto sync_result = fs_adapter_->SyncFile(new_probe_path);
+        sync_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - sync_started).count();
+        if (!sync_result) {
+            (void)delete_probe(new_probe_path);
+            return sync_result;
+        }
 
-    if (!IsBucketMode()) {
-        std::vector<ShardFile*> shards;
-        {
-            std::lock_guard cache_lock(shard_files_mutex_);
-            for (const auto& [_, shard] : shard_files_) {
-                shards.push_back(shard.get());
+        if (!active_health_probe_path_.empty()) {
+            auto delete_result = delete_probe(active_health_probe_path_);
+            if (!delete_result &&
+                delete_result.error() != ErrorCode::FILE_NOT_FOUND) {
+                (void)delete_probe(new_probe_path);
+                return tl::make_unexpected(delete_result.error());
             }
         }
-        std::vector<std::pair<ShardFile*, int>> opened;
-        for (auto* shard : shards) {
-            std::lock_guard shard_lock(shard->mutex);
-            if (shard->path.empty() || shard->write_fd.load() >= 0) continue;
-            auto fd = ValidateAndOpenShardFile(shard->path);
-            if (!fd) {
-                for (const auto& [_, new_fd] : opened) {
-                    (void)fs_adapter_->CloseFile(new_fd);
+        active_health_probe_path_ = new_probe_path;
+
+        if (!IsBucketMode()) {
+            std::vector<ShardFile*> shards;
+            {
+                std::lock_guard cache_lock(shard_files_mutex_);
+                for (const auto& [_, shard] : shard_files_) {
+                    shards.push_back(shard.get());
                 }
-                return tl::make_unexpected(fd.error());
             }
-            opened.emplace_back(shard, *fd);
-        }
-        for (const auto& [shard, fd] : opened) {
-            std::lock_guard shard_lock(shard->mutex);
-            if (shard->write_fd.load() < 0) {
-                shard->write_fd.store(fd);
-            } else {
-                (void)fs_adapter_->CloseFile(fd);
+            std::vector<std::pair<ShardFile*, int>> opened;
+            for (auto* shard : shards) {
+                std::lock_guard shard_lock(shard->mutex);
+                if (shard->path.empty() || shard->write_fd.load() >= 0) continue;
+                auto fd = ValidateAndOpenShardFile(shard->path);
+                if (!fd) {
+                    for (const auto& [_, new_fd] : opened) {
+                        (void)fs_adapter_->CloseFile(new_fd);
+                    }
+                    return tl::make_unexpected(fd.error());
+                }
+                opened.emplace_back(shard, *fd);
+            }
+            for (const auto& [shard, fd] : opened) {
+                std::lock_guard shard_lock(shard->mutex);
+                if (shard->write_fd.load() < 0) {
+                    shard->write_fd.store(fd);
+                } else {
+                    (void)fs_adapter_->CloseFile(fd);
+                }
             }
         }
+        return {};
+    }();
+    const auto finished_at = std::chrono::steady_clock::now();
+    const auto finished_at_unix_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto elapsed_ms = std::chrono::duration<double, std::milli>(
+        finished_at - started_at).count();
+    if (elapsed_ms >= timeout_ms) {
+        LOG(WARNING) << "Mooncake DFS native probe timedout: capability=write"
+                     << " timeout_ms=" << timeout_ms
+                     << " started_at_unix_ms=" << started_at_unix_ms
+                     << " finished_at_unix_ms=" << finished_at_unix_ms
+                     << " elapsed_ms=" << elapsed_ms
+                     << " create_ms=" << write_timings.create_ms
+                     << " write_ms=" << write_timings.write_ms
+                     << " write_total_ms=" << write_timings.write_total_ms
+                     << " sync_ms=" << sync_ms
+                     << " delete_ms=" << delete_ms
+                     << " delete_calls=" << delete_calls
+                     << " probe_suffix=" << probe_suffix
+                     << " deleted_probe_suffixes="
+                     << (deleted_probe_suffixes.empty() ? "none"
+                                                       : deleted_probe_suffixes)
+                     << " error=" << (result ? 0 : toInt(result.error()))
+                     << " root=" << root_dir_;
     }
-    return {};
+    return result;
 }
 
 tl::expected<std::shared_ptr<DistributedStorageBackend::OpenFileHandle>,

@@ -589,16 +589,16 @@ class MooncakeStorePyWrapper {
         return store_->probe_dfs_health();
     }
 
-    int probe_dfs_read() {
+    int probe_dfs_read(uint64_t timeout_ms) {
         if (!store_) return toInt(ErrorCode::INVALID_PARAMS);
         py::gil_scoped_release release;
-        return store_->probe_dfs_read();
+        return store_->probe_dfs_read(timeout_ms);
     }
 
-    int probe_dfs_write() {
+    int probe_dfs_write(uint64_t timeout_ms) {
         if (!store_) return toInt(ErrorCode::INVALID_PARAMS);
         py::gil_scoped_release release;
-        return store_->probe_dfs_write();
+        return store_->probe_dfs_write(timeout_ms);
     }
 
     int set_dfs_access_policy(bool allow_read, bool allow_write) {
@@ -2887,9 +2887,13 @@ PYBIND11_MODULE(_store, m) {
              "Probe DFS read/write health. Returns "
              "[read_error_code, write_error_code, backend_ready].")
         .def("probe_dfs_read", &MooncakeStorePyWrapper::probe_dfs_read,
-             "Probe DFS read capability and return an error code.")
+             py::arg("timeout_ms") = 25000,
+             "Probe DFS read capability and return an error code. "
+             "timeout_ms controls native timeout logging, not I/O cancellation.")
         .def("probe_dfs_write", &MooncakeStorePyWrapper::probe_dfs_write,
-             "Probe DFS write capability and return an error code.")
+             py::arg("timeout_ms") = 25000,
+             "Probe DFS write capability and return an error code. "
+             "timeout_ms controls native timeout logging, not I/O cancellation.")
         .def(
             "set_service_endpoint",
             [](MooncakeStorePyWrapper &self, const std::string &endpoint) {

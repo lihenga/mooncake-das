@@ -244,6 +244,30 @@ class FsAdapterFdTest : public ::testing::Test {
     std::unique_ptr<PosixFsAdapter> adapter_;
 };
 
+TEST_F(FsAdapterFdTest, WriteFileTimingsPreserveDataAndResetAfterCreateFailure) {
+    const std::string data = "probe payload";
+    const std::span<const char> payload(data.data(), data.size());
+    const auto path = tmp_->file("probe.data");
+    FileWriteTimings timings;
+    const auto written = adapter_->WriteFile(path, payload, &timings);
+    ASSERT_TRUE(written.has_value());
+    EXPECT_EQ(*written, data.size());
+    EXPECT_GE(timings.create_ms, 0);
+    EXPECT_GE(timings.write_ms, 0);
+    EXPECT_GE(timings.write_total_ms, timings.write_ms);
+    std::string readback(data.size(), '\0');
+    ASSERT_TRUE(adapter_->ReadFile(path, readback.data(), readback.size()).has_value());
+    EXPECT_EQ(readback, data);
+
+    const auto failed = adapter_->WriteFile(
+        tmp_->file("missing-parent/probe.data"), payload, &timings);
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error(), ErrorCode::FILE_OPEN_FAIL);
+    EXPECT_GE(timings.create_ms, 0);
+    EXPECT_EQ(timings.write_ms, -1);
+    EXPECT_EQ(timings.write_total_ms, -1);
+}
+
 TEST_F(FsAdapterFdTest, OpenClose) {
     auto pre = adapter_->PreallocateFile(tmp_->file("shard0.data"), 4096);
     ASSERT_TRUE(pre.has_value());
@@ -1866,11 +1890,12 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     int ReadCallCount() const { return read_calls_.load(); }
 
     tl::expected<size_t, ErrorCode> WriteFile(
-        const std::string& path, std::span<const char> data) override {
+        const std::string& path, std::span<const char> data,
+        FileWriteTimings* timings = nullptr) override {
         if (fail_file_create_.exchange(false)) {
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
-        return PosixFsAdapter::WriteFile(path, data);
+        return PosixFsAdapter::WriteFile(path, data, timings);
     }
 
     // Toggles the backend's fd-reopen gating. Defaults to true so the adapter
