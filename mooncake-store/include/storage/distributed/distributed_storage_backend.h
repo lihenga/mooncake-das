@@ -104,7 +104,10 @@ class DistributedStorageBackend
     // the initializer; TryEnsureInitialized returns unavailable immediately
     // when another read/write probe is initializing the shared backend.
     tl::expected<void, ErrorCode> EnsureInitialized();
-    tl::expected<void, ErrorCode> TryEnsureInitialized();
+    // Optional root-validation duration in milliseconds, included in the probe's
+    // init_ms. Set to -1 when the already-initialized validation is not reached.
+    tl::expected<void, ErrorCode> TryEnsureInitialized(
+        double* root_identity_ms = nullptr);
 
     // Configure before initialization/probes start. Only an empty startup
     // identity is refreshed; an established identity remains pinned.

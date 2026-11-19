@@ -3,6 +3,7 @@
 #include "storage/distributed/dfs_log_limiter.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <chrono>
 #include <condition_variable>
@@ -54,6 +55,22 @@ struct MergedReadScratch {
 
 thread_local MergedReadScratch merged_read_scratch;
 
+// Also records durations on early error returns. -1 means the stage was skipped.
+class ProbeStageTimer {
+   public:
+    explicit ProbeStageTimer(double& duration) : duration_(duration) {}
+    ~ProbeStageTimer() {
+        if (duration_ < 0) duration_ = 0;
+        duration_ += std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - started_)
+                         .count();
+    }
+
+   private:
+    double& duration_;
+    const std::chrono::steady_clock::time_point started_ =
+        std::chrono::steady_clock::now();
+};
 
 }  // namespace
 
@@ -69,9 +86,12 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::EnsureInitialized() {
 }
 
 tl::expected<void, ErrorCode>
-DistributedStorageBackend::TryEnsureInitialized() {
+DistributedStorageBackend::TryEnsureInitialized(double* root_identity_ms) {
+    if (root_identity_ms) *root_identity_ms = -1;
     if (initialized_.load(std::memory_order_acquire)) {
         if (UsesObjectStorage()) return {};
+        double ignored = -1;
+        ProbeStageTimer timer(root_identity_ms ? *root_identity_ms : ignored);
         return ValidateRootIdentity();
     }
     std::unique_lock<std::mutex> lock(init_mutex_, std::try_to_lock);
@@ -135,9 +155,21 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeRead(
     const auto started_at_unix_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
+    double init_ms = -1;
+    double root_identity_ms = -1;
+    struct ReadTimings {
+        double stat_ms = -1;
+        double open_ms = -1;
+        double read_ms = -1;
+        double close_ms = -1;
+    };
+    std::array<ReadTimings, kDfsReadProbeDirectoryNames.size()> read_timings;
     // Collect early error returns as well as success through one timing check.
     auto result = [&]() -> tl::expected<void, ErrorCode> {
-        auto initialized = TryEnsureInitialized();
+        auto initialized = [&] {
+            ProbeStageTimer timer(init_ms);
+            return TryEnsureInitialized(&root_identity_ms);
+        }();
         if (!initialized) return initialized;
         if (UsesObjectStorage()) return {};
         void* raw = nullptr;
@@ -153,7 +185,11 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeRead(
                 root_dir_ + "/" +
                 std::string(kDfsReadProbeDirectoryNames[probe_index]) + "/" +
                 kDfsReadProbeFileName;
-            auto size = fs_adapter_->GetFileSize(probe_path);
+            auto& timings = read_timings[probe_index];
+            auto size = [&] {
+                ProbeStageTimer timer(timings.stat_ms);
+                return fs_adapter_->GetFileSize(probe_path);
+            }();
             if (!size) return tl::make_unexpected(size.error());
             if (*size != kDfsReadProbeSize) {
                 return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
@@ -161,23 +197,33 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeRead(
 
             // Open and close on every probe. Strict open has no buffered fallback
             // and PosixFsAdapter uses O_RDONLY|O_DIRECT|O_CLOEXEC|O_NOFOLLOW.
-            auto fd = fs_adapter_->OpenFileDirectStrict(probe_path);
+            auto fd = [&] {
+                ProbeStageTimer timer(timings.open_ms);
+                return fs_adapter_->OpenFileDirectStrict(probe_path);
+            }();
             if (!fd) return tl::make_unexpected(fd.error());
+            auto close_probe = [&] {
+                ProbeStageTimer timer(timings.close_ms);
+                return fs_adapter_->CloseFile(*fd);
+            };
             size_t total_read = 0;
             while (total_read < kDfsReadProbeSize) {
                 iovec iov{static_cast<char*>(buffer.get()) + total_read,
                           kDfsReadProbeSize - total_read};
-                auto read = fs_adapter_->DirectReadAt(
-                    *fd, &iov, 1, static_cast<int64_t>(total_read));
+                auto read = [&] {
+                    ProbeStageTimer timer(timings.read_ms);
+                    return fs_adapter_->DirectReadAt(
+                        *fd, &iov, 1, static_cast<int64_t>(total_read));
+                }();
                 if (!read || *read == 0) {
                     const auto error =
                         read ? ErrorCode::FILE_READ_FAIL : read.error();
-                    (void)fs_adapter_->CloseFile(*fd);
+                    (void)close_probe();
                     return tl::make_unexpected(error);
                 }
                 total_read += *read;
             }
-            const auto close = fs_adapter_->CloseFile(*fd);
+            const auto close = close_probe();
             if (!close) return tl::make_unexpected(close.error());
 
             const auto expected =
@@ -196,11 +242,23 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeRead(
     const auto elapsed_ms = std::chrono::duration<double, std::milli>(
         finished_at - started_at).count();
     if (elapsed_ms >= timeout_ms) {
-        LOG(WARNING) << "Mooncake DFS native probe timed out: capability=read"
+        std::ostringstream stages;
+        for (size_t i = 0; i < read_timings.size(); ++i) {
+            const auto& timing = read_timings[i];
+            stages << " probe" << i << "_stat_ms=" << timing.stat_ms
+                   << " probe" << i << "_open_ms=" << timing.open_ms
+                   << " probe" << i << "_read_ms=" << timing.read_ms
+                   << " probe" << i << "_close_ms=" << timing.close_ms;
+        }
+        LOG(WARNING) << "Mooncake DFS native probe exceeded budget: "
+                        "capability=read"
                      << " timeout_ms=" << timeout_ms
                      << " started_at_unix_ms=" << started_at_unix_ms
                      << " finished_at_unix_ms=" << finished_at_unix_ms
                      << " elapsed_ms=" << elapsed_ms
+                     << " init_ms=" << init_ms
+                     << " root_identity_ms=" << root_identity_ms
+                     << stages.str()
                      << " error=" << (result ? 0 : toInt(result.error()))
                      << " root=" << root_dir_;
     }
@@ -214,6 +272,10 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
     FileWriteTimings write_timings;
+    double init_ms = -1;
+    double root_identity_ms = -1;
+    double lock_wait_ms = -1;
+    double shard_reopen_ms = -1;
     double sync_ms = -1;
     double delete_ms = -1;
     size_t delete_calls = 0;
@@ -232,11 +294,18 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite(
     };
     // Collect early error returns as well as success through one timing check.
     auto result = [&]() -> tl::expected<void, ErrorCode> {
-        auto initialized = TryEnsureInitialized();
+        auto initialized = [&] {
+            ProbeStageTimer timer(init_ms);
+            return TryEnsureInitialized(&root_identity_ms);
+        }();
         if (!initialized) return initialized;
         if (UsesObjectStorage()) return {};
 
-        std::lock_guard probe_lock(health_probe_write_mutex_);
+        std::unique_lock probe_lock(health_probe_write_mutex_, std::defer_lock);
+        {
+            ProbeStageTimer timer(lock_wait_ms);
+            probe_lock.lock();
+        }
         // Use a new path each round: deleting the previous file first could free
         // just enough space for the probe to pass on an otherwise full filesystem.
         probe_suffix = "_" + std::to_string(++health_probe_generation_);
@@ -274,6 +343,7 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite(
         active_health_probe_path_ = new_probe_path;
 
         if (!IsBucketMode()) {
+            ProbeStageTimer timer(shard_reopen_ms);
             std::vector<ShardFile*> shards;
             {
                 std::lock_guard cache_lock(shard_files_mutex_);
@@ -312,11 +382,16 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite(
     const auto elapsed_ms = std::chrono::duration<double, std::milli>(
         finished_at - started_at).count();
     if (elapsed_ms >= timeout_ms) {
-        LOG(WARNING) << "Mooncake DFS native probe timedout: capability=write"
+        LOG(WARNING) << "Mooncake DFS native probe exceeded budget: "
+                        "capability=write"
                      << " timeout_ms=" << timeout_ms
                      << " started_at_unix_ms=" << started_at_unix_ms
                      << " finished_at_unix_ms=" << finished_at_unix_ms
                      << " elapsed_ms=" << elapsed_ms
+                     << " init_ms=" << init_ms
+                     << " root_identity_ms=" << root_identity_ms
+                     << " lock_wait_ms=" << lock_wait_ms
+                     << " shard_reopen_ms=" << shard_reopen_ms
                      << " create_ms=" << write_timings.create_ms
                      << " write_ms=" << write_timings.write_ms
                      << " write_total_ms=" << write_timings.write_total_ms
