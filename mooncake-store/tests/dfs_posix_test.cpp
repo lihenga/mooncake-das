@@ -1844,7 +1844,7 @@ TEST_F(DfsBackendTest, HealthProbesUseStrictDirectDedicatedFile) {
             ++probe_file_count;
         }
     }
-    EXPECT_EQ(probe_file_count, 2u);
+    EXPECT_EQ(probe_file_count, 0u);
     EXPECT_TRUE(backend_->ProbeRead().has_value());
 
     const int fd = ::open(second_probe_path.c_str(), O_WRONLY | O_CLOEXEC);
@@ -1867,7 +1867,7 @@ TEST_F(DfsBackendTest, HealthProbesUseStrictDirectDedicatedFile) {
             ++probe_file_count;
         }
     }
-    EXPECT_EQ(probe_file_count, 2u);
+    EXPECT_EQ(probe_file_count, 0u);
 }
 
 TEST_F(DfsBackendTest, ZeroBudgetLogsPreserveReadAndWriteResults) {
@@ -1898,15 +1898,15 @@ TEST_F(DfsBackendTest, ZeroBudgetLogsPreserveReadAndWriteResults) {
     const auto write_log = logs.Last();
     EXPECT_NE(write_log.find("exceeded budget: capability=write"), std::string::npos);
     EXPECT_NE(write_log.find(" error=0"), std::string::npos);
-    EXPECT_NE(write_log.find(" delete_calls=1 probe_suffix=_2 deleted_probe_suffixes=_1"),
+    EXPECT_NE(write_log.find(" delete_calls=1 probe_suffix=_2 deleted_probe_suffixes=_2"),
               std::string::npos);
-    for (const auto& field : {"init_ms", "root_identity_ms", "lock_wait_ms",
+    for (const auto& field : {"init_ms", "root_identity_ms",
                               "create_ms", "write_ms",
                               "write_total_ms", "sync_ms", "delete_ms"}) {
         ExpectProbeTiming(write_log, field);
     }
 
-    // Root validation fails before either file I/O or the write lock is reached.
+    // Root validation fails before any probe file I/O is reached.
     {
         std::ofstream marker(tmp_->file(kDfsRootIdentityFileName),
                              std::ios::binary | std::ios::trunc);
@@ -1925,7 +1925,7 @@ TEST_F(DfsBackendTest, ZeroBudgetLogsPreserveReadAndWriteResults) {
     ASSERT_FALSE(logged_bad_root_write.has_value());
     EXPECT_EQ(bad_root_write.error(), logged_bad_root_write.error());
     ExpectProbeTiming(logs.Last(), "root_identity_ms");
-    EXPECT_NE(logs.Last().find(" lock_wait_ms=-1"), std::string::npos);
+    EXPECT_NE(logs.Last().find(" create_ms=-1"), std::string::npos);
     EXPECT_NE(logs.Last().find(" probe_suffix=none"), std::string::npos);
 }
 
@@ -1949,7 +1949,7 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
    public:
     void FailNextFileCreate() { fail_file_create_.store(true); }
     void FailNextSync() { fail_sync_ = true; }
-    void FailNextDelete() { fail_delete_ = true; }
+    void FailNextDelete(int calls = 1) { fail_delete_calls_ = calls; }
     const std::vector<std::string>& DeletedPaths() const { return deleted_paths_; }
 
     tl::expected<void, ErrorCode> SyncFile(const std::string& path) override {
@@ -1961,7 +1961,8 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
 
     tl::expected<void, ErrorCode> DeleteFile(const std::string& path) override {
         deleted_paths_.push_back(path);
-        if (std::exchange(fail_delete_, false)) {
+        if (fail_delete_calls_ > 0) {
+            --fail_delete_calls_;
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
         return PosixFsAdapter::DeleteFile(path);
@@ -2065,7 +2066,7 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
 
    private:
     bool fail_sync_ = false;
-    bool fail_delete_ = false;
+    int fail_delete_calls_ = 0;
     std::vector<std::string> deleted_paths_;
     std::atomic<bool> fail_file_create_{false};
     std::atomic<int> open_calls_{0};
@@ -2137,7 +2138,7 @@ TEST_F(DfsBackendTest, ZeroBudgetLogsWriteFailureCleanupOrder) {
     auto backend = MakeControlledBackend(tmp_->path(), &adapter);
     ASSERT_TRUE(backend->Init().has_value());
     ScopedProbeLogs logs;
-    ASSERT_TRUE(backend->ProbeWrite().has_value());  // Keep _1 active.
+    ASSERT_TRUE(backend->ProbeWrite().has_value());
 
     adapter->FailNextSync();
     const auto sync_failure = backend->ProbeWrite();
@@ -2149,23 +2150,24 @@ TEST_F(DfsBackendTest, ZeroBudgetLogsWriteFailureCleanupOrder) {
     EXPECT_NE(logs.Last().find(" delete_calls=1 probe_suffix=_3 deleted_probe_suffixes=_3"),
               std::string::npos);
 
-    adapter->FailNextDelete();
+    adapter->FailNextDelete(2);
     const auto delete_failure = backend->ProbeWrite();
-    adapter->FailNextDelete();
+    adapter->FailNextDelete(2);
     const auto logged_delete_failure = backend->ProbeWrite(0);
     ASSERT_FALSE(delete_failure.has_value());
     ASSERT_FALSE(logged_delete_failure.has_value());
     EXPECT_EQ(logged_delete_failure.error(), delete_failure.error());
-    EXPECT_NE(logs.Last().find(" delete_calls=2 probe_suffix=_5 deleted_probe_suffixes=_1,_4"),
+    EXPECT_NE(logs.Last().find(" delete_calls=2 probe_suffix=_5 deleted_probe_suffixes=_5,_5"),
               std::string::npos);
     const auto& paths = adapter->DeletedPaths();
-    ASSERT_EQ(paths.size(), 5u);
+    ASSERT_EQ(paths.size(), 7u);
     for (size_t i = 0; i < paths.size(); ++i) {
         EXPECT_TRUE(paths[i].ends_with(
-            std::array{"_2", "_3", "_1", "_1", "_4"}[i]));
+            std::array{"_1", "_2", "_3", "_4", "_4", "_5", "_5"}[i]));
     }
+    adapter->FailNextDelete();  // A successful retry keeps the probe successful.
     ASSERT_TRUE(backend->ProbeWrite(0).has_value());
-    EXPECT_NE(logs.Last().find(" delete_calls=2 probe_suffix=_6 deleted_probe_suffixes=_1,_5"),
+    EXPECT_NE(logs.Last().find(" delete_calls=2 probe_suffix=_6 deleted_probe_suffixes=_6,_6"),
               std::string::npos);
 
     adapter->FailNextFileCreate();
@@ -2269,21 +2271,21 @@ TEST_F(DfsBackendTest, BlockedProbeFileIoDoesNotBlockReplacement) {
         ASSERT_TRUE(backend->Init());
         std::future<bool> first, replacement;
         auto gate = std::make_shared<ProbeIoGate>();
-        auto old_file_deletes = std::make_shared<std::atomic<int>>(0);
+        auto own_file_deletes = std::make_shared<std::atomic<int>>(0);
         auto block_new_file = [gate](const std::string& path) {
             if (path.ends_with("_2")) gate->BlockOnce();
         };
         if (operation == "write") controlled->before_write = block_new_file;
         if (operation == "sync") controlled->before_sync = block_new_file;
         controlled->before_delete =
-            [gate, old_file_deletes, operation](const std::string& path) {
-                if (path.ends_with("_1")) {
-                    ++*old_file_deletes;
+            [gate, own_file_deletes, operation](const std::string& path) {
+                if (path.ends_with("_2")) {
+                    ++*own_file_deletes;
                     if (operation == "delete") gate->BlockOnce();
                 }
             };
         ReleaseProbeIoGate release{gate};
-        ASSERT_TRUE(backend->ProbeWrite());  // Retain _1 before creating _2.
+        ASSERT_TRUE(backend->ProbeWrite());  // Round _1 cleans up its own file.
         first = std::async(std::launch::async,
                            [&] { return backend->ProbeWrite().has_value(); });
         ASSERT_TRUE(gate->WaitUntilBlocked());
@@ -2292,11 +2294,20 @@ TEST_F(DfsBackendTest, BlockedProbeFileIoDoesNotBlockReplacement) {
         ASSERT_EQ(replacement.wait_for(std::chrono::seconds(5)),
                   std::future_status::ready);
         EXPECT_TRUE(replacement.get());
-        EXPECT_EQ(old_file_deletes->load(), 1);
+        EXPECT_EQ(own_file_deletes->load(), operation == "delete" ? 1 : 0);
+        // The replacement must not touch the older round's live file.
+        size_t pending_files = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(tmp_->path())) {
+            const auto name = entry.path().filename().string();
+            if (!name.starts_with(".mooncake_dfs_health_probe_")) continue;
+            ++pending_files;
+            EXPECT_TRUE(name.ends_with("_2"));
+        }
+        EXPECT_EQ(pending_files, operation == "write" ? 0u : 1u);
         gate->Release();
         EXPECT_TRUE(first.get());
 
-        // A late _2 completion must retire itself, never replace/delete _3.
+        // Both rounds clean up independently, including a late completion.
         std::vector<std::string> files;
         for (const auto& entry : std::filesystem::directory_iterator(tmp_->path())) {
             const auto name = entry.path().filename().string();
@@ -2304,11 +2315,9 @@ TEST_F(DfsBackendTest, BlockedProbeFileIoDoesNotBlockReplacement) {
                 files.push_back(name);
             }
         }
-        ASSERT_EQ(files.size(), 1u);
-        EXPECT_TRUE(files[0].ends_with("_3"));
-        EXPECT_EQ(old_file_deletes->load(), 1);
+        EXPECT_TRUE(files.empty());
+        EXPECT_EQ(own_file_deletes->load(), 1);
         ASSERT_TRUE(backend->ProbeWrite());
-        EXPECT_FALSE(std::filesystem::exists(tmp_->file(files[0])));
         // No async calls remain; teardown no longer needs these hooks.
         controlled->before_write = {};
         controlled->before_sync = {};
@@ -2352,29 +2361,36 @@ TEST_F(DfsBackendTest, ProbeDoesNotEagerlyOpenCachedReadOnlyShard) {
     controlled->before_close = {};
 }
 
-TEST_F(DfsBackendTest, FailedProbeCleanupIsRetriedAndRemovedOnTeardown) {
-    ControlledPosixFsAdapter* adapter = nullptr;
-    auto backend = MakeControlledBackend(tmp_->path(), &adapter);
-    ASSERT_TRUE(backend->Init());
-    adapter->FailNextSync();
-    adapter->FailNextDelete();
-    ASSERT_FALSE(backend->ProbeWrite());
-    ASSERT_EQ(adapter->DeletedPaths().size(), 1u);
-    const auto failed_path = adapter->DeletedPaths()[0];
-    EXPECT_TRUE(std::filesystem::exists(failed_path));
-    ASSERT_TRUE(backend->ProbeWrite());
-    EXPECT_FALSE(std::filesystem::exists(failed_path));
-    ASSERT_EQ(adapter->DeletedPaths().size(), 2u);
-    EXPECT_EQ(adapter->DeletedPaths()[1], failed_path);
-    adapter->FailNextDelete();
-    ASSERT_FALSE(backend->ProbeWrite());
-    const auto retired_path = adapter->DeletedPaths().back();
-    EXPECT_TRUE(std::filesystem::exists(retired_path));
-    backend.reset();
-    EXPECT_FALSE(std::filesystem::exists(retired_path));
-    for (const auto& entry : std::filesystem::directory_iterator(tmp_->path())) {
-        EXPECT_FALSE(entry.path().filename().string().starts_with(
-            ".mooncake_dfs_health_probe_"));
+TEST_F(DfsBackendTest, FailedProbeCleanupRetriesOnceWithoutCrossRoundCleanup) {
+    for (const std::string failure : {"delete", "sync", "create"}) {
+        SCOPED_TRACE(failure);
+        ControlledPosixFsAdapter* adapter = nullptr;
+        auto backend = MakeControlledBackend(tmp_->path(), &adapter);
+        ASSERT_TRUE(backend->Init());
+        if (failure == "sync") adapter->FailNextSync();
+        if (failure == "create") adapter->FailNextFileCreate();
+        adapter->FailNextDelete(2);
+        ScopedProbeLogs logs;
+        const auto result = backend->ProbeWrite();
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), ErrorCode::FILE_WRITE_FAIL);
+        ASSERT_EQ(adapter->DeletedPaths().size(), 2u);
+        const auto failed_path = adapter->DeletedPaths()[0];
+        EXPECT_EQ(adapter->DeletedPaths()[1], failed_path);
+        EXPECT_EQ(std::filesystem::exists(failed_path), failure != "create");
+        // The warning is unconditional, even with the normal 25s log budget.
+        EXPECT_NE(logs.Last().find("cleanup failed after 2 attempts"),
+                  std::string::npos);
+        EXPECT_NE(logs.Last().find(failed_path), std::string::npos);
+        EXPECT_NE(logs.Last().find(" error="), std::string::npos);
+
+        ASSERT_TRUE(backend->ProbeWrite());
+        ASSERT_EQ(adapter->DeletedPaths().size(), 3u);
+        EXPECT_NE(adapter->DeletedPaths()[2], failed_path);
+        EXPECT_FALSE(std::filesystem::exists(adapter->DeletedPaths()[2]));
+        EXPECT_EQ(std::filesystem::exists(failed_path), failure != "create");
+        backend.reset();
+        EXPECT_EQ(std::filesystem::exists(failed_path), failure != "create");
     }
 }
 

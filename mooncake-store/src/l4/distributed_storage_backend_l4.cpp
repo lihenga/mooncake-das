@@ -274,16 +274,11 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite(
     FileWriteTimings write_timings;
     double init_ms = -1;
     double root_identity_ms = -1;
-    double lock_wait_ms = -1;
     double sync_ms = -1;
     double delete_ms = -1;
     size_t delete_calls = 0;
     std::string probe_suffix = "none";
     std::string deleted_probe_suffixes;
-    auto lock_probe_state = [&] {
-        ProbeStageTimer timer(lock_wait_ms);
-        return std::unique_lock(health_probe_write_mutex_);
-    };
     auto delete_probe = [&](const std::string& path) {
         const auto delete_started = std::chrono::steady_clock::now();
         auto deleted = fs_adapter_->DeleteFile(path);
@@ -295,6 +290,23 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite(
         deleted_probe_suffixes += path.substr(health_probe_path_prefix_.size());
         return deleted;
     };
+    auto cleanup_probe = [&](const std::string& path)
+        -> tl::expected<void, ErrorCode> {
+        auto deleted = delete_probe(path);
+        if (!deleted && deleted.error() != ErrorCode::FILE_NOT_FOUND) {
+            deleted = delete_probe(path);  // At most one retry, in this round.
+        }
+        if (!deleted && deleted.error() != ErrorCode::FILE_NOT_FOUND) {
+            // Leave any residue after the retry. Later rounds and teardown do
+            // not take over this round's cleanup. Missing files are already clean.
+            LOG(WARNING) << "Mooncake DFS native probe cleanup failed "
+                            "after 2 attempts: "
+                         << "path=" << path
+                         << " error=" << toInt(deleted.error());
+            return deleted;
+        }
+        return {};
+    };
     // Collect early error returns as well as success through one timing check.
     auto result = [&]() -> tl::expected<void, ErrorCode> {
         auto initialized = [&] {
@@ -304,33 +316,24 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite(
         if (!initialized) return initialized;
         if (UsesObjectStorage()) return {};
 
-        uint64_t generation;
-        {
-            auto lock = lock_probe_state();
-            generation = ++health_probe_generation_;
-        }
-        // Use a new path each round: deleting the previous file first could free
-        // just enough space for the probe to pass on an otherwise full filesystem.
+        // Rounds are independent: create, write, sync, then delete only this
+        // round's file. Unique names also isolate overlapping timed-out probes;
+        // no probe lock, retained file, or cross-round cleanup queue is needed.
+        const auto generation =
+            health_probe_generation_.fetch_add(1, std::memory_order_relaxed) + 1;
         probe_suffix = "_" + std::to_string(generation);
         const std::string new_probe_path = health_probe_path_prefix_ + probe_suffix;
-        auto cleanup_new_probe = [&] {
-            auto deleted = delete_probe(new_probe_path);
-            if (!deleted && deleted.error() != ErrorCode::FILE_NOT_FOUND) {
-                auto lock = lock_probe_state();
-                health_probe_cleanup_.emplace(generation, false);
-            }
-        };
         auto write_result = fs_adapter_->WriteFile(
             new_probe_path,
             std::span<const char>(kDfsHealthProbePayload,
                                   sizeof(kDfsHealthProbePayload) - 1),
             &write_timings);
         if (!write_result) {
-            cleanup_new_probe();
+            (void)cleanup_probe(new_probe_path);
             return tl::make_unexpected(write_result.error());
         }
         if (*write_result != sizeof(kDfsHealthProbePayload) - 1) {
-            cleanup_new_probe();
+            (void)cleanup_probe(new_probe_path);
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
         const auto sync_started = std::chrono::steady_clock::now();
@@ -338,49 +341,8 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite(
         sync_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - sync_started).count();
         if (!sync_result) {
-            cleanup_new_probe();
+            (void)cleanup_probe(new_probe_path);
             return sync_result;
-        }
-
-        std::vector<uint64_t> cleanup;
-        {
-            auto lock = lock_probe_state();
-            // Completion may be out of order. Only a newer generation may
-            // replace the retained file; an older completion retires itself.
-            if (generation > active_health_probe_generation_) {
-                if (active_health_probe_generation_ != 0) {
-                    health_probe_cleanup_.emplace(
-                        active_health_probe_generation_, false);
-                }
-                active_health_probe_generation_ = generation;
-                active_health_probe_path_ = new_probe_path;
-            } else {
-                health_probe_cleanup_.emplace(generation, false);
-            }
-            for (auto& [retired, in_progress] : health_probe_cleanup_) {
-                if (in_progress) continue;
-                in_progress = true;
-                cleanup.push_back(retired);
-            }
-        }
-        ErrorCode cleanup_error = ErrorCode::OK;
-        for (uint64_t retired : cleanup) {
-            auto deleted = delete_probe(health_probe_path_prefix_ + "_" +
-                                        std::to_string(retired));
-            auto lock = lock_probe_state();
-            if (deleted || deleted.error() == ErrorCode::FILE_NOT_FOUND) {
-                health_probe_cleanup_.erase(retired);
-            } else {
-                // Do not roll back the active path: another probe may already
-                // have replaced it. Keep failed deletions for a later retry.
-                health_probe_cleanup_.at(retired) = false;
-                if (cleanup_error == ErrorCode::OK) {
-                    cleanup_error = deleted.error();
-                }
-            }
-        }
-        if (cleanup_error != ErrorCode::OK) {
-            return tl::make_unexpected(cleanup_error);
         }
 
         // Probe only the dedicated health file in both allocator modes.
@@ -388,7 +350,7 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite(
         // GetOrOpenShard/ExecuteSingleIo already recover fds on demand, so
         // probing must not traverse cached shards, acquire their I/O locks, or
         // eagerly reopen files and couple root health to a busy/broken shard.
-        return {};
+        return cleanup_probe(new_probe_path);
     }();
     const auto finished_at = std::chrono::steady_clock::now();
     const auto finished_at_unix_ms =
@@ -405,7 +367,6 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite(
                      << " elapsed_ms=" << elapsed_ms
                      << " init_ms=" << init_ms
                      << " root_identity_ms=" << root_identity_ms
-                     << " lock_wait_ms=" << lock_wait_ms
                      << " create_ms=" << write_timings.create_ms
                      << " write_ms=" << write_timings.write_ms
                      << " write_total_ms=" << write_timings.write_total_ms
