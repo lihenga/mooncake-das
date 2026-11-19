@@ -455,31 +455,52 @@ TEST_F(DfsBucketBackendTest, HeartbeatBindingKeepsMountAndCachedEpochChecks) {
 }
 
 TEST_F(DfsBucketBackendTest,
-       BucketEpochMustMatchHeartbeatEvenWithSameIdentity) {
+       ConfirmedEpochAdvancesWhenMasterStopsPublishingHeartbeatBindings) {
     const std::string key = "epoch_binding";
     const std::string value(4096, 'A');
     auto desc = WriteObject(key, value);
     const UUID old_epoch{9, 1};
     const UUID new_epoch{9, 2};
     UUID master_epoch = old_epoch;
-    backend_->SetMasterEpochProvider(
-        [&]() -> tl::expected<UUID, ErrorCode> { return master_epoch; });
+    int confirmations = 0;
+    backend_->SetMasterEpochProvider([&]() -> tl::expected<UUID, ErrorCode> {
+        ++confirmations;
+        return master_epoch;
+    });
     ASSERT_TRUE(
         backend_->UpdateDfsRootBinding({kTestDfsRootIdentity, old_epoch}));
     desc.master_epoch = old_epoch;
     ASSERT_EQ(ReadObject(key, desc), value);
 
     master_epoch = new_epoch;
+    // Model failover to a Master that serves descriptor epochs but omits the
+    // optional Ping binding. The retained binding stays on old_epoch.
     auto early = backend_->AcquireBucketEpoch(new_epoch);
-    ASSERT_FALSE(early);
-    EXPECT_EQ(early.error(), ErrorCode::DFS_STALE_HANDLE);
+    ASSERT_TRUE(early);
+    early->unlock();
+    const int confirmed = confirmations;
+    auto cached = backend_->AcquireBucketEpoch(new_epoch);
+    ASSERT_TRUE(cached);
+    EXPECT_EQ(confirmations, confirmed);
+    cached->unlock();
 
-    ASSERT_TRUE(
-        backend_->UpdateDfsRootBinding({kTestDfsRootIdentity, new_epoch}));
     auto stale = backend_->AcquireBucketEpoch(old_epoch);
     ASSERT_FALSE(stale);
     EXPECT_EQ(stale.error(), ErrorCode::DFS_STALE_HANDLE);
     desc.master_epoch = new_epoch;
+    auto written = backend_->BatchWrite(
+        {{key, desc, {{const_cast<char*>(value.data()), value.size()}}}});
+    ASSERT_TRUE(written[0]);
+    EXPECT_EQ(ReadObject(key, desc), value);
+
+    // Provider confirmation must not rewrite Ping's binding with new_epoch.
+    // A later Ping may carry a changed identity for that very same epoch.
+    const auto new_identity =
+        SerializeDfsRootIdentity("dfs_backend_test", UUID{5, 6});
+    ASSERT_TRUE(backend_->UpdateDfsRootBinding({new_identity, new_epoch}));
+    EXPECT_FALSE(backend_->ProbeRead());
+    WriteTestDfsRootIdentity(tmp_->path(), new_identity);
+    WriteTestDfsReadProbe(tmp_->path(), new_identity);
     EXPECT_EQ(ReadObject(key, desc), value);
 }
 
@@ -590,6 +611,8 @@ TEST_F(DfsBucketBackendTest, MasterEpochReopensReusedBucketBeforeReadAndWrite) {
         ++confirmations;
         return current_epoch;
     });
+    ASSERT_TRUE(
+        backend_->UpdateDfsRootBinding({kTestDfsRootIdentity, current_epoch}));
     old_desc.master_epoch = current_epoch;
     auto write = [&](const DistributedFSDescriptor& desc,
                      const std::string& value) {
@@ -611,6 +634,8 @@ TEST_F(DfsBucketBackendTest, MasterEpochReopensReusedBucketBeforeReadAndWrite) {
         replacement.put('\0');
         ASSERT_TRUE(replacement.good());
     }
+    // The Master restarted while its next Ping has not arrived. Keep the old
+    // binding throughout both reads and writes against the recreated bucket.
     current_epoch = UUID{1, 2};
     auto new_desc = old_desc;
     new_desc.master_epoch = current_epoch;

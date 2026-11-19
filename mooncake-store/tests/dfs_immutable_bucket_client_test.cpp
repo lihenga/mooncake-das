@@ -928,7 +928,8 @@ TEST_F(DfsBucketEpochClientTest,
     EXPECT_EQ(stale[0].error(), ErrorCode::DFS_STALE_HANDLE);
 }
 
-TEST_F(DfsBucketEpochClientTest, MasterRestartReusesBucketAfterEpochBinding) {
+TEST_F(DfsBucketEpochClientTest,
+       MasterRestartReusesBucketWithoutWaitingForHeartbeat) {
     const std::string key = "restart_reused_bucket";
     std::string old_value(4096, 'O');
     std::string new_value(4096, 'N');
@@ -971,18 +972,6 @@ TEST_F(DfsBucketEpochClientTest, MasterRestartReusesBucketAfterEpochBinding) {
         ASSERT_TRUE(connected);
     }
     ASSERT_TRUE(provider_->MountSegment(segment_, segment_size_, "tcp"));
-    auto snapshot = writer_->GetDfsBucketSnapshot({}, 0);
-    ASSERT_TRUE(snapshot);
-    const auto binding_deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    auto epoch_guard = backend_->AcquireBucketEpoch(snapshot->epoch);
-    while (!epoch_guard &&
-           std::chrono::steady_clock::now() < binding_deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        epoch_guard = backend_->AcquireBucketEpoch(snapshot->epoch);
-    }
-    ASSERT_TRUE(epoch_guard);
-    epoch_guard->unlock();
     std::vector<std::vector<Slice>> new_slices{
         {{new_value.data(), new_value.size()}}};
     auto puts = writer_->BatchPut({key}, new_slices, DfsConfig());

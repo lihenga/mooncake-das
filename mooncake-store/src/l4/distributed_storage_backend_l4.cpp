@@ -81,8 +81,8 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ValidateRootIdentity(
     // new identity while old I/O owns that guard, but it cannot relabel its
     // FDs.
     if (guarded_epoch != UUID{} &&
-        (bucket_epoch_identity_ != binding->identity ||
-         (binding->epoch != UUID{} && binding->epoch != guarded_epoch))) {
+        (bucket_epoch_ != guarded_epoch ||
+         bucket_epoch_identity_ != binding->identity)) {
         return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
     }
     return ValidateRootIdentity(*binding, root_dir_);
@@ -390,14 +390,8 @@ DistributedStorageBackend::AcquireBucketEpoch(const UUID& epoch) {
     if (!initialized_.load(std::memory_order_acquire)) {
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
-    const auto matches_epoch = [&epoch](const DfsRootBinding& binding) {
-        return binding.epoch == UUID{} || binding.epoch == epoch;
-    };
     std::shared_lock read_lock(bucket_epoch_mutex_);
     auto binding = std::atomic_load(&root_binding_);
-    if (!matches_epoch(*binding)) {
-        return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
-    }
     if (epoch == bucket_epoch_ && binding->identity == bucket_epoch_identity_) {
         if (epoch == UUID{} && master_epoch_provider_) {
             return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
@@ -416,7 +410,7 @@ DistributedStorageBackend::AcquireBucketEpoch(const UUID& epoch) {
     std::unique_lock confirmation_lock(bucket_epoch_confirmation_mutex_);
     read_lock.lock();
     binding = std::atomic_load(&root_binding_);
-    if (!matches_epoch(*binding) || retired_bucket_epochs_.contains(epoch)) {
+    if (retired_bucket_epochs_.contains(epoch)) {
         return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
     }
     if (epoch == bucket_epoch_ && binding->identity == bucket_epoch_identity_) {
@@ -444,9 +438,8 @@ DistributedStorageBackend::AcquireBucketEpoch(const UUID& epoch) {
         return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
     }
     binding = std::atomic_load(&root_binding_);
-    if (!matches_epoch(*binding)) {
-        return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
-    }
+    // Ping can lag a restart or come from a Master without root bindings.
+    // Keep its identity snapshot; the provider confirmed the business epoch.
     auto directory = std::make_shared<DfsRootDirectory>(root_dir_);
     if (directory->fd < 0) {
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);

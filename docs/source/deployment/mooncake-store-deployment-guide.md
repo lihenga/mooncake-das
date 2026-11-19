@@ -1003,8 +1003,19 @@ or tests, explicitly allow the filesystem used by the test root.
 When a verified bucket root is initialized with a new identity, an upgraded
 Master publishes the identity and bucket epoch through the regular heartbeat.
 Upgraded clients resume DFS access once their local root exposes the same
-identity. Replacing the mount or directory starts a new allocator generation
-and invalidates references to the old DFS replicas.
+identity. If a descriptor carries a different bucket epoch before the next
+heartbeat, the client can confirm it with the current Master, validate its
+local identity, and switch bucket handles. This also supports a Master that
+serves descriptor epochs while omitting the optional heartbeat binding.
+An identity change still requires the client to receive the matching identity.
+
+When a mount or directory changes, the Master checks the identity, root marker,
+and known bucket data files through the newly verified directory FD. If the
+nonempty buckets remain present, it preserves live replicas and the allocator's
+in-memory index, discards missing empty buckets, and switches the directory FD
+and epoch. A missing identity, marker, or nonempty bucket triggers a fresh
+allocator generation and invalidates the old DFS replica references. These
+online checks work with bucket recovery disabled.
 
 #### Restarting without recovering old DFS bucket replicas
 
