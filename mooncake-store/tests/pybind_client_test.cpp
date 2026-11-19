@@ -43,6 +43,7 @@
 #include "nof/nvmeof_initiator.h"
 #include "tenant_id.h"
 #include "test_server_helpers.h"
+#include "dfs_test_helpers.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
@@ -578,6 +579,8 @@ class RealClientDfsPrefetchTest : public RealClientTest {
         ASSERT_NE(created, nullptr);
         ssd_path_ = created;
         dfs_root_.emplace("MOONCAKE_DFS_ROOT_DIR", ssd_path_.c_str());
+        allowed_fs_types_.emplace("MOONCAKE_DFS_ALLOWED_FS_TYPES",
+                                  GetDfsTestFilesystemType(ssd_path_).c_str());
 
         ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
                                       .set_default_kv_lease_ttl(1000)
@@ -731,6 +734,7 @@ class RealClientDfsPrefetchTest : public RealClientTest {
     }
 
     std::optional<ScopedEnvVar> dfs_root_;
+    std::optional<ScopedEnvVar> allowed_fs_types_;
     std::vector<std::string> sources_;
 };
 

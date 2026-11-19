@@ -31,6 +31,7 @@
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #include "test_server_helpers.h"
+#include "dfs_test_helpers.h"
 #include "utils.h"
 
 namespace mooncake::test {
@@ -261,6 +262,8 @@ class DfsImmutableBucketClientTest : public ::testing::Test {
         SetEnv("MOONCAKE_DFS_FS_ADAPTER", "posix");
         SetEnv("MOONCAKE_DFS_ROOT_DIR", root_);
         SetEnv("MOONCAKE_DFS_ALLOCATOR", "bucket");
+        SetEnv("MOONCAKE_DFS_ALLOWED_FS_TYPES",
+               testing::GetDfsTestFilesystemType(root_));
         SetEnv("MOONCAKE_DFS_BUCKET_CAPACITY", "4096");
         SetEnv("MOONCAKE_DFS_MAX_BUCKET_COUNT",
                std::to_string(MaxBucketCount()));
@@ -568,6 +571,8 @@ class DfsBucketClientTest : public ::testing::Test {
         SetEnv("MOONCAKE_DFS_FS_ADAPTER", "posix");
         SetEnv("MOONCAKE_DFS_ROOT_DIR", root_);
         SetEnv("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+        SetEnv("MOONCAKE_DFS_ALLOWED_FS_TYPES",
+               testing::GetDfsTestFilesystemType(root_));
         SetEnv("MOONCAKE_DFS_BUCKET_CAPACITY", "1048576");
         SetEnv("MOONCAKE_DFS_MAX_BUCKET_COUNT", "16");
         SetEnv("MOONCAKE_DFS_ALIGNMENT", "4096");

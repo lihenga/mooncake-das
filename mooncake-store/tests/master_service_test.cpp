@@ -53,6 +53,7 @@
 #include "random.h"
 #include "types.h"
 #include "master_service_test_fixture.h"
+#include "dfs_test_helpers.h"
 
 namespace mooncake::test {
 
@@ -237,6 +238,8 @@ class ScopedBucketDfsEnv {
         : enable_dfs_("MOONCAKE_ENABLE_DFS", "1"),
           fs_adapter_("MOONCAKE_DFS_FS_ADAPTER", "posix"),
           root_dir_("MOONCAKE_DFS_ROOT_DIR", root.c_str()),
+          allowed_fs_types_("MOONCAKE_DFS_ALLOWED_FS_TYPES",
+                            testing::GetDfsTestFilesystemType(root).c_str()),
           allocator_type_("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket"),
           bucket_capacity_("MOONCAKE_DFS_BUCKET_CAPACITY", bucket_capacity),
           max_bucket_count_("MOONCAKE_DFS_MAX_BUCKET_COUNT", max_bucket_count),
@@ -254,6 +257,7 @@ class ScopedBucketDfsEnv {
     ScopedEnvVar enable_dfs_;
     ScopedEnvVar fs_adapter_;
     ScopedEnvVar root_dir_;
+    ScopedEnvVar allowed_fs_types_;
     ScopedEnvVar allocator_type_;
     ScopedEnvVar bucket_capacity_;
     ScopedEnvVar max_bucket_count_;
@@ -1559,6 +1563,9 @@ TEST_F(MasterServiceTest, DfsBucketMemoryAllocationFailurePreservesBuckets) {
     ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
     ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
     ScopedEnvVar allocator("MOONCAKE_DFS_ALLOCATOR", "bucket");
+    ScopedEnvVar allowed_fs_types(
+        "MOONCAKE_DFS_ALLOWED_FS_TYPES",
+        testing::GetDfsTestFilesystemType(dfs_root).c_str());
     ScopedEnvVar bucket_capacity("MOONCAKE_DFS_BUCKET_CAPACITY", "8192");
     ScopedEnvVar max_bucket_count("MOONCAKE_DFS_MAX_BUCKET_COUNT", "4");
     ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
@@ -1617,6 +1624,9 @@ TEST_F(MasterServiceTest, DfsBucketUpsertRestoresEvictedReplica) {
     ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
     ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
     ScopedEnvVar allocator("MOONCAKE_DFS_ALLOCATOR", "bucket");
+    ScopedEnvVar allowed_fs_types(
+        "MOONCAKE_DFS_ALLOWED_FS_TYPES",
+        testing::GetDfsTestFilesystemType(dfs_root).c_str());
     ScopedEnvVar bucket_capacity("MOONCAKE_DFS_BUCKET_CAPACITY", "8192");
     ScopedEnvVar max_bucket_count("MOONCAKE_DFS_MAX_BUCKET_COUNT", "2");
     ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
@@ -1730,6 +1740,9 @@ TEST_F(MasterServiceTest, DfsBucketEvictionKeepsBucketWithLeasedMember) {
     ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
     ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
     ScopedEnvVar allocator("MOONCAKE_DFS_ALLOCATOR", "bucket");
+    ScopedEnvVar allowed_fs_types(
+        "MOONCAKE_DFS_ALLOWED_FS_TYPES",
+        testing::GetDfsTestFilesystemType(dfs_root).c_str());
     ScopedEnvVar bucket_capacity("MOONCAKE_DFS_BUCKET_CAPACITY", "8192");
     ScopedEnvVar max_bucket_count("MOONCAKE_DFS_MAX_BUCKET_COUNT", "2");
     ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
@@ -1793,6 +1806,9 @@ TEST_F(MasterServiceTest,
     ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
     ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
     ScopedEnvVar allocator("MOONCAKE_DFS_ALLOCATOR", "bucket");
+    ScopedEnvVar allowed_fs_types(
+        "MOONCAKE_DFS_ALLOWED_FS_TYPES",
+        testing::GetDfsTestFilesystemType(dfs_root).c_str());
     ScopedEnvVar bucket_capacity("MOONCAKE_DFS_BUCKET_CAPACITY", "32768");
     ScopedEnvVar max_bucket_count("MOONCAKE_DFS_MAX_BUCKET_COUNT", "4");
     ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
@@ -5057,6 +5073,9 @@ TEST_F(MasterServiceTest, DfsReadFilterDoesNotBackfillMemoryReplica) {
     ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
     ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
     ScopedEnvVar allocator_type("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+    ScopedEnvVar allowed_fs_types(
+        "MOONCAKE_DFS_ALLOWED_FS_TYPES",
+        testing::GetDfsTestFilesystemType(dfs_root).c_str());
     ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
     ScopedEnvVar bucket_capacity("MOONCAKE_DFS_BUCKET_CAPACITY", "1048576");
     ScopedEnvVar max_bucket_count("MOONCAKE_DFS_MAX_BUCKET_COUNT", "16");
