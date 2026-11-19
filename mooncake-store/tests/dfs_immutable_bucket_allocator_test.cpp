@@ -34,6 +34,7 @@
 #include "replica.h"
 #include "storage/distributed/bucket_entry_layout.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
+#include "storage/distributed/dfs_root_directory.h"
 #include "storage/distributed/shard_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/dfs_allocator_interface.h"
@@ -374,6 +375,85 @@ TEST(ImmutableBucketAllocatorTest,
     ASSERT_TRUE(replacement_allocation.has_value())
         << toString(replacement_allocation.error());
     EXPECT_EQ(replacement_allocation->shard_idx, 1);
+}
+
+TEST(ImmutableBucketAllocatorTest,
+     FreeDuringRootRebindReleasesCommittedAndPendingKeys) {
+    for (const bool committed : {false, true}) {
+        SCOPED_TRACE(committed);
+        TempDir tmp("bucket_rebind_free");
+        auto config = MakeBucketConfig(tmp.path(), kBucketCapacity, 8);
+        ImmutableBucketAllocator alloc;
+        ASSERT_TRUE(alloc.Init(config));
+        auto victim = alloc.Allocate("victim", kBucketCapacity);
+        ASSERT_TRUE(victim);
+        if (committed) {
+            ASSERT_TRUE(alloc.MarkCommitted("victim", *victim));
+        }
+
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool entered = false;
+        bool release = false;
+        alloc.SetBeforeBucketPreallocateHookForTesting([&] {
+            std::unique_lock lock(mutex);
+            entered = true;
+            cv.notify_all();
+            cv.wait(lock, [&] { return release; });
+        });
+        std::vector<BatchAllocateResult> inflight;
+        std::thread allocation([&] {
+            inflight = alloc.BatchAllocate({{"inflight", kAlignment}});
+        });
+        bool reached;
+        {
+            std::unique_lock lock(mutex);
+            reached = cv.wait_for(lock, std::chrono::seconds(5),
+                                  [&] { return entered; });
+        }
+        if (!reached) {
+            {
+                std::lock_guard lock(mutex);
+                release = true;
+            }
+            cv.notify_all();
+            allocation.join();
+            FAIL() << "allocation did not reach the preallocation hook";
+            return;
+        }
+        tl::expected<bool, ErrorCode> rebound = false;
+        std::thread rebind([&] {
+            rebound = alloc.RebindRootDirectory(
+                std::make_shared<DfsRootDirectory>(tmp.path()));
+        });
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (alloc.IsInitialized() &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        const bool paused = !alloc.IsInitialized();
+        alloc.Free("victim", *victim);
+        const bool released_while_paused =
+            !alloc.GetBucketIdForKey("victim").has_value();
+        {
+            std::lock_guard lock(mutex);
+            release = true;
+        }
+        cv.notify_all();
+        allocation.join();
+        rebind.join();
+        ASSERT_TRUE(paused);
+        ASSERT_TRUE(rebound);
+        ASSERT_TRUE(*rebound);
+        EXPECT_TRUE(released_while_paused);
+        ASSERT_EQ(inflight.size(), 1u);
+        if (inflight[0].success) {
+            alloc.Free("inflight", inflight[0].descriptor);
+        }
+        EXPECT_FALSE(alloc.GetBucketIdForKey("victim").has_value());
+        EXPECT_TRUE(alloc.Allocate("victim", kAlignment).has_value());
+    }
 }
 
 std::string BucketDataFile(const TempDir& tmp, int64_t bucket_id) {

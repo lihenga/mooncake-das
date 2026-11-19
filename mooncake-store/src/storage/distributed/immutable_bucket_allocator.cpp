@@ -1617,9 +1617,11 @@ bool ImmutableBucketAllocator::MarkCommitted(
 
 void ImmutableBucketAllocator::Free(const std::string& key,
                                  const DistributedFSDescriptor& descriptor) {
-    if (!initialized_.load(std::memory_order_acquire)) return;
-
+    // Root rebinding pauses admission while retaining entries. Memory-only
+    // cleanup must still release those entries during that pause.
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_.load(std::memory_order_acquire) && buckets_.empty())
+        return;
     BucketPtr bucket;
     auto* entry = FindMatchingEntryLocked(key, descriptor, &bucket);
     if (entry == nullptr) {

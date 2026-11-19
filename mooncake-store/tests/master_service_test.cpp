@@ -6433,6 +6433,10 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
         DistributedStorageBackend backend(
             file_config, DistributedStorageConfig::FromEnvironment(),
             std::make_unique<PosixFsAdapter>(), storage->dfs_root_identity);
+        backend.SetMasterEpochProvider(
+            [&initial_service]() -> tl::expected<UUID, ErrorCode> {
+                return initial_service.GetDfsMasterEpoch();
+            });
         ASSERT_TRUE(backend.Init());
         std::string value(4096, 'R');
         auto written = backend.BatchWrite({{"retry_existing",
@@ -6842,6 +6846,8 @@ TEST_F(MasterServiceTest,
 
     {
         MasterService service;
+        // Let allocation observe the fault before the root guard handles it.
+        MasterServiceTestPeer::SetDfsRootStatErrorForTesting(service, EIO);
         const auto context = PrepareSimpleSegment(service);
         ReplicateConfig config;
         config.replica_num = 1;
@@ -6857,6 +6863,8 @@ TEST_F(MasterServiceTest,
                         .has_value());
 
         std::filesystem::rename(root, moved_root);
+        // Unlink the pinned directory so bucket creation itself fails.
+        std::filesystem::remove_all(moved_root);
         std::ofstream blocker(root, std::ios::binary);
         ASSERT_TRUE(blocker.good());
         blocker.close();
