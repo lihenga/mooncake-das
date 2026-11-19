@@ -1701,8 +1701,7 @@ class MasterService {
         bool require_allowed_type);
     bool RecoverDfsRootAfterReplacement(
         const std::string& root, const std::string& identity,
-        std::shared_ptr<const DfsRootDirectory> directory,
-        bool directory_changed);
+        std::shared_ptr<const DfsRootDirectory> directory);
     size_t DropDfsReplicasAfterRootReplacement();
     void ReconcileDfsRootFiles();
     void InitKvcsDfsEviction();

@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -169,6 +170,13 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     // operations drain. The caller keeps the retired object alive meanwhile.
     std::unique_ptr<ImmutableBucketAllocator>
     RetireAndCreateReplacementAllocator();
+
+    // Rebind live in-memory state after checking the replacement directory.
+    // False means a nonempty bucket is missing and a fresh allocator is needed.
+    // On failure the allocator stays paused until recovery retries or retires
+    // it.
+    tl::expected<bool, ErrorCode> RebindRootDirectory(
+        std::shared_ptr<const DfsRootDirectory> root);
 
     bool IsInitialized() const override {
         return initialized_.load(std::memory_order_acquire);
@@ -526,6 +534,9 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
 
     uint64_t UsedBytesLocked() const;
 
+    // Filesystem operations take this after metadata_io_mutex_ (when needed),
+    // and release it before reacquiring mutex_ after bucket preallocation.
+    mutable std::shared_mutex directory_io_mutex_;
     std::shared_ptr<const DfsRootDirectory> root_directory_;
     std::string fsdir_;
     std::string descriptor_fsdir_;

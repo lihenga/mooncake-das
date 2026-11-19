@@ -6046,6 +6046,7 @@ TEST_F(MasterServiceTest,
     const auto old_root = root + "_old";
     const auto replacement_root = root + "_replacement";
     ScopedBucketDfsEnv env(root, "1048576", "16");
+    ScopedEnvVar recovery("MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED", "false");
     ScopedEnvVar guard_interval("MOONCAKE_DFS_ROOT_GUARD_INTERVAL_SECONDS",
                                 "1");
     {
@@ -6098,6 +6099,14 @@ TEST_F(MasterServiceTest,
         std::filesystem::rename(root, old_root);
         std::filesystem::rename(replacement_root, root);
 
+        // The validated replacement must be inspected through its own FD.
+        // The old pinned directory deliberately no longer has the live bucket.
+        ASSERT_TRUE(std::filesystem::remove(
+            std::filesystem::path(old_root) /
+            ("bucket_" +
+             ImmutableBucketAllocator::FormatBucketId(descriptor.shard_idx) +
+             ".data")));
+
         UUID new_epoch = service.GetDfsMasterEpoch();
         const auto recovery_deadline =
             std::chrono::steady_clock::now() + std::chrono::seconds(8);
@@ -6117,6 +6126,10 @@ TEST_F(MasterServiceTest,
         EXPECT_EQ(preserved_dfs->get_dfs_descriptor().shard_idx,
                   descriptor.shard_idx);
         EXPECT_EQ(preserved_dfs->status, ReplicaStatus::COMPLETE);
+        auto present = MasterServiceTestPeer::IsDfsBucketDataFilePresent(
+            service, descriptor.shard_idx);
+        ASSERT_TRUE(present.has_value());
+        EXPECT_TRUE(*present);
         const auto tracked_after_recovery = MasterServiceTestPeer::GetTrackedDfsBucketIds(service);
         EXPECT_EQ(std::find(tracked_after_recovery.begin(),
                             tracked_after_recovery.end(), empty_bucket_id),
@@ -6127,6 +6140,48 @@ TEST_F(MasterServiceTest,
     std::filesystem::remove_all(root, ec);
     std::filesystem::remove_all(old_root, ec);
     std::filesystem::remove_all(replacement_root, ec);
+}
+
+TEST_F(MasterServiceTest, DfsRootGuardPreservesReplicasWhenMountIdChanges) {
+    const auto root = MakeDfsTestRoot("root_guard_mount_id");
+    ScopedBucketDfsEnv env(root, "1048576", "16");
+    ScopedEnvVar recovery("MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED", "false");
+    ScopedEnvVar guard_interval("MOONCAKE_DFS_ROOT_GUARD_INTERVAL_SECONDS",
+                                "3600");
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+        auto start = service.PutStart(context.client_id, "mount_preserved_key",
+                                      TenantId::Default(), 4096, config);
+        ASSERT_TRUE(start.has_value());
+        const auto* dfs = FindDfsDescriptor(*start);
+        ASSERT_NE(dfs, nullptr);
+        const auto descriptor = dfs->get_dfs_descriptor();
+        ASSERT_TRUE(service
+                        .PutEnd(context.client_id, "mount_preserved_key",
+                                TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+        const auto old_epoch = service.GetDfsMasterEpoch();
+        // Simulate only the guard's observed mount identity changing.
+        MasterServiceTestPeer::ChangeExpectedDfsMountId(service);
+        MasterServiceTestPeer::ReconcileDfsRootFiles(service);
+        EXPECT_TRUE(MasterServiceTestPeer::IsDfsEnabled(service));
+        EXPECT_NE(service.GetDfsMasterEpoch(), UUID{});
+        EXPECT_NE(service.GetDfsMasterEpoch(), old_epoch);
+        auto query = service.GetReplicaListForAdmin("mount_preserved_key",
+                                                    TenantId::Default());
+        ASSERT_TRUE(query.has_value());
+        const auto* preserved = FindDfsDescriptor(query->replicas);
+        ASSERT_NE(preserved, nullptr);
+        EXPECT_EQ(preserved->get_dfs_descriptor().shard_idx,
+                  descriptor.shard_idx);
+        EXPECT_TRUE(std::filesystem::exists(descriptor.file_path));
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
 }
 
 TEST_F(MasterServiceTest, DfsRootRecoveryPreparationDoesNotBlockL3Requests) {

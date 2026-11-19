@@ -428,6 +428,83 @@ ImmutableBucketAllocator::RetireAndCreateReplacementAllocator() {
     return replacement;
 }
 
+tl::expected<bool, ErrorCode> ImmutableBucketAllocator::RebindRootDirectory(
+    std::shared_ptr<const DfsRootDirectory> root) {
+    initialized_.store(false, std::memory_order_release);
+    StopBucketWorkers();
+    {
+        std::unique_lock lock(mutex_);
+        bucket_pool_cv_.wait(
+            lock, [this] { return bucket_creations_in_flight_ == 0; });
+    }
+
+    const std::string new_root = root->PinnedPath();
+    std::vector<int64_t> missing;
+    {
+        std::lock_guard metadata_lock(metadata_io_mutex_);
+        std::unique_lock directory_lock(directory_io_mutex_);
+        auto snapshot = GetBucketIdSnapshot();
+        if (!snapshot) return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        for (const int64_t id : snapshot->bucket_ids) {
+            const auto present =
+                fs_adapter_->FileExists(new_root + "/" + kBucketFilePrefix +
+                                        FormatBucketId(id) + kBucketDataSuffix);
+            if (!present) return tl::make_unexpected(present.error());
+            if (!*present) missing.push_back(id);
+        }
+        {
+            std::lock_guard lock(mutex_);
+            for (const int64_t id : missing) {
+                auto it = buckets_.find(id);
+                if (it != buckets_.end() && it->second->live_bytes != 0) {
+                    LOG(WARNING) << "Replacement DFS root is missing nonempty "
+                                    "bucket "
+                                 << id << ", root=" << new_root;
+                    return false;
+                }
+            }
+            root_directory_ = std::move(root);
+            fsdir_ = new_root;
+            for (const int64_t id : missing) {
+                buckets_.erase(id);
+                std::erase(ready_bucket_ids_, id);
+                RemoveFromLruLocked(id);
+                if (active_bucket_id_ == id) active_bucket_id_ = -1;
+            }
+            PublishBucketIdSnapshotLocked();
+            UpdateBucketPoolMetricsLocked();
+        }
+        for (const int64_t id : missing) {
+            auto removed =
+                fs_adapter_->DeleteFile(new_root + "/" + kBucketFilePrefix +
+                                        FormatBucketId(id) + kBucketMetaSuffix);
+            if (!removed && removed.error() != ErrorCode::FILE_NOT_FOUND)
+                return tl::make_unexpected(removed.error());
+        }
+    }
+    {
+        std::lock_guard lock(mutex_);
+        stop_bucket_workers_ = false;
+    }
+    try {
+        if (ready_bucket_target_ > 0) {
+            for (size_t i = 0; i < bucket_create_concurrency_; ++i) {
+                bucket_create_workers_.emplace_back(
+                    &ImmutableBucketAllocator::BucketCreateWorker, this);
+            }
+        }
+    } catch (const std::system_error& e) {
+        LOG(ERROR) << "Failed to restart DFS bucket workers: " << e.what();
+        StopBucketWorkers();
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    initialized_.store(true, std::memory_order_release);
+    bucket_pool_cv_.notify_all();
+    LOG(INFO) << "Rebound DFS bucket allocator to validated directory, root="
+              << new_root << ", discarded_empty_buckets=" << missing.size();
+    return true;
+}
+
 PersistedBucketMetadata ImmutableBucketAllocator::SnapshotLocked(
     BucketState& bucket) {
     PersistedBucketMetadata snapshot;
@@ -485,6 +562,7 @@ void ImmutableBucketAllocator::SealActiveBucketLocked() {
 
 tl::expected<void, ErrorCode> ImmutableBucketAllocator::PersistMetadata(
     const PersistedBucketMetadata& snapshot) {
+    std::shared_lock directory_lock(directory_io_mutex_);
     if (!fs_adapter_) {
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
@@ -559,6 +637,7 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::PersistMetadata(
 }
 
 void ImmutableBucketAllocator::DeleteBucketFiles(int64_t bucket_id) {
+    std::shared_lock directory_lock(directory_io_mutex_);
     if (!fs_adapter_) return;
     auto meta_result = fs_adapter_->DeleteFile(BucketMetaPath(bucket_id));
     if (!meta_result && meta_result.error() != ErrorCode::FILE_NOT_FOUND) {
@@ -794,8 +873,11 @@ void ImmutableBucketAllocator::BucketCreateWorker() {
 
             lock.unlock();
             const auto create_started = std::chrono::steady_clock::now();
-            auto preallocated = fs_adapter_->PreallocateFile(
-                BucketDataPath(reserved_bucket_id), bucket_capacity_);
+            auto preallocated = [this, reserved_bucket_id] {
+                std::shared_lock directory_lock(directory_io_mutex_);
+                return fs_adapter_->PreallocateFile(
+                    BucketDataPath(reserved_bucket_id), bucket_capacity_);
+            }();
             const auto create_latency_us =
                 std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - create_started)
@@ -917,8 +999,11 @@ ImmutableBucketAllocator::CreateBucketUnlocked(
             before_bucket_preallocate_hook_for_testing_();
         }
         const auto create_started = std::chrono::steady_clock::now();
-        auto result = fs_adapter_->PreallocateFile(
-            BucketDataPath(reservation->bucket_id), bucket_capacity_);
+        auto result = [this, &reservation] {
+            std::shared_lock directory_lock(directory_io_mutex_);
+            return fs_adapter_->PreallocateFile(
+                BucketDataPath(reservation->bucket_id), bucket_capacity_);
+        }();
         preallocated = result.has_value();
         if (!result) error = result.error();
         const auto create_latency_us =
@@ -1015,6 +1100,10 @@ ImmutableBucketAllocator::EnsureActiveBucket(std::unique_lock<std::mutex>& lock,
     };
 
     while (true) {
+        if (stop_bucket_workers_) {
+            observe_rollover();
+            return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+        }
         BucketPtr active;
         if (ActiveBucketHasSpaceLocked(required, &active)) {
             observe_rollover();
@@ -1023,11 +1112,6 @@ ImmutableBucketAllocator::EnsureActiveBucket(std::unique_lock<std::mutex>& lock,
         if (!rollover_started && active_bucket_id_ >= 0) {
             rollover_started = std::chrono::steady_clock::now();
         }
-        if (stop_bucket_workers_) {
-            observe_rollover();
-            return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
-        }
-
         if (ready_bucket_target_ == 0) {
             if (synchronous_creation_in_flight_) {
                 bucket_pool_cv_.wait(lock, [this] {
@@ -1810,6 +1894,7 @@ bool ImmutableBucketAllocator::HasBucket(int64_t bucket_id) const {
 
 tl::expected<bool, ErrorCode>
 ImmutableBucketAllocator::IsBucketDataFilePresent(int64_t bucket_id) const {
+    std::shared_lock directory_lock(directory_io_mutex_);
     if (bucket_id < 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }

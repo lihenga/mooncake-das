@@ -4,6 +4,7 @@
 
 #include "master_service.h"
 #include "rpc_service.h"
+#include "storage/distributed/dfs_root_directory.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
 
 namespace mooncake::test {
@@ -32,6 +33,11 @@ class MasterServiceTestPeer {
     static std::vector<int64_t> GetTrackedDfsBucketIds(MasterService& service) {
         auto snapshot = service.bucket_allocator_->GetBucketIdSnapshot();
         return snapshot ? snapshot->bucket_ids : std::vector<int64_t>{};
+    }
+
+    static tl::expected<bool, ErrorCode> IsDfsBucketDataFilePresent(
+        MasterService& service, int64_t id) {
+        return service.IsDfsBucketDataFilePresent(id);
     }
 
     static std::optional<bool> HasDfsReplicaInMetadata(MasterService& service,
@@ -63,6 +69,15 @@ class MasterServiceTestPeer {
 
     static void ReconcileDfsRootFiles(MasterService& service) {
         service.ReconcileDfsRootFiles();
+    }
+
+    static void ChangeExpectedDfsMountId(MasterService& service) {
+        std::lock_guard lock(service.dfs_root_guard_mutex_);
+        auto directory =
+            std::make_shared<DfsRootDirectory>(service.dfs_root_guard_path_);
+        directory->inode = service.dfs_root_guard_directory_->inode;
+        directory->mount_id = 0;
+        service.dfs_root_guard_directory_ = std::move(directory);
     }
 
     static bool IsDfsEnabled(const MasterService& service) {

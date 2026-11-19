@@ -525,7 +525,7 @@ size_t MasterService::DropDfsReplicasAfterRootReplacement() {
 
 bool MasterService::RecoverDfsRootAfterReplacement(
     const std::string& root, const std::string& identity,
-    std::shared_ptr<const DfsRootDirectory> directory, bool directory_changed) {
+    std::shared_ptr<const DfsRootDirectory> directory) {
     bool expected = false;
     if (!dfs_root_recovery_in_progress_.compare_exchange_strong(
             expected, true, std::memory_order_acq_rel)) {
@@ -578,55 +578,23 @@ bool MasterService::RecoverDfsRootAfterReplacement(
     // The root marker is created by the allocator, independently of the
     // identity. If only the identity was copied into a newly created root,
     // the missing marker proves that the old bucket generation is gone.
-    // A different directory or mount requires a fresh allocator.
-    bool root_lost_data = (directory_changed && bucket_allocator_ != nullptr) ||
-                          identity_status == DfsRootFileStatus::kMissing ||
+    bool root_lost_data = identity_status == DfsRootFileStatus::kMissing ||
                           marker_status == DfsRootFileStatus::kMissing;
+    {
+        std::lock_guard lock(dfs_root_guard_mutex_);
+        root_lost_data = root_lost_data || dfs_root_replacement_lost_data_;
+    }
     if (!root_lost_data && bucket_allocator_ != nullptr) {
-        const auto snapshot = bucket_allocator_->GetBucketIdSnapshot();
-        if (!snapshot) {
-            LOG(ERROR) << "Failed to inspect bucket generation while "
-                          "recovering replacement DFS root, root="
-                       << root;
+        auto rebound = bucket_allocator_->RebindRootDirectory(directory);
+        if (!rebound) {
+            LOG(ERROR) << "Failed to rebind DFS bucket allocator, root=" << root
+                       << ", error=" << rebound.error();
             return false;
         }
-        for (const int64_t bucket_id : snapshot->bucket_ids) {
-            const auto present =
-                bucket_allocator_->IsBucketDataFilePresent(bucket_id);
-            if (!present) {
-                LOG(ERROR) << "Failed to verify bucket " << bucket_id
-                           << " while recovering replacement DFS root, root="
-                           << root << ", error=" << present.error();
-                return false;
-            }
-            if (!*present) {
-                // Ready buckets are only preallocated capacity. Recheck under
-                // the allocator lock because SetMaxBucketCount may have
-                // removed one after this snapshot, or an in-flight allocation
-                // may have promoted it and made the missing file significant.
-                if (bucket_allocator_->DiscardMissingBucketIfEmpty(bucket_id)) {
-                    LOG(WARNING)
-                        << "Replacement DFS root is missing empty bucket "
-                        << bucket_id
-                        << "; discarded it without invalidating live DFS "
-                           "replicas, root="
-                        << root;
-                    continue;
-                }
-                root_lost_data = true;
-                LOG(WARNING) << "Replacement DFS root is missing bucket "
-                             << bucket_id
-                             << "; treating the old storage generation as "
-                                "lost, root="
-                             << root;
-                break;
-            }
-        }
+        root_lost_data = !*rebound;
     }
     {
         std::lock_guard lock(dfs_root_guard_mutex_);
-        root_lost_data =
-            root_lost_data || dfs_root_replacement_lost_data_;
         dfs_root_replacement_lost_data_ = root_lost_data;
     }
     if (identity_status == DfsRootFileStatus::kMissing &&
@@ -775,8 +743,8 @@ void MasterService::ReconcileDfsRootFiles() {
             std::lock_guard lock(dfs_root_guard_mutex_);
             dfs_root_recovery_needed_ = true;
         }
-        (void)RecoverDfsRootAfterReplacement(
-            root, identity, std::move(directory), directory_changed);
+        (void)RecoverDfsRootAfterReplacement(root, identity,
+                                             std::move(directory));
         return;
     }
 
