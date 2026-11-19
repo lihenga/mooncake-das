@@ -1283,6 +1283,13 @@ TEST_F(DfsBucketClientTest, BatchFinalizationKeepsEachKeysEpoch) {
         ASSERT_EQ(starts.size(), 2u);
         ASSERT_TRUE(starts[0]);
         ASSERT_TRUE(starts[1]);
+        const std::string memory_key = revoke ? "memory_revoke" : "memory_end";
+        ReplicateConfig memory_config;
+        memory_config.replica_num = 1;
+        auto memory_start =
+            writer_->StartBatchPutForSizes({memory_key}, {4096}, memory_config);
+        ASSERT_EQ(memory_start.size(), 1u);
+        ASSERT_TRUE(memory_start[0]);
         UUID current_epoch{};
         for (const auto& replica : *starts[1]) {
             if (replica.is_dfs_replica())
@@ -1290,16 +1297,65 @@ TEST_F(DfsBucketClientTest, BatchFinalizationKeepsEachKeysEpoch) {
         }
         ASSERT_NE(current_epoch, UUID{});
         ASSERT_NE(current_epoch, stale_epoch);
-        const std::vector<UUID> epochs{stale_epoch, current_epoch};
+        const std::vector<UUID> epochs{stale_epoch, current_epoch, UUID{}};
         auto results =
-            revoke ? writer_->BatchPutRevoke(keys, ReplicaType::ALL, epochs)
-                   : writer_->BatchPutEnd(
-                         {{keys[0], std::nullopt}, {keys[1], std::nullopt}},
-                         ReplicaType::ALL, epochs);
-        ASSERT_EQ(results.size(), 2u);
+            revoke ? writer_->BatchPutRevoke({keys[0], keys[1], memory_key},
+                                             ReplicaType::ALL, epochs)
+                   : writer_->BatchPutEnd({{keys[0], std::nullopt},
+                                           {keys[1], std::nullopt},
+                                           {memory_key, std::nullopt}},
+                                          ReplicaType::ALL, epochs);
+        ASSERT_EQ(results.size(), 3u);
         ASSERT_FALSE(results[0]);
         EXPECT_EQ(results[0].error(), ErrorCode::INVALID_WRITE);
         EXPECT_TRUE(results[1]);
+        EXPECT_TRUE(results[2]);
+    }
+}
+
+TEST_F(DfsBucketClientTest, BatchFinalizationSharesSoleDfsEpochWithMemoryKeys) {
+    const UUID stale_epoch{0, 1};
+    for (bool revoke : {false, true}) {
+        const std::string memory_key =
+            revoke ? "sole_memory_revoke" : "sole_memory_end";
+        const std::string dfs_key = revoke ? "sole_dfs_revoke" : "sole_dfs_end";
+        ReplicateConfig memory_config;
+        memory_config.replica_num = 1;
+        auto memory_start =
+            writer_->StartBatchPutForSizes({memory_key}, {4096}, memory_config);
+        auto dfs_start =
+            writer_->StartBatchPutForSizes({dfs_key}, {4096}, DfsConfig());
+        ASSERT_EQ(memory_start.size(), 1u);
+        ASSERT_EQ(dfs_start.size(), 1u);
+        ASSERT_TRUE(memory_start[0]);
+        ASSERT_TRUE(dfs_start[0]);
+        UUID epoch{};
+        for (const auto& replica : *dfs_start[0]) {
+            if (replica.is_dfs_replica()) {
+                epoch = replica.get_dfs_descriptor().MasterEpoch();
+            }
+        }
+        ASSERT_NE(epoch, UUID{});
+        ASSERT_NE(epoch, stale_epoch);
+        auto finalize = [&](const UUID& dfs_epoch) {
+            const std::vector<UUID> epochs{UUID{}, dfs_epoch};
+            return revoke ? writer_->BatchPutRevoke({memory_key, dfs_key},
+                                                    ReplicaType::ALL, epochs)
+                          : writer_->BatchPutEnd({{memory_key, std::nullopt},
+                                                  {dfs_key, std::nullopt}},
+                                                 ReplicaType::ALL, epochs);
+        };
+        // The memory key shares the nonempty epoch even when it comes first.
+        auto stale = finalize(stale_epoch);
+        ASSERT_EQ(stale.size(), 2u);
+        for (const auto& result : stale) {
+            ASSERT_FALSE(result);
+            EXPECT_EQ(result.error(), ErrorCode::INVALID_WRITE);
+        }
+        auto current = finalize(epoch);
+        ASSERT_EQ(current.size(), 2u);
+        EXPECT_TRUE(current[0]);
+        EXPECT_TRUE(current[1]);
     }
 }
 

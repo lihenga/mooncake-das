@@ -99,11 +99,18 @@ std::vector<tl::expected<void, ErrorCode>> FinalizeSessionsByEpoch(
     const std::vector<Item>& items, const std::vector<UUID>& epochs,
     Rpc&& rpc) {
     if (epochs.empty()) return rpc(items, UUID{});
-    if (epochs.size() == items.size() &&
-        std::all_of(epochs.begin(), epochs.end(), [&](const UUID& epoch) {
-            return epoch == epochs.front();
-        })) {
-        return rpc(items, epochs.front());
+    if (epochs.size() == items.size()) {
+        const auto first_dfs_epoch =
+            std::find_if(epochs.begin(), epochs.end(),
+                         [](const UUID& epoch) { return epoch != UUID{}; });
+        const UUID common_epoch =
+            first_dfs_epoch == epochs.end() ? UUID{} : *first_dfs_epoch;
+        // Keep one RPC when memory-only keys accompany a single DFS epoch.
+        if (std::all_of(epochs.begin(), epochs.end(), [&](const UUID& epoch) {
+                return epoch == UUID{} || epoch == common_epoch;
+            })) {
+            return rpc(items, common_epoch);
+        }
     }
     std::vector<tl::expected<void, ErrorCode>> results(
         items.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));

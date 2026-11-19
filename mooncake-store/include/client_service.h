@@ -1050,6 +1050,8 @@ class Client {
     // Finalize/revoke a put session for a batch of keys. Thin wrappers over
     // the master client, exposed so RealClient put sessions can end/revoke
     // without touching Client internals. Same RPC path as FinalizeBatchPut.
+    // Empty epoch entries join the sole nonempty epoch, including its stale
+    // epoch check. Multiple nonempty epochs are sent in separate groups.
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const std::vector<ObjectMeta>& object_metas,
         ReplicaType replica_type = ReplicaType::ALL,
