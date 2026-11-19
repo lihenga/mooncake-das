@@ -881,6 +881,12 @@ MasterService::ReserveDfsSpaceForBatch(
         if (epoch == UUID{} || source_allocator == nullptr ||
             !source_allocator->IsInitialized() ||
             dfs_root_recovery_in_progress_.load(std::memory_order_acquire)) {
+            // BatchPutStart needs an explicit per-key error to fall back.
+            for (size_t i = 0; i < keys.size(); ++i) {
+                if (needs_dfs[i]) {
+                    errors_out[keys[i]] = ErrorCode::DFS_SERVICE_UNAVAILABLE;
+                }
+            }
             return reservations;
         }
     }
