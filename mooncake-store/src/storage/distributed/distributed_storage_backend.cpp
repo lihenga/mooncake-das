@@ -177,6 +177,13 @@ DistributedStorageBackend::~DistributedStorageBackend() {
     if (fs_adapter_ && !active_health_probe_path_.empty()) {
         (void)fs_adapter_->DeleteFile(active_health_probe_path_);
     }
+    // As with shard teardown, all probe calls must have stopped before teardown.
+    if (fs_adapter_) {
+        for (const auto& [generation, _] : health_probe_cleanup_) {
+            (void)fs_adapter_->DeleteFile(health_probe_path_prefix_ + "_" +
+                                          std::to_string(generation));
+        }
+    }
     // Drop cached bucket handles before the adapter goes away; each handle
     // closes its own fd in its destructor via the adapter pointer it holds.
     {

@@ -524,18 +524,18 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     return {};
 }
 
-tl::expected<void, ErrorCode> FileStorage::ProbeDfsRead() {
+tl::expected<void, ErrorCode> FileStorage::ProbeDfsRead(uint64_t timeout_ms) {
     if (!distributed_backend_) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
-    return distributed_backend_->ProbeRead();
+    return distributed_backend_->ProbeRead(timeout_ms);
 }
 
-tl::expected<void, ErrorCode> FileStorage::ProbeDfsWrite() {
+tl::expected<void, ErrorCode> FileStorage::ProbeDfsWrite(uint64_t timeout_ms) {
     if (!distributed_backend_) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
-    return distributed_backend_->ProbeWrite();
+    return distributed_backend_->ProbeWrite(timeout_ms);
 }
 
 bool FileStorage::IsDfsBackendReady() const {

@@ -2212,13 +2212,13 @@ std::vector<int> DummyClient::probe_dfs_health() {
     return std::move(result.value());
 }
 
-int DummyClient::probe_dfs_read() {
-    auto result = invoke_rpc<&RealClient::probe_dfs_read_rpc, int>();
+int DummyClient::probe_dfs_read(uint64_t timeout_ms) {
+    auto result = invoke_rpc<&RealClient::probe_dfs_read_rpc, int>(timeout_ms);
     return result ? result.value() : toInt(result.error());
 }
 
-int DummyClient::probe_dfs_write() {
-    auto result = invoke_rpc<&RealClient::probe_dfs_write_rpc, int>();
+int DummyClient::probe_dfs_write(uint64_t timeout_ms) {
+    auto result = invoke_rpc<&RealClient::probe_dfs_write_rpc, int>(timeout_ms);
     return result ? result.value() : toInt(result.error());
 }
 

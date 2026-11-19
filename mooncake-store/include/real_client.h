@@ -511,10 +511,10 @@ class RealClient : public PyClient {
 
     int health_check() override;
     std::optional<std::string> get_client_metrics() override;
-    int probe_dfs_read() override;
-    int probe_dfs_write() override;
-    async_simple::coro::Lazy<int> probe_dfs_read_rpc();
-    async_simple::coro::Lazy<int> probe_dfs_write_rpc();
+    int probe_dfs_read(uint64_t timeout_ms = 25000) override;
+    int probe_dfs_write(uint64_t timeout_ms = 25000) override;
+    async_simple::coro::Lazy<int> probe_dfs_read_rpc(uint64_t timeout_ms = 25000);
+    async_simple::coro::Lazy<int> probe_dfs_write_rpc(uint64_t timeout_ms = 25000);
     std::vector<int> probe_dfs_health() override;
     int set_dfs_access_policy(bool allow_read, bool allow_write) override;
     int set_service_endpoint(const std::string& endpoint) override;

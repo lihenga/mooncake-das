@@ -67,32 +67,58 @@ tl::expected<void, ErrorCode> PosixFsAdapter::Init(
 tl::expected<void, ErrorCode> PosixFsAdapter::Shutdown() { return {}; }
 
 tl::expected<size_t, ErrorCode> PosixFsAdapter::WriteFile(
-    const std::string& path, std::span<const char> data) {
+    const std::string& path, std::span<const char> data,
+    FileWriteTimings* timings) {
+    const auto create_started = timings ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point{};
+    if (timings) *timings = {};
     int fd =
         ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (timings) {
+        timings->create_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - create_started).count();
+    }
     if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    const auto write_started = timings ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
+    auto result = [&]() -> tl::expected<size_t, ErrorCode> {
+        size_t total_written = 0;
+        const auto data_write_started = timings ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
+        while (total_written < data.size()) {
+            ssize_t ret = ::write(fd, data.data() + total_written,
+                                  data.size() - total_written);
+            if (ret < 0) {
+                int saved_errno = errno;
+                if (timings) {
+                    timings->write_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - data_write_started).count();
+                }
+                ::close(fd);
+                errno = saved_errno;
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            }
+            if (ret == 0) break;
+            total_written += static_cast<size_t>(ret);
+        }
 
-    size_t total_written = 0;
-    while (total_written < data.size()) {
-        ssize_t ret = ::write(fd, data.data() + total_written,
-                              data.size() - total_written);
-        if (ret < 0) {
-            int saved_errno = errno;
-            ::close(fd);
-            errno = saved_errno;
+        if (timings) {
+            timings->write_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - data_write_started).count();
+        }
+        if (::close(fd) != 0) {
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
-        if (ret == 0) break;
-        total_written += static_cast<size_t>(ret);
+        if (total_written != data.size()) {
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        return total_written;
+    }();
+    if (timings) {
+        timings->write_total_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - write_started).count();
     }
-
-    if (::close(fd) != 0) {
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-    }
-    if (total_written != data.size()) {
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-    }
-    return total_written;
+    return result;
 }
 
 tl::expected<size_t, ErrorCode> PosixFsAdapter::OverwriteFile(

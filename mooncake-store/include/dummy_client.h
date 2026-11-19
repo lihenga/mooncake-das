@@ -212,8 +212,8 @@ class DummyClient : public PyClient {
     int tearDownAll();
 
     int health_check() override;
-    int probe_dfs_read() override;
-    int probe_dfs_write() override;
+    int probe_dfs_read(uint64_t timeout_ms = 25000) override;
+    int probe_dfs_write(uint64_t timeout_ms = 25000) override;
     std::vector<int> probe_dfs_health() override;
     int set_dfs_access_policy(bool allow_read, bool allow_write) override;
     int set_service_endpoint(const std::string& endpoint) override;

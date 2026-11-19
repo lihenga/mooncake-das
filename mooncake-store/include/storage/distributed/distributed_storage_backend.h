@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -104,7 +105,10 @@ class DistributedStorageBackend
     // the initializer; TryEnsureInitialized returns unavailable immediately
     // when another read/write probe is initializing the shared backend.
     tl::expected<void, ErrorCode> EnsureInitialized();
-    tl::expected<void, ErrorCode> TryEnsureInitialized();
+    // Optional root-validation duration in milliseconds, included in the probe's
+    // init_ms. Set to -1 when the already-initialized validation is not reached.
+    tl::expected<void, ErrorCode> TryEnsureInitialized(
+        double* root_identity_ms = nullptr);
 
     // Configure before initialization/probes start. Only an empty startup
     // identity is refreshed; an established identity remains pinned.
@@ -122,8 +126,9 @@ class DistributedStorageBackend
 
     // Minimal adapter-level probes used by SGLang's health state machine.
     // These methods never touch business keys.
-    tl::expected<void, ErrorCode> ProbeRead();
-    tl::expected<void, ErrorCode> ProbeWrite();
+    // Log native execution exceeding this budget, without cancelling I/O.
+    tl::expected<void, ErrorCode> ProbeRead(uint64_t timeout_ms = 25000);
+    tl::expected<void, ErrorCode> ProbeWrite(uint64_t timeout_ms = 25000);
 
     [[nodiscard]] bool IsInitialized() const {
         return initialized_.load(std::memory_order_acquire);
@@ -351,8 +356,13 @@ class DistributedStorageBackend
     std::string root_dir_;
     std::string descriptor_root_dir_;
     std::string health_probe_path_prefix_;
+    // Protected by health_probe_write_mutex_. File I/O must run outside it.
     std::string active_health_probe_path_;
     uint64_t health_probe_generation_{0};
+    uint64_t active_health_probe_generation_{0};
+    // Retired generations, oldest first. true means one probe owns deletion;
+    // false means a later probe may claim/retry it after writing its new file.
+    std::map<uint64_t, bool> health_probe_cleanup_;
     std::atomic<bool> dfs_read_timed_out_{false};
     mutable std::mutex inflight_read_mutex_;
     std::condition_variable inflight_read_cv_;
