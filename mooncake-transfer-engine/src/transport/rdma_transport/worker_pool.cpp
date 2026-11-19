@@ -1240,6 +1240,11 @@ void WorkerPool::processCompletions(int thread_id,
             auto endpoint_lifecycle_lock =
                 context_.lockEndpointLifecycle(slice->peerNicPath());
 
+            // A keepalive may already have removed this endpoint from the
+            // store. Business errors still require backoff using the slice's
+            // stable peer path, even when deleteEndpointByPtr finds nothing.
+            context_.pauseConnect(slice->peerNicPath());
+
             // Completion errors are split by local context health. Local faults
             // hand off to another local RNIC; remote/default faults keep this
             // local context and switch peer rails.

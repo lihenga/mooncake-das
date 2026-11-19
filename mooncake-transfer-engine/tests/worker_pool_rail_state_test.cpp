@@ -89,6 +89,10 @@ namespace mooncake {
 
 class WorkerPoolTestPeer {
    public:
+    static void processCompletion(WorkerPool &pool, const ibv_wc &wc) {
+        pool.processCompletions(0, {wc});
+    }
+
     static void markRailFailed(WorkerPool &pool, const std::string &path,
                                bool immediate_pause) {
         pool.markRailFailed(path, immediate_pause);
@@ -242,6 +246,81 @@ class WorkerPoolRailStateTest : public ::testing::Test {
     std::unique_ptr<RdmaContext> context_;
     std::unique_ptr<WorkerPool> worker_pool_;
 };
+
+class WorkerPoolReconnectBackoffTest : public WorkerPoolRailStateTest {
+   protected:
+    void SetUp() override {
+        WorkerPoolRailStateTest::SetUp();
+        saved_ttl_ms_ = globalConfig().conn_pause_ttl_ms;
+        globalConfig().conn_pause_ttl_ms = 60000;
+        store_ = std::make_shared<SIEVEEndpointStore>(8);
+        RdmaContextTestPeer::bindEndpointStore(*context_, store_);
+        WorkerPoolTestPeer::setContextActive(*worker_pool_, true);
+        endpoint_ = std::make_shared<RdmaEndPoint>(*context_);
+        endpoint_->setPeerNicPath(kPeerA);
+        store_->testOnlyInsertEndpoint(kPeerA, endpoint_);
+    }
+
+    void TearDown() override {
+        endpoint_.reset();
+        store_.reset();
+        globalConfig().conn_pause_ttl_ms = saved_ttl_ms_;
+        WorkerPoolRailStateTest::TearDown();
+    }
+
+    void businessFailure(ibv_wc_status status) {
+        Transport::TransferTask task{};
+        Transport::Slice slice{};
+        slice.task = &task;
+        slice.peer_nic_path = kPeerA;
+        slice.rdma.endpoint = endpoint_.get();
+        slice.rdma.max_retry_cnt = 0;
+        ibv_wc wc{};
+        wc.wr_id = reinterpret_cast<uint64_t>(&slice);
+        wc.status = status;
+        WorkerPoolTestPeer::processCompletion(*worker_pool_, wc);
+        EXPECT_EQ(task.failed_slice_count, 1u);
+    }
+
+    void checkOrder(bool probe_first, ibv_wc_status status) {
+        ASSERT_FALSE(context_->isConnectPaused(kPeerA));
+        if (probe_first) {
+            ASSERT_EQ(context_->deleteEndpointByPtr(endpoint_.get(), false), 0);
+            ASSERT_FALSE(context_->findEndpoint(kPeerA));
+            ASSERT_FALSE(context_->isConnectPaused(kPeerA));
+        }
+        businessFailure(status);
+        EXPECT_TRUE(context_->isConnectPaused(kPeerA));
+        if (!probe_first)
+            context_->deleteEndpointByPtr(endpoint_.get(), false);
+        EXPECT_TRUE(context_->isConnectPaused(kPeerA));
+    }
+
+    int saved_ttl_ms_ = 0;
+    std::shared_ptr<SIEVEEndpointStore> store_;
+    std::shared_ptr<RdmaEndPoint> endpoint_;
+};
+
+TEST_F(WorkerPoolReconnectBackoffTest, ProbeBeforeRemoteBusinessError) {
+    checkOrder(true, IBV_WC_REM_ACCESS_ERR);
+}
+
+TEST_F(WorkerPoolReconnectBackoffTest, RemoteBusinessErrorBeforeProbe) {
+    checkOrder(false, IBV_WC_REM_ACCESS_ERR);
+}
+
+TEST_F(WorkerPoolReconnectBackoffTest, ProbeBeforeLocalBusinessError) {
+    checkOrder(true, IBV_WC_LOC_LEN_ERR);
+}
+
+TEST_F(WorkerPoolReconnectBackoffTest, LocalBusinessErrorBeforeProbe) {
+    checkOrder(false, IBV_WC_LOC_LEN_ERR);
+}
+
+TEST_F(WorkerPoolReconnectBackoffTest, IdleProbeDeletionDoesNotPauseConnect) {
+    ASSERT_EQ(context_->deleteEndpointByPtr(endpoint_.get(), false), 0);
+    EXPECT_FALSE(context_->isConnectPaused(kPeerA));
+}
 
 TEST_F(WorkerPoolRailStateTest, UnknownRailIsAvailable) {
     EXPECT_TRUE(railAvailable(kPeerA));
