@@ -30,6 +30,7 @@
 #include "storage/distributed/immutable_bucket_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
+#include "storage/distributed/dfs_filesystem.h"
 #include "test_server_helpers.h"
 #include "utils.h"
 
@@ -568,6 +569,7 @@ class DfsBucketClientTest : public ::testing::Test {
         SetEnv("MOONCAKE_DFS_FS_ADAPTER", "posix");
         SetEnv("MOONCAKE_DFS_ROOT_DIR", root_);
         SetEnv("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+        SetEnv("MOONCAKE_DFS_ALLOWED_FS_TYPES", ReadDfsFilesystemType(root_));
         SetEnv("MOONCAKE_DFS_BUCKET_CAPACITY", "1048576");
         SetEnv("MOONCAKE_DFS_MAX_BUCKET_COUNT", "16");
         SetEnv("MOONCAKE_DFS_ALIGNMENT", "4096");
@@ -840,6 +842,10 @@ class DfsBucketEpochClientTest : public DfsBucketClientTest {
         if (!master_.Start(
                 InProcMasterConfigBuilder().set_rpc_port(port).build()))
             return false;
+        return ReconnectClients();
+    }
+
+    bool ReconnectClients() {
         for (const auto& client : {writer_, provider_}) {
             const auto deadline =
                 std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -864,6 +870,54 @@ class DfsBucketEpochClientTest : public DfsBucketClientTest {
         DfsBucketClientTest::SetUp();
     }
 };
+
+TEST_F(DfsBucketEpochClientTest,
+       HeartbeatRefreshesIdentityAfterRootReplacementAndMasterRestart) {
+    const std::string old_key = "before_identity_recovery";
+    std::string old_value(4096, 'O');
+    std::vector<Slice> old_slices{{old_value.data(), old_value.size()}};
+    ASSERT_TRUE(writer_->Put(old_key, old_slices, DfsConfig()));
+    ASSERT_TRUE(WaitForDfsReplica(old_key));
+    auto old_query = QueryDfsOnly(old_key);
+    ASSERT_TRUE(old_query);
+    const auto old_desc = old_query->replicas[0].get_dfs_descriptor();
+    ExpectDfsValue(old_key, old_value);  // Prime both bucket FD caches.
+    const std::string old_identity = writer_->GetDfsRootIdentity();
+    const int port = master_.rpc_port();
+    ASSERT_TRUE(provider_->UnmountSegment(segment_, segment_size_));
+    master_.Stop();
+    // Retain the clients and backend, but start the master on a fresh DFS root.
+    std::filesystem::rename(root_, root_ + "_saved");
+    std::filesystem::create_directories(root_);
+    ASSERT_TRUE(
+        master_.Start(InProcMasterConfigBuilder().set_rpc_port(port).build()));
+    ASSERT_TRUE(ReconnectClients());
+    auto identity = writer_->FetchDfsRootIdentity();
+    ASSERT_TRUE(identity);
+    ASSERT_NE(old_identity, *identity);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    bool recovered = false;
+    do {
+        recovered = backend_->ProbeRead().has_value() &&
+                    backend_->ProbeWrite().has_value();
+        if (recovered) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    } while (std::chrono::steady_clock::now() < deadline);
+    ASSERT_TRUE(recovered)
+        << "live client must adopt the ready master's identity";
+    ASSERT_TRUE(provider_->MountSegment(segment_, segment_size_, "tcp"));
+    const std::string key = "heartbeat_identity_recovery";
+    std::string value(4096, 'H');
+    std::vector<Slice> slices{{value.data(), value.size()}};
+    ASSERT_TRUE(writer_->Put(key, slices, DfsConfig()));
+    ASSERT_TRUE(WaitForDfsReplica(key));
+    ExpectDfsValue(key, value);
+    auto stale = backend_->BatchRead(
+        {{old_key, old_desc, {{old_value.data(), old_value.size()}}}});
+    ASSERT_FALSE(stale[0]);
+    EXPECT_EQ(stale[0].error(), ErrorCode::DFS_STALE_HANDLE);
+}
 
 TEST_F(DfsBucketEpochClientTest,
        MasterRestartReusesBucketWithoutWaitingForHeartbeat) {

@@ -1685,6 +1685,9 @@ class MasterService {
     void RestoreRecoveredDfsReplicas(bool rebuild_metadata);
     bool PrepareDfsRootForInitialization(
         const DistributedStorageConfig& dfs_config);
+    bool ValidateDfsRootFilesystem(const std::string& root) const;
+    bool PublishDfsRootIdentity(const std::string& root,
+                                const std::string& identity);
     DfsInitResult InitDfsAllocatorFromEnvironment(
         const MasterServiceConfig& config);
     void DfsAllocatorRetryThreadFunc();

@@ -54,6 +54,17 @@ class MasterServiceTestPeer {
         service.ReconcileDfsRootFiles();
     }
 
+    static void ChangeExpectedDfsDevice(MasterService& service) {
+        std::lock_guard lock(service.dfs_root_guard_mutex_);
+        ++service.dfs_root_guard_device_;
+    }
+
+    static bool PublishDfsRootIdentity(MasterService& service,
+                                       const std::string& root,
+                                       const std::string& identity) {
+        return service.PublishDfsRootIdentity(root, identity);
+    }
+
     static bool IsDfsEnabled(const MasterService& service) {
         return service.enable_dfs_.load(std::memory_order_acquire);
     }
