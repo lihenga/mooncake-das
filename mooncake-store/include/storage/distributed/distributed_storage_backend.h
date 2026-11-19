@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -355,8 +356,13 @@ class DistributedStorageBackend
     std::string root_dir_;
     std::string descriptor_root_dir_;
     std::string health_probe_path_prefix_;
+    // Protected by health_probe_write_mutex_. File I/O must run outside it.
     std::string active_health_probe_path_;
     uint64_t health_probe_generation_{0};
+    uint64_t active_health_probe_generation_{0};
+    // Retired generations, oldest first. true means one probe owns deletion;
+    // false means a later probe may claim/retry it after writing its new file.
+    std::map<uint64_t, bool> health_probe_cleanup_;
     std::atomic<bool> dfs_read_timed_out_{false};
     mutable std::mutex inflight_read_mutex_;
     std::condition_variable inflight_read_cv_;

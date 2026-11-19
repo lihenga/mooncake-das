@@ -2536,6 +2536,7 @@ PYBIND11_MODULE(_store, m) {
                 const bool embedded = !self.use_dummy_client_;
                 py::dict features;
                 features["dfs_health"] = true;
+                features["dfs_health_timeout_ms"] = true;
                 features["dfs_prefetch"] = embedded;
                 features["read_plan"] = embedded;
                 features["read_layout"] = embedded;

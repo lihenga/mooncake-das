@@ -281,6 +281,10 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite(
     size_t delete_calls = 0;
     std::string probe_suffix = "none";
     std::string deleted_probe_suffixes;
+    auto lock_probe_state = [&] {
+        ProbeStageTimer timer(lock_wait_ms);
+        return std::unique_lock(health_probe_write_mutex_);
+    };
     auto delete_probe = [&](const std::string& path) {
         const auto delete_started = std::chrono::steady_clock::now();
         auto deleted = fs_adapter_->DeleteFile(path);
@@ -301,26 +305,33 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite(
         if (!initialized) return initialized;
         if (UsesObjectStorage()) return {};
 
-        std::unique_lock probe_lock(health_probe_write_mutex_, std::defer_lock);
+        uint64_t generation;
         {
-            ProbeStageTimer timer(lock_wait_ms);
-            probe_lock.lock();
+            auto lock = lock_probe_state();
+            generation = ++health_probe_generation_;
         }
         // Use a new path each round: deleting the previous file first could free
         // just enough space for the probe to pass on an otherwise full filesystem.
-        probe_suffix = "_" + std::to_string(++health_probe_generation_);
+        probe_suffix = "_" + std::to_string(generation);
         const std::string new_probe_path = health_probe_path_prefix_ + probe_suffix;
+        auto cleanup_new_probe = [&] {
+            auto deleted = delete_probe(new_probe_path);
+            if (!deleted && deleted.error() != ErrorCode::FILE_NOT_FOUND) {
+                auto lock = lock_probe_state();
+                health_probe_cleanup_.emplace(generation, false);
+            }
+        };
         auto write_result = fs_adapter_->WriteFile(
             new_probe_path,
             std::span<const char>(kDfsHealthProbePayload,
                                   sizeof(kDfsHealthProbePayload) - 1),
             &write_timings);
         if (!write_result) {
-            (void)delete_probe(new_probe_path);
+            cleanup_new_probe();
             return tl::make_unexpected(write_result.error());
         }
         if (*write_result != sizeof(kDfsHealthProbePayload) - 1) {
-            (void)delete_probe(new_probe_path);
+            cleanup_new_probe();
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
         const auto sync_started = std::chrono::steady_clock::now();
@@ -328,19 +339,50 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite(
         sync_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - sync_started).count();
         if (!sync_result) {
-            (void)delete_probe(new_probe_path);
+            cleanup_new_probe();
             return sync_result;
         }
 
-        if (!active_health_probe_path_.empty()) {
-            auto delete_result = delete_probe(active_health_probe_path_);
-            if (!delete_result &&
-                delete_result.error() != ErrorCode::FILE_NOT_FOUND) {
-                (void)delete_probe(new_probe_path);
-                return tl::make_unexpected(delete_result.error());
+        std::vector<uint64_t> cleanup;
+        {
+            auto lock = lock_probe_state();
+            // Completion may be out of order. Only a newer generation may
+            // replace the retained file; an older completion retires itself.
+            if (generation > active_health_probe_generation_) {
+                if (active_health_probe_generation_ != 0) {
+                    health_probe_cleanup_.emplace(
+                        active_health_probe_generation_, false);
+                }
+                active_health_probe_generation_ = generation;
+                active_health_probe_path_ = new_probe_path;
+            } else {
+                health_probe_cleanup_.emplace(generation, false);
+            }
+            for (auto& [retired, in_progress] : health_probe_cleanup_) {
+                if (in_progress) continue;
+                in_progress = true;
+                cleanup.push_back(retired);
             }
         }
-        active_health_probe_path_ = new_probe_path;
+        ErrorCode cleanup_error = ErrorCode::OK;
+        for (uint64_t retired : cleanup) {
+            auto deleted = delete_probe(health_probe_path_prefix_ + "_" +
+                                        std::to_string(retired));
+            auto lock = lock_probe_state();
+            if (deleted || deleted.error() == ErrorCode::FILE_NOT_FOUND) {
+                health_probe_cleanup_.erase(retired);
+            } else {
+                // Do not roll back the active path: another probe may already
+                // have replaced it. Keep failed deletions for a later retry.
+                health_probe_cleanup_.at(retired) = false;
+                if (cleanup_error == ErrorCode::OK) {
+                    cleanup_error = deleted.error();
+                }
+            }
+        }
+        if (cleanup_error != ErrorCode::OK) {
+            return tl::make_unexpected(cleanup_error);
+        }
 
         if (!IsBucketMode()) {
             ProbeStageTimer timer(shard_reopen_ms);
@@ -351,11 +393,21 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite(
                     shards.push_back(shard.get());
                 }
             }
-            std::vector<std::pair<ShardFile*, int>> opened;
+            std::vector<std::pair<ShardFile*, std::string>> reopen;
             for (auto* shard : shards) {
-                std::lock_guard shard_lock(shard->mutex);
+                if (shard->write_fd.load() >= 0) continue;
+                // Business I/O may hold this mutex while blocked in the kernel.
+                // A health probe must not queue behind it or perform I/O under it.
+                std::unique_lock shard_lock(shard->mutex, std::try_to_lock);
+                if (!shard_lock.owns_lock()) {
+                    return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+                }
                 if (shard->path.empty() || shard->write_fd.load() >= 0) continue;
-                auto fd = ValidateAndOpenShardFile(shard->path);
+                reopen.emplace_back(shard, shard->path);
+            }
+            std::vector<std::pair<ShardFile*, int>> opened;
+            for (const auto& [shard, path] : reopen) {
+                auto fd = ValidateAndOpenShardFile(path);
                 if (!fd) {
                     for (const auto& [_, new_fd] : opened) {
                         (void)fs_adapter_->CloseFile(new_fd);
@@ -364,13 +416,22 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite(
                 }
                 opened.emplace_back(shard, *fd);
             }
-            for (const auto& [shard, fd] : opened) {
-                std::lock_guard shard_lock(shard->mutex);
-                if (shard->write_fd.load() < 0) {
+            bool install_failed = false;
+            for (size_t i = 0; i < opened.size(); ++i) {
+                auto& [shard, fd] = opened[i];
+                std::unique_lock shard_lock(shard->mutex, std::try_to_lock);
+                if (!shard_lock.owns_lock() || shard->path != reopen[i].second) {
+                    install_failed = true;
+                } else if (shard->write_fd.load() < 0) {
                     shard->write_fd.store(fd);
-                } else {
-                    (void)fs_adapter_->CloseFile(fd);
+                    fd = -1;  // Ownership transferred to the shard.
                 }
+            }
+            for (const auto& [_, fd] : opened) {
+                if (fd >= 0) (void)fs_adapter_->CloseFile(fd);
+            }
+            if (install_failed) {
+                return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
             }
         }
         return {};

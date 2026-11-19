@@ -2157,16 +2157,16 @@ TEST_F(DfsBackendTest, ZeroBudgetLogsWriteFailureCleanupOrder) {
     ASSERT_FALSE(delete_failure.has_value());
     ASSERT_FALSE(logged_delete_failure.has_value());
     EXPECT_EQ(logged_delete_failure.error(), delete_failure.error());
-    EXPECT_NE(logs.Last().find(" delete_calls=2 probe_suffix=_5 deleted_probe_suffixes=_1,_5"),
+    EXPECT_NE(logs.Last().find(" delete_calls=2 probe_suffix=_5 deleted_probe_suffixes=_1,_4"),
               std::string::npos);
     const auto& paths = adapter->DeletedPaths();
-    ASSERT_EQ(paths.size(), 6u);
+    ASSERT_EQ(paths.size(), 5u);
     for (size_t i = 0; i < paths.size(); ++i) {
         EXPECT_TRUE(paths[i].ends_with(
-            std::array{"_2", "_3", "_1", "_4", "_1", "_5"}[i]));
+            std::array{"_2", "_3", "_1", "_1", "_4"}[i]));
     }
     ASSERT_TRUE(backend->ProbeWrite(0).has_value());
-    EXPECT_NE(logs.Last().find(" delete_calls=1 probe_suffix=_6 deleted_probe_suffixes=_1"),
+    EXPECT_NE(logs.Last().find(" delete_calls=2 probe_suffix=_6 deleted_probe_suffixes=_1,_5"),
               std::string::npos);
 
     adapter->FailNextFileCreate();
@@ -2176,6 +2176,252 @@ TEST_F(DfsBackendTest, ZeroBudgetLogsWriteFailureCleanupOrder) {
     EXPECT_NE(logs.Last().find(" delete_calls=1 probe_suffix=_7 deleted_probe_suffixes=_7"),
               std::string::npos);
     EXPECT_NE(logs.Last().find(" sync_ms=-1"), std::string::npos);
+}
+
+// A one-shot barrier kept alive by the adapter hooks.
+class ProbeIoGate {
+   public:
+    ~ProbeIoGate() { Release(); }
+    void BlockOnce() {
+        if (entered_.exchange(true)) return;
+        blocked_signal_.set_value();
+        released_.wait();
+    }
+    bool WaitUntilBlocked() {
+        return blocked_.wait_for(std::chrono::seconds(5)) ==
+               std::future_status::ready;
+    }
+    void Release() {
+        if (!released_once_.exchange(true)) release_signal_.set_value();
+    }
+
+   private:
+    std::atomic<bool> entered_{false};
+    std::atomic<bool> released_once_{false};
+    std::promise<void> blocked_signal_;
+    std::future<void> blocked_{blocked_signal_.get_future()};
+    std::promise<void> release_signal_;
+    std::shared_future<void> released_{release_signal_.get_future().share()};
+};
+
+struct ReleaseProbeIoGates {
+    // Declare this guard after async futures so failure unwinding releases I/O
+    // before the futures join and before the backend is destroyed.
+    std::shared_ptr<ProbeIoGate> first;
+    std::shared_ptr<ProbeIoGate> second;
+    ~ReleaseProbeIoGates() {
+        first->Release();
+        if (second) second->Release();
+    }
+};
+
+class ConcurrentProbeFsAdapter : public PosixFsAdapter {
+   public:
+    // Set hooks before starting any concurrent operations; then keep immutable.
+    std::function<void(const std::string&)> before_write;
+    std::function<void(const std::string&)> before_sync;
+    std::function<void(const std::string&)> before_delete;
+    std::function<void(const std::string&)> before_open;
+    std::function<void(int)> before_close;
+    std::function<void()> before_read;
+
+    tl::expected<size_t, ErrorCode> WriteFile(
+        const std::string& path, std::span<const char> data,
+        FileWriteTimings* timings = nullptr) override {
+        if (before_write) before_write(path);
+        return PosixFsAdapter::WriteFile(path, data, timings);
+    }
+    tl::expected<void, ErrorCode> SyncFile(const std::string& path) override {
+        if (before_sync) before_sync(path);
+        return PosixFsAdapter::SyncFile(path);
+    }
+    tl::expected<void, ErrorCode> DeleteFile(const std::string& path) override {
+        if (before_delete) before_delete(path);
+        return PosixFsAdapter::DeleteFile(path);
+    }
+    tl::expected<int, ErrorCode> OpenExistingFile(const std::string& path) override {
+        if (before_open) before_open(path);
+        return PosixFsAdapter::OpenExistingFile(path);
+    }
+    tl::expected<void, ErrorCode> CloseFile(int fd) override {
+        if (before_close) before_close(fd);
+        return PosixFsAdapter::CloseFile(fd);
+    }
+    tl::expected<size_t, ErrorCode> ReadAt(
+        int fd, iovec* iov, int iovcnt, int64_t offset) override {
+        if (before_read) before_read();
+        return PosixFsAdapter::ReadAt(fd, iov, iovcnt, offset);
+    }
+};
+
+std::unique_ptr<DistributedStorageBackend> MakeConcurrentProbeBackend(
+    const std::string& dir, std::unique_ptr<ConcurrentProbeFsAdapter> adapter) {
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = dir;
+    auto config = MakeAllocatorConfig(dir, 4, 64 * 1024 * 1024, 4096);
+    config.fs_adapter_type = "posix";
+    return std::make_unique<DistributedStorageBackend>(
+        file_config, config, std::move(adapter), kTestDfsRootIdentity);
+}
+
+TEST_F(DfsBackendTest, BlockedProbeFileIoDoesNotBlockReplacement) {
+    for (const std::string operation : {"write", "sync", "delete"}) {
+        SCOPED_TRACE(operation);
+        auto adapter = std::make_unique<ConcurrentProbeFsAdapter>();
+        auto* controlled = adapter.get();
+        auto backend = MakeConcurrentProbeBackend(tmp_->path(), std::move(adapter));
+        ASSERT_TRUE(backend->Init());
+        std::future<bool> first, replacement;
+        auto gate = std::make_shared<ProbeIoGate>();
+        auto old_file_deletes = std::make_shared<std::atomic<int>>(0);
+        auto block_new_file = [gate](const std::string& path) {
+            if (path.ends_with("_2")) gate->BlockOnce();
+        };
+        if (operation == "write") controlled->before_write = block_new_file;
+        if (operation == "sync") controlled->before_sync = block_new_file;
+        controlled->before_delete =
+            [gate, old_file_deletes, operation](const std::string& path) {
+                if (path.ends_with("_1")) {
+                    ++*old_file_deletes;
+                    if (operation == "delete") gate->BlockOnce();
+                }
+            };
+        ReleaseProbeIoGates release{gate, nullptr};
+        ASSERT_TRUE(backend->ProbeWrite());  // Retain _1 before creating _2.
+        first = std::async(std::launch::async,
+                           [&] { return backend->ProbeWrite().has_value(); });
+        ASSERT_TRUE(gate->WaitUntilBlocked());
+        replacement = std::async(std::launch::async,
+                                 [&] { return backend->ProbeWrite().has_value(); });
+        ASSERT_EQ(replacement.wait_for(std::chrono::seconds(5)),
+                  std::future_status::ready);
+        EXPECT_TRUE(replacement.get());
+        EXPECT_EQ(old_file_deletes->load(), 1);
+        gate->Release();
+        EXPECT_TRUE(first.get());
+
+        // A late _2 completion must retire itself, never replace/delete _3.
+        std::vector<std::string> files;
+        for (const auto& entry : std::filesystem::directory_iterator(tmp_->path())) {
+            const auto name = entry.path().filename().string();
+            if (name.starts_with(".mooncake_dfs_health_probe_")) {
+                files.push_back(name);
+            }
+        }
+        ASSERT_EQ(files.size(), 1u);
+        EXPECT_TRUE(files[0].ends_with("_3"));
+        EXPECT_EQ(old_file_deletes->load(), 1);
+        ASSERT_TRUE(backend->ProbeWrite());
+        EXPECT_FALSE(std::filesystem::exists(tmp_->file(files[0])));
+        // No async calls remain; teardown no longer needs these hooks.
+        controlled->before_write = {};
+        controlled->before_sync = {};
+        controlled->before_delete = {};
+    }
+}
+
+TEST_F(DfsBackendTest, ProbeShardOpenAndCloseDoNotBlockSameShardIo) {
+    auto adapter = std::make_unique<ConcurrentProbeFsAdapter>();
+    auto* controlled = adapter.get();
+    auto backend = MakeConcurrentProbeBackend(tmp_->path(), std::move(adapter));
+    ASSERT_TRUE(backend->Init());
+    auto read_shard = [&] {
+        std::string output(4096, 'X');
+        auto reads = backend->BatchRead(
+            {{"read", {ShardPath(0), 0, 4096, 4096, 0},
+              {{output.data(), output.size()}}}});
+        return reads.size() == 1 && reads[0] && output == std::string(4096, '\0');
+    };
+    ASSERT_TRUE(read_shard());  // Cached read fd, missing write fd.
+    std::future<bool> first, replacement, third;
+    auto open_gate = std::make_shared<ProbeIoGate>();
+    auto close_gate = std::make_shared<ProbeIoGate>();
+    controlled->before_open =
+        [open_gate, path_to_block = ShardPath(0)](const std::string& path) {
+            if (path == path_to_block) open_gate->BlockOnce();
+        };
+    controlled->before_close = [close_gate](int) { close_gate->BlockOnce(); };
+    ReleaseProbeIoGates release{open_gate, close_gate};
+    first = std::async(std::launch::async,
+                       [&] { return backend->ProbeWrite().has_value(); });
+    ASSERT_TRUE(open_gate->WaitUntilBlocked());
+    replacement = std::async(std::launch::async, [&] {
+        return read_shard() && backend->ProbeWrite().has_value();
+    });
+    ASSERT_EQ(replacement.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    EXPECT_TRUE(replacement.get());
+    open_gate->Release();
+    // The replacement installed a write fd; the older probe must close its
+    // unused fd without holding either the health mutex or the shard mutex.
+    ASSERT_TRUE(close_gate->WaitUntilBlocked());
+    third = std::async(std::launch::async, [&] {
+        return read_shard() && backend->ProbeWrite().has_value();
+    });
+    ASSERT_EQ(third.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_TRUE(third.get());
+    close_gate->Release();
+    EXPECT_TRUE(first.get());
+    controlled->before_open = {};
+    controlled->before_close = {};
+}
+
+TEST_F(DfsBackendTest, FailedProbeCleanupIsRetriedAndRemovedOnTeardown) {
+    ControlledPosixFsAdapter* adapter = nullptr;
+    auto backend = MakeControlledBackend(tmp_->path(), &adapter);
+    ASSERT_TRUE(backend->Init());
+    adapter->FailNextSync();
+    adapter->FailNextDelete();
+    ASSERT_FALSE(backend->ProbeWrite());
+    ASSERT_EQ(adapter->DeletedPaths().size(), 1u);
+    const auto failed_path = adapter->DeletedPaths()[0];
+    EXPECT_TRUE(std::filesystem::exists(failed_path));
+    ASSERT_TRUE(backend->ProbeWrite());
+    EXPECT_FALSE(std::filesystem::exists(failed_path));
+    ASSERT_EQ(adapter->DeletedPaths().size(), 2u);
+    EXPECT_EQ(adapter->DeletedPaths()[1], failed_path);
+    adapter->FailNextDelete();
+    ASSERT_FALSE(backend->ProbeWrite());
+    const auto retired_path = adapter->DeletedPaths().back();
+    EXPECT_TRUE(std::filesystem::exists(retired_path));
+    backend.reset();
+    EXPECT_FALSE(std::filesystem::exists(retired_path));
+    for (const auto& entry : std::filesystem::directory_iterator(tmp_->path())) {
+        EXPECT_FALSE(entry.path().filename().string().starts_with(
+            ".mooncake_dfs_health_probe_"));
+    }
+}
+
+TEST_F(DfsBackendTest, ProbeDoesNotWaitForShardLockHeldByBusinessRead) {
+    auto adapter = std::make_unique<ConcurrentProbeFsAdapter>();
+    auto* controlled = adapter.get();
+    auto backend = MakeConcurrentProbeBackend(tmp_->path(), std::move(adapter));
+    ASSERT_TRUE(backend->Init());
+    auto read_shard = [&] {
+        std::string output(4096, '\0');
+        auto reads = backend->BatchRead(
+            {{"read", {ShardPath(0), 0, 4096, 4096, 0},
+              {{output.data(), output.size()}}}});
+        return reads.size() == 1 && reads[0].has_value();
+    };
+    ASSERT_TRUE(read_shard());
+    std::future<bool> business;
+    std::future<tl::expected<void, ErrorCode>> probe;
+    auto gate = std::make_shared<ProbeIoGate>();
+    controlled->before_read = [gate] { gate->BlockOnce(); };
+    ReleaseProbeIoGates release{gate, nullptr};
+    business = std::async(std::launch::async, read_shard);
+    ASSERT_TRUE(gate->WaitUntilBlocked());
+    probe = std::async(std::launch::async, [&] { return backend->ProbeWrite(); });
+    ASSERT_EQ(probe.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    const auto result = probe.get();
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    gate->Release();
+    EXPECT_TRUE(business.get());
+    ASSERT_TRUE(backend->ProbeWrite());
+    controlled->before_read = {};
 }
 
 class BlockingShardFsAdapter : public PosixFsAdapter {
