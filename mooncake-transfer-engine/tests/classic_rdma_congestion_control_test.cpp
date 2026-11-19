@@ -449,6 +449,39 @@ TEST(ClassicRdmaCongestionControlTest, StaleEndpointFailureIsIgnored) {
 }
 
 TEST(ClassicRdmaCongestionControlTest,
+     RetirementClearsBindingAndAdvancesGeneration) {
+    adaptive_congestion_control::Config config;
+    config.mode = adaptive_congestion_control::Mode::kObserve;
+    ClassicRdmaCongestionControl adapter(config);
+    auto *endpoint = reinterpret_cast<RdmaEndPoint *>(uintptr_t{1});
+    Transport::Slice before{}, retired{}, rebound{};
+    for (auto *slice : {&before, &retired, &rebound}) {
+        slice->length = 64;
+        adapter.prepare(slice, "peer@nic");
+    }
+    auto acquire = [&](Transport::Slice *slice) {
+        std::vector<Transport::Slice *> queued{slice};
+        EXPECT_EQ(adapter.gate(queued), 1u);
+        adapter.releaseUnposted(slice);
+    };
+    adapter.bindEndpoint(&before, endpoint);
+    acquire(&before);
+    EXPECT_EQ(before.rdma_congestion_control_endpoint, endpoint);
+
+    adapter.retireEndpoint("peer@nic", endpoint);
+    acquire(&retired);
+    EXPECT_EQ(retired.rdma_congestion_control_endpoint, nullptr);
+    EXPECT_NE(retired.rdma_congestion_control_endpoint_generation,
+              before.rdma_congestion_control_endpoint_generation);
+
+    adapter.bindEndpoint(&rebound, endpoint);
+    acquire(&rebound);
+    EXPECT_EQ(rebound.rdma_congestion_control_endpoint, endpoint);
+    EXPECT_NE(rebound.rdma_congestion_control_endpoint_generation,
+              before.rdma_congestion_control_endpoint_generation);
+}
+
+TEST(ClassicRdmaCongestionControlTest,
      ReusedEndpointAddressDoesNotReviveOldFailure) {
     adaptive_congestion_control::Config config;
     config.mode = adaptive_congestion_control::Mode::kEnforce;

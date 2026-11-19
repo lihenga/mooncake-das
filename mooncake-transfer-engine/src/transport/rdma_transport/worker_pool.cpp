@@ -1115,6 +1115,12 @@ int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
                              << " failed: " << ibv_wc_status_str(wc[i].status)
                              << " (vendor_err " << wc[i].vendor_err
                              << "); retiring idle endpoint";
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+                // The slice and its peer path are valid until qp_depth is
+                // released below. Retirement must precede endpoint deletion.
+                adaptive_congestion_control_.retireEndpoint(
+                    completed->peerNicPath(), endpoint);
+#endif
                 failed_keepalives.push_back(endpoint);
             }
             completed->rdma.qp_depth->fetch_sub(1, std::memory_order_acq_rel);
