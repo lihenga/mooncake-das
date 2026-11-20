@@ -386,6 +386,10 @@ DistributedStorageBackend::CleanupBucketFd(int64_t bucket_id) {
 
 tl::expected<std::shared_lock<std::shared_mutex>, ErrorCode>
 DistributedStorageBackend::AcquireBucketEpoch(const UUID& epoch) {
+    // Heartbeats may arrive before a degraded backend finishes initialization.
+    if (!initialized_.load(std::memory_order_acquire)) {
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
     std::shared_lock read_lock(bucket_epoch_mutex_);
     auto binding = std::atomic_load(&root_binding_);
     if (epoch == bucket_epoch_ && binding->identity == bucket_epoch_identity_) {

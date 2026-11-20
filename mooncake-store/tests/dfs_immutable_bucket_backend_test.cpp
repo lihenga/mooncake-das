@@ -1364,6 +1364,109 @@ TEST(DistributedStorageBackendRootTest,
               1);
 }
 
+namespace {
+
+class InitTrackingPosixAdapter : public PosixFsAdapter {
+   public:
+    tl::expected<void, ErrorCode> Init(const std::string& root) override {
+        if (before_init) before_init();
+        return PosixFsAdapter::Init(root);
+    }
+
+    tl::expected<size_t, ErrorCode> ReadFile(const std::string& path,
+                                             void* data, size_t size) override {
+        ++read_calls;
+        return PosixFsAdapter::ReadFile(path, data, size);
+    }
+
+    std::function<void()> before_init;
+    std::atomic<int> read_calls{0};
+};
+
+}  // namespace
+
+TEST(DistributedStorageBackendRootTest,
+     SnapshotEpochAfterFailedInitializationDoesNotAccessAdapter) {
+    BucketTempDir root("dfs_snapshot_failed_init");
+    auto config = MakeBucketConfig(root.path());
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = root.path();
+    auto adapter = std::make_unique<InitTrackingPosixAdapter>();
+    auto* tracked = adapter.get();
+    DistributedStorageBackend backend(file_config, config, std::move(adapter));
+    const UUID epoch{8, 1};
+    int confirmations = 0;
+    backend.SetMasterEpochProvider([&]() -> tl::expected<UUID, ErrorCode> {
+        ++confirmations;
+        return epoch;
+    });
+
+    EXPECT_FALSE(backend.Init());  // Master has not published an identity yet.
+    ASSERT_FALSE(backend.IsInitialized());
+    ASSERT_TRUE(backend.UpdateDfsRootBinding({kTestDfsRootIdentity, epoch}));
+    const int reads = tracked->read_calls.load();
+    // The DFS heartbeat calls this directly when a snapshot arrives.
+    auto guard = backend.AcquireBucketEpoch(epoch);
+    ASSERT_FALSE(guard);
+    EXPECT_EQ(guard.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    EXPECT_EQ(confirmations, 0);
+    EXPECT_EQ(tracked->read_calls.load(), reads);
+    EXPECT_FALSE(backend.IsInitialized());
+
+    ASSERT_TRUE(backend.ProbeWrite());
+    EXPECT_TRUE(backend.AcquireBucketEpoch(epoch));
+    EXPECT_EQ(confirmations, 1);
+}
+
+TEST(DistributedStorageBackendRootTest,
+     SnapshotEpochDuringProbeInitializationWaitsForReadyBackend) {
+    BucketTempDir root("dfs_snapshot_probe_init");
+    auto config = MakeBucketConfig(root.path());
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = root.path();
+    auto adapter = std::make_unique<InitTrackingPosixAdapter>();
+    auto* tracked = adapter.get();
+    DistributedStorageBackend backend(file_config, config, std::move(adapter));
+    EXPECT_FALSE(backend.Init());
+    const UUID epoch{8, 2};
+    int confirmations = 0;
+    backend.SetMasterEpochProvider([&]() -> tl::expected<UUID, ErrorCode> {
+        ++confirmations;
+        return epoch;
+    });
+    ASSERT_TRUE(backend.UpdateDfsRootBinding({kTestDfsRootIdentity, epoch}));
+    WriteTestDfsReadProbe(root.path());
+    std::promise<void> entered;
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    tracked->before_init = [&] {
+        entered.set_value();
+        released.wait();
+    };
+    auto probe =
+        std::async(std::launch::async, [&] { return backend.ProbeRead(); });
+    const auto status = entered.get_future().wait_for(std::chrono::seconds(2));
+    const int reads = tracked->read_calls.load();
+    EXPECT_FALSE(backend.IsInitialized());
+    auto snapshot = backend.AcquireBucketEpoch(epoch);
+    EXPECT_FALSE(snapshot);
+    if (!snapshot) {
+        EXPECT_EQ(snapshot.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
+    // Drop the snapshot guard before resuming the probe.
+    if (snapshot) snapshot->unlock();
+    EXPECT_EQ(confirmations, 0);
+    EXPECT_EQ(tracked->read_calls.load(), reads);
+    release.set_value();
+    EXPECT_EQ(status, std::future_status::ready);
+    ASSERT_TRUE(probe.get());
+    EXPECT_TRUE(backend.IsInitialized());
+    EXPECT_TRUE(backend.AcquireBucketEpoch(epoch));
+    EXPECT_EQ(confirmations, 1);
+}
+
 TEST(DistributedStorageBackendRootTest,
      ProbeRefreshesEmptyStartupIdentityAndKeepsMountValidation) {
     BucketTempDir root("dfs_bucket_empty_identity_retry");
