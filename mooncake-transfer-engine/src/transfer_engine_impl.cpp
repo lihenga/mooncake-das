@@ -113,6 +113,13 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
                              const std::string& local_server_name,
                              const std::string& ip_or_host_name,
                              uint64_t rpc_port) {
+#if defined(USE_HIP) && defined(ENABLE_MULTI_PROTOCOL)
+    // Prefer RDMA/TCP by default; MC_DISABLE_HIP=0 restores HIP priority.
+    if (setenv("MC_DISABLE_HIP", "1", 0) != 0) {
+        LOG(WARNING) << "Failed to set default MC_DISABLE_HIP: "
+                     << strerror(errno);
+    }
+#endif
     TransferMetadata::RpcMetaDesc desc;
     std::string rpc_binding_method;
 

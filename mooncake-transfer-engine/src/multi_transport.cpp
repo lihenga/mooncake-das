@@ -19,6 +19,7 @@
 #include <sstream>
 #include <string>
 
+#include "common.h"
 #include "config.h"
 #include "multi_transport_locality.h"
 #ifdef WITH_METRICS
@@ -947,7 +948,7 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
             // hip+rdma segment must fall through to rdma; allow deployments
             // that know they need the cross-node path to de-prioritize hip.
             if (p == "hylink") return std::getenv("MC_DISABLE_HYLINK") ? 0 : 5;
-            if (p == "hip") return std::getenv("MC_DISABLE_HIP") ? 0 : 4;
+            if (p == "hip") return envFlagEnabled("MC_DISABLE_HIP") ? 0 : 4;
             if (p == "maca") return std::getenv("MC_DISABLE_MACA") ? 0 : 4;
             if (p == "musa") return std::getenv("MC_DISABLE_MUSA") ? 0 : 4;
             if (p == "shm") return 4;
