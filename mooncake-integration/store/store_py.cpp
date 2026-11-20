@@ -3543,6 +3543,17 @@ PYBIND11_MODULE(_store, m) {
             "Start a get session: query replicas once and cache them. "
             "Returns SESSION_START_LEASE_EXPIRED (-70702) for an expired query.")
         .def(
+            "all_get_sessions_memory",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                if (!self.is_client_initialized()) return false;
+                py::gil_scoped_release release;
+                return self.store_->all_get_sessions_memory(keys);
+            },
+            py::arg("keys"),
+            "Inspect selected active session replicas locally; false for missing, "
+            "expired, unknown or non-MEMORY sessions. No Master RPC or cache change.")
+        .def(
             "batch_get_session_refresh",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys) {
