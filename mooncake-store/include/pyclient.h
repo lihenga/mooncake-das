@@ -484,8 +484,9 @@ class PyClient {
     }
 
     // Inspect caller-owned get sessions without querying Master or changing
-    // their selected replicas and prefetched buffers.
-    virtual bool all_get_sessions_memory(
+    // their selected replicas and prefetched buffers. True when every source
+    // is MEMORY or a complete DFS prefetch buffer suitable for layer-wise reads.
+    virtual bool all_get_sessions_memory_or_prefetched(
         const std::vector<std::string> & /*keys*/) const {
         return false;
     }

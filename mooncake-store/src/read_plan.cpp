@@ -450,9 +450,9 @@ struct ReadPlan::Impl {
                         "Mooncake read plan session start failed");
             } else if (adaptive) {
                 // SGLang owns these sessions and any DFS prefetch buffers.
-                // Inspect their selected replicas without a second Master query.
+                // Check memory replicas and complete DFS buffers locally.
                 effective_page_wise =
-                    !client->all_get_sessions_memory(session);
+                    !client->all_get_sessions_memory_or_prefetched(session);
             }
             const char *enabled = std::getenv("MOONCAKE_READ_PLAN_PIPELINE");
             const bool requested = enabled && std::string(enabled) == "1";
