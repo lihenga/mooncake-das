@@ -17,7 +17,9 @@ using ReadComponent = std::array<size_t, 4>;
 using ReadLayout = std::tuple<std::vector<std::string>, std::vector<size_t>,
                               bool, std::vector<std::vector<ReadComponent>>>;
 
-// One-shot ordered range reads. Owns a strong client reference, not raw
+// One-shot ordered range reads of immutable objects. Expired get sessions are
+// reacquired with bounded retries; keys must keep identifying the same content.
+// Owns a strong client reference, not raw
 // destination memory. Keep destination allocations registered/alive and do not
 // close the client until run() ends. By default, a plan starts and ends get
 // sessions for its keys. Borrowed-session mode skips that ownership: the caller

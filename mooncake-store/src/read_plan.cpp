@@ -2,10 +2,12 @@
 #include <algorithm>
 #include <array>
 #include <condition_variable>
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -81,6 +83,7 @@ struct ReadPlan::Impl {
     bool borrowed_sessions;
     uint64_t built_count = 0, refreshed_count = 0;
     std::mutex mutex;
+    std::shared_mutex reads_mutex;
     std::condition_variable cv;
     int ready = -1;
     bool running = false, finished = false;
@@ -273,6 +276,69 @@ struct ReadPlan::Impl {
         if (k != out.keys.size())
             throw std::runtime_error("reused range shape mismatch");
     }
+    std::vector<int> read_ranges(const Ranges &r) {
+        std::vector<int> results;
+        {
+            std::shared_lock lock(reads_mutex);
+            results = client->batch_get_into_multi_buffer_ranges(
+                r.keys, r.addresses, r.sizes, r.offsets);
+        }
+        if (results.size() != r.keys.size()) return results;
+        constexpr int renew_attempts = 4;
+        for (int attempt = 0; attempt < renew_attempts; ++attempt) {
+            std::vector<size_t> failed;
+            Ranges retry;
+            std::vector<std::string> keys;
+            std::set<std::string> seen;
+            for (size_t k = 0; k < results.size(); ++k) {
+                size_t expected = 0;
+                for (auto size : r.sizes[k])
+                    expected = checked_add(expected, size);
+                if (results[k] >= 0 && size_t(results[k]) == expected) continue;
+                // Expiry erases the session; repeated keys and racing groups
+                // then report INVALID_PARAMS instead of the original expiry.
+                const auto code = static_cast<ErrorCode>(results[k]);
+                if (code != ErrorCode::SESSION_RANGE_LEASE_EXPIRED &&
+                    code != ErrorCode::SESSION_MEMORY_TRANSFER_LEASE_EXPIRED &&
+                    code != ErrorCode::LEASE_EXPIRED &&
+                    code != ErrorCode::INVALID_PARAMS)
+                    return results;
+                failed.push_back(k);
+                retry.keys.push_back(r.keys[k]);
+                retry.addresses.push_back(r.addresses[k]);
+                retry.sizes.push_back(r.sizes[k]);
+                retry.offsets.push_back(r.offsets[k]);
+                if (seen.insert(r.keys[k]).second) keys.push_back(r.keys[k]);
+            }
+            if (failed.empty()) return results;
+            // Drain old readers before replacing sessions: their expiry path
+            // could otherwise erase a newly renewed lease. Healthy reads share
+            // this lock and retain the pipeline's normal concurrency.
+            std::unique_lock lock(reads_mutex);
+            if (attempt)
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(50 << (attempt - 1)));
+            auto renewed = client->batch_get_session_start(keys);
+            if (renewed.size() != keys.size())
+                throw std::runtime_error(
+                    "Mooncake read plan session renewal result count mismatch");
+            for (size_t k = 0; k < renewed.size(); ++k)
+                if (renewed[k] != 0)
+                    throw std::runtime_error(
+                        "Mooncake read plan session renewal failed at "
+                        "key_index=" +
+                        std::to_string(k) +
+                        " rc=" + std::to_string(renewed[k]));
+            auto retried = client->batch_get_into_multi_buffer_ranges(
+                retry.keys, retry.addresses, retry.sizes, retry.offsets);
+            if (retried.size() != failed.size())
+                throw std::runtime_error(
+                    "Mooncake read plan renewed range result count mismatch");
+            for (size_t k = 0; k < failed.size(); ++k)
+                results[failed[k]] = retried[k];
+        }
+        return results;
+    }
     void check(const Ranges &r, const std::vector<int> &results, int group) {
         if (results.size() != r.keys.size())
             throw std::runtime_error(
@@ -353,9 +419,7 @@ struct ReadPlan::Impl {
                     slot.ranges = build(g);
                     slot.built = true;
                     auto &r = slot.ranges;
-                    if (!r.keys.empty())
-                        slot.result = client->batch_get_into_multi_buffer_ranges(
-                            r.keys, r.addresses, r.sizes, r.offsets);
+                    if (!r.keys.empty()) slot.result = read_ranges(r);
                 } catch (...) {
                     slot.error = std::current_exception();
                 }
@@ -475,8 +539,7 @@ struct ReadPlan::Impl {
                 auto r = build_all();
                 ++built_count;
                 if (!r.keys.empty()) {
-                    auto result = client->batch_get_into_multi_buffer_ranges(
-                        r.keys, r.addresses, r.sizes, r.offsets);
+                    auto result = read_ranges(r);
                     check(r, result, -1);
                 }
             } else if (pipeline) {
@@ -504,8 +567,7 @@ struct ReadPlan::Impl {
                     }
                     auto &r = *selected;
                     if (!r.keys.empty()) {
-                        auto result = client->batch_get_into_multi_buffer_ranges(
-                            r.keys, r.addresses, r.sizes, r.offsets);
+                        auto result = read_ranges(r);
                         check(r, result, group);
                     }
                     if (group < groups - 1)

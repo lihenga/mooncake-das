@@ -2887,6 +2887,43 @@ TEST_F(RealClientTest, ReadPlanBorrowsGetSession) {
     EXPECT_EQ(py_client_->unregister_buffer(destination.data()), 0);
 }
 
+TEST_F(RealClientTest, ReadPlanRenewsExpiredBorrowedSession) {
+    StartMasterAndSetupClient();
+    const std::string key = "read_plan_expired_session";
+    const std::string source = "immutable-read-plan-object";
+    std::string destination(source.size(), '?');
+    ASSERT_EQ(py_client_->put(key, source), 0);
+    ASSERT_EQ(
+        py_client_->register_buffer(destination.data(), destination.size()), 0);
+    ASSERT_EQ(py_client_->batch_get_session_start({key}), std::vector<int>{0});
+    auto original = py_client_->get_sessions_.at(key);
+    py_client_->get_sessions_.erase(key);
+    py_client_->get_sessions_.emplace(
+        key,
+        QueryResult(std::vector<Replica::Descriptor>(original.replicas),
+                    std::chrono::steady_clock::now(), original.object_checksum,
+                    original.resolved_tenant_id));
+
+    // Exercise the real range entry's -70706/session erase, followed by a fresh
+    // Master query and real TCP read. The plan borrows the caller's session.
+    const size_t half = source.size() / 2;
+    std::vector<ReadLayout> layout{
+        {{key},
+         {0},
+         true,
+         {{ReadComponent{reinterpret_cast<size_t>(destination.data()), 0, half,
+                         0}},
+          {ReadComponent{reinterpret_cast<size_t>(destination.data()) + half, 0,
+                         source.size() - half, half}}}}};
+    ReadPlan plan(py_client_, std::move(layout), 2, false, false, true);
+    EXPECT_NO_THROW(plan.run());
+    EXPECT_NO_THROW(plan.wait(1));
+    EXPECT_EQ(destination, source);
+    EXPECT_EQ(py_client_->get_sessions_.count(key), 1u);
+    EXPECT_EQ(py_client_->batch_get_session_end({key}), 0);
+    EXPECT_EQ(py_client_->unregister_buffer(destination.data()), 0);
+}
+
 // Issue #3658: read SSD-only keys through a separate TCP client.
 TEST_F(RealClientTest, TestGetSessionRangesFromSsdOffload) {
     ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
