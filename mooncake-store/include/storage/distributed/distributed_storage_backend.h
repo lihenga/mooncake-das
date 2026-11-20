@@ -393,7 +393,7 @@ class DistributedStorageBackend
     tl::expected<void, ErrorCode> ValidateRootIdentity(
         const UUID& guarded_epoch = {}) const;
     tl::expected<void, ErrorCode> ValidateRootIdentity(
-        const DfsRootBinding& binding) const;
+        const DfsRootBinding& binding, const std::string& root) const;
     void ResetFailedInitializationLocked();
 
     mutable std::mutex init_mutex_;

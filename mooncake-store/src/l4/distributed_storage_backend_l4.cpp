@@ -88,7 +88,7 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ValidateRootIdentity(
          bucket_epoch_identity_ != binding->identity)) {
         return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
     }
-    return ValidateRootIdentity(*binding);
+    return ValidateRootIdentity(*binding, root_dir_);
 }
 
 bool DistributedStorageBackend::UpdateDfsRootBinding(
@@ -123,7 +123,7 @@ bool DistributedStorageBackend::UpdateDfsRootBinding(
 }
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::ValidateRootIdentity(
-    const DfsRootBinding& binding) const {
+    const DfsRootBinding& binding, const std::string& root) const {
     if (UsesObjectStorage()) return {};
     const auto& identity = binding.identity;
     if (identity.empty() || identity.size() > kMaxDfsRootIdentitySize ||
@@ -132,8 +132,7 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ValidateRootIdentity(
     }
 
     std::vector<char> contents(identity.size() + 1);
-    const std::string marker_path =
-        root_dir_ + "/" + kDfsRootIdentityFileName;
+    const std::string marker_path = root + "/" + kDfsRootIdentityFileName;
     auto read_result = fs_adapter_->ReadFile(
         marker_path, contents.data(), contents.size());
     if (!read_result || *read_result != identity.size() ||
@@ -174,7 +173,7 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeRead() {
     if (!initialized) return initialized;
     if (UsesObjectStorage()) return {};
     const auto binding = std::atomic_load(&root_binding_);
-    auto validated = ValidateRootIdentity(*binding);
+    auto validated = ValidateRootIdentity(*binding, root_dir_);
     if (!validated) return validated;
     void* raw = nullptr;
     if (::posix_memalign(&raw, kDfsReadProbeBlockSize, kDfsReadProbeSize) !=
@@ -435,7 +434,11 @@ DistributedStorageBackend::AcquireBucketEpoch(const UUID& epoch) {
         return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
     }
     binding = std::atomic_load(&root_binding_);
-    auto validated = ValidateRootIdentity(*binding);
+    auto canonical_root = CanonicalizePath(root_dir_);
+    if (canonical_root.empty()) {
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
+    auto validated = ValidateRootIdentity(*binding, canonical_root);
     if (!validated) return tl::make_unexpected(validated.error());
     {
         std::unique_lock write_lock(bucket_epoch_mutex_);
@@ -445,6 +448,7 @@ DistributedStorageBackend::AcquireBucketEpoch(const UUID& epoch) {
         }
         auto invalidated = InvalidateAllBucketFds();
         if (!invalidated) return tl::make_unexpected(invalidated.error());
+        canonical_root_dir_ = std::move(canonical_root);
         if (bucket_epoch_ != UUID{} && bucket_epoch_ != epoch)
             retired_bucket_epochs_.insert(bucket_epoch_);
         bucket_epoch_ = epoch;
