@@ -2276,6 +2276,7 @@ class MasterService {
     uint64_t dfs_root_guard_inode_{0};
     bool dfs_root_guard_ready_{false};
     bool dfs_root_recovery_needed_{false};
+    bool dfs_root_identity_repair_pending_{false};
     bool dfs_root_replacement_lost_data_{false};
     std::atomic<bool> dfs_root_recovery_in_progress_{false};
     // Test-only synchronization point after slow recovery preparation and

@@ -447,6 +447,7 @@ bool MasterService::InitializeDfsRootGuard(const std::string& root,
     dfs_root_guard_inode_ = static_cast<uint64_t>(st.st_ino);
     dfs_root_guard_ready_ = true;
     dfs_root_recovery_needed_ = false;
+    dfs_root_identity_repair_pending_ = false;
     dfs_root_replacement_lost_data_ = false;
     return true;
 }
@@ -664,11 +665,13 @@ void MasterService::ReconcileDfsRootFiles() {
     uint64_t expected_device = 0;
     uint64_t expected_inode = 0;
     bool recovery_needed = false;
+    bool identity_repair_pending = false;
     {
         std::lock_guard lock(dfs_root_guard_mutex_);
         if (!dfs_root_guard_ready_ ||
             (!enable_dfs_.load(std::memory_order_acquire) &&
-             !dfs_root_recovery_needed_)) {
+             !dfs_root_recovery_needed_ &&
+             !dfs_root_identity_repair_pending_)) {
             return;
         }
         root = dfs_root_guard_path_;
@@ -676,6 +679,7 @@ void MasterService::ReconcileDfsRootFiles() {
         expected_device = dfs_root_guard_device_;
         expected_inode = dfs_root_guard_inode_;
         recovery_needed = dfs_root_recovery_needed_;
+        identity_repair_pending = dfs_root_identity_repair_pending_;
     }
 
     struct stat st {};
@@ -781,10 +785,16 @@ void MasterService::ReconcileDfsRootFiles() {
     // Identity is the safety boundary. Do not recreate the read-probe files
     // until the root still carries (or has atomically recovered) the exact
     // identity pinned when the allocator was initialized.
-    if (!reconcile(root, kDfsRootIdentityFileName, identity)) {
-        enable_dfs_.store(false, std::memory_order_release);
+    if (!reconcile(root, kDfsRootIdentityFileName, identity) ||
+        (identity_repair_pending &&
+         (!ValidateDfsRootFilesystem(root) ||
+          ReadExpectedDfsRootFile(root + "/" + kDfsRootIdentityFileName,
+                                  identity) != DfsRootFileStatus::kMatch))) {
         std::lock_guard lock(dfs_root_guard_mutex_);
-        dfs_root_recovery_needed_ = true;
+        enable_dfs_.store(false, std::memory_order_release);
+        // A failed identity write does not prove that the bucket generation
+        // was lost. Retry in place instead of entering replacement recovery.
+        dfs_root_identity_repair_pending_ = true;
         return;
     }
     reconcile(root, kDfsRootMarkerFileName,
@@ -803,6 +813,11 @@ void MasterService::ReconcileDfsRootFiles() {
             root + "/" + std::string(directory_name);
         reconcile(probe_directory, kDfsReadProbeFileName,
                   BuildDfsReadProbeContents(identity, probe_index));
+    }
+    if (identity_repair_pending) {
+        std::lock_guard lock(dfs_root_guard_mutex_);
+        dfs_root_identity_repair_pending_ = false;
+        enable_dfs_.store(true, std::memory_order_release);
     }
 }
 

@@ -8478,7 +8478,7 @@ auto MasterService::Ping(const UUID& client_id)
     }
     std::unique_lock root_lock(dfs_root_guard_mutex_, std::try_to_lock);
     if (root_lock.owns_lock() && dfs_root_guard_ready_ &&
-        !dfs_root_recovery_needed_) {
+        !dfs_root_recovery_needed_ && !dfs_root_identity_repair_pending_) {
         const auto epoch = GetDfsMasterEpoch();
         if (epoch != UUID{} && !dfs_root_guard_identity_.empty()) {
             response.dfs_root_binding =
