@@ -1368,14 +1368,11 @@ class Client {
         const std::vector<ErrorCode>& outcomes);
     void ExpireAsyncDfsWriteMetrics();
 
-    std::vector<tl::expected<void, ErrorCode>> BatchWriteWhenPreferSameNode(
-        std::vector<PutOperation>& ops, bool is_upsert);
     std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
         std::vector<std::vector<Slice>>& batched_slices);
     ReplicateConfig AttachConfig(const ReplicateConfig& config) const;
-    ReplicateConfig AttachHostId(const ReplicateConfig& config) const;
     HcaAffinity MakeHcaAffinity() const;
     void AttachHcaAffinity(ReplicateConfig& config,
                            const std::vector<Slice>& slices) const;

@@ -4,9 +4,7 @@
 #include "config/mmap_arena_config.h"
 #include "mmap_arena.h"
 
-#include "ascii_string.h"
 #include "common.h"
-#include "runtime_log_config.h"
 
 #include <algorithm>
 #include <atomic>
@@ -507,30 +505,9 @@ void *allocate_buffer_thp_interleaved(size_t total_size) {
     return ptr;
 }
 
-bool dfs_read_trace_enabled() {
-    return GetDfsReadTraceEnabled();
-}
-
 std::string GetEnvStringOr(const char *name, const std::string &default_value) {
     const char *env_val = std::getenv(name);
     return env_val ? std::string(env_val) : default_value;
 }
 
-std::string ResolveMooncakeHostId(const std::string &local_hostname) {
-    const std::string hostname(TrimAsciiWhitespace(local_hostname));
-    const std::string host_id = (hostname == "::1" || hostname == "::")
-                                    ? hostname
-                                    : std::string(TrimAsciiWhitespace(
-                                          getHostNameWithoutPort(hostname)));
-    if (host_id.empty()) {
-        return "";
-    }
-
-    if (AsciiCaseInsensitiveEquals(host_id, "localhost") ||
-        host_id == "127.0.0.1" || host_id == "0.0.0.0" || host_id == "::1" ||
-        host_id == "[::1]" || host_id == "::" || host_id == "[::]") {
-        return "";
-    }
-    return host_id;
-}
 }  // namespace mooncake
