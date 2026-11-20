@@ -5,6 +5,7 @@
 #include "storage/distributed/posix_fs_adapter.h"
 #include "storage/distributed/dfs_allocator_interface.h"
 #include "storage/distributed/dfs_root_identity.h"
+#include "storage/distributed/dfs_filesystem.h"
 #include "storage/distributed/dfs_read_probe.h"
 #include "storage/distributed/fs_adapter.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
@@ -196,6 +197,8 @@ class ScopedBucketDfsEnv {
           fs_adapter_("MOONCAKE_DFS_FS_ADAPTER", "posix"),
           root_dir_("MOONCAKE_DFS_ROOT_DIR", root.c_str()),
           allocator_type_("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket"),
+          allowed_fs_types_("MOONCAKE_DFS_ALLOWED_FS_TYPES",
+                            ReadDfsFilesystemType(root).c_str()),
           bucket_capacity_("MOONCAKE_DFS_BUCKET_CAPACITY", bucket_capacity),
           max_bucket_count_("MOONCAKE_DFS_MAX_BUCKET_COUNT", max_bucket_count),
           alignment_("MOONCAKE_DFS_ALIGNMENT", "4096"),
@@ -213,6 +216,7 @@ class ScopedBucketDfsEnv {
     ScopedEnvVar fs_adapter_;
     ScopedEnvVar root_dir_;
     ScopedEnvVar allocator_type_;
+    ScopedEnvVar allowed_fs_types_;
     ScopedEnvVar bucket_capacity_;
     ScopedEnvVar max_bucket_count_;
     ScopedEnvVar alignment_;
@@ -1517,6 +1521,8 @@ TEST_F(MasterServiceTest, DfsBucketMemoryAllocationFailurePreservesBuckets) {
     ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
     ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
     ScopedEnvVar allocator("MOONCAKE_DFS_ALLOCATOR", "bucket");
+    ScopedEnvVar allowed_fs_types("MOONCAKE_DFS_ALLOWED_FS_TYPES",
+                                  ReadDfsFilesystemType(dfs_root).c_str());
     ScopedEnvVar bucket_capacity("MOONCAKE_DFS_BUCKET_CAPACITY", "8192");
     ScopedEnvVar max_bucket_count("MOONCAKE_DFS_MAX_BUCKET_COUNT", "4");
     ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
@@ -1830,6 +1836,8 @@ TEST_F(MasterServiceTest, DfsBucketUpsertRestoresEvictedReplica) {
     ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
     ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
     ScopedEnvVar allocator("MOONCAKE_DFS_ALLOCATOR", "bucket");
+    ScopedEnvVar allowed_fs_types("MOONCAKE_DFS_ALLOWED_FS_TYPES",
+                                  ReadDfsFilesystemType(dfs_root).c_str());
     ScopedEnvVar bucket_capacity("MOONCAKE_DFS_BUCKET_CAPACITY", "8192");
     ScopedEnvVar max_bucket_count("MOONCAKE_DFS_MAX_BUCKET_COUNT", "2");
     ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
@@ -1943,6 +1951,8 @@ TEST_F(MasterServiceTest, DfsBucketEvictionKeepsBucketWithLeasedMember) {
     ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
     ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
     ScopedEnvVar allocator("MOONCAKE_DFS_ALLOCATOR", "bucket");
+    ScopedEnvVar allowed_fs_types("MOONCAKE_DFS_ALLOWED_FS_TYPES",
+                                  ReadDfsFilesystemType(dfs_root).c_str());
     ScopedEnvVar bucket_capacity("MOONCAKE_DFS_BUCKET_CAPACITY", "8192");
     ScopedEnvVar max_bucket_count("MOONCAKE_DFS_MAX_BUCKET_COUNT", "2");
     ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
@@ -2006,6 +2016,8 @@ TEST_F(MasterServiceTest,
     ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
     ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
     ScopedEnvVar allocator("MOONCAKE_DFS_ALLOCATOR", "bucket");
+    ScopedEnvVar allowed_fs_types("MOONCAKE_DFS_ALLOWED_FS_TYPES",
+                                  ReadDfsFilesystemType(dfs_root).c_str());
     ScopedEnvVar bucket_capacity("MOONCAKE_DFS_BUCKET_CAPACITY", "32768");
     ScopedEnvVar max_bucket_count("MOONCAKE_DFS_MAX_BUCKET_COUNT", "4");
     ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
@@ -5270,6 +5282,8 @@ TEST_F(MasterServiceTest, DfsReadFilterDoesNotBackfillMemoryReplica) {
     ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
     ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
     ScopedEnvVar allocator_type("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+    ScopedEnvVar allowed_fs_types("MOONCAKE_DFS_ALLOWED_FS_TYPES",
+                                  ReadDfsFilesystemType(dfs_root).c_str());
     ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
     ScopedEnvVar bucket_capacity("MOONCAKE_DFS_BUCKET_CAPACITY", "1048576");
     ScopedEnvVar max_bucket_count("MOONCAKE_DFS_MAX_BUCKET_COUNT", "16");
@@ -5793,6 +5807,167 @@ TEST_F(MasterServiceTest, DfsBucketSnapshotTracksVersionEpochAndHeartbeatInterva
             restarted.GetDfsBucketSnapshot({}, old_epoch, current->version);
         ASSERT_TRUE(stale_epoch.has_value());
         EXPECT_FALSE(stale_epoch->unchanged);
+    }
+    std::filesystem::remove_all(root);
+}
+
+TEST_F(MasterServiceTest, DfsRootRejectsUnlistedFilesystemBeforeWriting) {
+    const auto root = MakeDfsTestRoot("filesystem_rejected");
+    ScopedBucketDfsEnv env(root, "1048576", "16");
+    ScopedEnvVar rejected("MOONCAKE_DFS_ALLOWED_FS_TYPES", "not-the-test-fs");
+    {
+        MasterService service;
+        EXPECT_FALSE(service.UsesDfsBucketAllocator());
+        EXPECT_TRUE(std::filesystem::is_empty(root));
+        const auto context = PrepareSimpleSegment(service);
+        auto ping = service.Ping(context.client_id);
+        ASSERT_TRUE(ping);
+        EXPECT_FALSE(ping->dfs_root_binding.has_value());
+    }
+    std::filesystem::remove_all(root);
+}
+
+TEST_F(MasterServiceTest, DfsIdentityPublicationChecksFilesystemAndContents) {
+    const auto root = MakeDfsTestRoot("identity_checked_write");
+    const auto candidate = MakeDfsTestRoot("identity_checked_candidate");
+    ScopedBucketDfsEnv env(root, "1048576", "16");
+    {
+        MasterService service;
+        const auto config = service.GetStorageConfig();
+        ASSERT_TRUE(config);
+        ASSERT_FALSE(config->dfs_root_identity.empty());
+        {
+            ScopedEnvVar rejected("MOONCAKE_DFS_ALLOWED_FS_TYPES",
+                                  "not-the-test-fs");
+            EXPECT_FALSE(MasterServiceTestPeer::PublishDfsRootIdentity(
+                service, candidate, config->dfs_root_identity));
+            EXPECT_TRUE(std::filesystem::is_empty(candidate));
+        }
+        ASSERT_TRUE(MasterServiceTestPeer::PublishDfsRootIdentity(
+            service, candidate, config->dfs_root_identity));
+        std::ifstream file(candidate + "/" + kDfsRootIdentityFileName);
+        EXPECT_EQ(std::string(std::istreambuf_iterator<char>(file), {}),
+                  config->dfs_root_identity);
+        EXPECT_FALSE(MasterServiceTestPeer::PublishDfsRootIdentity(
+            service, candidate, "conflicting-identity"));
+    }
+    std::filesystem::remove_all(root);
+    std::filesystem::remove_all(candidate);
+}
+
+TEST_F(MasterServiceTest, DfsRootIdentityRepairRetriesWithoutReplacingBuckets) {
+    for (const bool identity_already_restored : {false, true}) {
+        SCOPED_TRACE(identity_already_restored);
+        const auto root = MakeDfsTestRoot("identity_repair_retry");
+        ScopedBucketDfsEnv env(root, "1048576", "16");
+        ScopedEnvVar guard_interval("MOONCAKE_DFS_ROOT_GUARD_INTERVAL_SECONDS",
+                                    "3600");
+        ScopedEnvVar recovery("MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED", "false");
+        {
+            MasterService service;
+            const auto context = PrepareSimpleSegment(service);
+            ReplicateConfig config;
+            config.replica_num = 1;
+            config.dfs_replica_num = 1;
+            auto start = service.PutStart(context.client_id, "repair_key",
+                                          TenantId::Default(), 4096, config);
+            ASSERT_TRUE(start);
+            const auto* dfs = FindDfsDescriptor(*start);
+            ASSERT_NE(dfs, nullptr);
+            const auto descriptor = dfs->get_dfs_descriptor();
+            ASSERT_TRUE(service.PutEnd(context.client_id, "repair_key",
+                                       TenantId::Default(), ReplicaType::ALL));
+            const auto old_epoch = service.GetDfsMasterEpoch();
+            const auto* old_allocator =
+                MasterServiceTestPeer::DfsAllocator(service).get();
+            const auto storage = service.GetStorageConfig();
+            ASSERT_TRUE(storage);
+            const auto identity_path = root + "/" + kDfsRootIdentityFileName;
+            ASSERT_TRUE(std::filesystem::remove(identity_path));
+            {
+                ScopedEnvVar rejected("MOONCAKE_DFS_ALLOWED_FS_TYPES",
+                                      "not-the-test-fs");
+                for (int attempt = 0; attempt < 2; ++attempt) {
+                    MasterServiceTestPeer::ReconcileDfsRootFiles(service);
+                    EXPECT_FALSE(MasterServiceTestPeer::IsDfsEnabled(service));
+                    EXPECT_FALSE(MasterServiceTestPeer::IsDfsRootRecoveryNeeded(
+                        service));
+                    EXPECT_TRUE(MasterServiceTestPeer::HasDfsReplicaInMetadata(
+                                    service, "repair_key")
+                                    .value_or(false));
+                    EXPECT_TRUE(std::filesystem::exists(descriptor.file_path));
+                    const auto ping = service.Ping(context.client_id);
+                    ASSERT_TRUE(ping);
+                    EXPECT_FALSE(ping->dfs_root_binding.has_value());
+                    if (identity_already_restored && attempt == 0) {
+                        // A prior write can succeed before its post-check
+                        // fails.
+                        std::ofstream file(identity_path);
+                        file << storage->dfs_root_identity;
+                        ASSERT_TRUE(file.good());
+                    }
+                }
+            }
+            MasterServiceTestPeer::ReconcileDfsRootFiles(service);
+            EXPECT_TRUE(MasterServiceTestPeer::IsDfsEnabled(service));
+            EXPECT_FALSE(
+                MasterServiceTestPeer::IsDfsRootRecoveryNeeded(service));
+            EXPECT_EQ(service.GetDfsMasterEpoch(), old_epoch);
+            EXPECT_EQ(MasterServiceTestPeer::DfsAllocator(service).get(),
+                      old_allocator);
+            EXPECT_TRUE(MasterServiceTestPeer::HasDfsReplicaInMetadata(
+                            service, "repair_key")
+                            .value_or(false));
+            EXPECT_TRUE(std::filesystem::exists(descriptor.file_path));
+            const auto ping = service.Ping(context.client_id);
+            ASSERT_TRUE(ping);
+            ASSERT_TRUE(ping->dfs_root_binding.has_value());
+            EXPECT_EQ(ping->dfs_root_binding->epoch, old_epoch);
+        }
+        std::filesystem::remove_all(root);
+    }
+}
+
+TEST_F(MasterServiceTest, DfsRootGuardAcceptsChangedDeviceOnAllowedFilesystem) {
+    const auto root = MakeDfsTestRoot("allowed_device_change");
+    ScopedBucketDfsEnv env(root, "1048576", "16");
+    ScopedEnvVar guard_interval("MOONCAKE_DFS_ROOT_GUARD_INTERVAL_SECONDS",
+                                "3600");
+    ScopedEnvVar recovery("MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED", "false");
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+        auto start = service.PutStart(context.client_id, "preserved_device_key",
+                                      TenantId::Default(), 4096, config);
+        ASSERT_TRUE(start);
+        const auto* dfs = FindDfsDescriptor(*start);
+        ASSERT_NE(dfs, nullptr);
+        const auto descriptor = dfs->get_dfs_descriptor();
+        ASSERT_TRUE(service.PutEnd(context.client_id, "preserved_device_key",
+                                   TenantId::Default(), ReplicaType::ALL));
+        const auto old_epoch = service.GetDfsMasterEpoch();
+        MasterServiceTestPeer::ChangeExpectedDfsDevice(service);
+        {
+            ScopedEnvVar rejected("MOONCAKE_DFS_ALLOWED_FS_TYPES",
+                                  "not-the-test-fs");
+            MasterServiceTestPeer::ReconcileDfsRootFiles(service);
+            EXPECT_FALSE(MasterServiceTestPeer::IsDfsEnabled(service));
+        }
+        MasterServiceTestPeer::ReconcileDfsRootFiles(service);
+        EXPECT_TRUE(MasterServiceTestPeer::IsDfsEnabled(service));
+        EXPECT_NE(service.GetDfsMasterEpoch(), old_epoch);
+        auto query =
+            service.GetReplicaList("preserved_device_key", TenantId::Default());
+        ASSERT_TRUE(query);
+        ASSERT_NE(FindDfsDescriptor(query->replicas), nullptr);
+        EXPECT_TRUE(std::filesystem::exists(descriptor.file_path));
+        auto ping = service.Ping(context.client_id);
+        ASSERT_TRUE(ping);
+        ASSERT_TRUE(ping->dfs_root_binding.has_value());
+        EXPECT_EQ(ping->dfs_root_binding->epoch, service.GetDfsMasterEpoch());
     }
     std::filesystem::remove_all(root);
 }

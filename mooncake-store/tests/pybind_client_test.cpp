@@ -39,6 +39,7 @@
 #include "real_client.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
+#include "storage/distributed/dfs_filesystem.h"
 #include "nof/dma_buffer_allocator.h"
 #include "nof/nvmeof_initiator.h"
 #include "tenant_id.h"
@@ -578,6 +579,8 @@ class RealClientDfsPrefetchTest : public RealClientTest {
         ASSERT_NE(created, nullptr);
         ssd_path_ = created;
         dfs_root_.emplace("MOONCAKE_DFS_ROOT_DIR", ssd_path_.c_str());
+        dfs_allowed_fs_types_.emplace("MOONCAKE_DFS_ALLOWED_FS_TYPES",
+                                      ReadDfsFilesystemType(ssd_path_).c_str());
 
         ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
                                       .set_default_kv_lease_ttl(1000)
@@ -731,6 +734,7 @@ class RealClientDfsPrefetchTest : public RealClientTest {
     }
 
     std::optional<ScopedEnvVar> dfs_root_;
+    std::optional<ScopedEnvVar> dfs_allowed_fs_types_;
     std::vector<std::string> sources_;
 };
 

@@ -5,14 +5,17 @@
 #include "random.h"
 #include "storage/distributed/dfs_io_timeout.h"
 #include "storage/distributed/dfs_log_limiter.h"
+#include "storage/distributed/dfs_filesystem.h"
 #include "storage/distributed/dfs_root_identity.h"
 #include "storage/distributed/dfs_read_probe.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
 #include "storage/distributed/shard_allocator.h"
 #include <algorithm>
 #include <cerrno>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -327,6 +330,41 @@ bool ProbeDfsRootWritable(const std::string& root, std::string& error) {
 
 }  // namespace
 
+bool MasterService::ValidateDfsRootFilesystem(const std::string& root) const {
+    if (DistributedStorageConfig::FromEnvironment().allocator_type !=
+        DfsAllocatorType::BUCKET) {
+        return true;
+    }
+    const auto actual = ReadDfsFilesystemType(root);
+    const char* configured = std::getenv("MOONCAKE_DFS_ALLOWED_FS_TYPES");
+    const std::string allowed = configured ? configured : "storage,kingstorage";
+    std::istringstream types(allowed);
+    std::string type;
+    while (!actual.empty() && std::getline(types, type, ',')) {
+        const auto begin = type.find_first_not_of(" \t\r\n");
+        if (begin == std::string::npos) continue;
+        const auto end = type.find_last_not_of(" \t\r\n");
+        if (type.substr(begin, end - begin + 1) == actual) return true;
+    }
+    static DfsLogLimiter log_limiter;
+    if (auto suppressed = log_limiter.ShouldLog()) {
+        LOG(ERROR) << "DFS root filesystem is not allowed, root=" << root
+                   << ", fstype=" << actual << ", allowed_fstypes=" << allowed
+                   << ", suppressed=" << *suppressed;
+    }
+    return false;
+}
+
+bool MasterService::PublishDfsRootIdentity(const std::string& root,
+                                           const std::string& identity) {
+    const std::string path = root + "/" + kDfsRootIdentityFileName;
+    // Best-effort checks around the pathname write, without pinning a mount.
+    return ValidateDfsRootFilesystem(root) &&
+           PublishExpectedDfsRootFile(root, path, identity) &&
+           ValidateDfsRootFilesystem(root) &&
+           ReadExpectedDfsRootFile(path, identity) == DfsRootFileStatus::kMatch;
+}
+
 void MasterService::DfsAllocatorRetryThreadFunc() {
     constexpr auto kInitialRetryInterval = std::chrono::seconds(5);
     constexpr auto kMaxRetryInterval = std::chrono::seconds(60);
@@ -409,6 +447,7 @@ bool MasterService::InitializeDfsRootGuard(const std::string& root,
     dfs_root_guard_inode_ = static_cast<uint64_t>(st.st_ino);
     dfs_root_guard_ready_ = true;
     dfs_root_recovery_needed_ = false;
+    dfs_root_identity_repair_pending_ = false;
     dfs_root_replacement_lost_data_ = false;
     return true;
 }
@@ -449,6 +488,8 @@ bool MasterService::RecoverDfsRootAfterReplacement(
         std::atomic<bool>& flag;
         ~RecoveryFlagReset() { flag.store(false, std::memory_order_release); }
     } recovery_flag_reset{dfs_root_recovery_in_progress_};
+
+    if (!ValidateDfsRootFilesystem(root)) return false;
 
     // Everything through allocator construction and guard publication is
     // deliberately outside master_state_mutex_. DFS publication is gated by
@@ -542,7 +583,7 @@ bool MasterService::RecoverDfsRootAfterReplacement(
         dfs_root_replacement_lost_data_ = root_lost_data;
     }
     if (identity_status == DfsRootFileStatus::kMissing &&
-        !PublishExpectedDfsRootFile(root, identity_path, identity)) {
+        !PublishDfsRootIdentity(root, identity)) {
         LOG(ERROR) << "Failed to restore identity in replacement DFS root "
                    << root;
         return false;
@@ -627,11 +668,13 @@ void MasterService::ReconcileDfsRootFiles() {
     uint64_t expected_device = 0;
     uint64_t expected_inode = 0;
     bool recovery_needed = false;
+    bool identity_repair_pending = false;
     {
         std::lock_guard lock(dfs_root_guard_mutex_);
         if (!dfs_root_guard_ready_ ||
             (!enable_dfs_.load(std::memory_order_acquire) &&
-             !dfs_root_recovery_needed_)) {
+             !dfs_root_recovery_needed_ &&
+             !dfs_root_identity_repair_pending_)) {
             return;
         }
         root = dfs_root_guard_path_;
@@ -639,6 +682,7 @@ void MasterService::ReconcileDfsRootFiles() {
         expected_device = dfs_root_guard_device_;
         expected_inode = dfs_root_guard_inode_;
         recovery_needed = dfs_root_recovery_needed_;
+        identity_repair_pending = dfs_root_identity_repair_pending_;
     }
 
     struct stat st {};
@@ -685,7 +729,7 @@ void MasterService::ReconcileDfsRootFiles() {
     }
     const uint64_t actual_device = static_cast<uint64_t>(st.st_dev);
     const uint64_t actual_inode = static_cast<uint64_t>(st.st_ino);
-    if (actual_device != expected_device) {
+    if (actual_device != expected_device && bucket_allocator_ == nullptr) {
         enable_dfs_.store(false, std::memory_order_release);
         {
             std::lock_guard lock(dfs_root_guard_mutex_);
@@ -701,7 +745,8 @@ void MasterService::ReconcileDfsRootFiles() {
         }
         return;
     }
-    if (recovery_needed || actual_inode != expected_inode) {
+    if (recovery_needed || actual_device != expected_device ||
+        actual_inode != expected_inode) {
         enable_dfs_.store(false, std::memory_order_release);
         {
             std::lock_guard lock(dfs_root_guard_mutex_);
@@ -711,14 +756,17 @@ void MasterService::ReconcileDfsRootFiles() {
         return;
     }
 
-    const auto reconcile = [](const std::string& parent, const char* filename,
-                              const std::string& expected) {
+    const auto reconcile = [this](const std::string& parent,
+                                  const char* filename,
+                                  const std::string& expected) {
         const std::string path = parent + "/" + filename;
         switch (ReadExpectedDfsRootFile(path, expected)) {
             case DfsRootFileStatus::kMatch:
                 return true;
             case DfsRootFileStatus::kMissing:
-                if (PublishExpectedDfsRootFile(parent, path, expected)) {
+                if (std::string_view(filename) == kDfsRootIdentityFileName
+                        ? PublishDfsRootIdentity(parent, expected)
+                        : PublishExpectedDfsRootFile(parent, path, expected)) {
                     LOG(WARNING) << "Recreated missing DFS root file " << path;
                     return true;
                 }
@@ -740,7 +788,16 @@ void MasterService::ReconcileDfsRootFiles() {
     // Identity is the safety boundary. Do not recreate the read-probe files
     // until the root still carries (or has atomically recovered) the exact
     // identity pinned when the allocator was initialized.
-    if (!reconcile(root, kDfsRootIdentityFileName, identity)) {
+    if (!reconcile(root, kDfsRootIdentityFileName, identity) ||
+        (identity_repair_pending &&
+         (!ValidateDfsRootFilesystem(root) ||
+          ReadExpectedDfsRootFile(root + "/" + kDfsRootIdentityFileName,
+                                  identity) != DfsRootFileStatus::kMatch))) {
+        std::lock_guard lock(dfs_root_guard_mutex_);
+        enable_dfs_.store(false, std::memory_order_release);
+        // A failed identity write does not prove that the bucket generation
+        // was lost. Retry in place instead of entering replacement recovery.
+        dfs_root_identity_repair_pending_ = true;
         return;
     }
     reconcile(root, kDfsRootMarkerFileName,
@@ -759,6 +816,11 @@ void MasterService::ReconcileDfsRootFiles() {
             root + "/" + std::string(directory_name);
         reconcile(probe_directory, kDfsReadProbeFileName,
                   BuildDfsReadProbeContents(identity, probe_index));
+    }
+    if (identity_repair_pending) {
+        std::lock_guard lock(dfs_root_guard_mutex_);
+        dfs_root_identity_repair_pending_ = false;
+        enable_dfs_.store(true, std::memory_order_release);
     }
 }
 
@@ -1060,8 +1122,13 @@ auto MasterService::GetDfsBucketSnapshot(
 
 bool MasterService::PrepareDfsRootForInitialization(
     const DistributedStorageConfig& dfs_config) {
-    if (!EnsureDfsRootIdentity(dfs_config.fsdir, cluster_id_,
-                               dfs_root_identity_)) {
+    if (!ValidateDfsRootFilesystem(dfs_config.fsdir) ||
+        !EnsureDfsRootIdentity(dfs_config.fsdir, cluster_id_,
+                               dfs_root_identity_) ||
+        !ValidateDfsRootFilesystem(dfs_config.fsdir) ||
+        ReadExpectedDfsRootFile(
+            dfs_config.fsdir + "/" + kDfsRootIdentityFileName,
+            dfs_root_identity_) != DfsRootFileStatus::kMatch) {
         enable_dfs_ = false;
         dfs_retry_needed_.store(true, std::memory_order_release);
         return false;

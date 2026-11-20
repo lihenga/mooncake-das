@@ -20,6 +20,7 @@
 
 #include "replica.h"
 #include "metadata_store.h"
+#include "rpc_types.h"
 #include "storage/distributed/bucket_entry_layout.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
@@ -37,7 +38,8 @@ constexpr uint64_t kBucketCapacity = 1024 * 1024;
 const std::string kTestDfsRootIdentity =
     SerializeDfsRootIdentity("dfs_backend_test", UUID{1, 2});
 
-void WriteTestDfsReadProbe(const std::string& root) {
+void WriteTestDfsReadProbe(const std::string& root,
+                           const std::string& identity = kTestDfsRootIdentity) {
     for (size_t probe_index = 0;
          probe_index < kDfsReadProbeDirectoryNames.size(); ++probe_index) {
         const std::filesystem::path directory =
@@ -46,8 +48,7 @@ void WriteTestDfsReadProbe(const std::string& root) {
         std::filesystem::create_directory(directory);
         std::ofstream output(directory / kDfsReadProbeFileName,
                              std::ios::binary | std::ios::trunc);
-        const auto contents =
-            BuildDfsReadProbeContents(kTestDfsRootIdentity, probe_index);
+        const auto contents = BuildDfsReadProbeContents(identity, probe_index);
         output.write(contents.data(), contents.size());
     }
 }
@@ -60,6 +61,32 @@ struct LegacyDfsDescriptor {
     uint64_t aligned_size = 0;
     int shard_idx = 0;
 };
+struct LegacyPingResponse {
+    ViewVersionId view_version_id;
+    ClientStatus client_status;
+};
+YLT_REFL(LegacyPingResponse, view_version_id, client_status);
+
+TEST(DfsEpochSerializationTest, PingBindingIsCompatibleWithLegacyPeers) {
+    LegacyPingResponse old{42, ClientStatus::OK};
+    auto current =
+        struct_pack::deserialize<PingResponse>(struct_pack::serialize(old));
+    ASSERT_TRUE(current);
+    EXPECT_EQ(current->view_version_id, 42u);
+    EXPECT_FALSE(current->dfs_root_binding.has_value());
+
+    current->dfs_root_binding = DfsRootBinding{kTestDfsRootIdentity, {3, 4}};
+    const auto bytes = struct_pack::serialize(*current);
+    auto legacy = struct_pack::deserialize<LegacyPingResponse>(bytes);
+    ASSERT_TRUE(legacy);
+    EXPECT_EQ(legacy->view_version_id, old.view_version_id);
+    EXPECT_EQ(legacy->client_status, old.client_status);
+    auto roundtrip = struct_pack::deserialize<PingResponse>(bytes);
+    ASSERT_TRUE(roundtrip);
+    ASSERT_TRUE(roundtrip->dfs_root_binding.has_value());
+    EXPECT_EQ(roundtrip->dfs_root_binding->identity, kTestDfsRootIdentity);
+    EXPECT_EQ(roundtrip->dfs_root_binding->epoch, (UUID{3, 4}));
+}
 struct LegacyReplicaDescriptor {
     ReplicaID id;
     std::variant<MemoryDescriptor, NoFDescriptor, DiskDescriptor,
@@ -456,6 +483,73 @@ class DfsBucketBackendTest : public ::testing::Test {
     FaultyPosixFsAdapter* adapter_ = nullptr;
 };
 
+TEST_F(DfsBucketBackendTest, HeartbeatBindingKeepsMountAndCachedEpochChecks) {
+    const std::string key = "identity_binding";
+    const std::string value(4096, 'A');
+    auto desc = WriteObject(key, value);
+    UUID epoch{9, 1};
+    backend_->SetMasterEpochProvider(
+        [&]() -> tl::expected<UUID, ErrorCode> { return epoch; });
+    ASSERT_TRUE(backend_->UpdateDfsRootBinding({kTestDfsRootIdentity, epoch}));
+    desc.master_epoch = epoch;
+    EXPECT_EQ(ReadObject(key, desc), value);
+
+    const DfsRootBinding next{
+        SerializeDfsRootIdentity("dfs_backend_test", UUID{5, 6}), {9, 2}};
+    // A stalled bucket operation must not stall the liveness/Ping publisher.
+    auto held = backend_->AcquireBucketEpoch(epoch);
+    ASSERT_TRUE(held);
+    auto publish = std::async(std::launch::async, [&] {
+        return backend_->UpdateDfsRootBinding(next);
+    });
+    const auto status = publish.wait_for(std::chrono::seconds(1));
+    held->unlock();
+    ASSERT_EQ(status, std::future_status::ready);
+    ASSERT_TRUE(publish.get());
+    epoch = next.epoch;
+    EXPECT_FALSE(backend_->ProbeRead());  // Local mount still contains A.
+    EXPECT_FALSE(backend_->ProbeWrite());
+    const int writes = adapter_->WriteCalls();
+    auto stale = backend_->BatchWrite(
+        {{key, desc, {{const_cast<char*>(value.data()), value.size()}}}});
+    ASSERT_FALSE(stale[0]);
+    EXPECT_EQ(stale[0].error(), ErrorCode::DFS_STALE_HANDLE);
+    EXPECT_EQ(adapter_->WriteCalls(), writes);
+
+    const auto wrong_mount =
+        SerializeDfsRootIdentity("dfs_backend_test", UUID{7, 8});
+    WriteTestDfsRootIdentity(tmp_->path(), wrong_mount);
+    WriteTestDfsReadProbe(tmp_->path(), wrong_mount);
+    EXPECT_FALSE(backend_->ProbeRead());
+    EXPECT_FALSE(backend_->ProbeWrite());
+    std::ifstream marker(tmp_->file(kDfsRootIdentityFileName));
+    EXPECT_EQ(std::string(std::istreambuf_iterator<char>(marker), {}),
+              wrong_mount);  // The client must not rewrite an unexpected root.
+
+    WriteTestDfsRootIdentity(tmp_->path(), next.identity);
+    WriteTestDfsReadProbe(tmp_->path(), next.identity);
+    EXPECT_TRUE(backend_->ProbeRead());
+    EXPECT_TRUE(backend_->ProbeWrite());
+    desc.master_epoch = epoch;
+    auto write = backend_->BatchWrite(
+        {{key, desc, {{const_cast<char*>(value.data()), value.size()}}}});
+    ASSERT_TRUE(write[0]);
+    EXPECT_EQ(ReadObject(key, desc), value);
+}
+
+TEST_F(DfsBucketBackendTest, InvalidHeartbeatBindingDoesNotReplaceIdentity) {
+    const UUID epoch{8, 1};
+    ASSERT_TRUE(backend_->UpdateDfsRootBinding({kTestDfsRootIdentity, epoch}));
+    EXPECT_TRUE(backend_->UpdateDfsRootBinding({kTestDfsRootIdentity, epoch}));
+    EXPECT_FALSE(backend_->UpdateDfsRootBinding({"malformed", {8, 2}}));
+    EXPECT_FALSE(backend_->UpdateDfsRootBinding({kTestDfsRootIdentity, {}}));
+    EXPECT_FALSE(backend_->UpdateDfsRootBinding(
+        {SerializeDfsRootIdentity("different_cluster", {3, 4}), {8, 2}}));
+    EXPECT_FALSE(backend_->UpdateDfsRootBinding(
+        {SerializeDfsRootIdentity("dfs_backend_test", {3, 4}), epoch}));
+    EXPECT_TRUE(backend_->ProbeWrite());
+}
+
 TEST_F(DfsBucketBackendTest, WriteThenReadRoundTrip) {
     const std::string key = "roundtrip_key";
     const std::string value(1000, 'A');
@@ -545,6 +639,81 @@ TEST_F(DfsBucketBackendTest, EpochInvalidationReopensReusedBucketPath) {
     ASSERT_TRUE(invalidated.has_value());
     EXPECT_GE(*invalidated, 1u);
     EXPECT_EQ(ReadObject("epoch_reuse", desc), new_value);
+}
+
+TEST_F(DfsBucketBackendTest,
+       EpochChangeRefreshesSymlinkRootBeforeReadAndWrite) {
+    const std::string key = "symlink_epoch";
+    const std::string old_value(4096, 'O');
+    const std::string new_value(4096, 'N');
+    auto desc = WriteObject(key, old_value);
+    const auto bucket_name = std::filesystem::path(desc.file_path).filename();
+    BucketTempDir replacement("dfs_bucket_symlink_replacement");
+    BucketTempDir links("dfs_bucket_symlink_links");
+    const auto alias = links.file("current");
+    std::filesystem::create_directory_symlink(tmp_->path(), alias);
+    std::filesystem::copy_file(
+        desc.file_path,
+        std::filesystem::path(replacement.path()) / bucket_name);
+    const auto new_identity =
+        SerializeDfsRootIdentity("dfs_backend_test", UUID{7, 8});
+    WriteTestDfsRootIdentity(replacement.path(), new_identity);
+    WriteTestDfsReadProbe(replacement.path(), new_identity);
+
+    auto config = config_;
+    config.fsdir = alias;
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = alias;
+    auto adapter = std::make_unique<FaultyPosixFsAdapter>();
+    adapter_ = adapter.get();
+    backend_ = MakeTestBackend(file_config, config, std::move(adapter));
+    ASSERT_TRUE(backend_->Init());
+    UUID epoch{4, 1};
+    backend_->SetMasterEpochProvider(
+        [&]() -> tl::expected<UUID, ErrorCode> { return epoch; });
+    ASSERT_TRUE(backend_->UpdateDfsRootBinding({kTestDfsRootIdentity, epoch}));
+    desc.file_path = (std::filesystem::path(alias) / bucket_name).string();
+    desc.master_epoch = epoch;
+    auto write = [&](const DistributedFSDescriptor& target,
+                     const std::string& value) {
+        return backend_->BatchWrite(
+            {{key, target, {{const_cast<char*>(value.data()), value.size()}}}});
+    };
+    auto old_write = write(desc, old_value);
+    ASSERT_EQ(old_write.size(), 1u);
+    ASSERT_TRUE(old_write[0]);
+    EXPECT_EQ(ReadObject(key, desc), old_value);
+
+    ASSERT_TRUE(std::filesystem::remove(alias));
+    std::filesystem::create_directory_symlink(replacement.path(), alias);
+    epoch = UUID{4, 2};
+    ASSERT_TRUE(backend_->UpdateDfsRootBinding({new_identity, epoch}));
+    ASSERT_TRUE(backend_->ProbeRead());
+    auto next = desc;
+    next.master_epoch = epoch;
+    auto new_write = write(next, new_value);
+    ASSERT_EQ(new_write.size(), 1u);
+    ASSERT_TRUE(new_write[0]);
+    EXPECT_EQ(ReadObject(key, next), new_value);
+
+    // Read each physical directory directly: a backend round trip alone could
+    // succeed even if both operations incorrectly used the old directory.
+    for (const auto& [root, expected] :
+         std::vector<std::pair<std::string, std::string>>{
+             {tmp_->path(), old_value}, {replacement.path(), new_value}}) {
+        std::ifstream disk(std::filesystem::path(root) / bucket_name,
+                           std::ios::binary);
+        disk.seekg(static_cast<std::streamoff>(desc.offset));
+        std::string bytes(expected.size(), '\0');
+        disk.read(bytes.data(), bytes.size());
+        ASSERT_TRUE(disk.good()) << root;
+        EXPECT_EQ(bytes, expected) << root;
+    }
+    auto stale = write(desc, old_value);
+    ASSERT_EQ(stale.size(), 1u);
+    ASSERT_FALSE(stale[0]);
+    EXPECT_EQ(stale[0].error(), ErrorCode::DFS_STALE_HANDLE);
 }
 
 TEST_F(DfsBucketBackendTest, MasterEpochReopensReusedBucketBeforeReadAndWrite) {
@@ -1285,6 +1454,109 @@ TEST(DistributedStorageBackendRootTest,
     EXPECT_EQ(std::distance(std::filesystem::directory_iterator(root.path()),
                             std::filesystem::directory_iterator{}),
               1);
+}
+
+namespace {
+
+class InitTrackingPosixAdapter : public PosixFsAdapter {
+   public:
+    tl::expected<void, ErrorCode> Init(const std::string& root) override {
+        if (before_init) before_init();
+        return PosixFsAdapter::Init(root);
+    }
+
+    tl::expected<size_t, ErrorCode> ReadFile(const std::string& path,
+                                             void* data, size_t size) override {
+        ++read_calls;
+        return PosixFsAdapter::ReadFile(path, data, size);
+    }
+
+    std::function<void()> before_init;
+    std::atomic<int> read_calls{0};
+};
+
+}  // namespace
+
+TEST(DistributedStorageBackendRootTest,
+     SnapshotEpochAfterFailedInitializationDoesNotAccessAdapter) {
+    BucketTempDir root("dfs_snapshot_failed_init");
+    auto config = MakeBucketConfig(root.path());
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = root.path();
+    auto adapter = std::make_unique<InitTrackingPosixAdapter>();
+    auto* tracked = adapter.get();
+    DistributedStorageBackend backend(file_config, config, std::move(adapter));
+    const UUID epoch{8, 1};
+    int confirmations = 0;
+    backend.SetMasterEpochProvider([&]() -> tl::expected<UUID, ErrorCode> {
+        ++confirmations;
+        return epoch;
+    });
+
+    EXPECT_FALSE(backend.Init());  // Master has not published an identity yet.
+    ASSERT_FALSE(backend.IsInitialized());
+    ASSERT_TRUE(backend.UpdateDfsRootBinding({kTestDfsRootIdentity, epoch}));
+    const int reads = tracked->read_calls.load();
+    // The DFS heartbeat calls this directly when a snapshot arrives.
+    auto guard = backend.AcquireBucketEpoch(epoch);
+    ASSERT_FALSE(guard);
+    EXPECT_EQ(guard.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    EXPECT_EQ(confirmations, 0);
+    EXPECT_EQ(tracked->read_calls.load(), reads);
+    EXPECT_FALSE(backend.IsInitialized());
+
+    ASSERT_TRUE(backend.ProbeWrite());
+    EXPECT_TRUE(backend.AcquireBucketEpoch(epoch));
+    EXPECT_EQ(confirmations, 1);
+}
+
+TEST(DistributedStorageBackendRootTest,
+     SnapshotEpochDuringProbeInitializationWaitsForReadyBackend) {
+    BucketTempDir root("dfs_snapshot_probe_init");
+    auto config = MakeBucketConfig(root.path());
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = root.path();
+    auto adapter = std::make_unique<InitTrackingPosixAdapter>();
+    auto* tracked = adapter.get();
+    DistributedStorageBackend backend(file_config, config, std::move(adapter));
+    EXPECT_FALSE(backend.Init());
+    const UUID epoch{8, 2};
+    int confirmations = 0;
+    backend.SetMasterEpochProvider([&]() -> tl::expected<UUID, ErrorCode> {
+        ++confirmations;
+        return epoch;
+    });
+    ASSERT_TRUE(backend.UpdateDfsRootBinding({kTestDfsRootIdentity, epoch}));
+    WriteTestDfsReadProbe(root.path());
+    std::promise<void> entered;
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    tracked->before_init = [&] {
+        entered.set_value();
+        released.wait();
+    };
+    auto probe =
+        std::async(std::launch::async, [&] { return backend.ProbeRead(); });
+    const auto status = entered.get_future().wait_for(std::chrono::seconds(2));
+    const int reads = tracked->read_calls.load();
+    EXPECT_FALSE(backend.IsInitialized());
+    auto snapshot = backend.AcquireBucketEpoch(epoch);
+    EXPECT_FALSE(snapshot);
+    if (!snapshot) {
+        EXPECT_EQ(snapshot.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
+    // Drop the snapshot guard before resuming the probe.
+    if (snapshot) snapshot->unlock();
+    EXPECT_EQ(confirmations, 0);
+    EXPECT_EQ(tracked->read_calls.load(), reads);
+    release.set_value();
+    EXPECT_EQ(status, std::future_status::ready);
+    ASSERT_TRUE(probe.get());
+    EXPECT_TRUE(backend.IsInitialized());
+    EXPECT_TRUE(backend.AcquireBucketEpoch(epoch));
+    EXPECT_EQ(confirmations, 1);
 }
 
 TEST(DistributedStorageBackendRootTest,
