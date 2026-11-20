@@ -7523,7 +7523,7 @@ RealClient::batch_get_session_start_with_sources(
     return result;
 }
 
-bool RealClient::all_get_sessions_memory(
+bool RealClient::all_get_sessions_memory_or_prefetched(
     const std::vector<std::string> &keys) const {
     if (keys.empty()) return false;
     auto now = std::chrono::steady_clock::now();
@@ -7531,12 +7531,16 @@ bool RealClient::all_get_sessions_memory(
     for (const auto &key : keys) {
         const auto it = get_sessions_.find(key);
         if (it == get_sessions_.end() || it->second.IsLeaseExpired(now) ||
-            it->second.replicas.empty() ||
-            !std::all_of(it->second.replicas.begin(), it->second.replicas.end(),
-                         [](const auto &replica) {
-                             return replica.status == ReplicaStatus::COMPLETE &&
-                                    replica.is_memory_replica();
-                         }))
+            it->second.replicas.empty())
+            return false;
+        // Session selection keeps only MEMORY candidates or one other replica.
+        const auto &replica = it->second.replicas.front();
+        if (replica.status != ReplicaStatus::COMPLETE) return false;
+        if (replica.is_memory_replica()) continue;
+        // Only validated full objects are published in the prefetch cache.
+        if (!replica.is_dfs_replica() || !dfs_prefetch_arena_available() ||
+            get_session_prefetch_cache_.find(key) ==
+                get_session_prefetch_cache_.end())
             return false;
     }
     return true;

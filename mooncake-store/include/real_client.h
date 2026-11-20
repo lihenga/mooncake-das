@@ -333,7 +333,7 @@ class RealClient : public PyClient {
     batch_get_session_start_with_sources(
         const std::vector<std::string> &keys) override;
 
-    bool all_get_sessions_memory(
+    bool all_get_sessions_memory_or_prefetched(
         const std::vector<std::string> &keys) const override;
 
     // Synchronously populate the prefetch buffer for DFS-backed active get

@@ -790,6 +790,62 @@ class RealClientLeasePrefetchTest : public RealClientDfsPrefetchTest {
 };
 
 TEST_F(RealClientLeasePrefetchTest,
+       ReadPlanUsesLayerWiseOnlyForMemoryOrCompletePrefetch) {
+    DfsPrefetchTestEnv dfs_env;
+    ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES", "32768");
+    ScopedEnvVar adaptive("MOONCAKE_READ_PLAN_ADAPTIVE_SOURCE", "1");
+    ScopedEnvVar pipeline("MOONCAKE_READ_PLAN_PIPELINE", "0");
+    std::vector<std::string> keys{"read_plan_dfs_a", "read_plan_dfs_b"};
+    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17841", keys));
+    ASSERT_NO_FATAL_FAILURE(RequirePrefetchArena());
+    if (IsSkipped()) return;
+    const std::string memory_source(kDfsPrefetchObjectSize, 'm');
+    keys.push_back("read_plan_memory");
+    ASSERT_EQ(py_client_->put(keys.back(), memory_source), 0);
+    ASSERT_EQ(py_client_->batch_get_session_start(keys), std::vector<int>(3, 0));
+    for (const auto& key : keys) {
+        SetSessionDeadline(key, std::chrono::steady_clock::time_point::max());
+    }
+    EXPECT_TRUE(py_client_->all_get_sessions_memory_or_prefetched({keys.back()}));
+
+    std::atomic<size_t> reads{0};
+    ASSERT_NO_FATAL_FAILURE(InstallBucketReadHook([&] { ++reads; }));
+    std::string destination(3 * kDfsPrefetchObjectSize, '?');
+    ASSERT_EQ(py_client_->register_buffer(destination.data(), destination.size()),
+              0);
+    const auto base = reinterpret_cast<size_t>(destination.data());
+    constexpr size_t half = kDfsPrefetchObjectSize / 2;
+    const std::vector<std::vector<ReadComponent>> groups{
+        {{base, kDfsPrefetchObjectSize, half, 0}},
+        {{base + half, kDfsPrefetchObjectSize, half, half}}};
+    for (size_t prefetched = 0; prefetched <= 2; ++prefetched) {
+        SCOPED_TRACE(prefetched);
+        if (prefetched > 0) {
+            ASSERT_EQ(py_client_->batch_get_session_prefetch(
+                          {keys[prefetched - 1]}),
+                      std::vector<int>{0});
+        }
+        EXPECT_EQ(py_client_->all_get_sessions_memory_or_prefetched(keys),
+                  prefetched == 2);
+        const auto reads_before = reads.load();
+        std::fill(destination.begin(), destination.end(), '?');
+        ReadPlan plan(py_client_, {ReadLayout{keys, {0, 1, 2}, true, groups}}, 2,
+                      false, true, true);
+        ASSERT_NO_THROW(plan.run());
+        EXPECT_EQ(plan.stats()[0], prefetched == 2 ? 2u : 1u);
+        EXPECT_EQ(destination, sources_[0] + sources_[1] + memory_source);
+        if (prefetched == 2) EXPECT_EQ(reads.load(), reads_before);
+    }
+
+    SetSessionDeadline(keys[0], std::chrono::steady_clock::now());
+    EXPECT_FALSE(py_client_->all_get_sessions_memory_or_prefetched(keys));
+    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+    EXPECT_FALSE(py_client_->all_get_sessions_memory_or_prefetched(keys));
+    EXPECT_EQ(py_client_->unregister_buffer(destination.data()), 0);
+}
+
+TEST_F(RealClientLeasePrefetchTest,
        BucketPrefetchKeepsCacheAcrossLeaseDeadline) {
     DfsPrefetchTestEnv dfs_env;
     ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
