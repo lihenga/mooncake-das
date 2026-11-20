@@ -104,7 +104,10 @@ class DistributedStorageBackend
     // the initializer; TryEnsureInitialized returns unavailable immediately
     // when another read/write probe is initializing the shared backend.
     tl::expected<void, ErrorCode> EnsureInitialized();
-    tl::expected<void, ErrorCode> TryEnsureInitialized();
+    // Optional root-validation duration in milliseconds, included in the probe's
+    // init_ms. Set to -1 when the already-initialized validation is not reached.
+    tl::expected<void, ErrorCode> TryEnsureInitialized(
+        double* root_identity_ms = nullptr);
 
     // Configure before initialization/probes start. Only an empty startup
     // identity is refreshed; an established identity remains pinned.
@@ -122,8 +125,9 @@ class DistributedStorageBackend
 
     // Minimal adapter-level probes used by SGLang's health state machine.
     // These methods never touch business keys.
-    tl::expected<void, ErrorCode> ProbeRead();
-    tl::expected<void, ErrorCode> ProbeWrite();
+    // Log native execution exceeding this budget, without cancelling I/O.
+    tl::expected<void, ErrorCode> ProbeRead(uint64_t timeout_ms = 25000);
+    tl::expected<void, ErrorCode> ProbeWrite(uint64_t timeout_ms = 25000);
 
     [[nodiscard]] bool IsInitialized() const {
         return initialized_.load(std::memory_order_acquire);
@@ -351,14 +355,13 @@ class DistributedStorageBackend
     std::string root_dir_;
     std::string descriptor_root_dir_;
     std::string health_probe_path_prefix_;
-    std::string active_health_probe_path_;
-    uint64_t health_probe_generation_{0};
+    // Each independent probe owns its uniquely numbered file through cleanup.
+    std::atomic<uint64_t> health_probe_generation_{0};
     std::atomic<bool> dfs_read_timed_out_{false};
     mutable std::mutex inflight_read_mutex_;
     std::condition_variable inflight_read_cv_;
     uint64_t inflight_read_batches_{0};
     uint64_t inflight_read_bytes_{0};
-    std::mutex health_probe_write_mutex_;
     std::string canonical_root_dir_;
     std::mutex shard_files_mutex_;
     std::unordered_map<int, std::unique_ptr<ShardFile>> shard_files_;
