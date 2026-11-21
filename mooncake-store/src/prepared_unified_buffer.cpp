@@ -139,8 +139,9 @@ int PrepareDfsUnifiedBuffer(int32_t device_id, int64_t size_bytes) {
 
     // Make the requested card current before allocating: the NUMA policy is
     // derived from the current device.
-    auto accelerators =
-        device::GetAcceleratorRegistry().RuntimeAccelerators(true).Devices();
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators(true);
+    auto accelerators = runtime_accelerator.Devices();
     for (auto *accelerator : accelerators) {
         if (accelerator != nullptr && device_id >= 0) {
             accelerator->SetContext(device_id);

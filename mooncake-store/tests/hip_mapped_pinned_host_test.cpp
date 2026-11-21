@@ -31,7 +31,10 @@
 #include <vector>
 
 #include "device/accelerator_registry.h"
+#include "file_storage.h"
 #include "pinned_buffer_pool.h"
+#include "prepared_unified_buffer.h"
+#include "real_client.h"
 #include "shared_segment/host_memfd.h"
 
 namespace mooncake {
@@ -172,6 +175,43 @@ TEST(HipMappedPinnedHostTest, RejectsEmptyAndOverflowingSizes) {
                   .data,
               nullptr);
     EXPECT_EQ(PinnedBufferPool::AllocatePinned(SIZE_MAX, true).data, nullptr);
+}
+
+TEST(HipMappedPinnedHostTest, FileStorageOwnsLateAndPreparedUnifiedBuffers) {
+    GET_HIP_OR_SKIP(hip);
+    const int32_t device_id = hip->CurrentDeviceId();
+    constexpr size_t kSize = 16 * 1024 * 1024;
+    for (bool prepare : {false, true}) {
+        SCOPED_TRACE(prepare ? "prepared" : "late allocation");
+        ASSERT_FALSE(PreparedUnifiedBuffer::Claim(device_id, kSize));
+        if (prepare) {
+            ASSERT_EQ(PreparedUnifiedBuffer::Prepare(device_id, kSize), 0);
+        }
+        FileStorageConfig config;
+        config.storage_filepath = "/tmp";
+        config.local_buffer_size = 1024 * 1024;
+        config.unified_buffer_size = kSize;
+        config.read_chunk_size = 1024 * 1024;
+        config.write_chunk_size = 1024 * 1024;
+        config.enable_dfs = true;
+        FileStorage storage(config, nullptr, "127.0.0.1:0");
+        ASSERT_TRUE(storage.HasPinnedRestoreArena());
+        EXPECT_EQ(storage.UnifiedBufferCapacity(), kSize);
+        EXPECT_NE(storage.UnifiedBufferHostAddress(), nullptr);
+        EXPECT_NE(storage.UnifiedBufferDeviceAddress(), nullptr);
+        EXPECT_FALSE(PreparedUnifiedBuffer::Claim(device_id, kSize));
+    }
+}
+
+TEST(HipMappedPinnedHostTest, ClientPreparationBeforeSetupHasNoFileStorage) {
+    GET_HIP_OR_SKIP(hip);
+    RealClient client;
+    EXPECT_EQ(client.prepare_dfs_unified_buffer(hip->CurrentDeviceId(),
+                                                16 * 1024 * 1024),
+              0);
+    // A DFS-enabled caller prepares a buffer; take it so this test releases it.
+    auto buffer =
+        PreparedUnifiedBuffer::Claim(hip->CurrentDeviceId(), 16 * 1024 * 1024);
 }
 
 TEST(HipMappedPinnedHostTest, ScatterKernelBatchCarriesExactBytes) {

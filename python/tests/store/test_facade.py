@@ -34,6 +34,10 @@ def _run_python(
 
 _CPP_PUBLIC_NAMES = {
     "RangedReadSnapshot",
+    "ReadKeyMapping",
+    "ReadComponent",
+    "ReadLayout",
+    "ReadPlan",
     "ObjectDataType",
     "SoftPinAction",
     "ReplicateConfig",
@@ -58,6 +62,7 @@ _CPP_PUBLIC_NAMES = {
     "MooncakeDistributedStore",
     "EngramStore",
     "bind_to_numa_node",
+    "prepare_dfs_unified_buffer",
     "get_alloc_func_addr",
     "get_free_func_addr",
     "UNKNOWN",
@@ -114,6 +119,29 @@ assert BufferPool is store.BufferPool
 assert RegisteredBufferPool is store.RegisteredBufferPool
 assert store.RegisteredBufferPool is store.BufferPool
 assert "_serialize_tensor" not in store.__all__
+""",
+        backend=backend,
+    )
+
+
+@pytest.mark.parametrize("backend", [None, "cpp"], ids=["default", "explicit-cpp"])
+def test_cpp_exports_dfs_buffer_preparation(
+    tmp_path: Path, backend: str | None
+) -> None:
+    _run_python(
+        tmp_path,
+        """
+import sys
+import types
+
+native = types.ModuleType("mooncake._store")
+native.prepare_dfs_unified_buffer = lambda device_id, size_bytes=0: (device_id, size_bytes)
+sys.modules[native.__name__] = native
+
+from mooncake.store import prepare_dfs_unified_buffer
+assert prepare_dfs_unified_buffer is native.prepare_dfs_unified_buffer
+assert prepare_dfs_unified_buffer(3) == (3, 0)
+assert prepare_dfs_unified_buffer(2, 1048576) == (2, 1048576)
 """,
         backend=backend,
     )

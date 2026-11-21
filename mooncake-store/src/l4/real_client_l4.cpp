@@ -832,19 +832,20 @@ int RealClient::prepare_dfs_unified_buffer(int32_t device_id,
 
     // Warm the H2D path with the streams the DFS read path will use. The pool
     // is created by the client, so it is present once the object exists.
-    if (!dfs_h2d_stream_pool_) return 0;
-    auto accelerators =
-        device::GetAcceleratorRegistry().RuntimeAccelerators().Devices();
+    if (!dfs_h2d_stream_pool_ || !file_storage_ ||
+        !file_storage_->HasPinnedRestoreArena()) {
+        return 0;
+    }
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    auto accelerators = runtime_accelerator.Devices();
     auto lease = dfs_h2d_stream_pool_->Acquire(
         accelerators.empty() ? nullptr : accelerators.front(), device_id);
     if (!lease) return 0;
-    const bool warmed = device::GetAcceleratorRegistry()
-                            .RuntimeAccelerators()
-                            .WarmMappedHostCopyPath(
-                                device_id, lease->streams(),
-                                file_storage_->UnifiedBufferHostAddress(),
-                                file_storage_->UnifiedBufferDeviceAddress(),
-                                file_storage_->UnifiedBufferCapacity());
+    const bool warmed = runtime_accelerator.WarmMappedHostCopyPath(
+        device_id, lease->streams(), file_storage_->UnifiedBufferHostAddress(),
+        file_storage_->UnifiedBufferDeviceAddress(),
+        file_storage_->UnifiedBufferCapacity());
     if (!warmed) {
         LOG(WARNING) << "prepare_dfs_unified_buffer: H2D warm-up partially "
                         "failed; the first batch may pay for it";

@@ -1749,8 +1749,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         // before request traffic, keeps it off the first business batch. Best
         // effort: a failure only means the first batch carries the cost.
         if (dfs_h2d_stream_pool_ && file_storage_->HasPinnedRestoreArena()) {
-            auto accelerators =
-                device::GetAcceleratorRegistry().RuntimeAccelerators().Devices();
+            auto runtime_accelerator =
+                device::GetAcceleratorRegistry().RuntimeAccelerators();
+            auto accelerators = runtime_accelerator.Devices();
             const int32_t prepare_device =
                 accelerators.empty() ? -1
                                      : accelerators.front()->CurrentDeviceId();
@@ -1758,14 +1759,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 accelerators.empty() ? nullptr : accelerators.front(),
                 prepare_device);
             if (lease) {
-                const bool warmed =
-                    device::GetAcceleratorRegistry()
-                        .RuntimeAccelerators()
-                        .WarmMappedHostCopyPath(
-                            prepare_device, lease->streams(),
-                            file_storage_->UnifiedBufferHostAddress(),
-                            file_storage_->UnifiedBufferDeviceAddress(),
-                            file_storage_->UnifiedBufferCapacity());
+                const bool warmed = runtime_accelerator.WarmMappedHostCopyPath(
+                    prepare_device, lease->streams(),
+                    file_storage_->UnifiedBufferHostAddress(),
+                    file_storage_->UnifiedBufferDeviceAddress(),
+                    file_storage_->UnifiedBufferCapacity());
                 if (!warmed) {
                     LOG(WARNING)
                         << "DFS H2D warm-up failed; the first scatter batch "

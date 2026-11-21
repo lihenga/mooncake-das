@@ -37,6 +37,7 @@ _CPP_EXPORTS = frozenset(
         "MooncakeDistributedStore",
         "EngramStore",
         "bind_to_numa_node",
+        "prepare_dfs_unified_buffer",
         "get_alloc_func_addr",
         "get_free_func_addr",
         "UNKNOWN",
