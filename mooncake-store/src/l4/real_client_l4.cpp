@@ -840,6 +840,31 @@ std::shared_ptr<BufferHandle> RealClient::AllocatePrefetchArenaRegion(
 
 std::vector<int> RealClient::batch_get_session_prefetch(
     const std::vector<std::string> &keys) {
+    return PrefetchSessionKeys(keys, {});
+}
+
+std::vector<std::vector<int>> RealClient::batch_get_session_prefetch_batch(
+    const std::vector<std::vector<std::string>> &requests) {
+    std::vector<std::string> keys;
+    std::vector<size_t> request_ids;
+    for (size_t i = 0; i < requests.size(); ++i) {
+        keys.insert(keys.end(), requests[i].begin(), requests[i].end());
+        request_ids.insert(request_ids.end(), requests[i].size(), i);
+    }
+    const auto flat_results = PrefetchSessionKeys(keys, request_ids);
+    std::vector<std::vector<int>> results;
+    size_t offset = 0;
+    for (const auto &request : requests) {
+        results.emplace_back(flat_results.begin() + offset,
+                             flat_results.begin() + offset + request.size());
+        offset += request.size();
+    }
+    return results;
+}
+
+std::vector<int> RealClient::PrefetchSessionKeys(
+    const std::vector<std::string> &keys,
+    const std::vector<size_t> &request_ids) {
     std::vector<int> results(
         keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     if (!client_) {
@@ -894,6 +919,9 @@ std::vector<int> RealClient::batch_get_session_prefetch(
             entries.push_back(NonMemReadEntry{
                 keys[i], i, replica, session_it->second, {}, {}, {},
                 session_it->second.lease_timeout});
+            if (!request_ids.empty()) {
+                entries.back().prefetch_group = request_ids[i];
+            }
         }
     }
 
@@ -1264,7 +1292,13 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
         SessionRangeReadRequest *entry;
         size_t offset;
         size_t size;
+        size_t group;
     };
+    struct Arena {
+        size_t size = 0;
+        std::shared_ptr<BufferHandle> buffer;
+    };
+    std::map<size_t, Arena> arenas;
 
     const size_t dfs_alignment =
         GetEnvOr<size_t>("MOONCAKE_DFS_ALIGNMENT", 4096);
@@ -1291,6 +1325,8 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
             continue;
         }
 
+        const size_t group = prefetch_only ? entry.prefetch_group : 0;
+        auto &planned_size = arenas[group].size;
         size_t aligned_offset = 0;
         // DFS iovecs read descriptor.aligned_size, including trailing padding.
         // Keep that full range inside the view while aligning each slot start
@@ -1300,9 +1336,11 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
         if (dfs_alignment == 0 ||
             (!entry.replica.is_dfs_replica() &&
              !AlignUp(source_bytes, dfs_alignment, &aligned_object_size)) ||
-            !AlignUp(arena_size, dfs_alignment, &aligned_offset) ||
+            !AlignUp(planned_size, dfs_alignment, &aligned_offset) ||
             aligned_object_size >
-                std::numeric_limits<size_t>::max() - aligned_offset) {
+                std::numeric_limits<size_t>::max() - aligned_offset ||
+            aligned_offset + aligned_object_size - planned_size >
+                std::numeric_limits<size_t>::max() - arena_size) {
             LOG(ERROR) << "DFS pinned arena size overflow, key: " << entry.key;
             results[entry.original_idx] =
                 static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
@@ -1319,29 +1357,32 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
             continue;
         }
         arena_views.push_back(
-            ArenaView{entry_ptr, aligned_offset, aligned_object_size});
-        arena_size = aligned_offset + aligned_object_size;
+            ArenaView{entry_ptr, aligned_offset, aligned_object_size, group});
+        arena_size += aligned_offset + aligned_object_size - planned_size;
+        planned_size = aligned_offset + aligned_object_size;
     }
 
-    std::shared_ptr<BufferHandle> arena;
     bool prefetch_arena_used = false;
     bool prefetch_arena_alloc_fail = false;
-    if (!arena_views.empty()) {
+    for (auto &[group, allocation] : arenas) {
+        if (allocation.size == 0) continue;
+        auto &arena = allocation.buffer;
         if (prefetch_only) {
             // Cached prefetch views retain their unified buffer allocation
             // until session end and count against the prefetch admission limit.
-            arena = AllocatePrefetchArenaRegion(arena_size, dfs_alignment);
-            prefetch_arena_used = arena != nullptr;
-            prefetch_arena_alloc_fail = arena == nullptr;
+            arena = AllocatePrefetchArenaRegion(allocation.size, dfs_alignment);
+            prefetch_arena_used |= arena != nullptr;
+            prefetch_arena_alloc_fail |= arena == nullptr;
         } else {
-            std::optional<BufferHandle> allocation;
+            std::optional<BufferHandle> handle;
             if (file_storage_) {
                 // Wait briefly for another holder to release; reads never wait
                 // on their own, so this bounded wait is what keeps a transient
                 // peak from dropping the read onto pageable memory.
-                allocation = file_storage_->AllocatePinnedStagingBuffer(
-                    arena_size, dfs_alignment, file_storage_->ReadArenaWait());
-                pinned_restore_arena_used = allocation.has_value();
+                handle = file_storage_->AllocatePinnedStagingBuffer(
+                    allocation.size, dfs_alignment,
+                    file_storage_->ReadArenaWait());
+                pinned_restore_arena_used = handle.has_value();
             }
             // Fall back to client_buffer_allocator_ when the unified buffer
             // refused. That pool is sized by the local_buffer_size argument of
@@ -1350,16 +1391,16 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
             // buffer is exhausted too. Writes and prefetch never take this
             // path: they wait within their own budget or fail, so they cannot
             // silently exceed the unified buffer.
-            if (!allocation && client_buffer_allocator_) {
-                allocation = client_buffer_allocator_->allocate_aligned(
-                    arena_size, dfs_alignment);
+            if (!handle && client_buffer_allocator_) {
+                handle = client_buffer_allocator_->allocate_aligned(
+                    allocation.size, dfs_alignment);
             }
-            if (allocation) {
-                arena = std::make_shared<BufferHandle>(std::move(*allocation));
+            if (handle) {
+                arena = std::make_shared<BufferHandle>(std::move(*handle));
             }
         }
         if (arena) {
-            arena_capacity = arena->size();
+            arena_capacity += arena->size();
         }
         if (!arena) {
             // Reached only when the unified buffer and the generic allocator
@@ -1377,16 +1418,17 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
                                file_storage_->HasPinnedRestoreArena())
                            << ", generic_buffer_fallback_failed=1";
             }
-            for (const auto &view : arena_views) {
-                results[view.entry->original_idx] =
-                    static_cast<int>(toInt(ErrorCode::NO_AVAILABLE_HANDLE));
-            }
-            arena_views.clear();
-            arena.reset();
         }
     }
 
+    std::erase_if(arena_views, [&](const ArenaView &view) {
+        if (arenas.at(view.group).buffer) return false;
+        results[view.entry->original_idx] =
+            static_cast<int>(toInt(ErrorCode::NO_AVAILABLE_HANDLE));
+        return true;
+    });
     for (const auto &view : arena_views) {
+        const auto &arena = arenas.at(view.group).buffer;
         auto *view_ptr = static_cast<char *>(arena->ptr()) + view.offset;
         void *view_device_ptr =
             arena->device_ptr()

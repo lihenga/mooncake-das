@@ -3598,6 +3598,19 @@ PYBIND11_MODULE(_store, m) {
             "Successful validated BUCKET reads may finish after lease expiry; "
             "range-get still requires a live or refreshed lease.")
         .def(
+            "batch_get_session_prefetch_batch",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::vector<std::string>> &requests) {
+                if (!self.is_client_initialized()) {
+                    return std::vector<std::vector<int>>{};
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_get_session_prefetch_batch(requests);
+            },
+            py::arg("requests"),
+            "Prefetch queued requests in one read batch, retaining separate "
+            "buffer ownership and per-key results for each request.")
+        .def(
             "dfs_prefetch_arena_available",
             [](MooncakeStorePyWrapper &self) {
                 if (!self.is_client_initialized()) return false;
