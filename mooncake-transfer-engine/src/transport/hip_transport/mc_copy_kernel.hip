@@ -4,37 +4,56 @@
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 
-// One block copies one range from mapped pinned host memory.
-// src_addr is the device-visible alias returned by hipHostGetDevicePointer.
 struct MCStoreH2DCopyRange {
     uint64_t dst_addr;
     uint64_t src_addr;
     uint64_t size;
 };
 
+__device__ __forceinline__ void CopyH2DRange(MCStoreH2DCopyRange range,
+                                             uint64_t tid, uint64_t step) {
+    uint8_t* dst = reinterpret_cast<uint8_t*>(range.dst_addr);
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(range.src_addr);
+    uint64_t copied_bytes = 0;
+
+    // A short tail must not force the entire aligned body into byte copies.
+    if (((range.dst_addr | range.src_addr) & 15) == 0) {
+        const uint64_t count = range.size / 16;
+        uint4* dst_v = reinterpret_cast<uint4*>(dst);
+        const uint4* src_v = reinterpret_cast<const uint4*>(src);
+        for (uint64_t i = tid; i < count; i += step) dst_v[i] = src_v[i];
+        copied_bytes = count * 16;
+    } else if (((range.dst_addr | range.src_addr) & 7) == 0) {
+        const uint64_t count = range.size / 8;
+        uint64_t* dst_v = reinterpret_cast<uint64_t*>(dst);
+        const uint64_t* src_v = reinterpret_cast<const uint64_t*>(src);
+        for (uint64_t i = tid; i < count; i += step) dst_v[i] = src_v[i];
+        copied_bytes = count * 8;
+    }
+    for (uint64_t i = copied_bytes + tid; i < range.size; i += step) {
+        dst[i] = src[i];
+    }
+}
+
 extern "C" __global__ __launch_bounds__(256) void MCStoreH2DScatterKernel(
     const MCStoreH2DCopyRange* ranges, uint64_t range_count) {
     const uint64_t range_index = static_cast<uint64_t>(blockIdx.x);
-    if (range_index >= range_count) return;
+    if (range_index < range_count) {
+        CopyH2DRange(ranges[range_index], threadIdx.x, blockDim.x);
+    }
+}
 
-    const MCStoreH2DCopyRange range = ranges[range_index];
-    uint8_t* dst = reinterpret_cast<uint8_t*>(range.dst_addr);
-    const uint8_t* src = reinterpret_cast<const uint8_t*>(range.src_addr);
-
-    const bool aligned =
-        ((range.dst_addr | range.src_addr | range.size) & 15) == 0;
-    if (aligned) {
-        uint4* dst_v = reinterpret_cast<uint4*>(dst);
-        const uint4* src_v = reinterpret_cast<const uint4*>(src);
-        const uint64_t n_v4 = range.size / 16;
-        for (uint64_t i = static_cast<uint64_t>(threadIdx.x); i < n_v4;
-             i += static_cast<uint64_t>(blockDim.x)) {
-            dst_v[i] = src_v[i];
-        }
-    } else {
-        for (uint64_t i = static_cast<uint64_t>(threadIdx.x); i < range.size;
-             i += static_cast<uint64_t>(blockDim.x)) {
-            dst[i] = src[i];
-        }
+// Four independent 64-thread groups share a block. Each group owns a range.
+extern "C" __global__ __launch_bounds__(256) void MCStoreH2DGroupedKernel(
+    const MCStoreH2DCopyRange* ranges, uint64_t range_count) {
+    constexpr uint64_t kGroupThreads = 64;
+    const uint64_t lane = threadIdx.x % kGroupThreads;
+    const uint64_t group = threadIdx.x / kGroupThreads;
+    const uint64_t groups_per_block = blockDim.x / kGroupThreads;
+    const uint64_t worker = blockIdx.x * groups_per_block + group;
+    const uint64_t workers = gridDim.x * groups_per_block;
+    for (uint64_t range_index = worker; range_index < range_count;
+         range_index += workers) {
+        CopyH2DRange(ranges[range_index], lane, kGroupThreads);
     }
 }
