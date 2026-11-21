@@ -3,11 +3,15 @@
 
 #include "cuda_alike.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <limits>
+#include <list>
 #include <mutex>
+#include <new>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -29,8 +33,7 @@ std::shared_mutex &HipRuntimeStateMutex() {
     return *mutex;
 }
 
-hipError_t AllocateHipPinnedHost(void **addr, size_t size,
-                                 unsigned int flags) {
+hipError_t AllocateHipPinnedHost(void **addr, size_t size, unsigned int flags) {
     std::unique_lock<std::shared_mutex> lock(HipRuntimeStateMutex());
     return hipHostMalloc(addr, size, flags);
 }
@@ -107,28 +110,39 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
                               static_cast<hipStream_t>(stream)) == hipSuccess;
     }
 
-    bool CopyFromHostBatchAsync(std::span<const HostCopyRange> ranges,
-                                void* stream,
-                                bool* used_batch_kernel = nullptr) const
-        override {
+    bool CopyFromHostBatchAsync(
+        std::span<const HostCopyRange> ranges, void *stream,
+        bool *used_batch_kernel = nullptr) const override {
         if (used_batch_kernel) *used_batch_kernel = false;
         constexpr size_t kKernelMinRanges = 32;
-        if (ranges.size() < kKernelMinRanges) {
+        const auto hip_stream = static_cast<hipStream_t>(stream);
+        if (ranges.size() < kKernelMinRanges || !stream ||
+            hip_stream == hipStreamLegacy || hip_stream == hipStreamPerThread) {
             return AcceleratorDevice::CopyFromHostBatchAsync(ranges, stream);
         }
 
+        bool grouped_shape = ranges.size() >= 128;
         for (const auto &range : ranges) {
+            grouped_shape = grouped_shape && range.size >= 16 * 1024 &&
+                            range.size <= 64 * 1024 &&
+                            range.size == ranges.front().size &&
+                            ((reinterpret_cast<uintptr_t>(range.dst) |
+                              reinterpret_cast<uintptr_t>(range.src_device)) &
+                             7) == 0;
             // The scatter kernel reads the source through its device-visible
             // mapped-host alias. If any source is ordinary pinned memory, keep
             // the whole batch on the DMA path so submission order is preserved.
             if (!range.dst || !range.src || range.size == 0 ||
                 !range.src_device) {
-                return AcceleratorDevice::CopyFromHostBatchAsync(ranges, stream);
+                return AcceleratorDevice::CopyFromHostBatchAsync(ranges,
+                                                                 stream);
             }
         }
 
         hipFunction_t function = nullptr;
-        if (!LoadCopyFunction(CurrentDeviceId(), &function)) {
+        bool grouped_kernel = false;
+        if (!LoadCopyFunction(CurrentDeviceId(), &function, grouped_shape,
+                              &grouped_kernel)) {
             return AcceleratorDevice::CopyFromHostBatchAsync(ranges, stream);
         }
 
@@ -137,56 +151,85 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
             uint64_t src_addr;
             uint64_t size;
         };
-        if (ranges.size() > std::numeric_limits<size_t>::max() /
-                                sizeof(DeviceRange) ||
+        if (ranges.size() >
+                std::numeric_limits<size_t>::max() / sizeof(DeviceRange) ||
             ranges.size() > std::numeric_limits<unsigned int>::max()) {
             return AcceleratorDevice::CopyFromHostBatchAsync(ranges, stream);
         }
 
         // Keep the descriptors in mapped pinned host memory. This avoids a
         // second H2D descriptor copy and remains valid until the stream has
-        // consumed the kernel, at which point SynchronizeStream releases it.
+        // consumed the kernel. Only completed descriptors may be reused.
         const size_t descriptor_bytes = ranges.size() * sizeof(DeviceRange);
-        void *host_descriptors = nullptr;
-        if (AllocateHipPinnedHost(&host_descriptors, descriptor_bytes,
-                                  hipHostMallocMapped) != hipSuccess) {
-            hipGetLastError();
+        const int descriptor_device_id = CurrentDeviceId();
+        DescriptorBuffer descriptor;
+        try {
+            std::lock_guard<std::mutex> lock(descriptor_mutex_);
+            auto &state = descriptors_[stream];
+            std::swap(descriptor, state.idle);
+            idle_descriptor_bytes_ -= descriptor.capacity;
+        } catch (const std::bad_alloc &) {
             return AcceleratorDevice::CopyFromHostBatchAsync(ranges, stream);
         }
+        if (descriptor.capacity < descriptor_bytes ||
+            descriptor.device_id != descriptor_device_id) {
+            if (descriptor.host) FreeHipPinnedHost(descriptor.host);
+            descriptor = {};
+            if (AllocateHipPinnedHost(&descriptor.host, descriptor_bytes,
+                                      hipHostMallocMapped) != hipSuccess) {
+                hipGetLastError();
+                return AcceleratorDevice::CopyFromHostBatchAsync(ranges,
+                                                                 stream);
+            }
+            descriptor.capacity = descriptor_bytes;
+            descriptor.device_id = descriptor_device_id;
+            if (GetHipHostDevicePointer(&descriptor.device, descriptor.host) !=
+                hipSuccess) {
+                hipGetLastError();
+                FreeHipPinnedHost(descriptor.host);
+                return AcceleratorDevice::CopyFromHostBatchAsync(ranges,
+                                                                 stream);
+            }
+        }
+        void *host_descriptors = descriptor.host;
         auto *descriptors = static_cast<DeviceRange *>(host_descriptors);
         for (size_t i = 0; i < ranges.size(); ++i) {
-            descriptors[i] = DeviceRange{
-                reinterpret_cast<uint64_t>(ranges[i].dst),
-                reinterpret_cast<uint64_t>(ranges[i].src_device),
-                ranges[i].size};
+            descriptors[i] =
+                DeviceRange{reinterpret_cast<uint64_t>(ranges[i].dst),
+                            reinterpret_cast<uint64_t>(ranges[i].src_device),
+                            ranges[i].size};
         }
 
-        void *device_descriptors = nullptr;
-        if (GetHipHostDevicePointer(&device_descriptors, host_descriptors) !=
-            hipSuccess) {
-            hipGetLastError();
-            FreeHipPinnedHost(host_descriptors);
-            return AcceleratorDevice::CopyFromHostBatchAsync(ranges, stream);
-        }
+        void *device_descriptors = descriptor.device;
 
         uint64_t range_count = ranges.size();
         void *args[] = {&device_descriptors, &range_count};
         constexpr unsigned int kThreads = 256;
-        const auto hip_stream = static_cast<hipStream_t>(stream);
-        const hipError_t launch_result = hipModuleLaunchKernel(
-            function, static_cast<unsigned int>(ranges.size()), 1, 1, kThreads,
-            1, 1, 0, hip_stream, args, nullptr);
+        const auto blocks = static_cast<unsigned int>(
+            grouped_kernel ? std::min<size_t>((ranges.size() + 3) / 4, 32)
+                           : ranges.size());
+        hipError_t launch_result;
+        try {
+            // Publish under the same lock used to capture the sync boundary.
+            // Allocate tracking before launch; sync can splice it without
+            // allocating, including when a failed sync must retain ownership.
+            std::lock_guard<std::mutex> lock(descriptor_mutex_);
+            auto &pending = descriptors_.at(stream).pending;
+            pending.push_back(descriptor);
+            launch_result =
+                hipModuleLaunchKernel(function, blocks, 1, 1, kThreads, 1, 1, 0,
+                                      hip_stream, args, nullptr);
+            if (launch_result != hipSuccess) pending.pop_back();
+        } catch (const std::bad_alloc &) {
+            FreeHipPinnedHost(host_descriptors);
+            return AcceleratorDevice::CopyFromHostBatchAsync(ranges, stream);
+        }
         if (launch_result != hipSuccess) {
             hipGetLastError();
             FreeHipPinnedHost(host_descriptors);
             return AcceleratorDevice::CopyFromHostBatchAsync(ranges, stream);
         }
 
-        {
-            std::lock_guard<std::mutex> lock(descriptor_mutex_);
-            pending_descriptors_[static_cast<void *>(hip_stream)].push_back(
-                host_descriptors);
-        }
         if (used_batch_kernel) *used_batch_kernel = true;
         return true;
     }
@@ -203,31 +246,69 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
 
     bool SynchronizeStream(void* stream) const override {
         const auto hip_stream = static_cast<hipStream_t>(stream);
+        std::list<DescriptorBuffer> descriptors;
+        {
+            std::lock_guard<std::mutex> lock(descriptor_mutex_);
+            auto it = descriptors_.find(stream);
+            if (it != descriptors_.end()) {
+                descriptors.splice(descriptors.end(), it->second.pending);
+            }
+        }
         bool success = false;
         {
             std::shared_lock<std::shared_mutex> lock(HipRuntimeStateMutex());
             success = hipStreamSynchronize(hip_stream) == hipSuccess;
         }
-        // Synchronization establishes that the kernel no longer dereferences
-        // the mapped descriptor array. Free it even when the stream reports a
-        // device-side error; the stream has completed in either case.
-        std::vector<void *> descriptors;
         {
             std::lock_guard<std::mutex> lock(descriptor_mutex_);
-            auto it = pending_descriptors_.find(static_cast<void *>(hip_stream));
-            if (it != pending_descriptors_.end()) {
-                descriptors = std::move(it->second);
-                pending_descriptors_.erase(it);
+            auto it = descriptors_.find(stream);
+            if (it != descriptors_.end() && !success) {
+                // An error is not proof that a device has stopped reading.
+                it->second.pending.splice(it->second.pending.end(),
+                                          descriptors);
+                return false;
+            }
+            // Cache only successful completions on explicit streams. Keep a
+            // single idle block per stream with a process-wide idle byte cap.
+            if (success && it != descriptors_.end() && stream &&
+                hip_stream != hipStreamPerThread &&
+                hip_stream != hipStreamLegacy) {
+                auto &idle = it->second.idle;
+                for (auto &descriptor : descriptors) {
+                    if (descriptor.capacity <= kMaxCachedDescriptorBytes &&
+                        descriptor.capacity > idle.capacity &&
+                        idle_descriptor_bytes_ - idle.capacity +
+                                descriptor.capacity <=
+                            kMaxIdleDescriptorBytes) {
+                        idle_descriptor_bytes_ = idle_descriptor_bytes_ -
+                                                 idle.capacity +
+                                                 descriptor.capacity;
+                        std::swap(idle, descriptor);
+                    }
+                }
             }
         }
-        for (void *descriptor : descriptors) {
-            FreeHipPinnedHost(descriptor);
+        for (const auto &descriptor : descriptors) {
+            if (descriptor.host) FreeHipPinnedHost(descriptor.host);
         }
         return success;
     }
 
     void DestroyStream(void* stream) const override {
+        // Destroy also drains submissions when a caller has not synchronized.
+        if (!SynchronizeStream(stream)) return;
         hipStreamDestroy(static_cast<hipStream_t>(stream));
+        DescriptorBuffer idle;
+        {
+            std::lock_guard<std::mutex> lock(descriptor_mutex_);
+            auto it = descriptors_.find(stream);
+            if (it != descriptors_.end()) {
+                idle = it->second.idle;
+                idle_descriptor_bytes_ -= idle.capacity;
+                descriptors_.erase(it);
+            }
+        }
+        if (idle.host) FreeHipPinnedHost(idle.host);
     }
 
     PinnedHostBuffer AllocatePinnedHost(size_t size) const override {
@@ -258,22 +339,22 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
     }
 
     ~HipAcceleratorDevice() override {
-        std::vector<void *> descriptors;
+        bool has_pending = false;
         {
             std::lock_guard<std::mutex> descriptor_lock(descriptor_mutex_);
-            for (auto &[_, pending] : pending_descriptors_) {
-                descriptors.insert(descriptors.end(), pending.begin(),
-                                   pending.end());
+            for (const auto &[_, state] : descriptors_) {
+                has_pending |= !state.pending.empty();
+                if (state.idle.host) FreeHipPinnedHost(state.idle.host);
             }
-            pending_descriptors_.clear();
+            // Normal stream-pool shutdown drains pending work. If it failed,
+            // retain its raw allocations and modules until process exit.
+            descriptors_.clear();
         }
-        for (void *descriptor : descriptors) {
-            FreeHipPinnedHost(descriptor);
-        }
-
+        if (has_pending) return;
         std::lock_guard<std::mutex> lock(module_mutex_);
-        for (const auto &[_, module] : copy_modules_) {
-            hipModuleUnload(module);
+        for (const auto &[device_id, functions] : copy_functions_) {
+            SetContext(device_id);
+            hipModuleUnload(functions.module);
         }
     }
 
@@ -297,15 +378,18 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
                 if (std::ifstream(path).good()) return path.string();
             }
         }
-        return "/usr/local/lib/python3.10/dist-packages/mooncake/mc_copy_kernel.co";
+        return "/usr/local/lib/python3.10/dist-packages/mooncake/"
+               "mc_copy_kernel.co";
     }
 
-    bool LoadCopyFunction(int device_id, hipFunction_t *function) const {
+    bool LoadCopyFunction(int device_id, hipFunction_t *function,
+                          bool request_grouped, bool *used_grouped) const {
         if (device_id < 0) return false;
         std::lock_guard<std::mutex> lock(module_mutex_);
         auto it = copy_functions_.find(device_id);
         if (it != copy_functions_.end()) {
-            *function = it->second;
+            *used_grouped = request_grouped && it->second.grouped;
+            *function = *used_grouped ? it->second.grouped : it->second.base;
             return true;
         }
 
@@ -325,18 +409,55 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
             hipModuleUnload(module);
             return false;
         }
-        copy_modules_.emplace(device_id, module);
-        copy_functions_.emplace(device_id, loaded_function);
-        *function = loaded_function;
+        hipFunction_t grouped_function = nullptr;
+        hipDeviceProp_t properties{};
+        const bool tuned_device =
+            hipGetDeviceProperties(&properties, device_id) == hipSuccess &&
+            std::strncmp(properties.gcnArchName, "gfx936", 6) == 0;
+        if (tuned_device &&
+            hipModuleGetFunction(&grouped_function, module,
+                                 "MCStoreH2DGroupedKernel") != hipSuccess) {
+            // Older code objects remain compatible with the baseline entry.
+            hipGetLastError();
+            grouped_function = nullptr;
+        }
+        try {
+            copy_functions_.emplace(
+                device_id,
+                CopyFunctions{module, loaded_function, grouped_function});
+        } catch (const std::bad_alloc &) {
+            hipModuleUnload(module);
+            return false;
+        }
+        *used_grouped = request_grouped && grouped_function;
+        *function = *used_grouped ? grouped_function : loaded_function;
         return true;
     }
 
+    struct DescriptorBuffer {
+        void *host = nullptr;
+        void *device = nullptr;
+        size_t capacity = 0;
+        int device_id = -1;
+    };
+    struct DescriptorState {
+        std::list<DescriptorBuffer> pending;
+        DescriptorBuffer idle;
+    };
+    // Retain one completed allocation per stream, at most 64 KiB each.
+    static constexpr size_t kMaxCachedDescriptorBytes = 64 * 1024;
+    static constexpr size_t kMaxIdleDescriptorBytes = 1024 * 1024;
+    mutable size_t idle_descriptor_bytes_ = 0;
+
     mutable std::mutex module_mutex_;
     mutable std::mutex descriptor_mutex_;
-    mutable std::unordered_map<int, hipModule_t> copy_modules_;
-    mutable std::unordered_map<int, hipFunction_t> copy_functions_;
-    mutable std::unordered_map<void *, std::vector<void *>>
-        pending_descriptors_;
+    struct CopyFunctions {
+        hipModule_t module = nullptr;
+        hipFunction_t base = nullptr;
+        hipFunction_t grouped = nullptr;
+    };
+    mutable std::unordered_map<int, CopyFunctions> copy_functions_;
+    mutable std::unordered_map<void *, DescriptorState> descriptors_;
 };
 
 const AcceleratorDevice& HipDeviceInstance() {
