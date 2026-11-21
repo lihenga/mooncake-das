@@ -1742,6 +1742,37 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 file_storage_config.prefetch_capacity_ratio > 0.0 &&
                 file_storage_->UnifiedPrefetchLimitBytes() > 0,
             std::memory_order_release);
+        // Warm the H2D scatter path once setup is complete. The scatter kernel
+        // module load and the per-stream descriptor arenas each touch the
+        // driver, and under HSA_USERPTR_FOR_PAGED_MEM=0 the arena allocation is
+        // a GTT allocation that can run a direct compaction. Paying that here,
+        // before request traffic, keeps it off the first business batch. Best
+        // effort: a failure only means the first batch carries the cost.
+        if (dfs_h2d_stream_pool_ && file_storage_->HasPinnedRestoreArena()) {
+            auto accelerators =
+                device::GetAcceleratorRegistry().RuntimeAccelerators().Devices();
+            const int32_t prepare_device =
+                accelerators.empty() ? -1
+                                     : accelerators.front()->CurrentDeviceId();
+            auto lease = dfs_h2d_stream_pool_->Acquire(
+                accelerators.empty() ? nullptr : accelerators.front(),
+                prepare_device);
+            if (lease) {
+                const bool warmed =
+                    device::GetAcceleratorRegistry()
+                        .RuntimeAccelerators()
+                        .WarmMappedHostCopyPath(
+                            prepare_device, lease->streams(),
+                            file_storage_->UnifiedBufferHostAddress(),
+                            file_storage_->UnifiedBufferDeviceAddress(),
+                            file_storage_->UnifiedBufferCapacity());
+                if (!warmed) {
+                    LOG(WARNING)
+                        << "DFS H2D warm-up failed; the first scatter batch "
+                           "may pay for the kernel load or arena allocation";
+                }
+            }
+        }
     }
     if (enable_ssd_offload) {
         // The dangling-replica heal in Client::Put needs an existence check

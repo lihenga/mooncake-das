@@ -24,7 +24,12 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
 
 #include "shared_segment/host_memfd.h"
 
@@ -83,6 +88,8 @@ void FreeHipRegisteredHostBuffer(void *addr) {
         span = it->second;
         RegisteredHostSpans().erase(it);
     }
+    // munmap drops the lock too; an explicit munlock would only add a failure
+    // mode between the unregister and the unmap.
     if (munmap(addr, span) != 0) {
         PLOG(WARNING) << "munmap of " << span << " unregistered bytes at "
                       << addr << " failed";
@@ -108,6 +115,75 @@ int CurrentDeviceNumaNode() {
         return -1;
     }
     return node;
+}
+
+// AnonHugePages and Locked bytes of the mapping that starts exactly at `addr`
+// and is roughly `size` long, read from /proc/self/smaps. Diagnostics only:
+// the numbers describe the current state, not a guarantee that the span stays
+// huge-page backed. A missing entry reports 0/0.
+struct MappingStats {
+    uint64_t anon_huge_bytes = 0;
+    uint64_t locked_bytes = 0;
+    uint64_t rss_bytes = 0;
+    bool found = false;
+};
+
+MappingStats ReadMappingStats(void *addr, size_t size) {
+    MappingStats stats;
+    FILE *fp = std::fopen("/proc/self/smaps", "r");
+    if (fp == nullptr) return stats;
+    const auto want_start = reinterpret_cast<uintptr_t>(addr);
+    const uintptr_t want_end = want_start + size;
+    char line[256];
+    bool in_range = false;
+    while (std::fgets(line, sizeof(line), fp) != nullptr) {
+        unsigned long long start = 0, end = 0;
+        if (std::sscanf(line, "%llx-%llx", &start, &end) == 2) {
+            in_range = static_cast<uintptr_t>(start) == want_start &&
+                       static_cast<uintptr_t>(end) == want_end;
+            if (in_range) stats.found = true;
+            continue;
+        }
+        if (!in_range) continue;
+        unsigned long long kb = 0;
+        if (std::sscanf(line, "AnonHugePages: %llu kB", &kb) == 1) {
+            stats.anon_huge_bytes = kb * 1024ULL;
+        } else if (std::sscanf(line, "Locked: %llu kB", &kb) == 1) {
+            stats.locked_bytes = kb * 1024ULL;
+        } else if (std::sscanf(line, "Rss: %llu kB", &kb) == 1) {
+            stats.rss_bytes = kb * 1024ULL;
+        }
+    }
+    std::fclose(fp);
+    return stats;
+}
+
+double MappedPinnedThpThreshold() {
+    static const double kThreshold = []() -> double {
+        const char *value = std::getenv("MC_STORE_DFS_THP_MIN_PERCENT");
+        if (value != nullptr && *value != '\0') {
+            char *end = nullptr;
+            const double parsed = std::strtod(value, &end);
+            if (end != value && parsed >= 0.0 && parsed <= 100.0) {
+                return parsed;
+            }
+        }
+        // Requiring THP without naming a threshold means "mostly huge pages";
+        // a value of 0 would silently accept a span that is entirely 4 KiB.
+        const char *require = std::getenv("MC_STORE_DFS_REQUIRE_THP");
+        const bool require_thp =
+            require != nullptr && *require != '\0' && std::strcmp(require, "0") != 0;
+        return require_thp ? 90.0 : 0.0;
+    }();
+    return kThreshold;
+}
+
+bool MappedPinnedRequireThp() {
+    static const bool kRequire = []() -> bool {
+        const char *value = std::getenv("MC_STORE_DFS_REQUIRE_THP");
+        return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+    }();
+    return kRequire;
 }
 
 class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
@@ -206,15 +282,40 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
             return AcceleratorDevice::CopyFromHostBatchAsync(ranges, stream);
         }
 
-        // Keep the descriptors in mapped pinned host memory. This avoids a
-        // second H2D descriptor copy and remains valid until the stream has
-        // consumed the kernel, at which point SynchronizeStream releases it.
+        // Descriptors come from a per-stream arena that is allocated once and
+        // reused until the stream is synchronized, so a batch no longer calls
+        // hipHostMalloc. Under HSA_USERPTR_FOR_PAGED_MEM=0 that call is a GTT
+        // allocation, which can run a direct compaction in the calling thread.
+        const auto hip_stream = static_cast<hipStream_t>(stream);
         const size_t descriptor_bytes = ranges.size() * sizeof(DeviceRange);
         void *host_descriptors = nullptr;
-        if (AllocateHipPinnedHost(&host_descriptors, descriptor_bytes,
-                                  hipHostMallocMapped) != hipSuccess) {
-            hipGetLastError();
-            return AcceleratorDevice::CopyFromHostBatchAsync(ranges, stream);
+        void *device_descriptors = nullptr;
+        size_t arena_offset = 0;
+        bool from_arena = false;
+        if (ReserveDescriptorArena(hip_stream, descriptor_bytes,
+                                   &host_descriptors, &device_descriptors,
+                                   &arena_offset)) {
+            from_arena = true;
+        } else {
+            LOG_EVERY_N(WARNING, 64)
+                << "DFS H2D descriptor arena could not serve "
+                << descriptor_bytes
+                << " bytes, falling back to a per-batch pinned allocation "
+                   "(count="
+                << descriptor_arena_fallbacks_.fetch_add(1) + 1 << ")";
+            if (AllocateHipPinnedHost(&host_descriptors, descriptor_bytes,
+                                      hipHostMallocMapped) != hipSuccess) {
+                hipGetLastError();
+                return AcceleratorDevice::CopyFromHostBatchAsync(ranges,
+                                                                 stream);
+            }
+            if (GetHipHostDevicePointer(&device_descriptors,
+                                        host_descriptors) != hipSuccess) {
+                hipGetLastError();
+                FreeHipPinnedHost(host_descriptors);
+                return AcceleratorDevice::CopyFromHostBatchAsync(ranges,
+                                                                 stream);
+            }
         }
         auto *descriptors = static_cast<DeviceRange *>(host_descriptors);
         for (size_t i = 0; i < ranges.size(); ++i) {
@@ -224,31 +325,28 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
                 ranges[i].size};
         }
 
-        void *device_descriptors = nullptr;
-        if (GetHipHostDevicePointer(&device_descriptors, host_descriptors) !=
-            hipSuccess) {
-            hipGetLastError();
-            FreeHipPinnedHost(host_descriptors);
-            return AcceleratorDevice::CopyFromHostBatchAsync(ranges, stream);
-        }
-
         uint64_t range_count = ranges.size();
         void *args[] = {&device_descriptors, &range_count};
         constexpr unsigned int kThreads = 256;
-        const auto hip_stream = static_cast<hipStream_t>(stream);
         const hipError_t launch_result = hipModuleLaunchKernel(
             function, static_cast<unsigned int>(ranges.size()), 1, 1, kThreads,
             1, 1, 0, hip_stream, args, nullptr);
         if (launch_result != hipSuccess) {
             hipGetLastError();
-            FreeHipPinnedHost(host_descriptors);
+            if (from_arena) {
+                ReleaseDescriptorArena(hip_stream, arena_offset,
+                                       descriptor_bytes);
+            } else {
+                FreeHipPinnedHost(host_descriptors);
+            }
             return AcceleratorDevice::CopyFromHostBatchAsync(ranges, stream);
         }
 
-        {
+        if (!from_arena) {
+            // The stream has not consumed a one-off allocation yet; keep it
+            // until SynchronizeStream reports the kernel has finished.
             std::lock_guard<std::mutex> lock(descriptor_mutex_);
-            pending_descriptors_[static_cast<void *>(hip_stream)].push_back(
-                host_descriptors);
+            pending_descriptors_[hip_stream].push_back(host_descriptors);
         }
         if (used_batch_kernel) *used_batch_kernel = true;
         return true;
@@ -272,16 +370,20 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
             success = hipStreamSynchronize(hip_stream) == hipSuccess;
         }
         // Synchronization establishes that the kernel no longer dereferences
-        // the mapped descriptor array. Free it even when the stream reports a
-        // device-side error; the stream has completed in either case.
+        // the mapped descriptor array. Free one-off allocations even when the
+        // stream reports a device-side error; the stream has completed in
+        // either case. The arena is not freed, only rewound: every descriptor
+        // it held has now been consumed.
         std::vector<void *> descriptors;
         {
             std::lock_guard<std::mutex> lock(descriptor_mutex_);
-            auto it = pending_descriptors_.find(static_cast<void *>(hip_stream));
+            auto it = pending_descriptors_.find(hip_stream);
             if (it != pending_descriptors_.end()) {
                 descriptors = std::move(it->second);
                 pending_descriptors_.erase(it);
             }
+            auto arena = descriptor_arenas_.find(hip_stream);
+            if (arena != descriptor_arenas_.end()) arena->second.used = 0;
         }
         for (void *descriptor : descriptors) {
             FreeHipPinnedHost(descriptor);
@@ -290,7 +392,20 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
     }
 
     void DestroyStream(void* stream) const override {
-        hipStreamDestroy(static_cast<hipStream_t>(stream));
+        const auto hip_stream = static_cast<hipStream_t>(stream);
+        // The caller has synchronized the stream (or is tearing the device
+        // down); a kernel still reading the arena would be a use-after-free.
+        hipStreamDestroy(hip_stream);
+        void *arena_host = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(descriptor_mutex_);
+            auto it = descriptor_arenas_.find(hip_stream);
+            if (it != descriptor_arenas_.end()) {
+                arena_host = it->second.host;
+                descriptor_arenas_.erase(it);
+            }
+        }
+        if (arena_host != nullptr) FreeHipPinnedHost(arena_host);
     }
 
     PinnedHostBuffer AllocatePinnedHost(size_t size) const override {
@@ -354,6 +469,41 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
         host_memfd::AdviseDontFork(addr, span);
         host_memfd::PrefaultRange(addr, span, host_memfd::kPrefaultStride);
 
+        // Compaction generally skips compound pages, so a span that is mostly
+        // huge-page backed is far less likely to be migrated and to evict the
+        // GPU queues that map it. The coverage is what this allocation got,
+        // not what it will keep: log it so a low value is visible.
+        const MappingStats stats = ReadMappingStats(addr, span);
+        const double thp_percent =
+            span == 0 ? 0.0
+                      : 100.0 * static_cast<double>(stats.anon_huge_bytes) /
+                            static_cast<double>(span);
+        LOG(INFO) << "Mapped pinned host: thp_coverage=" << thp_percent
+                  << "% (" << stats.anon_huge_bytes / 1024 / 1024 << "/"
+                  << span / 1024 / 1024 << " MiB) node=" << preferred_node;
+        const double min_percent = MappedPinnedThpThreshold();
+        if (thp_percent < min_percent) {
+            const std::string message =
+                "Mapped pinned host: thp_coverage " +
+                std::to_string(thp_percent) + "% is below the required " +
+                std::to_string(min_percent) + "%";
+            if (MappedPinnedRequireThp()) {
+                LOG(ERROR) << message << "; refusing the allocation";
+                munmap(addr, span);
+                return PinnedHostBuffer();
+            }
+            LOG(WARNING) << message;
+        }
+
+        // A migrated page is only one problem; a reclaimed or split one is
+        // another. Locking keeps the span resident and out of the swap path.
+        // It does not by itself stop compaction, which is why the coverage
+        // above is the first line of defence.
+        if (mlock(addr, span) != 0) {
+            PLOG(WARNING) << "Mapped pinned host: mlock of " << span
+                          << " bytes failed; the buffer stays migratable";
+        }
+
         // The span is recorded before registering, so a failed insert leaves
         // nothing registered and a registered span is never unrecorded.
         bool recorded = false;
@@ -396,6 +546,68 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
                                 device_addr);
     }
 
+    bool WarmMappedHostCopyPath(const std::vector<void *> &streams,
+                                void *host_buffer, void *host_device_alias,
+                                size_t buffer_size) const override {
+        // Module load and descriptor arenas are the parts that touch the
+        // driver; both are idempotent, so a second warm-up is cheap.
+        hipFunction_t function = nullptr;
+        const bool kernel_ready = LoadCopyFunction(CurrentDeviceId(), &function);
+        if (!kernel_ready) {
+            LOG(WARNING) << "DFS H2D warm-up: scatter kernel is unavailable; "
+                            "batches will use DMA";
+        }
+        bool arenas_ready = true;
+        for (void *stream : streams) {
+            if (stream == nullptr) continue;
+            if (!CreateDescriptorArena(static_cast<hipStream_t>(stream))) {
+                arenas_ready = false;
+                LOG(WARNING) << "DFS H2D warm-up: descriptor arena for stream "
+                             << stream << " failed";
+            }
+        }
+        if (!kernel_ready || !arenas_ready || streams.empty() ||
+            host_buffer == nullptr || host_device_alias == nullptr ||
+            buffer_size == 0) {
+            return false;
+        }
+
+        constexpr size_t kWarmupRanges = 32;
+        constexpr size_t kRangeBytes = 1;
+        void *warmup_device = nullptr;
+        if (hipMalloc(reinterpret_cast<void **>(&warmup_device),
+                      kWarmupRanges * kRangeBytes) != hipSuccess) {
+            hipGetLastError();
+            LOG(WARNING) << "DFS H2D warm-up: temporary device allocation "
+                            "failed";
+            return false;
+        }
+        std::vector<HostCopyRange> ranges;
+        ranges.reserve(kWarmupRanges);
+        const size_t stride = std::max<size_t>(buffer_size / kWarmupRanges, 1);
+        for (size_t i = 0; i < kWarmupRanges; ++i) {
+            const size_t src_offset =
+                std::min(i * stride, buffer_size - kRangeBytes);
+            ranges.push_back({static_cast<char *>(warmup_device) + i,
+                              static_cast<char *>(host_buffer) + src_offset,
+                              kRangeBytes,
+                              static_cast<char *>(host_device_alias) +
+                                  src_offset});
+        }
+        bool used_kernel = false;
+        void *stream = streams.front();
+        const bool warmed =
+            CopyFromHostBatchAsync(ranges, stream, &used_kernel) &&
+            used_kernel && SynchronizeStream(stream);
+        hipFree(warmup_device);
+        if (!warmed) {
+            LOG(WARNING) << "DFS H2D warm-up: scatter launch or synchronization "
+                            "failed";
+            return false;
+        }
+        return true;
+    }
+
     ~HipAcceleratorDevice() override {
         std::vector<void *> descriptors;
         {
@@ -410,6 +622,18 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
             FreeHipPinnedHost(descriptor);
         }
 
+        std::vector<void *> arenas;
+        {
+            std::lock_guard<std::mutex> descriptor_lock(descriptor_mutex_);
+            for (auto &[_, arena] : descriptor_arenas_) {
+                arenas.push_back(arena.host);
+            }
+            descriptor_arenas_.clear();
+        }
+        for (void *arena : arenas) {
+            FreeHipPinnedHost(arena);
+        }
+
         std::lock_guard<std::mutex> lock(module_mutex_);
         for (const auto &[_, module] : copy_modules_) {
             hipModuleUnload(module);
@@ -417,6 +641,128 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
     }
 
    private:
+    // Descriptor staging for one stream: a single mapped pinned allocation,
+    // handed out by bump allocation between two synchronizations. Mapped host
+    // memory stays valid for the device until the deleter runs, so the arena
+    // must outlive the kernel; the offset only resets once the stream has
+    // finished. A batch larger than the whole arena still makes progress
+    // through the one-off fallback in the caller.
+    struct DescriptorArena {
+        void *host = nullptr;
+        // Device alias of host. A mapped host allocation keeps a constant
+        // host/device address offset across its whole range, so a slot's alias
+        // is base+offset. Deriving it this way avoids calling
+        // hipHostGetDevicePointer with an interior (non-base) address, which is
+        // not guaranteed to be accepted.
+        void *device = nullptr;
+        size_t bytes = 0;
+        size_t used = 0;
+    };
+
+    size_t DescriptorArenaBytes() const {
+        static const size_t kBytes = []() -> size_t {
+            constexpr size_t kDefault = 4ULL * 1024 * 1024;
+            const char *value = std::getenv("MC_STORE_DFS_H2D_DESC_ARENA_BYTES");
+            if (value == nullptr || *value == '\0') return kDefault;
+            char *end = nullptr;
+            const unsigned long long parsed = std::strtoull(value, &end, 10);
+            if (end == value || *end != '\0' || parsed == 0) return kDefault;
+            return static_cast<size_t>(parsed);
+        }();
+        return kBytes;
+    }
+
+    // Bump-allocates descriptor_bytes from the stream's arena, creating it on
+    // first use. Returns false when the remaining space does not fit, so the
+    // caller can fall back to a one-off allocation. The HIP calls run outside
+    // descriptor_mutex_, so this path never nests it around
+    // HipRuntimeStateMutex().
+    bool ReserveDescriptorArena(hipStream_t stream, size_t descriptor_bytes,
+                                void **host, void **device,
+                                size_t *arena_offset) const {
+        if (descriptor_bytes == 0) return false;
+        if (!TryBumpDescriptorArena(stream, descriptor_bytes, host, device,
+                                    arena_offset)) {
+            if (!CreateDescriptorArena(stream)) return false;
+            if (!TryBumpDescriptorArena(stream, descriptor_bytes, host, device,
+                                        arena_offset)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool TryBumpDescriptorArena(hipStream_t stream, size_t descriptor_bytes,
+                                void **host, void **device,
+                                size_t *arena_offset) const {
+        std::lock_guard<std::mutex> lock(descriptor_mutex_);
+        auto it = descriptor_arenas_.find(stream);
+        if (it == descriptor_arenas_.end()) return false;
+        DescriptorArena &arena = it->second;
+        if (descriptor_bytes > arena.bytes - arena.used) return false;
+        const size_t offset = arena.used;
+        arena.used += descriptor_bytes;
+        *host = static_cast<char *>(arena.host) + offset;
+        *device = static_cast<char *>(arena.device) + offset;
+        if (arena_offset) *arena_offset = offset;
+        return true;
+    }
+
+    bool CreateDescriptorArena(hipStream_t stream) const {
+        {
+            std::lock_guard<std::mutex> lock(descriptor_mutex_);
+            if (descriptor_arenas_.count(stream) != 0) return true;
+        }
+        const size_t bytes = DescriptorArenaBytes();
+        void *host_addr = nullptr;
+        if (AllocateHipPinnedHost(&host_addr, bytes, hipHostMallocMapped) !=
+            hipSuccess) {
+            hipGetLastError();
+            return false;
+        }
+        void *device_addr = nullptr;
+        if (GetHipHostDevicePointer(&device_addr, host_addr) != hipSuccess) {
+            hipGetLastError();
+            FreeHipPinnedHost(host_addr);
+            return false;
+        }
+        bool keep = false;
+        {
+            std::lock_guard<std::mutex> lock(descriptor_mutex_);
+            auto [it, inserted] =
+                descriptor_arenas_.try_emplace(stream, DescriptorArena{});
+            if (inserted) {
+                it->second.host = host_addr;
+                it->second.device = device_addr;
+                it->second.bytes = bytes;
+                it->second.used = 0;
+                keep = true;
+            }
+        }
+        if (!keep) {
+            // Another submission created it first; keep the existing arena.
+            FreeHipPinnedHost(host_addr);
+            return true;
+        }
+        LOG(INFO) << "DFS H2D descriptor arena allocated: stream=" << stream
+                  << " bytes=" << bytes;
+        return true;
+    }
+
+    // Restores the reservation made for a launch that never reached the
+    // stream, so the space is not lost until the next synchronization. Only
+    // the tail reservation can be taken back; anything earlier is still
+    // waiting in the queue and stays accounted.
+    void ReleaseDescriptorArena(hipStream_t stream, size_t arena_offset,
+                                size_t descriptor_bytes) const {
+        std::lock_guard<std::mutex> lock(descriptor_mutex_);
+        auto it = descriptor_arenas_.find(stream);
+        if (it == descriptor_arenas_.end()) return;
+        if (it->second.used == arena_offset + descriptor_bytes) {
+            it->second.used = arena_offset;
+        }
+    }
+
     static std::string CopyKernelPath() {
         const char *directory = std::getenv("MC_COPY_KERNEL_PATH");
         if (directory && directory[0] != '\0') {
@@ -474,8 +820,10 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
     mutable std::mutex descriptor_mutex_;
     mutable std::unordered_map<int, hipModule_t> copy_modules_;
     mutable std::unordered_map<int, hipFunction_t> copy_functions_;
-    mutable std::unordered_map<void *, std::vector<void *>>
+    mutable std::unordered_map<hipStream_t, std::vector<void *>>
         pending_descriptors_;
+    mutable std::unordered_map<hipStream_t, DescriptorArena> descriptor_arenas_;
+    mutable std::atomic<uint64_t> descriptor_arena_fallbacks_{0};
 };
 
 const AcceleratorDevice& HipDeviceInstance() {

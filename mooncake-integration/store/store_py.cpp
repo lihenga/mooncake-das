@@ -22,6 +22,7 @@
 #include "ssd_register_client.h"
 #include "read_layout.h"
 #include "read_plan.h"
+#include "prepared_unified_buffer.h"
 #include "version.h"
 #include "device/accelerator_registry.h"
 #include "device/cuda_ipc_buffer.h"
@@ -2240,6 +2241,21 @@ PYBIND11_MODULE(_store, m) {
           "Return the serialized Mooncake tensor metadata size.");
     m.def("_deserialize_tensor", &deserialize_tensor_from_bytes,
           "Deserialize Mooncake tensor metadata plus payload bytes.");
+    m.def(
+        "prepare_dfs_unified_buffer",
+        [](int32_t device_id, int64_t size_bytes) {
+            // Runs before any client exists: the model loader calls this so the
+            // unified DFS buffer is allocated while memory is still free and
+            // can be backed by huge pages.
+            py::gil_scoped_release release;
+            return mooncake::PrepareDfsUnifiedBuffer(device_id, size_bytes);
+        },
+        py::arg("device_id"), py::arg("size_bytes") = 0,
+        "Allocate and register the mapped unified DFS buffer for device_id "
+        "before loading the model. size_bytes <= 0 uses "
+        "MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES. A Mooncake client created "
+        "later in the same process claims the buffer instead of allocating. "
+        "Returns 0 on success, -1 on failure.");
 
     py::class_<RangedReadSnapshotPy, std::shared_ptr<RangedReadSnapshotPy>>(
         m, "RangedReadSnapshot",
@@ -3624,6 +3640,25 @@ PYBIND11_MODULE(_store, m) {
                 return self.store_->dfs_prefetch_arena_status();
             },
             "\"ready\" or the reason the DFS prefetch arena is unavailable.")
+        .def(
+            "prepare_dfs_unified_buffer",
+            [](MooncakeStorePyWrapper &self, int32_t device_id,
+               int64_t size_bytes) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return -1;
+                }
+                py::gil_scoped_release release;
+                return self.store_->prepare_dfs_unified_buffer(device_id,
+                                                               size_bytes);
+            },
+            py::arg("device_id"), py::arg("size_bytes") = 0,
+            "Startup-only: allocate and register the mapped unified DFS buffer "
+            "for device_id before loading the model, so the span gets huge "
+            "pages while memory is free, and warm the H2D scatter path. "
+            "size_bytes <= 0 uses the configured unified buffer size. Call "
+            "after setting the device and before request traffic. Returns 0 on "
+            "success, -1 on failure; a later FileStorage claims the buffer.")
         .def(
             "record_prefetched_tokens",
             [](MooncakeStorePyWrapper &self, uint64_t tokens) {

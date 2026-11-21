@@ -78,6 +78,24 @@ bool RuntimeAccelerator::CopyFromHostBatchAsync(
     return accelerator->CopyFromHostBatchAsync(ranges, stream);
 }
 
+bool RuntimeAccelerator::WarmMappedHostCopyPath(
+    int32_t device_id, const std::vector<void*>& streams, void* host_buffer,
+    void* host_device_alias, size_t buffer_size) const {
+    // devices_ holds one entry per vendor, not per card; the requested card
+    // is selected through SetContext.
+    bool any = false;
+    bool all_warmed = true;
+    for (auto* accelerator : devices_) {
+        if (!accelerator) continue;
+        if (device_id >= 0) accelerator->SetContext(device_id);
+        any = true;
+        all_warmed = accelerator->WarmMappedHostCopyPath(
+                         streams, host_buffer, host_device_alias, buffer_size) &&
+                     all_warmed;
+    }
+    return any && all_warmed;
+}
+
 bool RuntimeAccelerator::CopyAuto(void* dst, const void* src,
                                   size_t size) const {
     PointerInfo src_info, dst_info;

@@ -129,6 +129,14 @@ class FileStorage {
         return pinned_restore_arena_ ? pinned_restore_arena_->capacity : 0;
     }
 
+    [[nodiscard]] void* UnifiedBufferHostAddress() const {
+        return pinned_restore_arena_ ? pinned_restore_arena_->data : nullptr;
+    }
+
+    [[nodiscard]] void* UnifiedBufferDeviceAddress() const {
+        return pinned_restore_arena_ ? pinned_restore_arena_->device_data : nullptr;
+    }
+
     [[nodiscard]] std::shared_ptr<DfsBufferUsageTracker>
     UnifiedBufferUsageTracker() const {
         return usage_tracker_;
