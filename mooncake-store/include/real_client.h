@@ -50,6 +50,7 @@ struct SessionRangeReadRequest {
     std::vector<size_t> src_offsets;
     std::chrono::steady_clock::time_point lease_deadline;
     size_t transferred_bytes{0};
+    size_t prefetch_group{0};
 };
 
 using NonMemReadEntry = SessionRangeReadRequest;
@@ -342,6 +343,8 @@ class RealClient : public PyClient {
     // this call returns. Non-DFS entries remain for the ordinary range-get.
     std::vector<int> batch_get_session_prefetch(
         const std::vector<std::string> &keys) override;
+    std::vector<std::vector<int>> batch_get_session_prefetch_batch(
+        const std::vector<std::vector<std::string>> &requests) override;
 
     // Whether waiting-queue DFS prefetch has a staging arena. Callers should
     // not submit prefetches when this is false: every DFS staging allocation
@@ -1510,6 +1513,9 @@ class RealClient : public PyClient {
         size_t local_buffer_size);
 
    private:
+    std::vector<int> PrefetchSessionKeys(
+        const std::vector<std::string> &keys,
+        const std::vector<size_t> &request_ids);
     // Called while session_mutex_ is held; detached owners stay in the caller.
     void CollectOrphanedDfsPrefetchBuffers(
         bool prefetch_cache_enabled, SessionRangeReadContext &context,

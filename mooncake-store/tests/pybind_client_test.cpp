@@ -1329,6 +1329,83 @@ TEST_F(RealClientDfsPrefetchTest, SharedRootRegionIsReleasedAfterLastKey) {
     EXPECT_EQ(py_client_->batch_get_session_end({keys[2]}), 0);
 }
 
+TEST_F(RealClientLeasePrefetchTest, BatchPrefetchReleasesEachRequestArena) {
+    DfsPrefetchTestEnv dfs_env;
+    ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES",
+                                "131072");
+    const std::vector<std::string> keys{"batch_release_a", "batch_release_b"};
+    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17991", keys));
+    ASSERT_NO_FATAL_FAILURE(RequirePrefetchArena());
+    if (IsSkipped()) return;
+    ASSERT_EQ(py_client_->batch_get_session_start(keys),
+              std::vector<int>(2, 0));
+    ASSERT_EQ(
+        py_client_->batch_get_session_prefetch_batch({{keys[0]}, {keys[1]}}),
+        (std::vector<std::vector<int>>{{0}, {0}}));
+    const auto before =
+        py_client_->file_storage_->UnifiedBufferReport().totalFreeSpace;
+    ASSERT_EQ(py_client_->batch_get_session_end({keys[0]}), 0);
+    // The other request from the same read batch must not retain this arena.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (py_client_->file_storage_->UnifiedBufferReport().totalFreeSpace <=
+               before &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    EXPECT_GT(py_client_->file_storage_->UnifiedBufferReport().totalFreeSpace,
+              before);
+    ExpectRead(keys[1], 1, 0, /*cache_only=*/true);
+    EXPECT_EQ(py_client_->batch_get_session_end({keys[1]}), 0);
+    ExpectArenaReleased();
+}
+
+TEST_F(RealClientLeasePrefetchTest, BatchPrefetchMapsSharedAndMissingKeys) {
+    DfsPrefetchTestEnv dfs_env;
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES",
+                                "131072");
+    const std::vector<std::string> keys{"batch_map_a", "batch_map_b"};
+    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17992", keys));
+    ASSERT_NO_FATAL_FAILURE(RequirePrefetchArena());
+    if (IsSkipped()) return;
+    ASSERT_EQ(py_client_->batch_get_session_start(keys),
+              std::vector<int>(2, 0));
+    EXPECT_EQ(py_client_->batch_get_session_prefetch_batch(
+                  {{keys[0], keys[0]}, {"no_session"}, {keys[1], keys[0]}, {}}),
+              (std::vector<std::vector<int>>{
+                  {0, 0}, {toInt(ErrorCode::INVALID_PARAMS)}, {0, 0}, {}}));
+    ExpectRead(keys[0], 0, 0, /*cache_only=*/true);
+    ExpectRead(keys[1], 1, 0, /*cache_only=*/true);
+    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+    ExpectArenaReleased();
+}
+
+TEST_F(RealClientLeasePrefetchTest, BatchPrefetchAllocationFailsPerRequest) {
+    DfsPrefetchTestEnv dfs_env;
+    ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES",
+                                "65536");
+    ScopedEnvVar prefetch_ratio("MC_STORE_DFS_PREFETCH_CAPACITY_RATIO",
+                                "0.125");
+    const std::vector<std::string> keys{"batch_full_a", "batch_full_b",
+                                        "batch_full_c", "batch_ok"};
+    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17993", keys));
+    ASSERT_NO_FATAL_FAILURE(RequirePrefetchArena());
+    if (IsSkipped()) return;
+    ASSERT_EQ(py_client_->batch_get_session_start(keys),
+              std::vector<int>(4, 0));
+    EXPECT_EQ(
+        py_client_->batch_get_session_prefetch_batch(
+            {{keys[0], keys[1], keys[2]}, {keys[3]}}),
+        (std::vector<std::vector<int>>{
+            {NoAvailableHandle(), NoAvailableHandle(), NoAvailableHandle()},
+            {0}}));
+    ExpectRead(keys[3], 3, 0, /*cache_only=*/true);
+    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+    ExpectArenaReleased();
+}
+
 TEST_F(RealClientDfsPrefetchTest, TearDownWithLivePrefetchedBuffers) {
     DfsPrefetchTestEnv dfs_env;
     // Two live prefetched objects need 16 KiB of prefetch budget, which a
