@@ -108,8 +108,9 @@ FileStorage::FileStorage(const FileStorageConfig& config,
             // A buffer prepared before the model loaded is the one that got
             // huge pages; take it instead of allocating into a full node. The
             // current device is the one the caller prepared for.
-            auto accelerators =
-                device::GetAcceleratorRegistry().RuntimeAccelerators().Devices();
+            auto runtime_accelerator =
+                device::GetAcceleratorRegistry().RuntimeAccelerators();
+            auto accelerators = runtime_accelerator.Devices();
             const int32_t device_id = accelerators.empty()
                                           ? -1
                                           : accelerators.front()->CurrentDeviceId();
