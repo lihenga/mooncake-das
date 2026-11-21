@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <vector>
 
 #include "pinned_host_buffer.h"
 
@@ -102,6 +103,18 @@ class AcceleratorDevice {
     // only needed by the DFS scatter-kernel path.
     virtual PinnedHostBuffer AllocateMappedPinnedHost(size_t size) const {
         return AllocatePinnedHost(size);
+    }
+
+    // Pay the one-off costs of the mapped-host H2D path up front: stream and
+    // sync-worker creation, the scatter kernel module load and descriptor
+    // arenas. Each carries a GTT or module-load cost that would otherwise land
+    // on the first business batch. `streams` are the streams later used for
+    // H2D; an empty set means "create nothing, only warm the kernel". Returns
+    // false when a backend step failed; callers may continue without warming.
+    virtual bool WarmMappedHostCopyPath(
+        const std::vector<void*>& /*streams*/, void* /*host_buffer*/,
+        void* /*host_device_alias*/, size_t /*buffer_size*/) const {
+        return true;
     }
 };
 

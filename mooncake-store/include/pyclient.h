@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
@@ -502,7 +503,6 @@ class PyClient {
 
     // Whether batch_get_session_prefetch() has a staging arena for DFS reads.
     virtual bool dfs_prefetch_arena_available() const { return false; }
-
     // Startup-only: disable DFS prefetch for future requests. The caller must
     // serialize this with session creation before request traffic. This does
     // not release the unified buffer. Unsupported clients must return false.
@@ -513,6 +513,17 @@ class PyClient {
     }
 
     virtual void record_prefetched_tokens(uint64_t /*tokens*/) {}
+
+    // Startup-only: allocate and register the mapped unified DFS buffer for
+    // `device_id` before the caller loads the model, so the allocation gets
+    // huge pages while memory is free. A later FileStorage that needs the
+    // unified buffer claims it instead of allocating. Must be called after the
+    // device is set and before any request traffic. Returns 0 on success, a
+    // negative value on failure; unsupported clients return -1. Idempotent.
+    virtual int prepare_dfs_unified_buffer(int32_t /*device_id*/,
+                                           int64_t /*size_bytes*/) {
+        return -1;
+    }
 
     virtual std::vector<int> batch_get_into_multi_buffer_ranges(
         const std::vector<std::string> &keys,

@@ -14,6 +14,7 @@
 #include "client_metric.h"
 #include "common/client_buffer_allocation.h"
 #include "device/accelerator_registry.h"
+#include "prepared_unified_buffer.h"
 #include "environment_variables.h"
 #include "environ.h"
 #ifdef USE_URING
@@ -101,8 +102,30 @@ FileStorage::FileStorage(const FileStorageConfig& config,
         const size_t arena_size =
             static_cast<size_t>(config_.unified_buffer_size);
         bool mapped_required = UseMappedPinnedRestoreArena();
-        auto buffer =
-            PinnedBufferPool::AllocatePinned(arena_size, mapped_required);
+        PinnedBufferPool::Buffer buffer;
+        bool claimed_prepared = false;
+        if (mapped_required) {
+            // A buffer prepared before the model loaded is the one that got
+            // huge pages; take it instead of allocating into a full node. The
+            // current device is the one the caller prepared for.
+            auto accelerators =
+                device::GetAcceleratorRegistry().RuntimeAccelerators().Devices();
+            const int32_t device_id = accelerators.empty()
+                                          ? -1
+                                          : accelerators.front()->CurrentDeviceId();
+            auto prepared =
+                PreparedUnifiedBuffer::Claim(device_id, arena_size);
+            if (prepared) {
+                buffer = std::move(*prepared);
+                claimed_prepared = true;
+                LOG(INFO) << "Using the pre-loaded unified DFS buffer, size="
+                          << buffer.capacity << ", device=" << device_id;
+            }
+        }
+        if (!claimed_prepared) {
+            buffer = PinnedBufferPool::AllocatePinned(arena_size,
+                                                     mapped_required);
+        }
         if (mapped_required &&
             (!buffer.pinned_host.addr || !buffer.mapped ||
              !buffer.device_data)) {

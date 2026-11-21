@@ -357,6 +357,14 @@ class RealClient : public PyClient {
     // "ready" or the reason the prefetch arena is unavailable.
     std::string dfs_prefetch_arena_status() const override;
 
+    // Startup-only: allocate and register the mapped unified DFS buffer for
+    // `device_id` before the model is loaded (see PyClient). size_bytes <= 0
+    // uses MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES. Also warms the H2D scatter
+    // path so the first business batch carries none of the module-load or
+    // descriptor-allocation cost. Returns 0 on success, -1 on failure.
+    int prepare_dfs_unified_buffer(int32_t device_id,
+                                   int64_t size_bytes) override;
+
     void record_prefetched_tokens(uint64_t tokens) override;
 
     std::vector<int> batch_get_into_multi_buffer_ranges(
