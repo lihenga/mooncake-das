@@ -1,1 +1,0 @@
-PASS device=1 checks=76 (geometry, tails, warm reuse, failures, concurrency, DMA, ceiling)
