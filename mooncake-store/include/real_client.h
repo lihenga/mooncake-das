@@ -50,7 +50,6 @@ struct SessionRangeReadRequest {
     std::vector<size_t> src_offsets;
     std::chrono::steady_clock::time_point lease_deadline;
     size_t transferred_bytes{0};
-    size_t prefetch_group{0};
 };
 
 using NonMemReadEntry = SessionRangeReadRequest;
@@ -1513,9 +1512,10 @@ class RealClient : public PyClient {
         size_t local_buffer_size);
 
    private:
+    template <bool Grouped>
     std::vector<int> PrefetchSessionKeys(
         const std::vector<std::string> &keys,
-        const std::vector<size_t> &request_ids);
+        const std::vector<size_t> *request_ids);
     // Called while session_mutex_ is held; detached owners stay in the caller.
     void CollectOrphanedDfsPrefetchBuffers(
         bool prefetch_cache_enabled, SessionRangeReadContext &context,
@@ -1525,11 +1525,13 @@ class RealClient : public PyClient {
     std::vector<std::vector<SessionRangeReadRequest *>> PlanDfsReadChunks(
         const std::vector<SessionRangeReadRequest *> &entries,
         size_t chunk_limit_bytes, size_t &request_planned_bytes);
+    template <bool Grouped = false>
     ErrorCode execute_session_dfs_range_reads_batch(
         std::vector<SessionRangeReadRequest *> &entries,
         std::vector<int> &results, uint64_t trace_id, bool prefetch_only,
         size_t chunk_index, size_t chunk_count, size_t chunk_limit_bytes,
-        size_t request_planned_bytes);
+        size_t request_planned_bytes,
+        const std::vector<size_t> *request_ids = nullptr);
     tl::expected<std::string, ErrorCode> StartEmbeddedMaster(
         bool enable_ssd_offload);
 
