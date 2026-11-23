@@ -852,7 +852,43 @@ std::vector<std::vector<int>> RealClient::batch_get_session_prefetch_batch(
         keys.insert(keys.end(), requests[i].begin(), requests[i].end());
         request_ids.insert(request_ids.end(), requests[i].size(), i);
     }
-    const auto flat_results = PrefetchSessionKeys<true>(keys, &request_ids);
+    auto flat_results = PrefetchSessionKeys<true>(keys, &request_ids);
+    // A shared key assigned to an oversized first arena may still fit a later
+    // request. Retry only allocation failures, never admission or I/O timeouts.
+    if (std::find(flat_results.begin(), flat_results.end(),
+                  toInt(ErrorCode::NO_AVAILABLE_HANDLE)) !=
+        flat_results.end()) {
+        std::unordered_set<std::string> earlier_keys;
+        std::unordered_map<std::string, int> resolved;
+        size_t begin = 0;
+        for (const auto &request : requests) {
+            std::vector<std::string> retry;
+            for (size_t i = 0; i < request.size(); ++i) {
+                const auto &key = request[i];
+                if (flat_results[begin + i] ==
+                        toInt(ErrorCode::NO_AVAILABLE_HANDLE) &&
+                    earlier_keys.contains(key) && !resolved.contains(key)) {
+                    retry.push_back(key);
+                }
+            }
+            if (!retry.empty()) {
+                const auto retried = PrefetchSessionKeys<false>(retry, nullptr);
+                for (size_t i = 0; i < retry.size(); ++i) {
+                    if (retried[i] != toInt(ErrorCode::NO_AVAILABLE_HANDLE)) {
+                        resolved.emplace(retry[i], retried[i]);
+                    }
+                }
+            }
+            earlier_keys.insert(request.begin(), request.end());
+            begin += request.size();
+        }
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (flat_results[i] == toInt(ErrorCode::NO_AVAILABLE_HANDLE) &&
+                resolved.contains(keys[i])) {
+                flat_results[i] = resolved.at(keys[i]);
+            }
+        }
+    }
     std::vector<std::vector<int>> results;
     size_t offset = 0;
     for (const auto &request : requests) {
@@ -1588,9 +1624,77 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
         std::vector<std::shared_ptr<void>> disk_buffer_owners(
             disk_temp_handles.begin(), disk_temp_handles.end());
         const auto io_start = std::chrono::steady_clock::now();
-        auto disk_results = client_->BatchGet(disk_batch_keys, disk_batch_qrs,
-                                              disk_batch_slices, false,
-                                              &disk_buffer_owners);
+        auto read_batch = [&] {
+            if constexpr (Grouped) {
+                const uint64_t limit =
+                    client_->GetDfsBatchReadAdmissionByteLimit();
+                std::vector<tl::expected<void, ErrorCode>> combined;
+                size_t batch_begin = 0;
+                uint64_t batch_bytes = 0;
+                auto submit = [&](size_t end) {
+                    if (batch_begin == 0 && end == disk_batch_keys.size()) {
+                        combined = client_->BatchGet(
+                            disk_batch_keys, disk_batch_qrs, disk_batch_slices,
+                            false, &disk_buffer_owners);
+                    } else {
+                        std::vector<std::string> keys(
+                            disk_batch_keys.begin() + batch_begin,
+                            disk_batch_keys.begin() + end);
+                        std::vector<QueryResult> queries(
+                            disk_batch_qrs.begin() + batch_begin,
+                            disk_batch_qrs.begin() + end);
+                        std::vector<std::vector<Slice>> slices(
+                            disk_batch_slices.begin() + batch_begin,
+                            disk_batch_slices.begin() + end);
+                        std::vector<std::shared_ptr<void>> owners(
+                            disk_buffer_owners.begin() + batch_begin,
+                            disk_buffer_owners.begin() + end);
+                        auto part = client_->BatchGet(keys, queries, slices,
+                                                      false, &owners);
+                        if (part.size() != end - batch_begin) {
+                            part.assign(
+                                end - batch_begin,
+                                tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+                        }
+                        combined.insert(combined.end(), part.begin(),
+                                        part.end());
+                    }
+                    batch_begin = end;
+                    batch_bytes = 0;
+                };
+                for (size_t first = 0; first < arena_views.size();) {
+                    size_t end = first;
+                    uint64_t bytes = 0;
+                    while (end < arena_views.size() &&
+                           arena_views[end].group == arena_views[first].group) {
+                        for (const auto &slice : disk_batch_slices[end]) {
+                            bytes += std::min<uint64_t>(
+                                slice.size,
+                                std::numeric_limits<uint64_t>::max() - bytes);
+                        }
+                        ++end;
+                    }
+                    if (first != batch_begin &&
+                        (bytes > limit || batch_bytes > limit - bytes)) {
+                        submit(first);
+                    }
+                    batch_bytes = bytes > limit ? bytes : batch_bytes + bytes;
+                    // Keep an individually oversized request intact so it
+                    // fails alone under the existing backend admission rule.
+                    if (bytes > limit) submit(end);
+                    first = end;
+                }
+                if (batch_begin < disk_batch_keys.size()) {
+                    submit(disk_batch_keys.size());
+                }
+                return combined;
+            } else {
+                return client_->BatchGet(disk_batch_keys, disk_batch_qrs,
+                                         disk_batch_slices, false,
+                                         &disk_buffer_owners);
+            }
+        };
+        auto disk_results = read_batch();
         const double io_duration =
             std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                           io_start)

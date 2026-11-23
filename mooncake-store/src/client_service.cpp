@@ -5646,6 +5646,12 @@ void Client::SetDfsStorageBackend(
     EnsureStorageControlPlaneStarted();
 }
 
+uint64_t Client::GetDfsBatchReadAdmissionByteLimit() const {
+    return dfs_storage_backend_
+               ? dfs_storage_backend_->BatchReadAdmissionByteLimit()
+               : std::numeric_limits<uint64_t>::max();
+}
+
 tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(
     std::vector<PromotionTaskItem>& promotion_objects) {
     auto response = master_client_.PromotionObjectHeartbeat(client_id_);
