@@ -205,9 +205,21 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
         uint64_t range_count = ranges.size();
         void *args[] = {&device_descriptors, &range_count};
         constexpr unsigned int kThreads = 256;
-        const auto blocks = static_cast<unsigned int>(
-            grouped_kernel ? std::min<size_t>((ranges.size() + 3) / 4, 32)
-                           : ranges.size());
+        size_t blocks = ranges.size();
+        if (grouped_kernel) {
+            constexpr size_t kGroupsPerBlock = kThreads / 64;
+            constexpr size_t kTargetBlocks = 32;
+            constexpr size_t kWorkers = kGroupsPerBlock * kTargetBlocks;
+            blocks = std::min<size_t>(1 + (ranges.size() - 1) / kGroupsPerBlock,
+                                      kTargetBlocks);
+            const size_t tail = ranges.size() % kWorkers;
+            if (ranges.size() > kWorkers && tail && tail <= kTargetBlocks) {
+                // Rebalance sparse tails while limiting grid growth to 25%.
+                const size_t rounds = ranges.size() / kWorkers;
+                const size_t ranges_per_block = kGroupsPerBlock * rounds;
+                blocks = 1 + (ranges.size() - 1) / ranges_per_block;
+            }
+        }
         hipError_t launch_result;
         try {
             // Publish under the same lock used to capture the sync boundary.
@@ -216,9 +228,9 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
             std::lock_guard<std::mutex> lock(descriptor_mutex_);
             auto &pending = descriptors_.at(stream).pending;
             pending.push_back(descriptor);
-            launch_result =
-                hipModuleLaunchKernel(function, blocks, 1, 1, kThreads, 1, 1, 0,
-                                      hip_stream, args, nullptr);
+            launch_result = hipModuleLaunchKernel(
+                function, static_cast<unsigned int>(blocks), 1, 1, kThreads, 1,
+                1, 0, hip_stream, args, nullptr);
             if (launch_result != hipSuccess) pending.pop_back();
         } catch (const std::bad_alloc &) {
             FreeHipPinnedHost(host_descriptors);

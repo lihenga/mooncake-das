@@ -11,9 +11,26 @@ struct MCStoreH2DCopyRange {
 };
 
 __device__ __forceinline__ void CopyH2DRange(MCStoreH2DCopyRange range,
-                                             uint64_t tid, uint64_t step) {
+                                           uint64_t tid, uint64_t step) {
     uint8_t* dst = reinterpret_cast<uint8_t*>(range.dst_addr);
     const uint8_t* src = reinterpret_cast<const uint8_t*>(range.src_addr);
+    // Keep naturally word-aligned copies on their direct vector path.
+    // Otherwise peel a shared prefix without reading outside either range.
+    if (((range.dst_addr | range.src_addr) & 3) != 0) {
+        const uint64_t mismatch = range.dst_addr ^ range.src_addr;
+        const uint64_t alignment = (mismatch & 15) == 0 ? 16
+                                   : (mismatch & 7) == 0 ? 8
+                                   : (mismatch & 3) == 0 ? 4
+                                   : (mismatch & 1) == 0 ? 2
+                                                         : 1;
+        const uint64_t prefix = min(range.size, (-range.src_addr) & (alignment - 1));
+        for (uint64_t i = tid; i < prefix; i += step) dst[i] = src[i];
+        dst += prefix;
+        src += prefix;
+        range.dst_addr += prefix;
+        range.src_addr += prefix;
+        range.size -= prefix;
+    }
     uint64_t copied_bytes = 0;
 
     // A short tail must not force the entire aligned body into byte copies.
@@ -29,6 +46,18 @@ __device__ __forceinline__ void CopyH2DRange(MCStoreH2DCopyRange range,
         const uint64_t* src_v = reinterpret_cast<const uint64_t*>(src);
         for (uint64_t i = tid; i < count; i += step) dst_v[i] = src_v[i];
         copied_bytes = count * 8;
+    } else if (((range.dst_addr | range.src_addr) & 3) == 0) {
+        const uint64_t count = range.size / 4;
+        uint32_t* dst_v = reinterpret_cast<uint32_t*>(dst);
+        const uint32_t* src_v = reinterpret_cast<const uint32_t*>(src);
+        for (uint64_t i = tid; i < count; i += step) dst_v[i] = src_v[i];
+        copied_bytes = count * 4;
+    } else if (((range.dst_addr | range.src_addr) & 1) == 0) {
+        const uint64_t count = range.size / 2;
+        uint16_t* dst_v = reinterpret_cast<uint16_t*>(dst);
+        const uint16_t* src_v = reinterpret_cast<const uint16_t*>(src);
+        for (uint64_t i = tid; i < count; i += step) dst_v[i] = src_v[i];
+        copied_bytes = count * 2;
     }
     for (uint64_t i = copied_bytes + tid; i < range.size; i += step) {
         dst[i] = src[i];
