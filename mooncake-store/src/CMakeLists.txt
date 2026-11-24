@@ -553,6 +553,22 @@ string(TOUPPER "${CMAKE_BUILD_TYPE}" CMAKE_BUILD_TYPE_UPPER)
 # so SDK presence must not enable CUDA support by itself.
 if(USE_CUDA)
   find_package(CUDAToolkit REQUIRED)
+  if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL 13.0)
+    # Keep the Store's C++ compiler and other accelerator builds unchanged.
+    # Forward-compatible PTX avoids baking the build host's GPU into wheels.
+    set(CUDA_H2D_OBJECT ${CMAKE_CURRENT_BINARY_DIR}/cuda_h2d_scatter.o)
+    add_custom_command(
+      OUTPUT ${CUDA_H2D_OBJECT}
+      COMMAND
+        ${CUDAToolkit_NVCC_EXECUTABLE} -O3 -std=c++17 -c -gencode
+        arch=compute_80,code=compute_80 -Xcompiler=-fPIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/device/cuda_h2d_scatter.cu -o
+        ${CUDA_H2D_OBJECT}
+      DEPENDS device/cuda_h2d_scatter.cu device/cuda_h2d_scatter.h
+      VERBATIM)
+    set_source_files_properties(${CUDA_H2D_OBJECT}
+                                PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+  endif()
 elseif(USE_HIP)
   find_package(hip REQUIRED)
 endif()
@@ -669,6 +685,10 @@ endif()
 if(USE_CUDA)
   message(STATUS "mooncake_store: CUDA enabled, enabling D2H staging")
   target_compile_definitions(mooncake_store_client_objects PRIVATE USE_CUDA)
+  if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL 13.0)
+    target_compile_definitions(mooncake_store_client_objects
+                               PRIVATE MOONCAKE_CUDA_H2D_SCATTER)
+  endif()
   target_include_directories(mooncake_store_client_objects
                              PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
 elseif(USE_HIP)
@@ -739,6 +759,9 @@ add_library(
   $<TARGET_OBJECTS:mooncake_store_shared_objects>
   $<TARGET_OBJECTS:mooncake_store_master_objects>
   $<TARGET_OBJECTS:mooncake_store_client_objects>)
+if(USE_CUDA AND CUDAToolkit_VERSION VERSION_GREATER_EQUAL 13.0)
+  target_sources(mooncake_store PRIVATE ${CUDA_H2D_OBJECT})
+endif()
 target_include_directories(mooncake_store PUBLIC ${MOONCAKE_STORE_INCLUDE_DIRS})
 target_link_libraries(
   mooncake_store

@@ -25,7 +25,7 @@ namespace mooncake {
 namespace {
 
 bool UseMappedPinnedRestoreArena() {
-#if defined(USE_HYGON)
+#if defined(USE_HYGON) || defined(MOONCAKE_CUDA_H2D_SCATTER)
     return true;
 #else
     return false;

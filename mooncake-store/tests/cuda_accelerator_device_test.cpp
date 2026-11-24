@@ -78,5 +78,84 @@ TEST_F(CudaAcceleratorDeviceTest, BatchCopiesUnalignedRangesAndPreservesGaps) {
     }
 }
 
+TEST_F(CudaAcceleratorDeviceTest,
+       MappedBatchesRetainDescriptorsUntilCompletion) {
+    constexpr size_t count = 65;
+    constexpr size_t stride = 8192;
+    constexpr size_t bytes = 2 * count * stride;
+    auto source = device_->AllocateMappedPinnedHost(bytes);
+    ASSERT_NE(source.addr, nullptr);
+    cudaDeviceProp properties{};
+    ASSERT_EQ(cudaGetDeviceProperties(&properties, 0), cudaSuccess);
+    const bool expect_kernel = CUDART_VERSION >= 13000 && source.device_addr &&
+                               properties.major == 10 && properties.minor == 3;
+    void* destination = nullptr;
+    ASSERT_EQ(cudaMalloc(&destination, bytes), cudaSuccess);
+    auto* src = static_cast<unsigned char*>(source.addr);
+    auto* dst = static_cast<unsigned char*>(destination);
+    for (size_t i = 0; i < bytes; ++i) src[i] = (i * 17 + i / stride) & 0xff;
+
+    for (int round = 0; round < 3; ++round) {
+        ASSERT_EQ(cudaMemset(destination, 0xa5, bytes), cudaSuccess);
+        std::vector<unsigned char> expected(bytes, 0xa5);
+        // Two different descriptor arrays must survive together on one stream.
+        for (size_t batch = 0; batch < 2; ++batch) {
+            std::vector<HostCopyRange> ranges;
+            for (size_t i = 0; i < count; ++i) {
+                size_t offset = (batch * count + i) * stride + 1;
+                size_t size = 4097 + i % 17;
+                const void* alias =
+                    source.device_addr
+                        ? static_cast<unsigned char*>(source.device_addr) +
+                              offset
+                        : nullptr;
+                ranges.push_back({dst + offset, src + offset, size, alias});
+                std::memcpy(expected.data() + offset, src + offset, size);
+            }
+            bool used_kernel = false;
+            ASSERT_TRUE(
+                device_->CopyFromHostBatchAsync(ranges, stream_, &used_kernel));
+            EXPECT_EQ(used_kernel, expect_kernel);
+        }
+        ASSERT_TRUE(device_->SynchronizeStream(stream_));
+        std::vector<unsigned char> actual(bytes);
+        ASSERT_EQ(cudaMemcpy(actual.data(), destination, bytes,
+                             cudaMemcpyDeviceToHost),
+                  cudaSuccess);
+        EXPECT_EQ(actual, expected);
+    }
+    ASSERT_EQ(cudaFree(destination), cudaSuccess);
+}
+
+TEST_F(CudaAcceleratorDeviceTest, DestroyStreamDrainsPendingMappedBatch) {
+    constexpr size_t count = 32;
+    constexpr size_t size = 4096;
+    constexpr size_t bytes = count * size;
+    auto source = device_->AllocateMappedPinnedHost(bytes);
+    ASSERT_NE(source.addr, nullptr);
+    std::memset(source.addr, 0x3c, bytes);
+    void* destination = nullptr;
+    ASSERT_EQ(cudaMalloc(&destination, bytes), cudaSuccess);
+    std::vector<HostCopyRange> ranges;
+    for (size_t i = 0; i < count; ++i) {
+        auto* src = static_cast<unsigned char*>(source.addr) + i * size;
+        const void* alias =
+            source.device_addr
+                ? static_cast<unsigned char*>(source.device_addr) + i * size
+                : nullptr;
+        ranges.push_back({static_cast<unsigned char*>(destination) + i * size,
+                          src, size, alias});
+    }
+    ASSERT_TRUE(device_->CopyFromHostBatchAsync(ranges, stream_));
+    device_->DestroyStream(stream_);
+    stream_ = nullptr;
+    std::vector<unsigned char> actual(bytes);
+    ASSERT_EQ(
+        cudaMemcpy(actual.data(), destination, bytes, cudaMemcpyDeviceToHost),
+        cudaSuccess);
+    EXPECT_EQ(actual, std::vector<unsigned char>(bytes, 0x3c));
+    ASSERT_EQ(cudaFree(destination), cudaSuccess);
+}
+
 }  // namespace
 }  // namespace mooncake::device
