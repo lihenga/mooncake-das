@@ -18,6 +18,7 @@ namespace mooncake {
 namespace {
 // Bound parallel bucket staging buffers and background preallocation workers.
 constexpr int kMaxBatchReadThreads = 256;
+constexpr int kMaxBatchReadStride = 256;
 constexpr int kMaxBucketCreateConcurrency = 8;
 
 bool ValidateEvictionSettings(const DistributedStorageConfig& config) {
@@ -262,6 +263,8 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
         config.bucket_create_concurrency);
     config.batch_read_threads = Environ::ReadOr(
         Variables::MOONCAKE_DFS_BATCH_READ_THREADS, config.batch_read_threads);
+    config.batch_read_stride = Environ::ReadOr(
+        Variables::MOONCAKE_DFS_BATCH_READ_STRIDE, config.batch_read_stride);
     config.batch_read_merge_enabled = Environ::ReadOr(
         Variables::MOONCAKE_DFS_BATCH_READ_MERGE_ENABLED,
         config.batch_read_merge_enabled);
@@ -308,6 +311,7 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", ready_bucket_target=" << ready_bucket_target
         << ", bucket_create_concurrency=" << bucket_create_concurrency
         << ", batch_read_threads=" << batch_read_threads
+        << ", batch_read_stride=" << batch_read_stride
         << ", batch_read_merge_enabled=" << batch_read_merge_enabled
         << ", direct_read_enabled=" << direct_read_enabled
         << ", batch_get_timeout_ms=" << batch_get_timeout_ms
@@ -393,6 +397,13 @@ bool DistributedStorageConfig::ValidateForBucketAllocator() const {
                       "[1, "
                    << kMaxBatchReadThreads
                    << "], batch_read_threads=" << batch_read_threads;
+        return false;
+    }
+    if (batch_read_stride < 1 || batch_read_stride > kMaxBatchReadStride) {
+        LOG(ERROR) << "DistributedStorageConfig: batch_read_stride must be in "
+                      "[1, "
+                   << kMaxBatchReadStride
+                   << "], batch_read_stride=" << batch_read_stride;
         return false;
     }
     return true;

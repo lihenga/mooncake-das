@@ -81,6 +81,7 @@ struct DistributedStorageEnvironment {
     ScopedEnvVar bucket_create_concurrency{
         "MOONCAKE_DFS_BUCKET_CREATE_CONCURRENCY"};
     ScopedEnvVar batch_read_threads{"MOONCAKE_DFS_BATCH_READ_THREADS"};
+    ScopedEnvVar batch_read_stride{"MOONCAKE_DFS_BATCH_READ_STRIDE"};
     ScopedEnvVar batch_read_merge{"MOONCAKE_DFS_BATCH_READ_MERGE_ENABLED"};
     ScopedEnvVar direct_read{"MOONCAKE_DFS_DIRECT_READ_ENABLED"};
     ScopedEnvVar batch_get_timeout{"MOONCAKE_DFS_BATCH_GET_TIMEOUT_MS"};
@@ -141,6 +142,7 @@ TEST_F(DistributedStorageConfigTest, ReadsL4SettingsThroughTypedEnvironment) {
     env.ready_bucket_count.Set("6");
     env.bucket_create_concurrency.Set("3");
     env.batch_read_threads.Set("16");
+    env.batch_read_stride.Set("1");
     env.batch_read_merge.Set("true");
     env.direct_read.Set("false");
     env.batch_get_timeout.Set("20000");
@@ -158,6 +160,7 @@ TEST_F(DistributedStorageConfigTest, ReadsL4SettingsThroughTypedEnvironment) {
     EXPECT_EQ(config.ready_bucket_target, 6);
     EXPECT_EQ(config.bucket_create_concurrency, 3);
     EXPECT_EQ(config.batch_read_threads, 16);
+    EXPECT_EQ(config.batch_read_stride, 1);
     EXPECT_TRUE(config.batch_read_merge_enabled);
     EXPECT_FALSE(config.direct_read_enabled);
     EXPECT_EQ(config.batch_get_timeout_ms, 20000U);

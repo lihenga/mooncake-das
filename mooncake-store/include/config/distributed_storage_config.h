@@ -59,6 +59,10 @@ struct DistributedStorageConfig {
     // buckets. Set to 1 to disable parallelism. Must be in
     // [1, kMaxBatchReadThreads].
     int batch_read_threads = 128;
+    // Interleave merged read tasks by this index stride so neighbouring file
+    // ranges do not enter the filesystem together. One keeps legacy ordering.
+    // Must be in [1, kMaxBatchReadStride].
+    int batch_read_stride = 2;
     // When true, BatchRead keeps the legacy flow that groups reads by bucket
     // and merges contiguous entries. When false (default), every key is read
     // directly on its own with batch_read_threads concurrency.
