@@ -3,6 +3,7 @@
 #include "storage/distributed/dfs_log_limiter.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <condition_variable>
 #include <cstdlib>
@@ -23,6 +24,7 @@
 #include "storage/distributed/immutable_bucket_allocator.h"
 #include "storage/distributed/dfs_root_identity.h"
 #include "storage/distributed/dfs_read_probe.h"
+#include "storage/distributed/dfs_write_probe.h"
 #include "storage/distributed/shard_allocator.h"
 #include "thread_pool.h"
 #include "types.h"
@@ -189,6 +191,16 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite() {
     if (UsesObjectStorage()) return {};
 
     std::lock_guard probe_lock(health_probe_write_mutex_);
+    const std::string probe_directory =
+        root_dir_ + "/" + kDfsWriteProbeDirectoryName;
+    // Concurrent clients may create the directory at the same time.
+    if (::mkdir(probe_directory.c_str(), 0755) != 0 && errno != EEXIST) {
+        const int error = errno;
+        LOG(WARNING) << "Failed to create DFS write-probe directory "
+                     << probe_directory << ", errno=" << error
+                     << ", error=" << std::strerror(error);
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
     // Use a new path each round: deleting the previous file first could free
     // just enough space for the probe to pass on an otherwise full filesystem.
     const std::string new_probe_path =

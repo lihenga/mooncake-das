@@ -76,6 +76,21 @@ TEST(DfsProbeGcExpiryTest, FarFutureTimestampCannotOverflowIntoThePast) {
     EXPECT_FALSE(dfs_probe_gc::IsExpired(info, kTtl));
 }
 
+TEST(DfsProbeGcConfigTest, BothDurationsMustExceedOneMinute) {
+    for (const char* name : {
+             "MOONCAKE_DFS_HEALTH_PROBE_TTL_SECONDS",
+             "MOONCAKE_DFS_HEALTH_PROBE_CLEANUP_INTERVAL_SECONDS"}) {
+        for (const int configured : {-100, 0, 1, 59, 60}) {
+            EXPECT_EQ(dfs_probe_gc::NormalizeDurationSeconds(name, configured),
+                      61);
+        }
+        for (const int configured : {61, 62, 3600, 7200}) {
+            EXPECT_EQ(dfs_probe_gc::NormalizeDurationSeconds(name, configured),
+                      configured);
+        }
+    }
+}
+
 TEST_F(DfsProbeGcTest, DeletesOnlyExpiredRegularMatchingFiles) {
     Create(kProbe, 7201);
     Create(".mooncake_dfs_health_probe_123-456_2", 0);
@@ -83,13 +98,159 @@ TEST_F(DfsProbeGcTest, DeletesOnlyExpiredRegularMatchingFiles) {
     Create(".mooncake_dfs_health_probe_bad_1", 14400);
     Create(".mooncake_dfs_read_probe", 14400);
     Create(".mooncake_dfs_root_identity", 14400);
-    dfs_probe_gc::Cleanup(root_, kTtl);
+    EXPECT_EQ(dfs_probe_gc::Cleanup(root_, kTtl), 1u);
     EXPECT_FALSE(Exists(kProbe));
     EXPECT_TRUE(Exists(".mooncake_dfs_health_probe_123-456_2"));
     EXPECT_TRUE(Exists(".mooncake_dfs_health_probe_123-456_3"));
     EXPECT_TRUE(Exists(".mooncake_dfs_health_probe_bad_1"));
     EXPECT_TRUE(Exists(".mooncake_dfs_read_probe"));
     EXPECT_TRUE(Exists(".mooncake_dfs_root_identity"));
+    EXPECT_EQ(dfs_probe_gc::Cleanup(root_, kTtl), 0u);
+}
+
+TEST_F(DfsProbeGcTest, ReportsTotalDeletionCountAcrossMultipleFiles) {
+    Create(kProbe, 14400);
+    Create(".mooncake_dfs_health_probe_123-456_2", 14400);
+    Create(".mooncake_dfs_health_probe_123-456_3", 0);
+    EXPECT_EQ(dfs_probe_gc::Cleanup(root_, kTtl), 2u);
+    EXPECT_EQ(dfs_probe_gc::Cleanup(root_, kTtl), 0u);
+}
+
+TEST(DfsProbeGcConfigTest, LegacyScanBudgetRoundsUpWithoutExtraStartupScan) {
+    EXPECT_EQ(dfs_probe_gc::LegacyRootScanCount(std::chrono::seconds(3600),
+                                              std::chrono::seconds(7200)),
+              1u);
+    EXPECT_EQ(dfs_probe_gc::LegacyRootScanCount(kTtl, std::chrono::seconds(3600)),
+              2u);
+    EXPECT_EQ(dfs_probe_gc::LegacyRootScanCount(std::chrono::seconds(7201),
+                                              std::chrono::seconds(3600)),
+              3u);
+    EXPECT_EQ(dfs_probe_gc::LegacyRootScanCount(std::chrono::seconds(61),
+                                              std::chrono::seconds(3600)),
+              1u);
+    EXPECT_EQ(dfs_probe_gc::LegacyRootScanCount(std::chrono::seconds(61),
+                                              std::chrono::seconds(61)),
+              1u);
+}
+
+TEST_F(DfsProbeGcTest, RepeatedRootScansCollectInitiallyFreshLegacyFiles) {
+    const std::string write_directory = kDfsWriteProbeDirectoryName;
+    ASSERT_TRUE(std::filesystem::create_directory(root_ + "/" + write_directory));
+    const std::string current = write_directory + "/" + kProbe;
+    const std::string fresh = ".mooncake_dfs_health_probe_123-456_2";
+    Create(kProbe, 14400);
+    Create(current, 14400);
+    Create(fresh, 0);
+    Create(write_directory + "/" + fresh, 0);
+    auto scans_remaining =
+        dfs_probe_gc::LegacyRootScanCount(kTtl, std::chrono::seconds(2400));
+
+    EXPECT_EQ(dfs_probe_gc::CleanupRound(root_, kTtl, scans_remaining), 2u);
+    EXPECT_EQ(scans_remaining, 2u);
+    EXPECT_FALSE(Exists(kProbe));
+    EXPECT_FALSE(Exists(current));
+    EXPECT_TRUE(Exists(fresh));
+
+    Create(kProbe, 14400);
+    Create(current, 14400);
+    // At the second scan a file created just before startup is still fresh.
+    SetAge(fresh, 3600);
+    EXPECT_EQ(dfs_probe_gc::CleanupRound(root_, kTtl, scans_remaining), 2u);
+    EXPECT_EQ(scans_remaining, 1u);
+    EXPECT_TRUE(Exists(fresh));
+
+    // Once the file has expired, the final allowed scan collects it.
+    SetAge(fresh, 14400);
+    SetAge(write_directory + "/" + fresh, 14400);
+    EXPECT_EQ(dfs_probe_gc::CleanupRound(root_, kTtl, scans_remaining), 2u);
+    EXPECT_EQ(scans_remaining, 0u);
+    EXPECT_FALSE(Exists(fresh));
+
+    Create(kProbe, 14400);
+    Create(current, 14400);
+    EXPECT_EQ(dfs_probe_gc::CleanupRound(root_, kTtl, scans_remaining), 1u);
+    EXPECT_TRUE(Exists(kProbe));
+    EXPECT_FALSE(Exists(current));
+    EXPECT_FALSE(Exists(write_directory + "/" + fresh));
+
+    // A newly constructed master gets its own scan budget.
+    scans_remaining =
+        dfs_probe_gc::LegacyRootScanCount(kTtl, std::chrono::seconds(2400));
+    EXPECT_EQ(dfs_probe_gc::CleanupRound(root_, kTtl, scans_remaining), 1u);
+}
+
+TEST_F(DfsProbeGcTest, CleanupDoesNotCreateMissingWriteDirectory) {
+    Create(".mooncake_dfs_read_probe", 14400);
+    uint64_t scans_remaining = 2;
+    EXPECT_EQ(dfs_probe_gc::CleanupRound(root_, kTtl, scans_remaining), 0u);
+    EXPECT_EQ(scans_remaining, 0u);
+    EXPECT_FALSE(Exists(kDfsWriteProbeDirectoryName));
+    EXPECT_TRUE(Exists(".mooncake_dfs_read_probe"));
+}
+
+TEST_F(DfsProbeGcTest, DefaultBudgetScansRootOnlyOnceEvenWithFreshProbes) {
+    const auto ttl = std::chrono::seconds(3600);
+    auto scans_remaining =
+        dfs_probe_gc::LegacyRootScanCount(ttl, std::chrono::seconds(7200));
+    Create(kProbe, 0);
+    EXPECT_EQ(dfs_probe_gc::CleanupRound(root_, ttl, scans_remaining), 0u);
+    EXPECT_EQ(scans_remaining, 0u);
+    EXPECT_TRUE(Exists(kProbe));
+
+    SetAge(kProbe, 7200);
+    EXPECT_EQ(dfs_probe_gc::CleanupRound(root_, ttl, scans_remaining), 0u);
+    EXPECT_TRUE(Exists(kProbe));
+}
+
+TEST_F(DfsProbeGcTest, StopsRootScansAfterDeletingTheLastLegacyProbe) {
+    Create(kProbe, 14400);
+    uint64_t scans_remaining = 3;
+    EXPECT_EQ(dfs_probe_gc::CleanupRound(root_, kTtl, scans_remaining), 1u);
+    EXPECT_EQ(scans_remaining, 0u);
+
+    ASSERT_TRUE(std::filesystem::create_directory(
+        root_ + "/" + kDfsWriteProbeDirectoryName));
+    const std::string current =
+        std::string(kDfsWriteProbeDirectoryName) + "/" + kProbe;
+    Create(current, 14400);
+    Create(kProbe, 14400);
+    EXPECT_EQ(dfs_probe_gc::CleanupRound(root_, kTtl, scans_remaining), 1u);
+    EXPECT_TRUE(Exists(kProbe));
+    EXPECT_FALSE(Exists(current));
+}
+
+TEST_F(DfsProbeGcTest, FailedRootScanDoesNotCountAsNoProbesRemaining) {
+    bool no_probes_remaining = true;
+    EXPECT_EQ(dfs_probe_gc::Cleanup(root_ + "/missing", kTtl, false,
+                                   &no_probes_remaining),
+              0u);
+    EXPECT_FALSE(no_probes_remaining);
+    uint64_t scans_remaining = 3;
+    EXPECT_EQ(dfs_probe_gc::CleanupRound(root_ + "/missing", kTtl,
+                                        scans_remaining),
+              0u);
+    EXPECT_EQ(scans_remaining, 2u);
+}
+
+TEST_F(DfsProbeGcTest, LegacyRootDeleteFailureDoesNotSkipWriteDirectory) {
+    if (::geteuid() == 0) GTEST_SKIP() << "root bypasses directory permissions";
+    ASSERT_TRUE(std::filesystem::create_directory(
+        root_ + "/" + kDfsWriteProbeDirectoryName));
+    Create(kProbe, 14400);
+    const std::string current =
+        std::string(kDfsWriteProbeDirectoryName) + "/" + kProbe;
+    Create(current, 14400);
+    ASSERT_EQ(::chmod(root_.c_str(), 0500), 0);
+    uint64_t scans_remaining = 2;
+    EXPECT_EQ(dfs_probe_gc::CleanupRound(root_, kTtl, scans_remaining), 1u);
+    const int restored = ::chmod(root_.c_str(), 0700);
+    ASSERT_EQ(restored, 0);
+    EXPECT_EQ(scans_remaining, 1u);
+    EXPECT_TRUE(Exists(kProbe));
+    EXPECT_FALSE(Exists(current));
+    EXPECT_EQ(dfs_probe_gc::CleanupRound(root_, kTtl, scans_remaining), 1u);
+    EXPECT_EQ(scans_remaining, 0u);
+    EXPECT_FALSE(Exists(kProbe));
 }
 
 TEST_F(DfsProbeGcTest, DoesNotRecurseOrFollowSymlinks) {
@@ -110,12 +271,16 @@ TEST_F(DfsProbeGcTest, DoesNotRecurseOrFollowSymlinks) {
     EXPECT_TRUE(Exists(std::string("nested/") + kProbe));
     EXPECT_TRUE(Exists(directory));
     EXPECT_TRUE(Exists(fifo));
-    // A symlink used as the root must not be traversed either.
+}
+
+TEST_F(DfsProbeGcTest, AllowsSymlinkAsConfiguredRoot) {
+    ASSERT_TRUE(std::filesystem::create_directory(root_ + "/nested"));
+    Create(std::string("nested/") + kProbe, 14400);
     ASSERT_EQ(::symlink((root_ + "/nested").c_str(),
                         (root_ + "/alias").c_str()),
               0);
     dfs_probe_gc::Cleanup(root_ + "/alias", kTtl);
-    EXPECT_TRUE(Exists(std::string("nested/") + kProbe));
+    EXPECT_FALSE(Exists(std::string("nested/") + kProbe));
 }
 
 TEST_F(DfsProbeGcTest, RechecksMtimeAndTypeBeforeDeletion) {
@@ -143,9 +308,11 @@ TEST_F(DfsProbeGcTest, RechecksMtimeAndTypeBeforeDeletion) {
 TEST_F(DfsProbeGcTest, MissingFileAndFailedScanDoNotPreventLaterCleanup) {
     const int fd = ::open(root_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     ASSERT_GE(fd, 0);
-    EXPECT_NO_THROW(dfs_probe_gc::DeleteIfExpired(fd, root_, kProbe, kTtl));
+    EXPECT_EQ(dfs_probe_gc::DeleteIfExpired(fd, root_, kProbe, kTtl),
+              dfs_probe_gc::DeleteResult::kAlreadyAbsent);
     ::close(fd);
-    EXPECT_NO_THROW(dfs_probe_gc::DeleteIfExpired(-1, root_, kProbe, kTtl));
+    EXPECT_EQ(dfs_probe_gc::DeleteIfExpired(-1, root_, kProbe, kTtl),
+              dfs_probe_gc::DeleteResult::kFailed);
     EXPECT_NO_THROW(dfs_probe_gc::Cleanup(root_ + "/missing", kTtl));
     Create(kProbe, 14400);
     dfs_probe_gc::Cleanup(root_, kTtl);
@@ -158,13 +325,13 @@ TEST_F(DfsProbeGcTest, FailedUnlinkCanBeRetriedOnTheNextScan) {
     const std::string second = ".mooncake_dfs_health_probe_123-456_2";
     Create(second, 14400);
     ASSERT_EQ(::chmod(root_.c_str(), 0500), 0);
-    EXPECT_NO_THROW(dfs_probe_gc::Cleanup(root_, kTtl));
+    EXPECT_EQ(dfs_probe_gc::Cleanup(root_, kTtl), 0u);
     EXPECT_TRUE(Exists(kProbe));
     EXPECT_TRUE(Exists(second));
     // Restore permissions before assertions that could abort the test.
     const int restored = ::chmod(root_.c_str(), 0700);
     ASSERT_EQ(restored, 0);
-    dfs_probe_gc::Cleanup(root_, kTtl);
+    EXPECT_EQ(dfs_probe_gc::Cleanup(root_, kTtl), 2u);
     EXPECT_FALSE(Exists(kProbe));
     EXPECT_FALSE(Exists(second));
 }
