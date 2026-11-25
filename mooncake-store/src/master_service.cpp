@@ -605,6 +605,19 @@ MasterService::MasterService(const MasterServiceConfig& config)
                 MOONCAKE_DFS_ROOT_GUARD_INTERVAL_SECONDS,
             5),
         1));
+    dfs_health_probe_ttl_ = std::chrono::seconds(std::max(
+        Environ::ReadOr(DistributedStorageEnvironmentVariables::
+                            MOONCAKE_DFS_HEALTH_PROBE_TTL_SECONDS,
+                        7200),
+        1));
+    dfs_health_probe_cleanup_interval_ = std::chrono::seconds(std::max(
+        Environ::ReadOr(DistributedStorageEnvironmentVariables::
+                            MOONCAKE_DFS_HEALTH_PROBE_CLEANUP_INTERVAL_SECONDS,
+                        3600),
+        1));
+    LOG(INFO) << "DFS write-probe cleanup initialized, ttl_seconds="
+              << dfs_health_probe_ttl_.count() << ", interval_seconds="
+              << dfs_health_probe_cleanup_interval_.count();
     LOG(INFO) << "DFS heartbeat interval initialized to "
               << dfs_heartbeat_interval_seconds_.load(
                      std::memory_order_acquire)

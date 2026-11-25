@@ -180,6 +180,9 @@ struct DistributedStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(uint64_t, MOONCAKE_DFS_BATCH_PUT_TIMEOUT_MS);
     MC_DEFINE_ENV_VAR(std::size_t, MC_STORE_DFS_PINNED_POOL_BYTES);
     MC_DEFINE_ENV_VAR(int, MOONCAKE_DFS_ROOT_GUARD_INTERVAL_SECONDS);
+    // Write-probe garbage collection: defaults are 2 hours and 1 hour.
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_DFS_HEALTH_PROBE_TTL_SECONDS);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_DFS_HEALTH_PROBE_CLEANUP_INTERVAL_SECONDS);
 };
 
 struct KvcsEnvironmentVariables {

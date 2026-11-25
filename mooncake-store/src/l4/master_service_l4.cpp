@@ -7,6 +7,7 @@
 #include "storage/distributed/dfs_log_limiter.h"
 #include "storage/distributed/dfs_root_identity.h"
 #include "storage/distributed/dfs_read_probe.h"
+#include "storage/distributed/dfs_probe_gc.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
 #include "storage/distributed/shard_allocator.h"
 #include <algorithm>
@@ -759,6 +760,23 @@ void MasterService::ReconcileDfsRootFiles() {
             root + "/" + std::string(directory_name);
         reconcile(probe_directory, kDfsReadProbeFileName,
                   BuildDfsReadProbeContents(identity, probe_index));
+    }
+
+    // Run after identity/read-probe reconciliation, on the same DFS worker.
+    // A failed scan must not take down that worker or change DFS health.
+    const auto cleanup_now = std::chrono::steady_clock::now();
+    if (cleanup_now >= next_dfs_health_probe_cleanup_) {
+        try {
+            dfs_probe_gc::Cleanup(root, dfs_health_probe_ttl_);
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "DFS write-probe cleanup threw, root=" << root
+                         << ", error=" << e.what();
+        } catch (...) {
+            LOG(WARNING) << "DFS write-probe cleanup threw, root=" << root
+                         << ", error=unknown exception";
+        }
+        next_dfs_health_probe_cleanup_ = std::chrono::steady_clock::now() +
+                                         dfs_health_probe_cleanup_interval_;
     }
 }
 
