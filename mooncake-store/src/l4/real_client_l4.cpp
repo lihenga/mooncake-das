@@ -852,12 +852,21 @@ std::vector<std::vector<int>> RealClient::batch_get_session_prefetch_batch(
         keys.insert(keys.end(), requests[i].begin(), requests[i].end());
         request_ids.insert(request_ids.end(), requests[i].size(), i);
     }
-    auto flat_results = PrefetchSessionKeys<true>(keys, &request_ids);
-    // A shared key assigned to an oversized first arena may still fit a later
-    // request. Retry only allocation failures, never admission or I/O timeouts.
-    if (std::find(flat_results.begin(), flat_results.end(),
+    std::vector<size_t> oversized_entries;
+    auto flat_results =
+        PrefetchSessionKeys<true>(keys, &request_ids, &oversized_entries);
+    // Rescue only allocation failures and groups rejected before allocation
+    // for exceeding the byte limit, never capacity waits or I/O timeouts.
+    if (!oversized_entries.empty() ||
+        std::find(flat_results.begin(), flat_results.end(),
                   toInt(ErrorCode::NO_AVAILABLE_HANDLE)) !=
-        flat_results.end()) {
+            flat_results.end()) {
+        std::unordered_set<std::string> oversized_keys;
+        for (size_t i : oversized_entries) oversized_keys.insert(keys[i]);
+        const auto rescuable = [&](size_t i) {
+            return flat_results[i] == toInt(ErrorCode::NO_AVAILABLE_HANDLE) ||
+                   oversized_keys.contains(keys[i]);
+        };
         std::unordered_set<std::string> earlier_keys;
         std::unordered_map<std::string, int> resolved;
         size_t begin = 0;
@@ -865,9 +874,8 @@ std::vector<std::vector<int>> RealClient::batch_get_session_prefetch_batch(
             std::vector<std::string> retry;
             for (size_t i = 0; i < request.size(); ++i) {
                 const auto &key = request[i];
-                if (flat_results[begin + i] ==
-                        toInt(ErrorCode::NO_AVAILABLE_HANDLE) &&
-                    earlier_keys.contains(key) && !resolved.contains(key)) {
+                if (rescuable(begin + i) && earlier_keys.contains(key) &&
+                    !resolved.contains(key)) {
                     retry.push_back(key);
                 }
             }
@@ -883,8 +891,7 @@ std::vector<std::vector<int>> RealClient::batch_get_session_prefetch_batch(
             begin += request.size();
         }
         for (size_t i = 0; i < keys.size(); ++i) {
-            if (flat_results[i] == toInt(ErrorCode::NO_AVAILABLE_HANDLE) &&
-                resolved.contains(keys[i])) {
+            if (rescuable(i) && resolved.contains(keys[i])) {
                 flat_results[i] = resolved.at(keys[i]);
             }
         }
@@ -902,7 +909,8 @@ std::vector<std::vector<int>> RealClient::batch_get_session_prefetch_batch(
 template <bool Grouped>
 std::vector<int> RealClient::PrefetchSessionKeys(
     const std::vector<std::string> &keys,
-    const std::vector<size_t> *request_ids) {
+    const std::vector<size_t> *request_ids,
+    std::vector<size_t> *oversized_entries) {
     std::vector<int> results(
         keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     if (!client_) {
@@ -986,7 +994,7 @@ std::vector<int> RealClient::PrefetchSessionKeys(
             } else {
                 execute_session_dfs_range_reads_batch<true>(
                     dfs_entries, results, trace_id, true, 1, 1, 0, 0,
-                    request_ids);
+                    request_ids, oversized_entries);
             }
         } else {
             process_session_disk_dfs_reads(dfs_entries, results, trace_id,
@@ -1167,7 +1175,8 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
     std::vector<SessionRangeReadRequest *> &entries, std::vector<int> &results,
     uint64_t trace_id, bool prefetch_only, size_t chunk_index,
     size_t chunk_count, size_t chunk_limit_bytes, size_t request_planned_bytes,
-    const std::vector<size_t> *request_ids) {
+    const std::vector<size_t> *request_ids,
+    std::vector<size_t> *oversized_entries) {
     const auto timing_start = std::chrono::steady_clock::now();
     const auto chunk_entries = entries;
     const bool trace_enabled = trace_id != 0;
@@ -1356,9 +1365,16 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
     struct NoGroups {};
     struct Arena {
         size_t size = 0;
+        uint64_t read_bytes = 0;
         std::shared_ptr<BufferHandle> buffer;
     };
     std::conditional_t<Grouped, std::map<size_t, Arena>, NoGroups> arenas;
+    const uint64_t admission_limit = [&] {
+        if constexpr (Grouped)
+            return client_->GetDfsBatchReadAdmissionByteLimit();
+        else
+            return std::numeric_limits<uint64_t>::max();
+    }();
 
     const size_t dfs_alignment =
         GetEnvOr<size_t>("MOONCAKE_DFS_ALIGNMENT", 4096);
@@ -1387,9 +1403,11 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
 
         size_t group = 0;
         size_t *planned = &arena_size;
+        Arena *group_arena = nullptr;
         if constexpr (Grouped) {
             group = (*request_ids)[entry.original_idx];
-            planned = &arenas[group].size;
+            group_arena = &arenas[group];
+            planned = &group_arena->size;
         }
         auto &planned_size = *planned;
         size_t aligned_offset = 0;
@@ -1430,6 +1448,11 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
                 {{entry_ptr, aligned_offset, aligned_object_size}, group});
             arena_size += growth;
             planned_size = aligned_offset + aligned_object_size;
+            // DFS allocateSlices reads exactly source_size, including padding;
+            // arena slot alignment and allocator rounding are not I/O bytes.
+            auto &read_bytes = group_arena->read_bytes;
+            read_bytes += std::min<uint64_t>(
+                source_size, std::numeric_limits<uint64_t>::max() - read_bytes);
         } else {
             arena_views.push_back(
                 {entry_ptr, aligned_offset, aligned_object_size});
@@ -1443,6 +1466,14 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
     if constexpr (Grouped) {
         for (auto &[group, allocation] : arenas) {
             if (allocation.size == 0) continue;
+            if (allocation.read_bytes > admission_limit) {
+                LOG_EVERY_N(WARNING, 64)
+                    << "DFS_PREFETCH_ADMISSION_REJECTED "
+                    << "reason=request_exceeds_read_admission_limit, group="
+                    << group << ", request_bytes=" << allocation.read_bytes
+                    << ", max_bytes=" << admission_limit;
+                continue;
+            }
             auto &arena = allocation.buffer;
             if (prefetch_only) {
                 // Cached prefetch views retain their unified buffer allocation
@@ -1503,9 +1534,15 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
         }
 
         std::erase_if(arena_views, [&](const ArenaView &view) {
-            if (arenas.at(view.group).buffer) return false;
+            const auto &allocation = arenas.at(view.group);
+            if (allocation.buffer) return false;
+            const bool oversized = allocation.read_bytes > admission_limit;
             results[view.entry->original_idx] =
-                static_cast<int>(toInt(ErrorCode::NO_AVAILABLE_HANDLE));
+                toInt(oversized ? ErrorCode::DFS_BATCH_GET_ADMISSION_TIMEOUT
+                                : ErrorCode::NO_AVAILABLE_HANDLE);
+            if (oversized && oversized_entries) {
+                oversized_entries->push_back(view.entry->original_idx);
+            }
             return true;
         });
     } else {
@@ -1626,8 +1663,6 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
         const auto io_start = std::chrono::steady_clock::now();
         auto read_batch = [&] {
             if constexpr (Grouped) {
-                const uint64_t limit =
-                    client_->GetDfsBatchReadAdmissionByteLimit();
                 std::vector<tl::expected<void, ErrorCode>> combined;
                 size_t batch_begin = 0;
                 uint64_t batch_bytes = 0;
@@ -1664,24 +1699,17 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
                 };
                 for (size_t first = 0; first < arena_views.size();) {
                     size_t end = first;
-                    uint64_t bytes = 0;
+                    const uint64_t bytes =
+                        arenas.at(arena_views[first].group).read_bytes;
                     while (end < arena_views.size() &&
                            arena_views[end].group == arena_views[first].group) {
-                        for (const auto &slice : disk_batch_slices[end]) {
-                            bytes += std::min<uint64_t>(
-                                slice.size,
-                                std::numeric_limits<uint64_t>::max() - bytes);
-                        }
                         ++end;
                     }
                     if (first != batch_begin &&
-                        (bytes > limit || batch_bytes > limit - bytes)) {
+                        batch_bytes > admission_limit - bytes) {
                         submit(first);
                     }
-                    batch_bytes = bytes > limit ? bytes : batch_bytes + bytes;
-                    // Keep an individually oversized request intact so it
-                    // fails alone under the existing backend admission rule.
-                    if (bytes > limit) submit(end);
+                    batch_bytes += bytes;
                     first = end;
                 }
                 if (batch_begin < disk_batch_keys.size()) {
@@ -2016,6 +2044,7 @@ RealClient::PlanDfsReadChunks(
 // Restore callers in real_client.cpp use the scalar specialization.
 template ErrorCode RealClient::execute_session_dfs_range_reads_batch<false>(
     std::vector<SessionRangeReadRequest *> &, std::vector<int> &, uint64_t,
-    bool, size_t, size_t, size_t, size_t, const std::vector<size_t> *);
+    bool, size_t, size_t, size_t, size_t, const std::vector<size_t> *,
+    std::vector<size_t> *);
 
 }  // namespace mooncake

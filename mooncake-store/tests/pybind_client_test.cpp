@@ -1457,6 +1457,92 @@ TEST_F(RealClientLeasePrefetchTest,
 }
 
 TEST_F(RealClientLeasePrefetchTest,
+       BatchPrefetchSharedKeySurvivesOversizedAdmissionPeer) {
+    DfsPrefetchTestEnv dfs_env;
+    ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+    ScopedEnvVar unified("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES", "262144");
+    ScopedEnvVar admission("MOONCAKE_DFS_BATCH_GET_MAX_INFLIGHT_BYTES", "8192");
+    const std::vector<std::string> keys{
+        "batch_admission_shared", "batch_admission_a", "batch_admission_b"};
+    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17998", keys));
+    ASSERT_NO_FATAL_FAILURE(RequirePrefetchArena());
+    if (IsSkipped()) return;
+    const int rejected = toInt(ErrorCode::DFS_BATCH_GET_ADMISSION_TIMEOUT);
+    for (bool reverse : {false, true}) {
+        SCOPED_TRACE(reverse ? "fitting first" : "oversized first");
+        ASSERT_EQ(py_client_->batch_get_session_start(keys),
+                  std::vector<int>(keys.size(), 0));
+        for (const auto& key : keys) {
+            SetSessionDeadline(key,
+                               std::chrono::steady_clock::time_point::max());
+        }
+        const std::vector<std::string> oversized{keys[0], keys[1], keys[2],
+                                                 keys[0]};
+        const std::vector<std::string> fitting{keys[0], keys[0]};
+        const std::vector<std::vector<std::string>> requests =
+            reverse ? std::vector<std::vector<std::string>>{fitting, oversized}
+                    : std::vector<std::vector<std::string>>{oversized, fitting};
+        const auto results =
+            py_client_->batch_get_session_prefetch_batch(requests);
+        const size_t small = reverse ? 0 : 1;
+        EXPECT_EQ(results[small], (std::vector<int>{0, 0}));
+        EXPECT_EQ(results[1 - small],
+                  reverse ? std::vector<int>(4, 0)
+                          : std::vector<int>({0, rejected, rejected, 0}));
+        for (size_t offset : {0u, 1024u, 3072u}) {
+            ExpectRead(keys[0], 0, offset, /*cache_only=*/true);
+        }
+        EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+        ExpectArenaReleased();
+    }
+}
+
+TEST_F(RealClientLeasePrefetchTest,
+       BatchPrefetchOversizedAdmissionPeerDoesNotReserveArena) {
+    DfsPrefetchTestEnv dfs_env;
+    ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+    ScopedEnvVar unified("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES", "65536");
+    ScopedEnvVar ratio("MC_STORE_DFS_PREFETCH_CAPACITY_RATIO", "0.375");
+    ScopedEnvVar admission("MOONCAKE_DFS_BATCH_GET_MAX_INFLIGHT_BYTES",
+                           "16384");
+    const std::vector<std::string> keys{
+        "batch_reservation_0",     "batch_reservation_1",
+        "batch_reservation_2",     "batch_reservation_3",
+        "batch_reservation_4",     "batch_reservation_peer_0",
+        "batch_reservation_peer_1"};
+    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17999", keys));
+    ASSERT_NO_FATAL_FAILURE(RequirePrefetchArena());
+    if (IsSkipped()) return;
+    ASSERT_EQ(py_client_->file_storage_->UnifiedPrefetchLimitBytes(), 24576u);
+    const std::vector<std::string> oversized(keys.begin(), keys.begin() + 5);
+    const std::vector<std::string> fitting(keys.begin() + 5, keys.end());
+    const int rejected = toInt(ErrorCode::DFS_BATCH_GET_ADMISSION_TIMEOUT);
+    for (bool reverse : {false, true}) {
+        SCOPED_TRACE(reverse ? "fitting first" : "oversized first");
+        ASSERT_EQ(py_client_->batch_get_session_start(keys),
+                  std::vector<int>(keys.size(), 0));
+        for (const auto& key : keys) {
+            SetSessionDeadline(key,
+                               std::chrono::steady_clock::time_point::max());
+        }
+        auto expected = std::vector<std::vector<int>>{
+            std::vector<int>(5, rejected), std::vector<int>(2, 0)};
+        if (reverse) std::reverse(expected.begin(), expected.end());
+        EXPECT_EQ(py_client_->batch_get_session_prefetch_batch(
+                      reverse ? std::vector<std::vector<std::string>>{fitting,
+                                                                      oversized}
+                              : std::vector<std::vector<std::string>>{oversized,
+                                                                      fitting}),
+                  expected);
+        EXPECT_EQ(py_client_->get_session_prefetch_cache_.size(), 2u);
+        ExpectRead(keys[5], 5, 1024, /*cache_only=*/true);
+        ExpectRead(keys[6], 6, 2048, /*cache_only=*/true);
+        EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+        ExpectArenaReleased();
+    }
+}
+
+TEST_F(RealClientLeasePrefetchTest,
        BatchPrefetchSharedKeyRescuePreservesAdmissionFailure) {
     DfsPrefetchTestEnv dfs_env;
     ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
@@ -1487,9 +1573,7 @@ TEST_F(RealClientLeasePrefetchTest,
     EXPECT_EQ(py_client_->batch_get_session_prefetch_batch(
                   {keys, {keys[0]}, {keys[0]}}),
               (std::vector<std::vector<int>>{
-                  {rejected, NoAvailableHandle(), NoAvailableHandle()},
-                  {rejected},
-                  {rejected}}));
+                  {rejected, rejected, rejected}, {rejected}, {rejected}}));
     EXPECT_TRUE(py_client_->get_session_prefetch_cache_.empty());
     EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
     ExpectArenaReleased();
