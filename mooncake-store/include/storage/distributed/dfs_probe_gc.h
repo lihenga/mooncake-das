@@ -97,8 +97,9 @@ inline void DeleteIfExpired(int directory_fd, const std::string& root,
 }
 
 inline void Cleanup(const std::string& root, std::chrono::seconds ttl) {
-    const int fd = ::open(root.c_str(),
-                          O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    // Allow deployments whose configured DFS root is a directory symlink.
+    // Individual entries are still inspected with AT_SYMLINK_NOFOLLOW.
+    const int fd = ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd < 0) {
         LogFailure(root, "open directory", errno);
         return;

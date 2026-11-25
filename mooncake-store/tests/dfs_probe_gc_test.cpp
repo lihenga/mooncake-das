@@ -110,12 +110,16 @@ TEST_F(DfsProbeGcTest, DoesNotRecurseOrFollowSymlinks) {
     EXPECT_TRUE(Exists(std::string("nested/") + kProbe));
     EXPECT_TRUE(Exists(directory));
     EXPECT_TRUE(Exists(fifo));
-    // A symlink used as the root must not be traversed either.
+}
+
+TEST_F(DfsProbeGcTest, AllowsSymlinkAsConfiguredRoot) {
+    ASSERT_TRUE(std::filesystem::create_directory(root_ + "/nested"));
+    Create(std::string("nested/") + kProbe, 14400);
     ASSERT_EQ(::symlink((root_ + "/nested").c_str(),
                         (root_ + "/alias").c_str()),
               0);
     dfs_probe_gc::Cleanup(root_ + "/alias", kTtl);
-    EXPECT_TRUE(Exists(std::string("nested/") + kProbe));
+    EXPECT_FALSE(Exists(std::string("nested/") + kProbe));
 }
 
 TEST_F(DfsProbeGcTest, RechecksMtimeAndTypeBeforeDeletion) {
