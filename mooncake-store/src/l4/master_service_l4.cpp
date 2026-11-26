@@ -762,7 +762,8 @@ void MasterService::ReconcileDfsRootFiles() {
                   BuildDfsReadProbeContents(identity, probe_index));
     }
 
-    // Run after identity/read-probe reconciliation, on the same DFS worker.
+    // Run last, on the same worker that checks the identity/read-probe files
+    // (currently DfsEvictionThreadFunc); do not dispatch to a separate worker.
     // A failed scan must not take down that worker or change DFS health.
     const auto cleanup_now = std::chrono::steady_clock::now();
     if (cleanup_now >= next_dfs_health_probe_cleanup_) {

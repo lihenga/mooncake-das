@@ -76,6 +76,21 @@ TEST(DfsProbeGcExpiryTest, FarFutureTimestampCannotOverflowIntoThePast) {
     EXPECT_FALSE(dfs_probe_gc::IsExpired(info, kTtl));
 }
 
+TEST(DfsProbeGcConfigTest, BothDurationsMustExceedOneMinute) {
+    for (const char* name : {
+             "MOONCAKE_DFS_HEALTH_PROBE_TTL_SECONDS",
+             "MOONCAKE_DFS_HEALTH_PROBE_CLEANUP_INTERVAL_SECONDS"}) {
+        for (const int configured : {-100, 0, 1, 59, 60}) {
+            EXPECT_EQ(dfs_probe_gc::NormalizeDurationSeconds(name, configured),
+                      61);
+        }
+        for (const int configured : {61, 62, 3600, 7200}) {
+            EXPECT_EQ(dfs_probe_gc::NormalizeDurationSeconds(name, configured),
+                      configured);
+        }
+    }
+}
+
 TEST_F(DfsProbeGcTest, DeletesOnlyExpiredRegularMatchingFiles) {
     Create(kProbe, 7201);
     Create(".mooncake_dfs_health_probe_123-456_2", 0);
@@ -83,13 +98,22 @@ TEST_F(DfsProbeGcTest, DeletesOnlyExpiredRegularMatchingFiles) {
     Create(".mooncake_dfs_health_probe_bad_1", 14400);
     Create(".mooncake_dfs_read_probe", 14400);
     Create(".mooncake_dfs_root_identity", 14400);
-    dfs_probe_gc::Cleanup(root_, kTtl);
+    EXPECT_EQ(dfs_probe_gc::Cleanup(root_, kTtl), 1u);
     EXPECT_FALSE(Exists(kProbe));
     EXPECT_TRUE(Exists(".mooncake_dfs_health_probe_123-456_2"));
     EXPECT_TRUE(Exists(".mooncake_dfs_health_probe_123-456_3"));
     EXPECT_TRUE(Exists(".mooncake_dfs_health_probe_bad_1"));
     EXPECT_TRUE(Exists(".mooncake_dfs_read_probe"));
     EXPECT_TRUE(Exists(".mooncake_dfs_root_identity"));
+    EXPECT_EQ(dfs_probe_gc::Cleanup(root_, kTtl), 0u);
+}
+
+TEST_F(DfsProbeGcTest, ReportsTotalDeletionCountAcrossMultipleFiles) {
+    Create(kProbe, 14400);
+    Create(".mooncake_dfs_health_probe_123-456_2", 14400);
+    Create(".mooncake_dfs_health_probe_123-456_3", 0);
+    EXPECT_EQ(dfs_probe_gc::Cleanup(root_, kTtl), 2u);
+    EXPECT_EQ(dfs_probe_gc::Cleanup(root_, kTtl), 0u);
 }
 
 TEST_F(DfsProbeGcTest, DoesNotRecurseOrFollowSymlinks) {
@@ -147,9 +171,11 @@ TEST_F(DfsProbeGcTest, RechecksMtimeAndTypeBeforeDeletion) {
 TEST_F(DfsProbeGcTest, MissingFileAndFailedScanDoNotPreventLaterCleanup) {
     const int fd = ::open(root_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     ASSERT_GE(fd, 0);
-    EXPECT_NO_THROW(dfs_probe_gc::DeleteIfExpired(fd, root_, kProbe, kTtl));
+    EXPECT_EQ(dfs_probe_gc::DeleteIfExpired(fd, root_, kProbe, kTtl),
+              dfs_probe_gc::DeleteResult::kAlreadyAbsent);
     ::close(fd);
-    EXPECT_NO_THROW(dfs_probe_gc::DeleteIfExpired(-1, root_, kProbe, kTtl));
+    EXPECT_EQ(dfs_probe_gc::DeleteIfExpired(-1, root_, kProbe, kTtl),
+              dfs_probe_gc::DeleteResult::kFailed);
     EXPECT_NO_THROW(dfs_probe_gc::Cleanup(root_ + "/missing", kTtl));
     Create(kProbe, 14400);
     dfs_probe_gc::Cleanup(root_, kTtl);
@@ -162,13 +188,13 @@ TEST_F(DfsProbeGcTest, FailedUnlinkCanBeRetriedOnTheNextScan) {
     const std::string second = ".mooncake_dfs_health_probe_123-456_2";
     Create(second, 14400);
     ASSERT_EQ(::chmod(root_.c_str(), 0500), 0);
-    EXPECT_NO_THROW(dfs_probe_gc::Cleanup(root_, kTtl));
+    EXPECT_EQ(dfs_probe_gc::Cleanup(root_, kTtl), 0u);
     EXPECT_TRUE(Exists(kProbe));
     EXPECT_TRUE(Exists(second));
     // Restore permissions before assertions that could abort the test.
     const int restored = ::chmod(root_.c_str(), 0700);
     ASSERT_EQ(restored, 0);
-    dfs_probe_gc::Cleanup(root_, kTtl);
+    EXPECT_EQ(dfs_probe_gc::Cleanup(root_, kTtl), 2u);
     EXPECT_FALSE(Exists(kProbe));
     EXPECT_FALSE(Exists(second));
 }

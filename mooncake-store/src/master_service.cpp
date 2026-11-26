@@ -2,6 +2,7 @@
 #include "config/replica_selection_config.h"
 #include "storage/distributed/dfs_io_timeout.h"
 #include "storage/distributed/dfs_log_limiter.h"
+#include "storage/distributed/dfs_probe_gc.h"
 #include "storage/distributed/dfs_root_identity.h"
 #include "storage/distributed/dfs_read_probe.h"
 #include <filesystem>
@@ -605,16 +606,18 @@ MasterService::MasterService(const MasterServiceConfig& config)
                 MOONCAKE_DFS_ROOT_GUARD_INTERVAL_SECONDS,
             5),
         1));
-    dfs_health_probe_ttl_ = std::chrono::seconds(std::max(
-        Environ::ReadOr(DistributedStorageEnvironmentVariables::
-                            MOONCAKE_DFS_HEALTH_PROBE_TTL_SECONDS,
-                        7200),
-        1));
-    dfs_health_probe_cleanup_interval_ = std::chrono::seconds(std::max(
-        Environ::ReadOr(DistributedStorageEnvironmentVariables::
-                            MOONCAKE_DFS_HEALTH_PROBE_CLEANUP_INTERVAL_SECONDS,
-                        3600),
-        1));
+    dfs_health_probe_ttl_ =
+        std::chrono::seconds(dfs_probe_gc::NormalizeDurationSeconds(
+            "MOONCAKE_DFS_HEALTH_PROBE_TTL_SECONDS",
+            Environ::ReadOr(DistributedStorageEnvironmentVariables::
+                                MOONCAKE_DFS_HEALTH_PROBE_TTL_SECONDS,
+                            7200)));
+    dfs_health_probe_cleanup_interval_ =
+        std::chrono::seconds(dfs_probe_gc::NormalizeDurationSeconds(
+            "MOONCAKE_DFS_HEALTH_PROBE_CLEANUP_INTERVAL_SECONDS",
+            Environ::ReadOr(DistributedStorageEnvironmentVariables::
+                                MOONCAKE_DFS_HEALTH_PROBE_CLEANUP_INTERVAL_SECONDS,
+                            3600)));
     LOG(INFO) << "DFS write-probe cleanup initialized, ttl_seconds="
               << dfs_health_probe_ttl_.count() << ", interval_seconds="
               << dfs_health_probe_cleanup_interval_.count();

@@ -181,6 +181,7 @@ struct DistributedStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::size_t, MC_STORE_DFS_PINNED_POOL_BYTES);
     MC_DEFINE_ENV_VAR(int, MOONCAKE_DFS_ROOT_GUARD_INTERVAL_SECONDS);
     // Write-probe garbage collection: defaults are 2 hours and 1 hour.
+    // Both durations are clamped to at least 61 seconds, with a warning.
     MC_DEFINE_ENV_VAR(int, MOONCAKE_DFS_HEALTH_PROBE_TTL_SECONDS);
     MC_DEFINE_ENV_VAR(int, MOONCAKE_DFS_HEALTH_PROBE_CLEANUP_INTERVAL_SECONDS);
 };
