@@ -15,8 +15,12 @@
 
 #if defined(USE_HIP)
 
+#include <chrono>
 #include <dlfcn.h>
 #include <filesystem>
+#include <glog/logging.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 namespace mooncake {
 namespace device {
@@ -98,7 +102,46 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
                 kind = hipMemcpyDefault;
                 break;
         }
-        return hipMemcpy(dst, src, size, kind) == hipSuccess;
+        const hipError_t status = hipMemcpy(dst, src, size, kind);
+        if (status == hipSuccess) return true;
+
+        // Keep diagnostics off the successful copy path. Use the copy's own
+        // return code; hipGetLastError() would clear the thread's error state.
+        const auto timestamp_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count();
+        int device_id = -1;
+        const hipError_t device_status = hipGetDevice(&device_id);
+        const char* direction_name = "auto";
+        switch (direction) {
+            case CopyDirection::kHostToDevice:
+                direction_name = "H2D";
+                break;
+            case CopyDirection::kDeviceToHost:
+                direction_name = "D2H";
+                break;
+            case CopyDirection::kDeviceToDevice:
+                direction_name = "D2D";
+                break;
+            case CopyDirection::kHostToHost:
+                direction_name = "H2H";
+                break;
+            case CopyDirection::kAuto:
+                break;
+        }
+        LOG(ERROR) << "hipMemcpy failed"
+                   << " timestamp_us=" << timestamp_us
+                   << " tid=" << syscall(SYS_gettid)
+                   << " device=" << device_id
+                   << " device_query_status=" << static_cast<int>(device_status)
+                   << " status=" << static_cast<int>(status)
+                   << " error_name=" << hipGetErrorName(status)
+                   << " error_message=" << hipGetErrorString(status)
+                   << " direction=" << direction_name
+                   << " memcpy_kind=" << static_cast<int>(kind)
+                   << " src=" << src << " dst=" << dst << " bytes=" << size;
+        return false;
     }
 
     bool CopyFromHostAsync(void* dst, const void* src, size_t size,
