@@ -6,7 +6,11 @@ namespace mooncake::test {
 class ImmutableBucketAllocatorTestPeer {
    public:
     static auto& DeletionMutex(ImmutableBucketAllocator& allocator) {
-        return allocator.metadata_io_mutex_;
+        return allocator.metadata_io_root_mutex_;
+    }
+
+    static void WaitForAsyncDeletes(ImmutableBucketAllocator& allocator) {
+        allocator.WaitForPendingAsyncDeletes();
     }
 
     static void SetAdapter(ImmutableBucketAllocator& allocator,

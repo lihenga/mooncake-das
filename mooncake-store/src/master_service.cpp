@@ -8370,7 +8370,7 @@ bool MasterService::RunBucketDfsEvictionInternal(
         if (!invalidating_missing_bucket &&
             keep_until > std::chrono::system_clock::now()) {
             allocator->DeferDeletion(std::move(evicted_bucket), keep_until);
-        } else {
+        } else if (force_one || invalidating_missing_bucket) {
             auto result =
                 allocator->DeleteEvictedBucket(std::move(evicted_bucket));
             if (!result) {
@@ -8381,6 +8381,17 @@ bool MasterService::RunBucketDfsEvictionInternal(
                 // Invalidation finished logically; maintenance owns physical
                 // retry.
                 return invalidating_missing_bucket || evicted;
+            }
+            deleted = true;
+        } else {
+            auto result = allocator->EnqueueDeleteEvictedBucket(
+                std::move(evicted_bucket));
+            if (!result) {
+                LOG(ERROR)
+                    << "DFS bucket async deletion enqueue failed; capacity "
+                       "remains reserved for runtime retry, error="
+                    << result.error();
+                return evicted;
             }
             deleted = true;
         }

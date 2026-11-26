@@ -7480,6 +7480,8 @@ TEST_F(MasterServiceTest, DfsBucketEvictionStopsOnPhysicalDeleteFailure) {
                      << ", prior_success=" << prior_success);
         const auto root = MakeDfsTestRoot("evict_delete_failure");
         ScopedBucketDfsEnv env(root, "4096", "4", "0", "0.5", "0.1");
+        ScopedEnvVar delete_concurrency(
+            "MOONCAKE_DFS_BUCKET_DELETE_CONCURRENCY", "0");
         ScopedEnvVar ready_buckets("MOONCAKE_DFS_READY_BUCKET_COUNT", "0");
         {
             MasterService service;
@@ -7557,6 +7559,8 @@ TEST_F(MasterServiceTest, DfsBucketDeleteFailureBacklogLimitsNormalEviction) {
         const auto root = MakeDfsTestRoot("delete_failure_backlog");
         ScopedBucketDfsEnv env(root, "8192", "6", "0", "0.5", "0.1");
         ScopedEnvVar recovery("MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED", "true");
+        ScopedEnvVar delete_concurrency(
+            "MOONCAKE_DFS_BUCKET_DELETE_CONCURRENCY", "0");
         ScopedEnvVar ready_buckets("MOONCAKE_DFS_READY_BUCKET_COUNT", "0");
         {
             MasterService service;
@@ -7654,6 +7658,8 @@ TEST_F(MasterServiceTest, DfsBucketEvictionContinuesAfterLeaseDeferral) {
         SCOPED_TRACE(force_one);
         const auto root = MakeDfsTestRoot("evict_defer_then_delete");
         ScopedBucketDfsEnv env(root, "4096", "4", "0", "0.5", "0.1");
+        ScopedEnvVar delete_concurrency(
+            "MOONCAKE_DFS_BUCKET_DELETE_CONCURRENCY", "0");
         ScopedEnvVar ready_buckets("MOONCAKE_DFS_READY_BUCKET_COUNT", "0");
         {
             MasterService service(MasterServiceConfig::builder()

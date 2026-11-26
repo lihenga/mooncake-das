@@ -225,6 +225,8 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     ready_bucket_target_ = static_cast<size_t>(config.ready_bucket_target);
     bucket_create_concurrency_ =
         static_cast<size_t>(config.bucket_create_concurrency);
+    bucket_delete_concurrency_ =
+        static_cast<size_t>(config.bucket_delete_concurrency);
     eviction_enabled_ = config.eviction_enabled;
     eviction_high_watermark_ = config.eviction_high_watermark;
     eviction_low_watermark_ = config.eviction_low_watermark;
@@ -290,12 +292,15 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     }
 
     const size_t recovered_bucket_count = buckets_.size();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stop_bucket_workers_ = false;
+    }
     size_t initial_ready_target = 0;
     ErrorCode initial_creation_error = ErrorCode::OK;
     if (ready_bucket_target_ > 0) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            stop_bucket_workers_ = false;
             bucket_creation_retry_after_ =
                 std::chrono::steady_clock::time_point::min();
             initial_ready_target = EffectiveReadyTargetLocked();
@@ -384,6 +389,32 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
         return tl::make_unexpected(initial_creation_error);
     }
 
+    if (bucket_delete_concurrency_ > 0) {
+        try {
+            bucket_delete_workers_.reserve(bucket_delete_concurrency_);
+            for (size_t i = 0; i < bucket_delete_concurrency_; ++i) {
+                bucket_delete_workers_.emplace_back(
+                    &ImmutableBucketAllocator::BucketDeleteWorker, this);
+            }
+        } catch (const std::system_error& e) {
+            LOG(ERROR) << "Failed to start DFS bucket deletion workers: "
+                       << e.what();
+            StopBucketWorkers();
+            std::vector<int64_t> ready_bucket_ids;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                ready_bucket_ids = DetachReadyBucketsLocked();
+                UpdateBucketPoolMetricsLocked();
+            }
+            for (const int64_t bucket_id : ready_bucket_ids) {
+                DeleteBucketFiles(bucket_id);
+            }
+            fs_adapter_->Shutdown();
+            fs_adapter_.reset();
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+
     initialized_.store(true, std::memory_order_release);
 
     // Recovery may have rewritten in-memory state (legacy format upgrade,
@@ -405,6 +436,7 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
               << ", max_bucket_count=" << max_bucket_count_
               << ", ready_bucket_target=" << ready_bucket_target_
               << ", bucket_create_concurrency=" << bucket_create_concurrency_
+              << ", bucket_delete_concurrency=" << bucket_delete_concurrency_
               << ", recovered_buckets=" << recovered_bucket_count
               << ", ready_buckets=" << ready_bucket_count
               << ", recovered_replicas=" << recovered_replicas_.size()
@@ -424,7 +456,8 @@ ImmutableBucketAllocator::RetireAndCreateReplacementAllocator() {
     // file from the deleted directory, while paths in the recreated root may
     // already belong to the replacement generation.
     {
-        std::lock_guard<std::mutex> metadata_lock(metadata_io_mutex_);
+        std::unique_lock<std::shared_mutex> metadata_lock(
+            metadata_io_root_mutex_);
         std::lock_guard<std::mutex> lock(mutex_);
         replacement->next_bucket_id_ = next_bucket_id_;
         replacement->next_generation_ = next_generation_;
@@ -435,6 +468,7 @@ ImmutableBucketAllocator::RetireAndCreateReplacementAllocator() {
             }
         }
         ready_bucket_ids_.clear();
+        delete_queue_.clear();
         buckets_.clear();
         key_index_.clear();
         lru_list_.clear();
@@ -446,6 +480,8 @@ ImmutableBucketAllocator::RetireAndCreateReplacementAllocator() {
         total_used_bytes_ = 0;
         evicting_bucket_count_ = 0;
         failed_delete_bucket_count_ = 0;
+        async_deletes_in_flight_ = 0;
+        async_delete_bytes_ = 0;
         // Keep bucket ids and entry generations monotonic across recovery.
         // An RPC that completed against the old allocator immediately before
         // the master's exclusive recovery barrier may be stamped with the new
@@ -759,22 +795,91 @@ void ImmutableBucketAllocator::UpdateBucketPoolMetricsLocked() const {
         static_cast<uint64_t>(ready_bucket_ids_.size()) * bucket_capacity_);
 }
 
+std::mutex& ImmutableBucketAllocator::MetadataIoStripe(int64_t bucket_id) {
+    const size_t idx =
+        bucket_id < 0
+            ? 0
+            : static_cast<size_t>(bucket_id) % kMetadataIoStripeCount;
+    return metadata_io_stripes_[idx];
+}
+
 void ImmutableBucketAllocator::StopBucketWorkers() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         stop_bucket_workers_ = true;
         initialization_creations_remaining_ = 0;
+        while (!delete_queue_.empty()) {
+            auto& pending = delete_queue_.front();
+            auto it = buckets_.find(pending.bucket_id_);
+            if (it != buckets_.end() &&
+                it->second.get() == pending.identity_.get() &&
+                it->second->delete_in_flight) {
+                it->second->delete_in_flight = false;
+                if (async_deletes_in_flight_ > 0) --async_deletes_in_flight_;
+                async_delete_bytes_ =
+                    async_delete_bytes_ >= it->second->append_offset
+                        ? async_delete_bytes_ - it->second->append_offset
+                        : 0;
+            }
+            delete_queue_.pop_front();
+        }
         bucket_pool_cv_.notify_all();
+        delete_cv_.notify_all();
     }
     for (auto& worker : bucket_create_workers_) {
         if (worker.joinable()) worker.join();
     }
     bucket_create_workers_.clear();
+    for (auto& worker : bucket_delete_workers_) {
+        if (worker.joinable()) worker.join();
+    }
+    bucket_delete_workers_.clear();
     // The legacy sweep deletes files through the fs adapter, so it must finish
     // before the adapter is shut down.
     if (legacy_cleanup_worker_.joinable()) {
         legacy_cleanup_worker_.join();
     }
+}
+
+void ImmutableBucketAllocator::BucketDeleteWorker() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (true) {
+        delete_cv_.wait(lock, [this] {
+            return stop_bucket_workers_ || !delete_queue_.empty();
+        });
+        if (stop_bucket_workers_ && delete_queue_.empty()) break;
+
+        EvictedBucket bucket = std::move(delete_queue_.front());
+        delete_queue_.pop_front();
+        const int64_t bucket_id = bucket.bucket_id_;
+        auto identity = bucket.identity_;
+        lock.unlock();
+
+        auto result = DeleteEvictedBucket(std::move(bucket));
+
+        lock.lock();
+        if (!result) {
+            auto it = buckets_.find(bucket_id);
+            if (it != buckets_.end() && it->second.get() == identity.get() &&
+                it->second->delete_in_flight) {
+                it->second->delete_in_flight = false;
+                if (async_deletes_in_flight_ > 0) --async_deletes_in_flight_;
+                async_delete_bytes_ =
+                    async_delete_bytes_ >= it->second->append_offset
+                        ? async_delete_bytes_ - it->second->append_offset
+                        : 0;
+            }
+        }
+        delete_cv_.notify_all();
+    }
+}
+
+void ImmutableBucketAllocator::WaitForPendingAsyncDeletes() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    delete_cv_.wait(lock, [this] {
+        return stop_bucket_workers_ ||
+               (delete_queue_.empty() && async_deletes_in_flight_ == 0);
+    });
 }
 
 void ImmutableBucketAllocator::LegacyCleanupWorker(
@@ -1793,7 +1898,10 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
     size_t flushed = 0;
     for (const auto& item : pending) {
         if (item.write_metadata) {
-            std::lock_guard<std::mutex> metadata_lock(metadata_io_mutex_);
+            std::shared_lock<std::shared_mutex> root_lock(
+                metadata_io_root_mutex_);
+            std::lock_guard<std::mutex> metadata_lock(
+                MetadataIoStripe(item.bucket_id));
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 auto it = buckets_.find(item.bucket_id);
@@ -1942,7 +2050,8 @@ ImmutableBucketAllocator::GetBucketIdSnapshot() const {
 }
 
 bool ImmutableBucketAllocator::DiscardMissingBucketIfEmpty(int64_t bucket_id) {
-    std::lock_guard<std::mutex> metadata_lock(metadata_io_mutex_);
+    std::shared_lock<std::shared_mutex> root_lock(metadata_io_root_mutex_);
+    std::lock_guard<std::mutex> metadata_lock(MetadataIoStripe(bucket_id));
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = buckets_.find(bucket_id);
@@ -2129,6 +2238,14 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (DeleteFailureBacklogFullLocked()) return pending;
+        const size_t max_inflight_deletes =
+            bucket_delete_concurrency_ > 0
+                ? std::max<size_t>(bucket_delete_concurrency_ * 4, 32)
+                : 0;
+        if (!force_one && max_inflight_deletes > 0 &&
+            async_deletes_in_flight_ >= max_inflight_deletes) {
+            return pending;
+        }
 
         const uint64_t capacity =
             max_bucket_count_ > 0
@@ -2136,8 +2253,12 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
                 : static_cast<uint64_t>(buckets_.size()) * bucket_capacity_;
         if (capacity == 0) return pending;
 
-        const double usage = static_cast<double>(UsedBytesLocked()) /
-                             static_cast<double>(capacity);
+        const uint64_t total_used = UsedBytesLocked();
+        const uint64_t effective_used = total_used >= async_delete_bytes_
+                                            ? total_used - async_delete_bytes_
+                                            : 0;
+        const double usage =
+            static_cast<double>(effective_used) / static_cast<double>(capacity);
         const bool prioritize_low_utilization =
             low_utilization_threshold > 0.0 &&
             low_utilization_threshold < 1.0;
@@ -2283,9 +2404,15 @@ ImmutableBucketAllocator::CommitEvictionLogical(PendingEviction&& pending) {
 
 tl::expected<void, ErrorCode> ImmutableBucketAllocator::DeleteEvictedBucket(
     EvictedBucket&& bucket) {
-    // Serialize with metadata flush and root retirement. A retired token must
-    // never touch paths that may now belong to a replacement filesystem root.
-    std::lock_guard<std::mutex> metadata_lock(metadata_io_mutex_);
+    if (bucket.bucket_id_ < 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    // Serialize with metadata flush per bucket stripe and root retirement. A
+    // retired token must never touch paths that may now belong to a
+    // replacement filesystem root.
+    std::shared_lock<std::shared_mutex> root_lock(metadata_io_root_mutex_);
+    std::lock_guard<std::mutex> metadata_lock(
+        MetadataIoStripe(bucket.bucket_id_));
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = buckets_.find(bucket.bucket_id_);
@@ -2348,6 +2475,13 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::DeleteEvictedBucket(
         if (it != buckets_.end()) {
             const auto& state = *it->second;
             total_used_bytes_ -= state.append_offset;
+            if (state.delete_in_flight) {
+                if (async_deletes_in_flight_ > 0) --async_deletes_in_flight_;
+                async_delete_bytes_ =
+                    async_delete_bytes_ >= state.append_offset
+                        ? async_delete_bytes_ - state.append_offset
+                        : 0;
+            }
             if (state.evicting) {
                 --evicting_bucket_count_;
                 if (state.delete_failures != 0) --failed_delete_bucket_count_;
@@ -2362,7 +2496,34 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::DeleteEvictedBucket(
     }
     bucket.identity_.reset();
     bucket_pool_cv_.notify_all();
+    delete_cv_.notify_all();
     LOG(INFO) << "Evicted DFS bucket " << bucket.bucket_id_;
+    return {};
+}
+
+tl::expected<void, ErrorCode>
+ImmutableBucketAllocator::EnqueueDeleteEvictedBucket(EvictedBucket&& bucket) {
+    if (bucket_delete_concurrency_ == 0) {
+        return DeleteEvictedBucket(std::move(bucket));
+    }
+    if (bucket.bucket_id_ < 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = buckets_.find(bucket.bucket_id_);
+        if (!initialized_.load(std::memory_order_acquire) ||
+            stop_bucket_workers_ || it == buckets_.end() ||
+            it->second.get() != bucket.identity_.get() ||
+            !it->second->evicting || it->second->delete_in_flight) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        it->second->delete_in_flight = true;
+        ++async_deletes_in_flight_;
+        async_delete_bytes_ += it->second->append_offset;
+        delete_queue_.push_back(std::move(bucket));
+    }
+    delete_cv_.notify_one();
     return {};
 }
 
@@ -2388,8 +2549,8 @@ size_t ImmutableBucketAllocator::RetryFailedEvictions() {
         const auto now = std::chrono::system_clock::now();
         const auto steady_now = std::chrono::steady_clock::now();
         for (const auto& [id, state] : buckets_) {
-            if (!state->evicting || !state->delete_after ||
-                *state->delete_after > now ||
+            if (!state->evicting || state->delete_in_flight ||
+                !state->delete_after || *state->delete_after > now ||
                 state->delete_retry_after > steady_now)
                 continue;
             EvictedBucket bucket;

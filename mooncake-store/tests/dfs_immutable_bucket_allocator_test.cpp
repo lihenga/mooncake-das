@@ -173,6 +173,7 @@ DistributedStorageConfig MakeBucketConfig(const std::string& fsdir,
     config.bucket_recovery_enabled = true;
     config.max_bucket_count = max_bucket_count;
     config.ready_bucket_target = 0;
+    config.bucket_delete_concurrency = 0;
     config.alignment = kAlignment;
     config.bucket_batch_alignment = 0;
     config.single_tenant = true;
@@ -2847,6 +2848,165 @@ TEST(ImmutableBucketAllocatorTest,
     ASSERT_TRUE(recovered.CommitEviction(std::move(recovered_sparse)));
     // Once the last sparse bucket is evicted, empty index returns immediately.
     EXPECT_LT(recovered.PrepareEvictionForLowUtilization(0.5).bucket_id(), 0);
+}
+
+namespace {
+
+class BarrierDeleteAdapter : public PosixFsAdapter {
+   public:
+    explicit BarrierDeleteAdapter(size_t target_concurrent)
+        : target_concurrent_(target_concurrent) {}
+
+    tl::expected<void, ErrorCode> DeleteFile(const std::string& path) override {
+        ++calls_;
+        if (path == blocked_path_) {
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        if (wait_for_barrier_ && path.ends_with(".data")) {
+            std::unique_lock<std::mutex> lock(mu_);
+            ++active_;
+            max_active_ = std::max(max_active_, active_);
+            if (active_ >= target_concurrent_) {
+                barrier_reached_ = true;
+                cv_.notify_all();
+            } else {
+                cv_.wait_for(lock, std::chrono::seconds(5),
+                             [this] { return barrier_reached_; });
+            }
+            --active_;
+        }
+        return PosixFsAdapter::DeleteFile(path);
+    }
+
+    void DisableBarrier() {
+        std::lock_guard<std::mutex> lock(mu_);
+        wait_for_barrier_ = false;
+        barrier_reached_ = true;
+        cv_.notify_all();
+    }
+
+    void SetBlockedPath(std::string path) {
+        std::lock_guard<std::mutex> lock(mu_);
+        blocked_path_ = std::move(path);
+    }
+
+    size_t max_active() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return max_active_;
+    }
+
+    size_t calls() const { return calls_.load(); }
+
+   private:
+    size_t target_concurrent_;
+    mutable std::mutex mu_;
+    std::condition_variable cv_;
+    bool wait_for_barrier_ = true;
+    bool barrier_reached_ = false;
+    size_t active_ = 0;
+    size_t max_active_ = 0;
+    std::string blocked_path_;
+    std::atomic<size_t> calls_{0};
+};
+
+}  // namespace
+
+TEST(ImmutableBucketAllocatorTest,
+     AsyncDeleteWorkersDeleteConcurrentlyAndRespectEffectiveWatermark) {
+    TempDir tmp("bucket_async_delete_concurrent");
+    auto config = MakeEvictionConfig(tmp.path(), kAlignment, 6);
+    config.bucket_delete_concurrency = 4;
+    config.eviction_high_watermark = 0.5;
+    config.eviction_low_watermark = 0.25;
+
+    ImmutableBucketAllocator alloc;
+    ASSERT_TRUE(alloc.Init(config));
+    auto adapter = std::make_unique<BarrierDeleteAdapter>(2);
+    ASSERT_TRUE(adapter->Init(tmp.path()));
+    auto* io = adapter.get();
+    ImmutableBucketAllocatorTestPeer::SetAdapter(alloc, std::move(adapter));
+
+    std::vector<DistributedFSDescriptor> descs;
+    for (int i = 0; i < 4; ++i) {
+        auto desc = alloc.Allocate("k" + std::to_string(i), 100);
+        ASSERT_TRUE(desc);
+        ASSERT_TRUE(alloc.MarkCommitted("k" + std::to_string(i), *desc));
+        descs.push_back(*desc);
+    }
+    EXPECT_EQ(alloc.GetUsedBytes(), 4 * kAlignment);
+
+    // Enqueue 2 bucket deletes; BarrierDeleteAdapter requires both workers to
+    // run DeleteFile concurrently on different bucket stripes to pass.
+    // Meanwhile effective watermark drops to 2/6 <= 0.25 + epsilon? Wait: 2/6
+    // = 0.33 > 0.25, then 3rd drops effective usage to 1/6 <= 0.25, stopping
+    // over-eviction!
+    for (int i = 0; i < 3; ++i) {
+        auto pending = alloc.PrepareEviction();
+        ASSERT_FALSE(pending.Empty());
+        auto logical = alloc.CommitEvictionLogical(std::move(pending));
+        ASSERT_TRUE(logical);
+        ASSERT_TRUE(alloc.EnqueueDeleteEvictedBucket(std::move(*logical)));
+    }
+    // Effective usage is now 1/6 (below low watermark 0.25), so PrepareEviction
+    // stops even while async deletes are still finishing.
+    EXPECT_TRUE(alloc.PrepareEviction().Empty());
+
+    ImmutableBucketAllocatorTestPeer::WaitForAsyncDeletes(alloc);
+    EXPECT_GE(io->max_active(), 2u);
+    EXPECT_EQ(alloc.GetUsedBytes(), kAlignment);
+    EXPECT_EQ(alloc.GetBucketCount(), 1u);
+}
+
+TEST(ImmutableBucketAllocatorTest,
+     AsyncDeleteFailureBacksOffAndRetireStopsSafely) {
+    TempDir tmp("bucket_async_delete_fail_retire");
+    auto config = MakeEvictionConfig(tmp.path(), kAlignment, 4);
+    config.bucket_delete_concurrency = 2;
+
+    ImmutableBucketAllocator alloc;
+    ASSERT_TRUE(alloc.Init(config));
+    auto adapter = std::make_unique<BarrierDeleteAdapter>(2);
+    ASSERT_TRUE(adapter->Init(tmp.path()));
+    adapter->DisableBarrier();
+    auto* io = adapter.get();
+    ImmutableBucketAllocatorTestPeer::SetAdapter(alloc, std::move(adapter));
+
+    auto d0 = alloc.Allocate("k0", 100);
+    auto d1 = alloc.Allocate("k1", 100);
+    auto d2 = alloc.Allocate("k2", 100);
+    ASSERT_TRUE(d0 && d1 && d2);
+    ASSERT_TRUE(alloc.MarkCommitted("k0", *d0));
+    ASSERT_TRUE(alloc.MarkCommitted("k1", *d1));
+    ASSERT_TRUE(alloc.MarkCommitted("k2", *d2));
+
+    // Failing async delete records failure backoff and releases in-flight
+    // accounting so RetryFailedEvictions can retry later.
+    io->SetBlockedPath(d0->file_path);
+    auto l0 = alloc.CommitEvictionLogical(alloc.PrepareEvictionForAllocationFailure());
+    ASSERT_TRUE(l0);
+    ASSERT_TRUE(alloc.EnqueueDeleteEvictedBucket(std::move(*l0)));
+    ImmutableBucketAllocatorTestPeer::WaitForAsyncDeletes(alloc);
+    EXPECT_EQ(ImmutableBucketAllocatorTestPeer::RetryState(alloc, d0->shard_idx).first, 1);
+    EXPECT_EQ(alloc.GetUsedBytes(), 3 * kAlignment);
+
+    io->SetBlockedPath({});
+    ImmutableBucketAllocatorTestPeer::ExpireDeletions(alloc);
+    EXPECT_EQ(alloc.RetryFailedEvictions(), 1u);
+    EXPECT_EQ(alloc.GetUsedBytes(), 2 * kAlignment);
+
+    // Enqueue a delete then immediately retire; workers must drain/stop cleanly
+    // and never touch files after RetireAndCreateReplacementAllocator returns.
+    auto l1 = alloc.CommitEvictionLogical(alloc.PrepareEvictionForAllocationFailure());
+    ASSERT_TRUE(l1);
+    auto stale_token =
+        ImmutableBucketAllocatorTestPeer::DeletionToken(alloc, d2->shard_idx);
+    ASSERT_TRUE(alloc.EnqueueDeleteEvictedBucket(std::move(*l1)));
+    auto replacement = alloc.RetireAndCreateReplacementAllocator();
+    const size_t calls_after_retire = io->calls();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(io->calls(), calls_after_retire);
+    EXPECT_EQ(alloc.GetUsedBytes(), 0u);
+    EXPECT_FALSE(alloc.EnqueueDeleteEvictedBucket(std::move(stale_token)));
 }
 
 }  // namespace mooncake::test
