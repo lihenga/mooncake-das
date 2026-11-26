@@ -5847,8 +5847,7 @@ TEST_F(MasterServiceTest,
         const std::string marker_path = root + "/" + kDfsRootMarkerFileName;
         const std::string write_probe_directory =
             root + "/" + kDfsWriteProbeDirectoryName;
-        ASSERT_TRUE(std::filesystem::is_directory(write_probe_directory));
-        ASSERT_TRUE(std::filesystem::remove(write_probe_directory));
+        ASSERT_FALSE(std::filesystem::exists(write_probe_directory));
         std::array<std::string, 2> read_probe_paths;
         for (size_t probe_index = 0;
              probe_index < kDfsReadProbeDirectoryNames.size(); ++probe_index) {
@@ -5870,7 +5869,6 @@ TEST_F(MasterServiceTest,
                               std::chrono::seconds(5);
         while ((!std::filesystem::exists(identity_path) ||
                 !std::filesystem::exists(marker_path) ||
-                !std::filesystem::is_directory(write_probe_directory) ||
                 !std::filesystem::exists(read_probe_paths[0]) ||
                 !std::filesystem::exists(read_probe_paths[1])) &&
                std::chrono::steady_clock::now() < deadline) {
@@ -5888,7 +5886,7 @@ TEST_F(MasterServiceTest,
             (std::istreambuf_iterator<char>(marker_file)),
             std::istreambuf_iterator<char>());
         EXPECT_EQ(restored_marker, kDfsRootMarkerPayload);
-        EXPECT_TRUE(std::filesystem::is_directory(write_probe_directory));
+        EXPECT_FALSE(std::filesystem::exists(write_probe_directory));
 
         for (size_t probe_index = 0;
              probe_index < read_probe_paths.size(); ++probe_index) {

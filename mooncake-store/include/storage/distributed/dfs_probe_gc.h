@@ -112,12 +112,16 @@ inline DeleteResult DeleteIfExpired(int directory_fd, const std::string& root,
 
 // Return the number of files actually unlinked; an already absent file is not
 // an error, but does not increment the deletion count.
-inline size_t Cleanup(const std::string& root, std::chrono::seconds ttl) {
+inline size_t Cleanup(const std::string& root, std::chrono::seconds ttl,
+                      bool missing_ok = false) {
     // Allow deployments whose configured DFS root is a directory symlink.
     // Individual entries are still inspected with AT_SYMLINK_NOFOLLOW.
     const int fd = ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd < 0) {
-        LogFailure(root, "open directory", errno);
+        const int error = errno;
+        if (!(missing_ok && error == ENOENT)) {
+            LogFailure(root, "open directory", error);
+        }
         return 0;
     }
     DIR* opened = ::fdopendir(fd);
@@ -161,9 +165,10 @@ inline size_t Cleanup(const std::string& root, std::chrono::seconds ttl) {
 inline size_t CleanupRound(const std::string& root, std::chrono::seconds ttl,
                            bool& initial_scan_pending) {
     size_t deleted_count = 0;
-    const auto cleanup_directory = [&](const std::string& directory) {
+    const auto cleanup_directory = [&](const std::string& directory,
+                                       bool missing_ok) {
         try {
-            deleted_count += Cleanup(directory, ttl);
+            deleted_count += Cleanup(directory, ttl, missing_ok);
         } catch (const std::exception& e) {
             LOG(WARNING) << "DFS write-probe cleanup threw, directory="
                          << directory << ", error=" << e.what();
@@ -174,9 +179,11 @@ inline size_t CleanupRound(const std::string& root, std::chrono::seconds ttl,
     };
     if (initial_scan_pending) {
         initial_scan_pending = false;
-        cleanup_directory(root);
+        cleanup_directory(root, false);
     }
-    cleanup_directory(root + "/" + kDfsWriteProbeDirectoryName);
+    // The directory does not exist until a client starts probing. GC must not
+    // create it or report its expected absence as a cleanup failure.
+    cleanup_directory(root + "/" + kDfsWriteProbeDirectoryName, true);
     LOG(INFO) << "DFS write-probe cleanup finished, deleted_count="
               << deleted_count;
     return deleted_count;

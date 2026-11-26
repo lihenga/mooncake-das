@@ -1737,15 +1737,12 @@ TEST(DfsRootMarkerTest, ShardAllocatorDoesNotOverwriteInvalidMarker) {
     EXPECT_EQ(contents, "unexpected-format\n");
 }
 
-TEST_F(DfsBackendTest, HealthWriteProbeRequiresMasterCreatedDirectory) {
+TEST_F(DfsBackendTest, HealthWriteProbeCreatesAndRecreatesItsDirectory) {
     const std::string directory = tmp_->file(kDfsWriteProbeDirectoryName);
     ASSERT_TRUE(std::filesystem::remove(directory));
-    const auto missing = backend_->ProbeWrite();
-    ASSERT_FALSE(missing.has_value());
-    EXPECT_EQ(missing.error(), ErrorCode::FILE_OPEN_FAIL);
-    EXPECT_FALSE(std::filesystem::exists(directory));
-
-    ASSERT_TRUE(std::filesystem::create_directory(directory));
+    ASSERT_TRUE(backend_->ProbeWrite().has_value());
+    EXPECT_TRUE(std::filesystem::is_directory(directory));
+    // mkdir returns EEXIST on the next round; it must still succeed.
     ASSERT_TRUE(backend_->ProbeWrite().has_value());
     EXPECT_EQ(std::distance(std::filesystem::directory_iterator(directory),
                             std::filesystem::directory_iterator()),
@@ -1755,13 +1752,33 @@ TEST_F(DfsBackendTest, HealthWriteProbeRequiresMasterCreatedDirectory) {
             kDfsWriteProbeFilePrefix));
     }
 
-    // Losing the directory after a successful round must fail again, without
-    // the client recreating it or moving probes back into the DFS root.
+    // Recreate the directory if it disappears between probe rounds.
     ASSERT_GT(std::filesystem::remove_all(directory), 0u);
-    EXPECT_FALSE(backend_->ProbeWrite().has_value());
-    EXPECT_FALSE(std::filesystem::exists(directory));
-    ASSERT_TRUE(std::filesystem::create_directory(directory));
     EXPECT_TRUE(backend_->ProbeWrite().has_value());
+    EXPECT_TRUE(std::filesystem::is_directory(directory));
+}
+
+TEST_F(DfsBackendTest, HealthWriteProbeFailsWhenDirectoryPathIsAFile) {
+    const std::string directory = tmp_->file(kDfsWriteProbeDirectoryName);
+    ASSERT_TRUE(std::filesystem::remove(directory));
+    std::ofstream(directory).close();
+    // EEXIST is accepted by mkdir, but creating a probe below a regular file
+    // must fail rather than falsely reporting that the DFS is writable.
+    EXPECT_FALSE(backend_->ProbeWrite().has_value());
+    EXPECT_TRUE(std::filesystem::is_regular_file(directory));
+}
+
+TEST_F(DfsBackendTest, HealthWriteProbeFailsWhenMkdirIsDenied) {
+    if (::geteuid() == 0) GTEST_SKIP() << "root bypasses directory permissions";
+    const std::string directory = tmp_->file(kDfsWriteProbeDirectoryName);
+    ASSERT_TRUE(std::filesystem::remove(directory));
+    ASSERT_EQ(::chmod(tmp_->path().c_str(), 0500), 0);
+    const auto result = backend_->ProbeWrite();
+    const int restored = ::chmod(tmp_->path().c_str(), 0700);
+    ASSERT_EQ(restored, 0);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::FILE_OPEN_FAIL);
+    EXPECT_FALSE(std::filesystem::exists(directory));
 }
 
 TEST_F(DfsBackendTest, HealthProbesUseStrictDirectDedicatedFile) {

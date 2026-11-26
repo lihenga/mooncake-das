@@ -403,12 +403,6 @@ bool MasterService::InitializeDfsRootGuard(const std::string& root,
         }
     }
 
-    if (!EnsureDfsProbeDirectory(root, kDfsWriteProbeDirectoryName)) {
-        LOG(ERROR) << "Failed to create DFS write-probe directory " << root
-                   << "/" << kDfsWriteProbeDirectoryName;
-        return false;
-    }
-
     std::lock_guard lock(dfs_root_guard_mutex_);
     dfs_root_guard_path_ = root;
     dfs_root_guard_identity_ = identity;
@@ -766,13 +760,6 @@ void MasterService::ReconcileDfsRootFiles() {
             root + "/" + std::string(directory_name);
         reconcile(probe_directory, kDfsReadProbeFileName,
                   BuildDfsReadProbeContents(identity, probe_index));
-    }
-
-    // Check every guard cycle, even when the hourly cleanup is not due.
-    if (!EnsureDfsProbeDirectory(root, kDfsWriteProbeDirectoryName)) {
-        LOG(ERROR) << "Failed to create DFS write-probe directory " << root
-                   << "/" << kDfsWriteProbeDirectoryName;
-        return;
     }
 
     // Run last, on the same worker that checks the identity/read-probe files
