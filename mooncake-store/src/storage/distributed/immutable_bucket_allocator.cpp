@@ -108,6 +108,7 @@ ImmutableBucketAllocator::PendingEviction::PendingEviction(
     : owner_(std::exchange(other.owner_, nullptr)),
       bucket_id_(std::exchange(other.bucket_id_, -1)),
       invalidation_(other.invalidation_),
+      force_one_(other.force_one_),
       bucket_identity_(std::move(other.bucket_identity_)),
       candidates_(std::move(other.candidates_)) {
     other.candidates_.clear();
@@ -129,6 +130,7 @@ ImmutableBucketAllocator::PendingEviction::operator=(
         owner_ = std::exchange(other.owner_, nullptr);
         bucket_id_ = std::exchange(other.bucket_id_, -1);
         invalidation_ = other.invalidation_;
+        force_one_ = other.force_one_;
         bucket_identity_ = std::move(other.bucket_identity_);
         candidates_ = std::move(other.candidates_);
         other.candidates_.clear();
@@ -2224,11 +2226,14 @@ ImmutableBucketAllocator::PrepareEvictionForLowUtilization(double threshold) {
     return PrepareEvictionInternal(/*force_one=*/false, threshold);
 }
 
-bool ImmutableBucketAllocator::DeleteFailureBacklogFullLocked() const {
-    // Async deletion runs ahead of unlink; brake on the first unrecovered
-    // failure so a filesystem outage cannot drain Master metadata across many
-    // buckets at once.
-    const size_t limit = bucket_delete_concurrency_ > 0 ? 1 : 2;
+bool ImmutableBucketAllocator::DeleteFailureBacklogFullLocked(
+    bool force_one) const {
+    // Async regular eviction brakes on the first unrecovered failure so a
+    // filesystem outage cannot drain Master metadata across many buckets at
+    // once. Forced (synchronous) and sync-mode paths keep tolerating one bad
+    // bucket (limit 2).
+    const size_t limit =
+        (!force_one && bucket_delete_concurrency_ > 0) ? 1 : 2;
     return failed_delete_bucket_count_ >= limit;
 }
 
@@ -2256,7 +2261,7 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
                 return pending;
             }
         }
-        if (DeleteFailureBacklogFullLocked()) return pending;
+        if (DeleteFailureBacklogFullLocked(force_one)) return pending;
 
         const uint64_t capacity =
             max_bucket_count_ > 0
@@ -2367,6 +2372,7 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
         }
 
         pending.owner_ = this;
+        pending.force_one_ = force_one;
         pending.bucket_id_ = victim->bucket_id;
         pending.bucket_identity_ = victim;
         pending.candidates_ = std::move(candidates);
@@ -2388,7 +2394,8 @@ ImmutableBucketAllocator::CommitEvictionLogical(PendingEviction&& pending) {
     }
     // Already committed buckets may still fail later; this gates new commits
     // only.
-    if (!pending.invalidation_ && DeleteFailureBacklogFullLocked()) {
+    if (!pending.invalidation_ &&
+        DeleteFailureBacklogFullLocked(pending.force_one_)) {
         lock.unlock();
         AbortEviction(std::move(pending), /*demote=*/false);
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -2534,7 +2541,7 @@ ImmutableBucketAllocator::EnqueueDeleteEvictedBucket(EvictedBucket&& bucket) {
         async_delete_bytes_ += it->second->append_offset;
         delete_queue_.push_back(std::move(bucket));
     }
-    delete_cv_.notify_one();
+    delete_cv_.notify_all();
     return {};
 }
 

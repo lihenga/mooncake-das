@@ -269,6 +269,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
         ImmutableBucketAllocator* owner_ = nullptr;
         int64_t bucket_id_ = -1;
         bool invalidation_ = false;
+        bool force_one_ = false;
         // Keeps the exact BucketState captured by PrepareEviction alive. The
         // allocator compares pointer identity before Commit/Abort can act.
         std::shared_ptr<void> bucket_identity_;
@@ -422,7 +423,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     PendingEviction PrepareEvictionInternal(
         bool force_one, double low_utilization_threshold = -1.0);
     PendingEviction PrepareInvalidationInternal(int64_t bucket_id);
-    bool DeleteFailureBacklogFullLocked() const;
+    bool DeleteFailureBacklogFullLocked(bool force_one = false) const;
 
     // Shared implementation of AbortEviction. `demote` distinguishes an
     // explicit master rejection (return the bucket at the warm end so the scan

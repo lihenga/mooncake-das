@@ -7655,7 +7655,7 @@ TEST_F(MasterServiceTest, DfsBucketDeleteFailureBacklogLimitsNormalEviction) {
 
 TEST_F(MasterServiceTest, AsyncDfsBucketDeleteFailureBrakesAndRetries) {
     const auto root = MakeDfsTestRoot("async_delete_failure_brake");
-    ScopedBucketDfsEnv env(root, "8192", "5", "0", "0.5", "0.1");
+    ScopedBucketDfsEnv env(root, "8192", "5", "0", "0.35", "0.1");
     ScopedEnvVar ready_buckets("MOONCAKE_DFS_READY_BUCKET_COUNT", "0");
     {
         MasterService service;
@@ -7697,12 +7697,19 @@ TEST_F(MasterServiceTest, AsyncDfsBucketDeleteFailureBrakesAndRetries) {
         MasterServiceTestPeer::PostponeDfsRetry(service,
                                                 descriptors[0].shard_idx);
 
-        // A single async failure brakes further normal eviction.
+        // A single async failure brakes further normal eviction, while forced
+        // eviction still reclaims another bucket until a second failure occurs.
         EXPECT_FALSE(
             MasterServiceTestPeer::RunBucketDfsEviction(service, false));
         EXPECT_EQ(
             MasterServiceTestPeer::HasDfsReplicaInMetadata(service, "async_fail_1"),
             std::optional<bool>(true));
+        EXPECT_TRUE(
+            MasterServiceTestPeer::RunBucketDfsEviction(service, true));
+        EXPECT_EQ(
+            MasterServiceTestPeer::HasDfsReplicaInMetadata(service, "async_fail_1"),
+            std::optional<bool>(false));
+        EXPECT_EQ(MasterServiceTestPeer::GetDfsUsedBytes(service), 3 * 8192u);
 
         std::filesystem::remove_all(first);
         std::filesystem::rename(first + ".backup", first);

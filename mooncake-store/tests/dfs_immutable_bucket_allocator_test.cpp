@@ -2997,8 +2997,12 @@ TEST(ImmutableBucketAllocatorTest,
     ImmutableBucketAllocatorTestPeer::WaitForAsyncDeletes(alloc);
     EXPECT_EQ(ImmutableBucketAllocatorTestPeer::RetryState(alloc, d0->shard_idx).first, 1);
     EXPECT_EQ(alloc.GetUsedBytes(), 3 * kAlignment);
-    // Single async failure brakes further regular eviction.
+    // Single async failure brakes further regular eviction, while forced
+    // eviction tolerates one bad bucket.
     EXPECT_TRUE(alloc.PrepareEviction().Empty());
+    auto forced = alloc.PrepareEvictionForAllocationFailure();
+    EXPECT_EQ(forced.bucket_id(), d1->shard_idx);
+    alloc.AbortEviction(std::move(forced));
 
     io->SetBlockedPath({});
     ImmutableBucketAllocatorTestPeer::ExpireDeletions(alloc);
