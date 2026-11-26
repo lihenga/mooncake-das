@@ -73,6 +73,11 @@ class ObjectPart {
         return std::move(replicas_);
     }
 
+    template <typename Pred>
+    size_t EraseReplicas(Pred&& pred) {
+        return std::erase_if(replicas_, std::forward<Pred>(pred));
+    }
+
    private:
     const size_t length_;
     std::optional<uint64_t> checksum_;

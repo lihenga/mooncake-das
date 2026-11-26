@@ -7556,6 +7556,7 @@ TEST_F(MasterServiceTest, DfsBucketDeleteFailureBacklogLimitsNormalEviction) {
         SCOPED_TRACE(mode);
         const auto root = MakeDfsTestRoot("delete_failure_backlog");
         ScopedBucketDfsEnv env(root, "8192", "6", "0", "0.5", "0.1");
+        ScopedEnvVar recovery("MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED", "true");
         ScopedEnvVar ready_buckets("MOONCAKE_DFS_READY_BUCKET_COUNT", "0");
         {
             MasterService service;
@@ -8095,6 +8096,7 @@ TEST_F(MasterServiceTest, DfsRootRecoveryIgnoresLogicallyEvictedMissingBucket) {
         SCOPED_TRACE(mode);
         const auto root = MakeDfsTestRoot("root_pending_delete");
         ScopedBucketDfsEnv env(root, "4096", "4");
+        ScopedEnvVar recovery("MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED", "true");
         ScopedEnvVar ready_buckets("MOONCAKE_DFS_READY_BUCKET_COUNT", "0");
         {
             MasterService service;
@@ -8179,6 +8181,7 @@ TEST_F(MasterServiceTest, DfsRootRecoveryIgnoresLogicallyEvictedMissingBucket) {
 TEST_F(MasterServiceTest, DfsBucketInvalidationRetriesFailedFinalization) {
     const auto root = MakeDfsTestRoot("missing_finalize_failure");
     ScopedBucketDfsEnv env(root, "4096", "4");
+    ScopedEnvVar recovery("MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED", "true");
     {
         MasterService service(MasterServiceConfig::builder()
                                   .set_default_kv_lease_ttl(60000)

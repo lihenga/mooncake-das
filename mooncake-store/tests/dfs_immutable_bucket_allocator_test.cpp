@@ -170,6 +170,7 @@ DistributedStorageConfig MakeBucketConfig(const std::string& fsdir,
     config.fs_adapter_type = "posix";
     config.allocator_type = DfsAllocatorType::BUCKET;
     config.bucket_capacity = bucket_capacity;
+    config.bucket_recovery_enabled = true;
     config.max_bucket_count = max_bucket_count;
     config.ready_bucket_target = 0;
     config.alignment = kAlignment;
@@ -2697,6 +2698,87 @@ TEST(BucketMetadataDurabilityTest, FlushRacesWithConcurrentAllocateAndCommit) {
     const size_t restored = recovered.TakeRecoveredReplicas().size();
     EXPECT_GE(restored, kTotal - kEntriesPerBucket);
     EXPECT_LE(restored, kTotal);
+}
+
+TEST(ImmutableBucketAllocatorTest,
+     RecoveryDisabledSkipsMetaIoAndKeepsCountersExact) {
+    TempDir tmp("bucket_no_recovery_p0");
+    auto config = MakeEvictionConfig(tmp.path(), 4 * kAlignment, 6);
+    config.bucket_recovery_enabled = false;
+    config.posix_write_context_enabled = false;
+
+    ImmutableBucketAllocator alloc;
+    ASSERT_TRUE(alloc.Init(config));
+    auto adapter = std::make_unique<DeleteCountingAdapter>();
+    ASSERT_TRUE(adapter->Init(tmp.path()));
+    auto* io = adapter.get();
+    ImmutableBucketAllocatorTestPeer::SetAdapter(alloc, std::move(adapter));
+
+    auto b0 = alloc.Allocate("k0", 100);
+    ASSERT_TRUE(b0);
+    ASSERT_TRUE(alloc.MarkCommitted("k0", *b0));
+    EXPECT_EQ(alloc.GetUsedBytes(), kAlignment);
+
+    // Roll over to buckets 1..5 (6 live buckets total); sealing must not create
+    // `.meta` files.
+    auto b1 = alloc.Allocate("k1", 4 * kAlignment);
+    auto b2 = alloc.Allocate("k2", 4 * kAlignment);
+    auto b3 = alloc.Allocate("k3", 4 * kAlignment);
+    auto b4 = alloc.Allocate("k4", 4 * kAlignment);
+    auto b5 = alloc.Allocate("k5", 2 * kAlignment);
+    ASSERT_TRUE(b1 && b2 && b3 && b4 && b5);
+    EXPECT_EQ(alloc.FlushDirtyMetadata(), 0u);
+    for (int id = 0; id <= 5; ++id) {
+        EXPECT_FALSE(std::filesystem::exists(BucketMetaFile(tmp, id)));
+    }
+    EXPECT_EQ(alloc.GetUsedBytes(), 19 * kAlignment);
+
+    // Batch allocation rollback (k_rollback reserved in b5, then rolled back
+    // when k_overflow hits max_bucket_count) restores append_offset and bytes.
+    auto batch_fail =
+        alloc.BatchAllocate({{"k_rollback", 100}, {"k_overflow", 4 * kAlignment}});
+    ASSERT_EQ(batch_fail.size(), 2u);
+    EXPECT_FALSE(batch_fail[0].success);
+    EXPECT_FALSE(batch_fail[1].success);
+    EXPECT_EQ(alloc.GetUsedBytes(), 19 * kAlignment);
+
+    // Freeing k0 leaves live_bytes == 0 while append_offset == kAlignment.
+    alloc.Free("k0", *b0);
+    EXPECT_EQ(alloc.FlushDirtyMetadata(), 0u);
+    EXPECT_FALSE(std::filesystem::exists(BucketMetaFile(tmp, 0)));
+    EXPECT_EQ(alloc.GetUsedBytes(), 19 * kAlignment);
+
+    // Discarding an empty missing bucket subtracts its append_offset too.
+    EXPECT_TRUE(alloc.DiscardMissingBucketIfEmpty(b0->shard_idx));
+    EXPECT_EQ(alloc.GetUsedBytes(), 18 * kAlignment);
+
+    // When bucket_recovery_enabled is false, DeleteEvictedBucket only unlinks
+    // the `.data` file (1 DeleteFile call, not 2).
+    const auto calls_before_delete = io->calls.load();
+    auto p1 = alloc.PrepareEvictionForAllocationFailure();
+    ASSERT_EQ(p1.bucket_id(), b1->shard_idx);
+    ASSERT_TRUE(alloc.CommitEviction(std::move(p1)));
+    EXPECT_EQ(io->calls.load(), calls_before_delete + 1);
+    EXPECT_EQ(alloc.GetUsedBytes(), 14 * kAlignment);
+
+    // Two failed deletions saturate the backlog; retrying clears it.
+    auto l2 = alloc.CommitEvictionLogical(alloc.PrepareInvalidation(b2->shard_idx));
+    auto l3 = alloc.CommitEvictionLogical(alloc.PrepareInvalidation(b3->shard_idx));
+    ASSERT_TRUE(l2 && l3);
+    io->blocked = b2->file_path;
+    EXPECT_FALSE(alloc.DeleteEvictedBucket(std::move(*l2)));
+    io->blocked = b3->file_path;
+    EXPECT_FALSE(alloc.DeleteEvictedBucket(std::move(*l3)));
+    EXPECT_TRUE(alloc.PrepareEvictionForAllocationFailure().Empty());
+
+    io->blocked.clear();
+    ImmutableBucketAllocatorTestPeer::ExpireDeletions(alloc);
+    EXPECT_EQ(alloc.RetryFailedEvictions(), 2u);
+    EXPECT_EQ(alloc.GetUsedBytes(), 6 * kAlignment);
+    EXPECT_FALSE(alloc.PrepareEvictionForAllocationFailure().Empty());
+
+    auto replacement = alloc.RetireAndCreateReplacementAllocator();
+    EXPECT_EQ(alloc.GetUsedBytes(), 0u);
 }
 
 }  // namespace mooncake::test

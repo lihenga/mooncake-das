@@ -8170,11 +8170,6 @@ bool MasterService::RunBucketDfsEvictionInternal(
             ? low_utilization_eviction_limit
             : dfs_bucket_low_utilization_evictions_per_tick_;
 
-    // Free() defers its metadata write so it never fsyncs under a key
-    // lock. This tick holds no master lock, so it is the right place to
-    // make those tombstones durable.
-    allocator->FlushDirtyMetadata();
-
     const TenantId tenant_id = TenantId::Default();
     // Buckets already inspected in this cycle. Bounds the scan when every
     // remaining bucket keeps getting rejected.
@@ -8258,8 +8253,8 @@ bool MasterService::RunBucketDfsEvictionInternal(
         };
         const auto acceptable = [&](const ObjectMetadata& metadata,
             const route::ObjectState& state,
-            const DfsAllocatorInterface::EvictionCandidate& candidate) {
-            auto now = std::chrono::system_clock::now();
+            const DfsAllocatorInterface::EvictionCandidate& candidate,
+            std::chrono::system_clock::time_point& now) {
             return !state.is_processing &&
                    !metadata.HasReplica([&](const Replica& replica) {
                        return matches_candidate(replica, candidate) && replica.is_processing();
@@ -8279,15 +8274,18 @@ bool MasterService::RunBucketDfsEvictionInternal(
             std::shared_lock<std::shared_mutex> state_lock(master_state_mutex_);
             accepted = allocator == bucket_allocator_.get() &&
                        !dfs_root_recovery_in_progress_.load(std::memory_order_acquire);
-            if (accepted) {
+            auto* ns = namespaces_.Lookup(tenant_id);
+            if (accepted && ns != nullptr) {
+                auto validate_now = std::chrono::system_clock::now();
+                validated_leases.reserve(candidates.size());
                 for (const auto& candidate : candidates) {
-                    MetadataAccessorRO accessor(this, {tenant_id, candidate.key});
-                    if (!accessor.IsPublished()) continue;
-                    const auto& metadata = accessor.Get();
+                    auto guard = ns->objects.Read(candidate.key);
+                    if (!guard) continue;
+                    const auto& metadata = guard->metadata();
                     if (!metadata.HasReplica([&](const Replica& replica) {
                             return matches_candidate(replica, candidate);
                         })) continue;
-                    if (!acceptable(metadata, accessor.GetState(), candidate)) {
+                    if (!acceptable(metadata, guard->state(), candidate, validate_now)) {
                         accepted = false;
                         log_low_utilization_rejection(evicted_bucket_id, "validate", candidate.key, "protected_replica");
                         break;
@@ -8308,24 +8306,35 @@ bool MasterService::RunBucketDfsEvictionInternal(
                 }
             }
             if (committed) {
-                for (const auto& candidate : candidates) {
-                    MetadataAccessorRW accessor(this, {tenant_id, candidate.key}, MetadataAccessorRW::AsIs{});
-                    if (!accessor.IsPublished()) continue;
-                    auto& metadata = accessor.Get();
-                    // A read since validation can extend the shared object
-                    // lease.
-                    const auto deadline = metadata.EvictionDeadline();
-                    const size_t erased = metadata.EraseReplicas([&](const Replica& replica) {
-                        return matches_candidate(replica, candidate);
-                    });
-                    if (erased == 0) continue;
-                    keep_until = std::max(keep_until, deadline);
-                    if (!invalidating_missing_bucket) {
-                        MasterMetricManager::instance().inc_dfs_bucket_evicted_replicas(static_cast<int64_t>(erased));
-                        MasterMetricManager::instance().inc_dfs_bucket_evicted_bytes(static_cast<int64_t>(metadata.GetPart(0).length() * erased));
+                if (ns == nullptr) ns = namespaces_.Lookup(tenant_id);
+                if (ns != nullptr) {
+                    int64_t evicted_replicas = 0;
+                    int64_t evicted_bytes = 0;
+                    for (const auto& candidate : candidates) {
+                        auto guard = ns->objects.Write(candidate.key);
+                        if (!guard || !guard->has_object()) continue;
+                        auto& metadata = guard->metadata();
+                        // A read since validation can extend the shared object
+                        // lease.
+                        const auto deadline = metadata.EvictionDeadline();
+                        const size_t erased = metadata.EraseReplicas([&](const Replica& replica) {
+                            return matches_candidate(replica, candidate);
+                        });
+                        if (erased == 0) continue;
+                        keep_until = std::max(keep_until, deadline);
+                        if (!invalidating_missing_bucket) {
+                            evicted_replicas += static_cast<int64_t>(erased);
+                            evicted_bytes += static_cast<int64_t>(metadata.GetPart(0).length() * erased);
+                        }
+                        PublishKvRemovedAfterEvict(candidate.key, erased, "disk", metadata, tenant_id);
+                        if (!metadata.IsValid()) {
+                            EraseMetadata(*ns, *guard, EraseMode::kFull);
+                        }
                     }
-                    PublishKvRemovedAfterEvict(candidate.key, erased, "disk", metadata, tenant_id);
-                    if (!metadata.IsValid()) accessor.Erase();
+                    if (!invalidating_missing_bucket && evicted_replicas > 0) {
+                        MasterMetricManager::instance().inc_dfs_bucket_evicted_replicas(evicted_replicas);
+                        MasterMetricManager::instance().inc_dfs_bucket_evicted_bytes(evicted_bytes);
+                    }
                 }
                 const auto lease_check_time = std::chrono::system_clock::now();
                 for (const auto& lease : validated_leases) {
@@ -12485,23 +12494,25 @@ void MasterService::DfsEvictionThreadFunc() {
             std::this_thread::sleep_for(std::chrono::milliseconds(kEvictionThreadSleepMs));
             continue;
         }
-        if (dfs_allocator_ && dfs_allocator_->IsEvictionEnabled()) {
+        if (dfs_allocator_ &&
+            (dfs_allocator_->IsEvictionEnabled() || bucket_allocator_ != nullptr)) {
             ProcessInvalidatedDfsBuckets();
             const auto steady_now = std::chrono::steady_clock::now();
             if (steady_now >= next_dfs_eviction_time) {
-                RunDfsEviction();
-                next_dfs_eviction_time =
-                    std::chrono::steady_clock::now() +
-                    dfs_allocator_->GetEvictionCheckInterval();
-            }
-        } else if (bucket_allocator_ != nullptr && dfs_allocator_) {
-            ProcessInvalidatedDfsBuckets();
-            // Even with eviction disabled, deferred bucket tombstones still
-            // need a lock-free context in which to become durable.
-            const auto steady_now = std::chrono::steady_clock::now();
-            if (steady_now >= next_dfs_eviction_time) {
-                bucket_allocator_->RetryFailedEvictions();
-                bucket_allocator_->FlushDirtyMetadata();
+                if (dfs_allocator_->IsEvictionEnabled()) {
+                    RunDfsEviction();
+                } else {
+                    bucket_allocator_->RetryFailedEvictions();
+                }
+                // Free() defers its metadata write so it never fsyncs under a
+                // key lock. Flush once per tick after eviction frees space,
+                // including when eviction is disabled so deferred tombstones
+                // still become durable.
+                if (bucket_allocator_ != nullptr &&
+                    !dfs_root_recovery_in_progress_.load(
+                        std::memory_order_acquire)) {
+                    bucket_allocator_->FlushDirtyMetadata();
+                }
                 next_dfs_eviction_time =
                     std::chrono::steady_clock::now() +
                     dfs_allocator_->GetEvictionCheckInterval();

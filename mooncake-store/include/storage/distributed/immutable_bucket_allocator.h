@@ -495,7 +495,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
 
     // Marks `bucket` as needing its `.meta` file (re)written. A bucket that is
     // still active is never persisted, so the flag is only set once sealed.
-    static void MarkMetaDirtyLocked(BucketState& bucket);
+    void MarkMetaDirtyLocked(BucketState& bucket) const;
 
     // Seals the currently active bucket - it stops accepting allocations - and
     // marks it for persistence. Requires `mutex_`.
@@ -579,6 +579,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     // With the POSIX write context enabled, client write handles stop updating
     // mtime, so the master refreshes it once when a bucket is sealed.
     bool mtime_refresh_on_seal_ = false;
+    bool bucket_recovery_enabled_ = false;
     mutable std::mutex mutex_;
     // Serializes `.meta` writes and eviction deletion. Flush and eviction both
     // revalidate BucketState pointer identity after taking this mutex so a
@@ -606,6 +607,9 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     int64_t next_bucket_id_ = 0;
     int64_t active_bucket_id_ = -1;
     uint64_t next_generation_ = 1;
+    uint64_t total_used_bytes_ = 0;
+    size_t evicting_bucket_count_ = 0;
+    size_t failed_delete_bucket_count_ = 0;
     // Once the high watermark is crossed, keep evicting until usage falls
     // below the low watermark; protected buckets may make that span several
     // prepare/resolve rounds.
