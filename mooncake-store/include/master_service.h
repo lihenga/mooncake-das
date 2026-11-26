@@ -2313,8 +2313,8 @@ class MasterService {
     // treated as the errno from a failed stat; zero uses the real filesystem.
     std::atomic<int> dfs_root_stat_error_for_testing_{0};
     std::chrono::seconds dfs_root_guard_interval_{5};
-    std::chrono::seconds dfs_health_probe_ttl_{7200};
-    std::chrono::seconds dfs_health_probe_cleanup_interval_{3600};
+    std::chrono::seconds dfs_health_probe_ttl_{3600};
+    std::chrono::seconds dfs_health_probe_cleanup_interval_{7200};
     std::chrono::steady_clock::time_point next_dfs_health_probe_cleanup_{};
     bool use_kvcs_{false};
     std::unique_ptr<KvcsCapacityProvider> dfs_kvcs_capacity_provider_;

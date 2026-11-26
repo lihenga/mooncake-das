@@ -608,12 +608,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
     dfs_health_probe_ttl_ = std::chrono::seconds(std::max(
         Environ::ReadOr(DistributedStorageEnvironmentVariables::
                             MOONCAKE_DFS_HEALTH_PROBE_TTL_SECONDS,
-                        7200),
+                        3600),
         1));
     dfs_health_probe_cleanup_interval_ = std::chrono::seconds(std::max(
         Environ::ReadOr(DistributedStorageEnvironmentVariables::
                             MOONCAKE_DFS_HEALTH_PROBE_CLEANUP_INTERVAL_SECONDS,
-                        3600),
+                        7200),
         1));
     LOG(INFO) << "DFS write-probe cleanup initialized, ttl_seconds="
               << dfs_health_probe_ttl_.count() << ", interval_seconds="
@@ -12493,6 +12493,9 @@ void MasterService::DfsEvictionThreadFunc() {
 
     auto next_dfs_eviction_time = std::chrono::steady_clock::now();
     auto next_dfs_root_guard_time = std::chrono::steady_clock::now();
+    // Wait a full cleanup interval before the first probe-directory scan.
+    next_dfs_health_probe_cleanup_ = std::chrono::steady_clock::now() +
+                                     dfs_health_probe_cleanup_interval_;
     while (eviction_running_) {
         if (!AdmitsBusinessWorkers()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(kEvictionThreadSleepMs));
