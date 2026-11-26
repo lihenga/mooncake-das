@@ -8248,8 +8248,7 @@ bool MasterService::RunBucketDfsEvictionInternal(
             return desc.shard_idx == candidate.descriptor.shard_idx &&
                    desc.offset == candidate.descriptor.offset &&
                    desc.object_size == candidate.descriptor.object_size &&
-                   desc.aligned_size == candidate.descriptor.aligned_size &&
-                   desc.file_path == candidate.descriptor.file_path;
+                   desc.aligned_size == candidate.descriptor.aligned_size;
         };
         const auto acceptable = [&](const ObjectMetadata& metadata,
             const route::ObjectState& state,

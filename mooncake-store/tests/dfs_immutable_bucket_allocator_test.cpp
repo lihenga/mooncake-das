@@ -1498,9 +1498,9 @@ TEST(ImmutableBucketAllocatorTest, CommitEvictionDeletesBucketAndFrees) {
     ASSERT_EQ(pending.Candidates().size(), 1u);
     const auto& candidate = pending.Candidates()[0];
     EXPECT_EQ(candidate.key, "k0");
-    // The candidate descriptor must be byte-identical to what Allocate returned
-    // so the master can match it against replica metadata.
-    EXPECT_EQ(candidate.descriptor.file_path, descs[0].file_path);
+    // Eviction candidates omit file_path to avoid per-key heap allocations,
+    // matching replica metadata on the integer layout fields.
+    EXPECT_TRUE(candidate.descriptor.file_path.empty());
     EXPECT_EQ(candidate.descriptor.offset, descs[0].offset);
     EXPECT_EQ(candidate.descriptor.object_size, descs[0].object_size);
     EXPECT_EQ(candidate.descriptor.aligned_size, descs[0].aligned_size);

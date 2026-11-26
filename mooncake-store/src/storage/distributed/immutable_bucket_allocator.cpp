@@ -2164,7 +2164,6 @@ ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
         const BucketPtr& victim = bucket_it->second;
         if (victim->pending_entries != 0) return pending;
 
-        const std::string data_path = BucketDataPath(bucket_id);
         std::vector<DfsAllocatorInterface::EvictionCandidate> candidates;
         candidates.reserve(victim->entries.size() > victim->tombstones
                                ? victim->entries.size() - victim->tombstones
@@ -2184,7 +2183,7 @@ ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
             candidate.shard_idx = static_cast<int>(bucket_id);
             candidate.offset = layout->offset;
             candidate.descriptor =
-                MakeBucketDescriptor(data_path, *layout,
+                MakeBucketDescriptor(std::string{}, *layout,
                                      bucket_id, entry.generation);
             candidates.push_back(std::move(candidate));
         }
@@ -2315,7 +2314,6 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
         }
         if (!victim) return pending;
 
-        const std::string data_path = BucketDataPath(victim->bucket_id);
         std::vector<DfsAllocatorInterface::EvictionCandidate> candidates;
         candidates.reserve(victim->entries.size() > victim->tombstones
                                ? victim->entries.size() - victim->tombstones
@@ -2336,10 +2334,10 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
             candidate.key = key;
             candidate.shard_idx = static_cast<int>(victim->bucket_id);
             candidate.offset = layout->offset;
-            // Byte-identical to what Allocate handed out, so the master can
-            // match replica metadata field by field.
+            // Omit file_path on eviction candidates to avoid per-key heap
+            // allocations; integer layout fields uniquely identify the slot.
             candidate.descriptor =
-                MakeBucketDescriptor(data_path, *layout,
+                MakeBucketDescriptor(std::string{}, *layout,
                                      victim->bucket_id, entry.generation);
             candidates.push_back(std::move(candidate));
         }
