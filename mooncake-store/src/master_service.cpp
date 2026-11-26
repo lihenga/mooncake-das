@@ -8152,6 +8152,10 @@ bool MasterService::TryRecoverDfsSpaceAfterAllocationFailure() {
         !bucket_allocator_->IsEvictionEnabled()) {
         return false;
     }
+    if (bucket_allocator_->WaitForAnyAsyncDeleteCompletion(
+            std::chrono::milliseconds(300))) {
+        return true;
+    }
     LOG(WARNING) << "DFS bucket allocation exhausted; forcing one validated "
                     "whole-bucket eviction";
     return RunBucketDfsEvictionInternal(true);

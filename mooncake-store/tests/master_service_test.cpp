@@ -7653,6 +7653,155 @@ TEST_F(MasterServiceTest, DfsBucketDeleteFailureBacklogLimitsNormalEviction) {
     }
 }
 
+TEST_F(MasterServiceTest, AsyncDfsBucketDeleteFailureBrakesAndRetries) {
+    const auto root = MakeDfsTestRoot("async_delete_failure_brake");
+    ScopedBucketDfsEnv env(root, "8192", "5", "0", "0.5", "0.1");
+    ScopedEnvVar ready_buckets("MOONCAKE_DFS_READY_BUCKET_COUNT", "0");
+    {
+        MasterService service;
+        MasterServiceTestPeer::StopEviction(service);
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+        std::vector<DistributedFSDescriptor> descriptors;
+        for (int i = 0; i < 4; ++i) {
+            const auto key = "async_fail_" + std::to_string(i);
+            const uint64_t size = (i == 0) ? 100 : 5000;
+            auto start = service.PutStart(context.client_id, key,
+                                          TenantId::Default(), size, config);
+            ASSERT_TRUE(start);
+            descriptors.push_back(
+                FindDfsDescriptor(*start)->get_dfs_descriptor());
+            ASSERT_TRUE(service.PutEnd(context.client_id, key,
+                                       TenantId::Default(), ReplicaType::ALL));
+            if (i == 0) {
+                const auto pad = key + "_pad";
+                ASSERT_TRUE(service.PutStart(context.client_id, pad,
+                                             TenantId::Default(), 100, config));
+                ASSERT_TRUE(service.PutEnd(context.client_id, pad,
+                                           TenantId::Default(),
+                                           ReplicaType::ALL));
+                ASSERT_TRUE(service.Remove(pad, TenantId::Default(), true));
+            }
+        }
+        const auto& first = descriptors[0].file_path;
+        std::filesystem::rename(first, first + ".backup");
+        ASSERT_TRUE(std::filesystem::create_directory(first));
+        std::ofstream(first + "/blocked") << "block async deletion";
+
+        EXPECT_TRUE(
+            MasterServiceTestPeer::RunLowUtilizationBucketEviction(service));
+        ImmutableBucketAllocatorTestPeer::WaitForAsyncDeletes(
+            MasterServiceTestPeer::BucketAllocator(service));
+        MasterServiceTestPeer::PostponeDfsRetry(service,
+                                                descriptors[0].shard_idx);
+
+        // A single async failure brakes further normal eviction.
+        EXPECT_FALSE(
+            MasterServiceTestPeer::RunBucketDfsEviction(service, false));
+        EXPECT_EQ(
+            MasterServiceTestPeer::HasDfsReplicaInMetadata(service, "async_fail_1"),
+            std::optional<bool>(true));
+
+        std::filesystem::remove_all(first);
+        std::filesystem::rename(first + ".backup", first);
+        MasterServiceTestPeer::ExpireDfsDeletions(service);
+        EXPECT_EQ(MasterServiceTestPeer::RetryDfsDeletions(service), 1u);
+
+        EXPECT_TRUE(
+            MasterServiceTestPeer::RunBucketDfsEviction(service, false));
+        ImmutableBucketAllocatorTestPeer::WaitForAsyncDeletes(
+            MasterServiceTestPeer::BucketAllocator(service));
+        EXPECT_EQ(MasterServiceTestPeer::GetDfsUsedBytes(service), 8192u);
+    }
+    std::filesystem::remove_all(root);
+}
+
+namespace {
+
+class DelayedDataDeleteAdapter : public PosixFsAdapter {
+   public:
+    tl::expected<void, ErrorCode> DeleteFile(const std::string& path) override {
+        if (path.ends_with(".data")) {
+            std::unique_lock<std::mutex> lock(mu_);
+            entered_ = true;
+            cv_.notify_all();
+            cv_.wait(lock, [this] { return released_; });
+        }
+        return PosixFsAdapter::DeleteFile(path);
+    }
+
+    void WaitUntilEntered() {
+        std::unique_lock<std::mutex> lock(mu_);
+        cv_.wait(lock, [this] { return entered_; });
+    }
+
+    void Release() {
+        std::lock_guard<std::mutex> lock(mu_);
+        released_ = true;
+        cv_.notify_all();
+    }
+
+   private:
+    std::mutex mu_;
+    std::condition_variable cv_;
+    bool entered_ = false;
+    bool released_ = false;
+};
+
+}  // namespace
+
+TEST_F(MasterServiceTest,
+       TryRecoverAfterAllocationFailureWaitsForInFlightAsyncDelete) {
+    const auto root = MakeDfsTestRoot("recover_waits_async_delete");
+    ScopedBucketDfsEnv env(root, "4096", "3", "0", "0.5", "0.1");
+    ScopedEnvVar ready_buckets("MOONCAKE_DFS_READY_BUCKET_COUNT", "0");
+    {
+        MasterService service;
+        MasterServiceTestPeer::StopEviction(service);
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+        for (int i = 0; i < 3; ++i) {
+            const auto key = "wait_k" + std::to_string(i);
+            ASSERT_TRUE(service.PutStart(context.client_id, key,
+                                         TenantId::Default(), 100, config));
+            ASSERT_TRUE(service.PutEnd(context.client_id, key,
+                                       TenantId::Default(), ReplicaType::ALL));
+        }
+        auto& allocator = MasterServiceTestPeer::BucketAllocator(service);
+        auto adapter = std::make_unique<DelayedDataDeleteAdapter>();
+        ASSERT_TRUE(adapter->Init(root));
+        auto* io = adapter.get();
+        ImmutableBucketAllocatorTestPeer::SetAdapter(allocator,
+                                                     std::move(adapter));
+
+        auto pending = allocator.PrepareEviction();
+        ASSERT_EQ(pending.bucket_id(), 0);
+        auto logical = allocator.CommitEvictionLogical(std::move(pending));
+        ASSERT_TRUE(logical);
+        ASSERT_TRUE(allocator.EnqueueDeleteEvictedBucket(std::move(*logical)));
+        io->WaitUntilEntered();
+
+        std::thread releaser([io] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            io->Release();
+        });
+        auto put_next = service.PutStart(context.client_id, "wait_k3",
+                                         TenantId::Default(), 100, config);
+        releaser.join();
+        ASSERT_TRUE(put_next.has_value());
+        // k1 was not force-evicted because PutStart waited for k0's in-flight
+        // async delete to release space.
+        EXPECT_EQ(
+            MasterServiceTestPeer::HasDfsReplicaInMetadata(service, "wait_k1"),
+            std::optional<bool>(true));
+    }
+    std::filesystem::remove_all(root);
+}
+
 TEST_F(MasterServiceTest, DfsBucketEvictionContinuesAfterLeaseDeferral) {
     for (const bool force_one : {false, true}) {
         SCOPED_TRACE(force_one);

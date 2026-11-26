@@ -2997,6 +2997,8 @@ TEST(ImmutableBucketAllocatorTest,
     ImmutableBucketAllocatorTestPeer::WaitForAsyncDeletes(alloc);
     EXPECT_EQ(ImmutableBucketAllocatorTestPeer::RetryState(alloc, d0->shard_idx).first, 1);
     EXPECT_EQ(alloc.GetUsedBytes(), 3 * kAlignment);
+    // Single async failure brakes further regular eviction.
+    EXPECT_TRUE(alloc.PrepareEviction().Empty());
 
     io->SetBlockedPath({});
     ImmutableBucketAllocatorTestPeer::ExpireDeletions(alloc);
@@ -3016,6 +3018,103 @@ TEST(ImmutableBucketAllocatorTest,
     EXPECT_EQ(io->calls(), calls_after_retire);
     EXPECT_EQ(alloc.GetUsedBytes(), 0u);
     EXPECT_FALSE(alloc.EnqueueDeleteEvictedBucket(std::move(stale_token)));
+}
+
+namespace {
+
+class GatedDeleteAdapter : public PosixFsAdapter {
+   public:
+    tl::expected<void, ErrorCode> DeleteFile(const std::string& path) override {
+        if (path.ends_with(".data")) {
+            std::unique_lock<std::mutex> lock(mu_);
+            ++entered_;
+            cv_.notify_all();
+            cv_.wait(lock, [this] { return !paused_; });
+        }
+        return PosixFsAdapter::DeleteFile(path);
+    }
+
+    void WaitUntilEntered(size_t count) {
+        std::unique_lock<std::mutex> lock(mu_);
+        cv_.wait(lock, [this, count] { return entered_ >= count; });
+    }
+
+    void ReleaseDeletes() {
+        std::lock_guard<std::mutex> lock(mu_);
+        paused_ = false;
+        cv_.notify_all();
+    }
+
+   private:
+    std::mutex mu_;
+    std::condition_variable cv_;
+    bool paused_ = true;
+    size_t entered_ = 0;
+};
+
+}  // namespace
+
+TEST(ImmutableBucketAllocatorTest,
+     WaitForAnyAsyncDeleteCompletionAndBackpressureWait) {
+    TempDir tmp("bucket_async_wait_bp");
+    auto config = MakeEvictionConfig(tmp.path(), kAlignment, 20);
+    config.bucket_delete_concurrency = 1;
+    config.eviction_high_watermark = 0.5;
+    config.eviction_low_watermark = 0.05;
+
+    ImmutableBucketAllocator alloc;
+    ASSERT_TRUE(alloc.Init(config));
+    auto adapter = std::make_unique<GatedDeleteAdapter>();
+    ASSERT_TRUE(adapter->Init(tmp.path()));
+    auto* io = adapter.get();
+    ImmutableBucketAllocatorTestPeer::SetAdapter(alloc, std::move(adapter));
+
+    // Nothing in flight returns false immediately.
+    EXPECT_FALSE(
+        alloc.WaitForAnyAsyncDeleteCompletion(std::chrono::milliseconds(50)));
+
+    for (int i = 0; i < 18; ++i) {
+        auto desc = alloc.Allocate("k" + std::to_string(i), 100);
+        ASSERT_TRUE(desc);
+        ASSERT_TRUE(alloc.MarkCommitted("k" + std::to_string(i), *desc));
+    }
+
+    // Saturate the async in-flight window (max(1 * 2, 16) = 16) while paused.
+    for (int i = 0; i < 16; ++i) {
+        auto pending = alloc.PrepareEviction();
+        ASSERT_FALSE(pending.Empty());
+        auto logical = alloc.CommitEvictionLogical(std::move(pending));
+        ASSERT_TRUE(logical);
+        ASSERT_TRUE(alloc.EnqueueDeleteEvictedBucket(std::move(*logical)));
+    }
+    io->WaitUntilEntered(1);
+    EXPECT_FALSE(
+        alloc.WaitForAnyAsyncDeleteCompletion(std::chrono::milliseconds(20)));
+
+    // 17th PrepareEviction waits for an in-flight slot instead of returning
+    // empty prematurely; WaitForAnyAsyncDeleteCompletion also wakes up on
+    // physical deletion.
+    auto next_prepare = std::async(std::launch::async,
+                                   [&] { return alloc.PrepareEviction(); });
+    auto completion_waiter = std::async(std::launch::async, [&] {
+        return alloc.WaitForAnyAsyncDeleteCompletion(
+            std::chrono::milliseconds(2000));
+    });
+    EXPECT_EQ(next_prepare.wait_for(std::chrono::milliseconds(20)),
+              std::future_status::timeout);
+
+    io->ReleaseDeletes();
+    EXPECT_TRUE(completion_waiter.get());
+    auto prepared = next_prepare.get();
+    EXPECT_FALSE(prepared.Empty());
+    alloc.AbortEviction(std::move(prepared));
+
+    // Enqueue one more and confirm WaitForAnyAsyncDeleteCompletion wakes up.
+    auto last_logical = alloc.CommitEvictionLogical(alloc.PrepareEviction());
+    ASSERT_TRUE(last_logical);
+    ASSERT_TRUE(alloc.EnqueueDeleteEvictedBucket(std::move(*last_logical)));
+    ImmutableBucketAllocatorTestPeer::WaitForAsyncDeletes(alloc);
+    EXPECT_EQ(alloc.GetBucketCount(), 1u);
 }
 
 }  // namespace mooncake::test

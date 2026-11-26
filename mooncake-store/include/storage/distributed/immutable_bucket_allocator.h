@@ -343,6 +343,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     tl::expected<void, ErrorCode> DeleteEvictedBucket(EvictedBucket&& bucket);
     tl::expected<void, ErrorCode> EnqueueDeleteEvictedBucket(
         EvictedBucket&& bucket);
+    bool WaitForAnyAsyncDeleteCompletion(std::chrono::milliseconds timeout);
     void DeferDeletion(EvictedBucket&& bucket,
                        std::chrono::system_clock::time_point not_before);
     size_t RetryFailedEvictions();
@@ -609,6 +610,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     size_t bucket_creations_in_flight_ = 0;
     size_t async_deletes_in_flight_ = 0;
     uint64_t async_delete_bytes_ = 0;
+    uint64_t async_delete_completion_seq_ = 0;
     size_t waiting_allocators_ = 0;
     bool synchronous_creation_in_flight_ = false;
     bool stop_bucket_workers_ = false;

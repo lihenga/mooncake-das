@@ -482,6 +482,7 @@ ImmutableBucketAllocator::RetireAndCreateReplacementAllocator() {
         failed_delete_bucket_count_ = 0;
         async_deletes_in_flight_ = 0;
         async_delete_bytes_ = 0;
+        async_delete_completion_seq_ = 0;
         // Keep bucket ids and entry generations monotonic across recovery.
         // An RPC that completed against the old allocator immediately before
         // the master's exclusive recovery barrier may be stamped with the new
@@ -2224,8 +2225,11 @@ ImmutableBucketAllocator::PrepareEvictionForLowUtilization(double threshold) {
 }
 
 bool ImmutableBucketAllocator::DeleteFailureBacklogFullLocked() const {
-    constexpr size_t kMaxFailedDeletions = 2;
-    return failed_delete_bucket_count_ >= kMaxFailedDeletions;
+    // Async deletion runs ahead of unlink; brake on the first unrecovered
+    // failure so a filesystem outage cannot drain Master metadata across many
+    // buckets at once.
+    const size_t limit = bucket_delete_concurrency_ > 0 ? 1 : 2;
+    return failed_delete_bucket_count_ >= limit;
 }
 
 ImmutableBucketAllocator::PendingEviction
@@ -2235,16 +2239,24 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
     if (!initialized_.load(std::memory_order_acquire)) return pending;
 
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (DeleteFailureBacklogFullLocked()) return pending;
+        std::unique_lock<std::mutex> lock(mutex_);
         const size_t max_inflight_deletes =
             bucket_delete_concurrency_ > 0
-                ? std::max<size_t>(bucket_delete_concurrency_ * 4, 32)
+                ? std::max<size_t>(bucket_delete_concurrency_ * 2, 16)
                 : 0;
-        if (!force_one && max_inflight_deletes > 0 &&
-            async_deletes_in_flight_ >= max_inflight_deletes) {
-            return pending;
+        if (!force_one && max_inflight_deletes > 0) {
+            delete_cv_.wait(lock, [this, max_inflight_deletes] {
+                return !initialized_.load(std::memory_order_acquire) ||
+                       stop_bucket_workers_ ||
+                       DeleteFailureBacklogFullLocked() ||
+                       async_deletes_in_flight_ < max_inflight_deletes;
+            });
+            if (!initialized_.load(std::memory_order_acquire) ||
+                stop_bucket_workers_) {
+                return pending;
+            }
         }
+        if (DeleteFailureBacklogFullLocked()) return pending;
 
         const uint64_t capacity =
             max_bucket_count_ > 0
@@ -2488,6 +2500,7 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::DeleteEvictedBucket(
                 -1, -static_cast<int64_t>(state.append_offset));
             RemoveFromLowUtilizationLocked(bucket.bucket_id_);
             buckets_.erase(it);
+            ++async_delete_completion_seq_;
         }
         PublishBucketIdSnapshotLocked();
         UpdateBucketPoolMetricsLocked();
@@ -2523,6 +2536,21 @@ ImmutableBucketAllocator::EnqueueDeleteEvictedBucket(EvictedBucket&& bucket) {
     }
     delete_cv_.notify_one();
     return {};
+}
+
+bool ImmutableBucketAllocator::WaitForAnyAsyncDeleteCompletion(
+    std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!initialized_.load(std::memory_order_acquire) ||
+        stop_bucket_workers_ || async_deletes_in_flight_ == 0) {
+        return false;
+    }
+    const uint64_t start_seq = async_delete_completion_seq_;
+    return delete_cv_.wait_for(lock, timeout, [this, start_seq] {
+        if (async_delete_completion_seq_ > start_seq) return true;
+        return !initialized_.load(std::memory_order_acquire) ||
+               stop_bucket_workers_ || async_deletes_in_flight_ == 0;
+    }) && async_delete_completion_seq_ > start_seq;
 }
 
 void ImmutableBucketAllocator::DeferDeletion(
