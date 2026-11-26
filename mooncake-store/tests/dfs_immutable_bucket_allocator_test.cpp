@@ -2723,11 +2723,20 @@ TEST(ImmutableBucketAllocatorTest,
     // Roll over to buckets 1..5 (6 live buckets total); sealing must not create
     // `.meta` files.
     auto b1 = alloc.Allocate("k1", 4 * kAlignment);
+    ASSERT_TRUE(b1);
+    ASSERT_TRUE(alloc.MarkCommitted("k1", *b1));
     auto b2 = alloc.Allocate("k2", 4 * kAlignment);
+    ASSERT_TRUE(b2);
+    ASSERT_TRUE(alloc.MarkCommitted("k2", *b2));
     auto b3 = alloc.Allocate("k3", 4 * kAlignment);
+    ASSERT_TRUE(b3);
+    ASSERT_TRUE(alloc.MarkCommitted("k3", *b3));
     auto b4 = alloc.Allocate("k4", 4 * kAlignment);
+    ASSERT_TRUE(b4);
+    ASSERT_TRUE(alloc.MarkCommitted("k4", *b4));
     auto b5 = alloc.Allocate("k5", 2 * kAlignment);
-    ASSERT_TRUE(b1 && b2 && b3 && b4 && b5);
+    ASSERT_TRUE(b5);
+    ASSERT_TRUE(alloc.MarkCommitted("k5", *b5));
     EXPECT_EQ(alloc.FlushDirtyMetadata(), 0u);
     for (int id = 0; id <= 5; ++id) {
         EXPECT_FALSE(std::filesystem::exists(BucketMetaFile(tmp, id)));

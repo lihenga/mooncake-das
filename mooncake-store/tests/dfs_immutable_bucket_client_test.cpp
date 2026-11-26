@@ -938,9 +938,15 @@ TEST_F(DfsBucketEpochClientTest,
     ExpectDfsValue(key, new_value);
 }
 
-TEST_F(DfsBucketEpochClientTest,
+class DfsBucketEpochRecoveryClientTest : public DfsBucketEpochClientTest {
+   protected:
+    void ConfigureClientEnvironment() override {
+        SetEnv("MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED", "true");
+    }
+};
+
+TEST_F(DfsBucketEpochRecoveryClientTest,
        HealthyRestartRefreshesOnlyUnchangedReadViews) {
-    SetEnv("MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED", "true");
     const std::string key = "healthy_restart_read";
     std::string value(4096, 'R');
     std::vector<Slice> slices{{value.data(), value.size()}};
