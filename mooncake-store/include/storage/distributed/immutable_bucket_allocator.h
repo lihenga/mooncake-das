@@ -538,6 +538,11 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
 
     void TouchLruLocked(int64_t bucket_id, int64_t now_ns);
     void RemoveFromLruLocked(int64_t bucket_id);
+    bool IsLowUtilizationLocked(const BucketState& bucket,
+                                double threshold) const;
+    void TrackLowUtilizationLocked(const BucketState& bucket,
+                                   bool front = false);
+    void RemoveFromLowUtilizationLocked(int64_t bucket_id);
 
     // Applies one reservation to `bucket` and returns the descriptor.
     tl::expected<DistributedFSDescriptor, ErrorCode> ReserveInBucketLocked(
@@ -575,6 +580,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     bool eviction_enabled_ = true;
     double eviction_high_watermark_ = 0.9;
     double eviction_low_watermark_ = 0.7;
+    double low_utilization_threshold_ = 0.0;
     std::chrono::seconds eviction_check_interval_{5};
     // With the POSIX write context enabled, client write handles stop updating
     // mtime, so the master refreshes it once when a bucket is sealed.
@@ -617,6 +623,12 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
 
     std::list<int64_t> lru_list_;
     std::unordered_map<int64_t, std::list<int64_t>::iterator> lru_index_;
+    // Sealed, non-frozen, non-evicting buckets below low_utilization_threshold_.
+    // Scanned from the front; newly sparse and rejected (demoted) buckets join
+    // the back so rejected candidates do not starve other sparse buckets.
+    std::list<int64_t> low_utilization_buckets_;
+    std::unordered_map<int64_t, std::list<int64_t>::iterator>
+        low_utilization_index_;
 
     std::vector<RecoveredReplica> recovered_replicas_;
 

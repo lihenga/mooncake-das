@@ -228,6 +228,10 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     eviction_enabled_ = config.eviction_enabled;
     eviction_high_watermark_ = config.eviction_high_watermark;
     eviction_low_watermark_ = config.eviction_low_watermark;
+    low_utilization_threshold_ = (config.low_utilization_threshold > 0.0 &&
+                                  config.low_utilization_threshold < 1.0)
+                                     ? config.low_utilization_threshold
+                                     : 0.0;
     eviction_check_interval_ = config.eviction_check_interval;
     // The mtime refresh ioctl exists only on the POSIX adapter. Other adapters
     // never receive a write context from the client, so they still update it
@@ -435,6 +439,8 @@ ImmutableBucketAllocator::RetireAndCreateReplacementAllocator() {
         key_index_.clear();
         lru_list_.clear();
         lru_index_.clear();
+        low_utilization_buckets_.clear();
+        low_utilization_index_.clear();
         recovered_replicas_.clear();
         active_bucket_id_ = -1;
         total_used_bytes_ = 0;
@@ -517,6 +523,7 @@ void ImmutableBucketAllocator::SealActiveBucketLocked() {
     // refreshed. Both I/O operations happen later, outside mutex_.
     if (bucket_recovery_enabled_) bucket.meta_dirty = true;
     if (mtime_refresh_on_seal_) bucket.mtime_dirty = true;
+    TrackLowUtilizationLocked(bucket);
 }
 
 tl::expected<void, ErrorCode> ImmutableBucketAllocator::PersistMetadata(
@@ -667,6 +674,7 @@ void ImmutableBucketAllocator::RollbackBucketPublicationLocked(
         std::find(ready_bucket_ids_.begin(), ready_bucket_ids_.end(), bucket_id);
     if (ready_it != ready_bucket_ids_.end()) ready_bucket_ids_.erase(ready_it);
     RemoveFromLruLocked(bucket_id);
+    RemoveFromLowUtilizationLocked(bucket_id);
     if (active_bucket_id_ == bucket_id) active_bucket_id_ = -1;
     auto it = buckets_.find(bucket_id);
     if (it != buckets_.end() && it->second == bucket) {
@@ -1193,6 +1201,53 @@ void ImmutableBucketAllocator::RemoveFromLruLocked(int64_t bucket_id) {
     lru_index_.erase(index_it);
 }
 
+bool ImmutableBucketAllocator::IsLowUtilizationLocked(
+    const BucketState& bucket, double threshold) const {
+    return threshold > 0.0 && threshold < 1.0 && bucket.capacity > 0 &&
+           static_cast<double>(bucket.live_bytes) /
+                   static_cast<double>(bucket.capacity) <
+               threshold;
+}
+
+void ImmutableBucketAllocator::TrackLowUtilizationLocked(
+    const BucketState& bucket, bool front) {
+    if (!bucket.sealed || bucket.evicting || bucket.frozen ||
+        !IsLowUtilizationLocked(bucket, low_utilization_threshold_)) {
+        return;
+    }
+    if (low_utilization_index_.find(bucket.bucket_id) !=
+        low_utilization_index_.end()) {
+        return;
+    }
+    if (front) {
+        low_utilization_buckets_.push_front(bucket.bucket_id);
+        try {
+            low_utilization_index_.emplace(bucket.bucket_id,
+                                           low_utilization_buckets_.begin());
+        } catch (...) {
+            low_utilization_buckets_.pop_front();
+            throw;
+        }
+    } else {
+        low_utilization_buckets_.push_back(bucket.bucket_id);
+        try {
+            low_utilization_index_.emplace(
+                bucket.bucket_id, std::prev(low_utilization_buckets_.end()));
+        } catch (...) {
+            low_utilization_buckets_.pop_back();
+            throw;
+        }
+    }
+}
+
+void ImmutableBucketAllocator::RemoveFromLowUtilizationLocked(
+    int64_t bucket_id) {
+    auto index_it = low_utilization_index_.find(bucket_id);
+    if (index_it == low_utilization_index_.end()) return;
+    low_utilization_buckets_.erase(index_it->second);
+    low_utilization_index_.erase(index_it);
+}
+
 tl::expected<DistributedFSDescriptor, ErrorCode>
 ImmutableBucketAllocator::ReserveInBucketLocked(BucketState& bucket,
                                              const std::string& key,
@@ -1274,6 +1329,7 @@ void ImmutableBucketAllocator::UnreserveInBucketLocked(
     } else {
         bucket.live_bytes = 0;
     }
+    TrackLowUtilizationLocked(bucket);
 
     if (bucket.pending_entries > 0) --bucket.pending_entries;
 
@@ -1667,6 +1723,7 @@ void ImmutableBucketAllocator::Free(const std::string& key,
     } else {
         bucket->live_bytes = 0;
     }
+    TrackLowUtilizationLocked(*bucket);
     auto index_it = key_index_.find(key);
     if (index_it != key_index_.end() && index_it->second == bucket->bucket_id) {
         key_index_.erase(index_it);
@@ -1900,6 +1957,7 @@ bool ImmutableBucketAllocator::DiscardMissingBucketIfEmpty(int64_t bucket_id) {
         total_used_bytes_ -= it->second->append_offset;
         buckets_.erase(it);
         RemoveFromLruLocked(bucket_id);
+        RemoveFromLowUtilizationLocked(bucket_id);
         if (active_bucket_id_ == bucket_id) active_bucket_id_ = -1;
         PublishBucketIdSnapshotLocked();
         UpdateBucketPoolMetricsLocked();
@@ -2024,6 +2082,7 @@ ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
 
         victim->frozen = true;
         RemoveFromLruLocked(bucket_id);
+        RemoveFromLowUtilizationLocked(bucket_id);
         if (!victim->sealed) {
             victim->sealed = true;
             if (bucket_recovery_enabled_) victim->meta_dirty = true;
@@ -2093,25 +2152,45 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
             }
         }
 
-        // Walk the LRU from the cold end. A low-utilization eviction pass
-        // restricts candidates to sparse buckets.
         BucketPtr victim;
-        for (auto it = lru_list_.rbegin(); it != lru_list_.rend(); ++it) {
-            const int64_t bucket_id = *it;
-            if (bucket_id == active_bucket_id_) continue;
-            auto bucket_it = buckets_.find(bucket_id);
-            if (bucket_it == buckets_.end()) continue;
-            if (bucket_it->second->frozen) continue;
-            const auto& candidate = bucket_it->second;
-            const bool is_low_utilization =
-                candidate->capacity > 0 &&
-                static_cast<double>(candidate->live_bytes) /
-                        static_cast<double>(candidate->capacity) <
-                    low_utilization_threshold;
-            if (prioritize_low_utilization && !is_low_utilization) continue;
-            if (candidate->pending_entries != 0) continue;
-            victim = candidate;
-            break;
+        const bool use_low_utilization_index =
+            prioritize_low_utilization && low_utilization_threshold_ > 0.0 &&
+            low_utilization_threshold_ < 1.0 &&
+            low_utilization_threshold <= low_utilization_threshold_;
+        if (use_low_utilization_index) {
+            for (const int64_t bucket_id : low_utilization_buckets_) {
+                if (bucket_id == active_bucket_id_) continue;
+                auto bucket_it = buckets_.find(bucket_id);
+                if (bucket_it == buckets_.end()) continue;
+                const auto& candidate = bucket_it->second;
+                if (candidate->frozen || candidate->evicting) continue;
+                if (!IsLowUtilizationLocked(*candidate,
+                                            low_utilization_threshold)) {
+                    continue;
+                }
+                if (candidate->pending_entries != 0) continue;
+                victim = candidate;
+                break;
+            }
+        } else {
+            // Walk the LRU from the cold end. A low-utilization eviction pass
+            // with a threshold above the indexed threshold falls back to LRU.
+            for (auto it = lru_list_.rbegin(); it != lru_list_.rend(); ++it) {
+                const int64_t bucket_id = *it;
+                if (bucket_id == active_bucket_id_) continue;
+                auto bucket_it = buckets_.find(bucket_id);
+                if (bucket_it == buckets_.end()) continue;
+                if (bucket_it->second->frozen) continue;
+                const auto& candidate = bucket_it->second;
+                if (prioritize_low_utilization &&
+                    !IsLowUtilizationLocked(*candidate,
+                                            low_utilization_threshold)) {
+                    continue;
+                }
+                if (candidate->pending_entries != 0) continue;
+                victim = candidate;
+                break;
+            }
         }
         if (!victim) return pending;
 
@@ -2146,6 +2225,7 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
 
         victim->frozen = true;
         RemoveFromLruLocked(victim->bucket_id);
+        RemoveFromLowUtilizationLocked(victim->bucket_id);
 
         // If the master rejects eviction, normal maintenance can persist this
         // sealed state; preparing eviction itself does no metadata I/O.
@@ -2191,6 +2271,7 @@ ImmutableBucketAllocator::CommitEvictionLogical(PendingEviction&& pending) {
     }
     it->second->evicting = true;
     ++evicting_bucket_count_;
+    RemoveFromLowUtilizationLocked(pending.bucket_id_);
     MasterMetricManager::instance().add_dfs_bucket_pending_deletion(
         1, static_cast<int64_t>(it->second->append_offset));
     EvictedBucket bucket;
@@ -2273,6 +2354,7 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::DeleteEvictedBucket(
             }
             MasterMetricManager::instance().add_dfs_bucket_pending_deletion(
                 -1, -static_cast<int64_t>(state.append_offset));
+            RemoveFromLowUtilizationLocked(bucket.bucket_id_);
             buckets_.erase(it);
         }
         PublishBucketIdSnapshotLocked();
@@ -2348,6 +2430,7 @@ void ImmutableBucketAllocator::AbortEviction(PendingEviction&& pending,
         return;
     }
     it->second->frozen = false;
+    TrackLowUtilizationLocked(*it->second, /*front=*/!demote);
     if (lru_index_.find(bucket_id) != lru_index_.end()) return;
 
     if (demote) {
@@ -2733,6 +2816,7 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
     for (const int64_t bucket_id : ordered) {
         lru_list_.push_front(bucket_id);
         lru_index_[bucket_id] = lru_list_.begin();
+        TrackLowUtilizationLocked(*buckets_.at(bucket_id));
     }
 
     PublishBucketIdSnapshotLocked();

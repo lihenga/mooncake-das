@@ -2781,4 +2781,72 @@ TEST(ImmutableBucketAllocatorTest,
     EXPECT_EQ(alloc.GetUsedBytes(), 0u);
 }
 
+TEST(ImmutableBucketAllocatorTest,
+     LowUtilizationIndexTracksSealedFreedRecoveredAndDemotedBuckets) {
+    TempDir tmp("bucket_low_util_index");
+    auto config = MakeEvictionConfig(tmp.path(), 4 * kAlignment, 8);
+    config.low_utilization_threshold = 0.5;
+    config.eviction_high_watermark = 0.95;
+    config.eviction_low_watermark = 0.85;
+
+    int64_t sparse_on_seal_id = -1;
+    {
+        ImmutableBucketAllocator alloc;
+        ASSERT_TRUE(alloc.Init(config));
+
+        // Empty sparse index returns immediately when no bucket is sparse.
+        EXPECT_LT(alloc.PrepareEvictionForLowUtilization(0.5).bucket_id(), 0);
+
+        // Bucket 0 has 1/4 = 25% live bytes (< 50%), becomes sparse as soon as
+        // rollover seals it (without calling Free).
+        auto b0 = alloc.Allocate("sparse_on_seal", 100);
+        ASSERT_TRUE(b0);
+        ASSERT_TRUE(alloc.MarkCommitted("sparse_on_seal", *b0));
+        sparse_on_seal_id = b0->shard_idx;
+
+        // Bucket 1 is 100% full (not sparse); rollover seals bucket 0.
+        auto b1 = alloc.Allocate("full_then_free", 4 * kAlignment);
+        ASSERT_TRUE(b1);
+        ASSERT_TRUE(alloc.MarkCommitted("full_then_free", *b1));
+
+        // Bucket 2 is active and 100% full; rollover seals bucket 1.
+        auto b2 = alloc.Allocate("active_full", 4 * kAlignment);
+        ASSERT_TRUE(b2);
+        ASSERT_TRUE(alloc.MarkCommitted("active_full", *b2));
+
+        // Seal-time sparsity: bucket 0 is selected immediately.
+        auto p0 = alloc.PrepareEvictionForLowUtilization(0.5);
+        ASSERT_EQ(p0.bucket_id(), sparse_on_seal_id);
+        // Only bucket 0 is sparse right now, so a second prepare returns empty.
+        EXPECT_LT(alloc.PrepareEvictionForLowUtilization(0.5).bucket_id(), 0);
+        // Abort with demote=true returns bucket 0 to the back of the index.
+        alloc.AbortEviction(std::move(p0));
+
+        // Freeing bucket 1 drops its utilization to 0% (< 50%) and adds it to
+        // the sparse index.
+        alloc.Free("full_then_free", *b1);
+
+        // AbortEviction(demote=true) must rotate past the rejected bucket:
+        // bucket 0 is picked first, demoted to back, then bucket 1 is picked.
+        auto first = alloc.PrepareEvictionForLowUtilization(0.5);
+        ASSERT_EQ(first.bucket_id(), sparse_on_seal_id);
+        alloc.AbortEviction(std::move(first));
+
+        auto second = alloc.PrepareEvictionForLowUtilization(0.5);
+        ASSERT_EQ(second.bucket_id(), b1->shard_idx);
+        // Evict bucket 1; bucket 0 remains and is persisted for recovery check.
+        ASSERT_TRUE(alloc.CommitEviction(std::move(second)));
+        (void)alloc.FlushDirtyMetadata();
+    }
+
+    // Recovery must re-index recovered sparse sealed buckets (bucket 0).
+    ImmutableBucketAllocator recovered;
+    ASSERT_TRUE(recovered.Init(config));
+    auto recovered_sparse = recovered.PrepareEvictionForLowUtilization(0.5);
+    ASSERT_EQ(recovered_sparse.bucket_id(), sparse_on_seal_id);
+    ASSERT_TRUE(recovered.CommitEviction(std::move(recovered_sparse)));
+    // Once the last sparse bucket is evicted, empty index returns immediately.
+    EXPECT_LT(recovered.PrepareEvictionForLowUtilization(0.5).bucket_id(), 0);
+}
+
 }  // namespace mooncake::test
