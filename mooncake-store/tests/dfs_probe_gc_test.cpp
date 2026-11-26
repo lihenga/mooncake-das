@@ -116,6 +116,65 @@ TEST_F(DfsProbeGcTest, ReportsTotalDeletionCountAcrossMultipleFiles) {
     EXPECT_EQ(dfs_probe_gc::Cleanup(root_, kTtl), 0u);
 }
 
+TEST_F(DfsProbeGcTest, FirstRoundScansBothDirectoriesThenOnlyWriteDirectory) {
+    const std::string write_directory = kDfsWriteProbeDirectoryName;
+    ASSERT_TRUE(std::filesystem::create_directory(root_ + "/" + write_directory));
+    const std::string current = write_directory + "/" + kProbe;
+    const std::string fresh = ".mooncake_dfs_health_probe_123-456_2";
+    Create(kProbe, 14400);
+    Create(current, 14400);
+    Create(fresh, 0);
+    Create(write_directory + "/" + fresh, 0);
+    bool initial_scan_pending = true;
+
+    EXPECT_EQ(dfs_probe_gc::CleanupRound(root_, kTtl, initial_scan_pending), 2u);
+    EXPECT_FALSE(initial_scan_pending);
+    EXPECT_FALSE(Exists(kProbe));
+    EXPECT_FALSE(Exists(current));
+    EXPECT_TRUE(Exists(fresh));
+
+    Create(kProbe, 14400);
+    Create(current, 14400);
+    SetAge(fresh, 14400);
+    SetAge(write_directory + "/" + fresh, 14400);
+    EXPECT_EQ(dfs_probe_gc::CleanupRound(root_, kTtl, initial_scan_pending), 2u);
+    EXPECT_TRUE(Exists(kProbe));
+    EXPECT_TRUE(Exists(fresh));
+    EXPECT_FALSE(Exists(current));
+    EXPECT_FALSE(Exists(write_directory + "/" + fresh));
+
+    // A newly constructed master gets its own first scan.
+    initial_scan_pending = true;
+    EXPECT_EQ(dfs_probe_gc::CleanupRound(root_, kTtl, initial_scan_pending), 2u);
+}
+
+TEST_F(DfsProbeGcTest, CleanupDoesNotCreateMissingWriteDirectory) {
+    bool initial_scan_pending = true;
+    EXPECT_EQ(dfs_probe_gc::CleanupRound(root_, kTtl, initial_scan_pending), 0u);
+    EXPECT_FALSE(initial_scan_pending);
+    EXPECT_FALSE(Exists(kDfsWriteProbeDirectoryName));
+}
+
+TEST_F(DfsProbeGcTest, LegacyRootDeleteFailureDoesNotSkipWriteDirectory) {
+    if (::geteuid() == 0) GTEST_SKIP() << "root bypasses directory permissions";
+    ASSERT_TRUE(std::filesystem::create_directory(
+        root_ + "/" + kDfsWriteProbeDirectoryName));
+    Create(kProbe, 14400);
+    const std::string current =
+        std::string(kDfsWriteProbeDirectoryName) + "/" + kProbe;
+    Create(current, 14400);
+    ASSERT_EQ(::chmod(root_.c_str(), 0500), 0);
+    bool initial_scan_pending = true;
+    EXPECT_EQ(dfs_probe_gc::CleanupRound(root_, kTtl, initial_scan_pending), 1u);
+    const int restored = ::chmod(root_.c_str(), 0700);
+    ASSERT_EQ(restored, 0);
+    EXPECT_FALSE(initial_scan_pending);
+    EXPECT_TRUE(Exists(kProbe));
+    EXPECT_FALSE(Exists(current));
+    EXPECT_EQ(dfs_probe_gc::CleanupRound(root_, kTtl, initial_scan_pending), 0u);
+    EXPECT_TRUE(Exists(kProbe));
+}
+
 TEST_F(DfsProbeGcTest, DoesNotRecurseOrFollowSymlinks) {
     ASSERT_TRUE(std::filesystem::create_directory(root_ + "/nested"));
     Create(std::string("nested/") + kProbe, 14400);

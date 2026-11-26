@@ -194,6 +194,8 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite() {
     const std::string new_probe_path =
         health_probe_path_prefix_ + "_" +
         std::to_string(++health_probe_generation_);
+    // Only the master creates .probe_write. WriteFile must fail if that
+    // directory is missing; never recreate it or fall back to the DFS root.
     auto write_result = fs_adapter_->WriteFile(
         new_probe_path,
         std::span<const char>(kDfsHealthProbePayload,

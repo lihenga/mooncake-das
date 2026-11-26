@@ -25,6 +25,7 @@
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/dfs_root_identity.h"
 #include "storage/distributed/dfs_read_probe.h"
+#include "storage/distributed/dfs_write_probe.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #include "storage_backend.h"
 
@@ -38,6 +39,9 @@ const std::string kTestDfsRootIdentity =
     SerializeDfsRootIdentity("dfs_backend_test", UUID{1, 2});
 
 void WriteTestDfsReadProbe(const std::string& root) {
+    // Emulate the probe directories provisioned by the master.
+    std::filesystem::create_directory(
+        std::filesystem::path(root) / kDfsWriteProbeDirectoryName);
     for (size_t probe_index = 0;
          probe_index < kDfsReadProbeDirectoryNames.size(); ++probe_index) {
         const std::filesystem::path directory =

@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <dirent.h>
 #include <fcntl.h>
 #include <memory>
@@ -14,6 +15,8 @@
 #include <string_view>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include "storage/distributed/dfs_write_probe.h"
 
 namespace mooncake::dfs_probe_gc {
 
@@ -33,7 +36,7 @@ inline int NormalizeDurationSeconds(const char* name, int configured) {
 // UuidToString emits two canonical decimal uint64_t values separated by '-'.
 // Do not use StringToUuid here: it accepts partially parsed numeric strings.
 inline bool IsProbeFileName(std::string_view name) {
-    constexpr std::string_view prefix = ".mooncake_dfs_health_probe_";
+    constexpr std::string_view prefix = kDfsWriteProbeFilePrefix;
     if (!name.starts_with(prefix)) return false;
     name.remove_prefix(prefix.size());
     const auto consume_number = [](std::string_view number, bool nonzero) {
@@ -150,6 +153,30 @@ inline size_t Cleanup(const std::string& root, std::chrono::seconds ttl) {
             ++deleted_count;
         }
     }
+    return deleted_count;
+}
+
+// A master lifetime gets exactly one legacy-root scan. Each directory has its
+// own error boundary, so a failed root scan cannot suppress .probe_write GC.
+inline size_t CleanupRound(const std::string& root, std::chrono::seconds ttl,
+                           bool& initial_scan_pending) {
+    size_t deleted_count = 0;
+    const auto cleanup_directory = [&](const std::string& directory) {
+        try {
+            deleted_count += Cleanup(directory, ttl);
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "DFS write-probe cleanup threw, directory="
+                         << directory << ", error=" << e.what();
+        } catch (...) {
+            LOG(WARNING) << "DFS write-probe cleanup threw, directory="
+                         << directory << ", error=unknown exception";
+        }
+    };
+    if (initial_scan_pending) {
+        initial_scan_pending = false;
+        cleanup_directory(root);
+    }
+    cleanup_directory(root + "/" + kDfsWriteProbeDirectoryName);
     LOG(INFO) << "DFS write-probe cleanup finished, deleted_count="
               << deleted_count;
     return deleted_count;
