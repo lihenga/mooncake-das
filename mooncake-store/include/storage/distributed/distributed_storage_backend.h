@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -87,6 +88,12 @@ class DistributedStorageBackend
 
     bool UsesObjectStorage() const {
         return storage_mode_ == DistributedStorageMode::kObjectStorage;
+    }
+
+    uint64_t BatchReadAdmissionByteLimit() const {
+        return UsesObjectStorage()
+                   ? std::numeric_limits<uint64_t>::max()
+                   : distributed_config_.batch_get_max_inflight_bytes;
     }
 
     // Set the master's path namespace before publishing the backend for I/O.

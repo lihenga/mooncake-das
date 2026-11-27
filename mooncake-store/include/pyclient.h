@@ -500,6 +500,15 @@ class PyClient {
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }
 
+    virtual std::vector<std::vector<int>> batch_get_session_prefetch_batch(
+        const std::vector<std::vector<std::string>> &requests) {
+        std::vector<std::vector<int>> results;
+        for (const auto &keys : requests) {
+            results.push_back(batch_get_session_prefetch(keys));
+        }
+        return results;
+    }
+
     // Whether batch_get_session_prefetch() has a staging arena for DFS reads.
     virtual bool dfs_prefetch_arena_available() const { return false; }
 

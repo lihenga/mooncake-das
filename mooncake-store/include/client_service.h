@@ -803,6 +803,7 @@ class Client {
         const std::vector<StorageObjectMetadata>& metadatas);
     void SetDfsStorageBackend(
         std::shared_ptr<DistributedStorageBackend> backend);
+    uint64_t GetDfsBatchReadAdmissionByteLimit() const;
 
     void SetDfsAccessPolicy(bool allow_read, bool allow_write) {
         dfs_read_allowed_.store(allow_read, std::memory_order_release);
