@@ -6,6 +6,7 @@
 #include "storage/distributed/dfs_allocator_interface.h"
 #include "storage/distributed/dfs_root_identity.h"
 #include "storage/distributed/dfs_read_probe.h"
+#include "storage/distributed/dfs_write_probe.h"
 #include "storage/distributed/fs_adapter.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
 #include "master_service.h"
@@ -5885,6 +5886,9 @@ TEST_F(MasterServiceTest,
         const std::string identity_path =
             root + "/" + kDfsRootIdentityFileName;
         const std::string marker_path = root + "/" + kDfsRootMarkerFileName;
+        const std::string write_probe_directory =
+            root + "/" + kDfsWriteProbeDirectoryName;
+        ASSERT_FALSE(std::filesystem::exists(write_probe_directory));
         std::array<std::string, 2> read_probe_paths;
         for (size_t probe_index = 0;
              probe_index < kDfsReadProbeDirectoryNames.size(); ++probe_index) {
@@ -5923,6 +5927,7 @@ TEST_F(MasterServiceTest,
             (std::istreambuf_iterator<char>(marker_file)),
             std::istreambuf_iterator<char>());
         EXPECT_EQ(restored_marker, kDfsRootMarkerPayload);
+        EXPECT_FALSE(std::filesystem::exists(write_probe_directory));
 
         for (size_t probe_index = 0;
              probe_index < read_probe_paths.size(); ++probe_index) {

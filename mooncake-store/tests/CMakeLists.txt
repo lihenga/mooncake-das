@@ -40,6 +40,7 @@ function(add_ha_test name)
 endfunction()
 
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
+add_store_test(dfs_probe_gc_test dfs_probe_gc_test.cpp)
 add_store_test(weight_management_contract_test
                weight_management_contract_test.cpp)
 add_store_test(weight_metadata_store_test weight_metadata_store_test.cpp)

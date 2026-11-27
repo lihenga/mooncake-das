@@ -27,6 +27,7 @@
 #include "storage/distributed/dfs_io_timeout.h"
 #include "storage/distributed/dfs_root_identity.h"
 #include "storage/distributed/dfs_read_probe.h"
+#include "storage/distributed/dfs_write_probe.h"
 #include "storage/distributed/shard_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
@@ -1301,6 +1302,8 @@ class DfsBackendTest : public ::testing::Test {
     void SetUp() override {
         tmp_ = std::make_unique<TempDir>("dfs_backend");
         ASSERT_TRUE(WriteTestDfsRootIdentity(tmp_->path()));
+        ASSERT_TRUE(std::filesystem::create_directory(
+            tmp_->file(kDfsWriteProbeDirectoryName)));
         FileStorageConfig file_config;
         file_config.storage_backend_type = StorageBackendType::kDistributed;
         file_config.storage_filepath = tmp_->path();
@@ -1734,6 +1737,50 @@ TEST(DfsRootMarkerTest, ShardAllocatorDoesNotOverwriteInvalidMarker) {
     EXPECT_EQ(contents, "unexpected-format\n");
 }
 
+TEST_F(DfsBackendTest, HealthWriteProbeCreatesAndRecreatesItsDirectory) {
+    const std::string directory = tmp_->file(kDfsWriteProbeDirectoryName);
+    ASSERT_TRUE(std::filesystem::remove(directory));
+    ASSERT_TRUE(backend_->ProbeWrite().has_value());
+    EXPECT_TRUE(std::filesystem::is_directory(directory));
+    // mkdir returns EEXIST on the next round; it must still succeed.
+    ASSERT_TRUE(backend_->ProbeWrite().has_value());
+    EXPECT_EQ(std::distance(std::filesystem::directory_iterator(directory),
+                            std::filesystem::directory_iterator()),
+              1);
+    for (const auto& entry : std::filesystem::directory_iterator(tmp_->path())) {
+        EXPECT_FALSE(entry.path().filename().string().starts_with(
+            kDfsWriteProbeFilePrefix));
+    }
+
+    // Recreate the directory if it disappears between probe rounds.
+    ASSERT_GT(std::filesystem::remove_all(directory), 0u);
+    EXPECT_TRUE(backend_->ProbeWrite().has_value());
+    EXPECT_TRUE(std::filesystem::is_directory(directory));
+}
+
+TEST_F(DfsBackendTest, HealthWriteProbeFailsWhenDirectoryPathIsAFile) {
+    const std::string directory = tmp_->file(kDfsWriteProbeDirectoryName);
+    ASSERT_TRUE(std::filesystem::remove(directory));
+    std::ofstream(directory).close();
+    // EEXIST is accepted by mkdir, but creating a probe below a regular file
+    // must fail rather than falsely reporting that the DFS is writable.
+    EXPECT_FALSE(backend_->ProbeWrite().has_value());
+    EXPECT_TRUE(std::filesystem::is_regular_file(directory));
+}
+
+TEST_F(DfsBackendTest, HealthWriteProbeFailsWhenMkdirIsDenied) {
+    if (::geteuid() == 0) GTEST_SKIP() << "root bypasses directory permissions";
+    const std::string directory = tmp_->file(kDfsWriteProbeDirectoryName);
+    ASSERT_TRUE(std::filesystem::remove(directory));
+    ASSERT_EQ(::chmod(tmp_->path().c_str(), 0500), 0);
+    const auto result = backend_->ProbeWrite();
+    const int restored = ::chmod(tmp_->path().c_str(), 0700);
+    ASSERT_EQ(restored, 0);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::FILE_OPEN_FAIL);
+    EXPECT_FALSE(std::filesystem::exists(directory));
+}
+
 TEST_F(DfsBackendTest, HealthProbesUseStrictDirectDedicatedFile) {
     const std::string first_probe_path =
         TestDfsReadProbePath(tmp_->path(), 0);
@@ -1782,7 +1829,8 @@ TEST_F(DfsBackendTest, HealthProbesUseStrictDirectDedicatedFile) {
     ASSERT_TRUE(second_client_backend.ProbeWrite().has_value());
 
     size_t probe_file_count = 0;
-    for (const auto& entry : std::filesystem::directory_iterator(tmp_->path())) {
+    for (const auto& entry : std::filesystem::directory_iterator(
+             tmp_->file(kDfsWriteProbeDirectoryName))) {
         if (entry.path().filename().string().starts_with(
                 ".mooncake_dfs_health_probe_")) {
             ++probe_file_count;
@@ -1805,7 +1853,8 @@ TEST_F(DfsBackendTest, HealthProbesUseStrictDirectDedicatedFile) {
     EXPECT_TRUE(backend_->ProbeRead().has_value());
 
     probe_file_count = 0;
-    for (const auto& entry : std::filesystem::directory_iterator(tmp_->path())) {
+    for (const auto& entry : std::filesystem::directory_iterator(
+             tmp_->file(kDfsWriteProbeDirectoryName))) {
         if (entry.path().filename().string().starts_with(
                 ".mooncake_dfs_health_probe_")) {
             ++probe_file_count;

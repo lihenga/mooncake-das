@@ -2313,6 +2313,12 @@ class MasterService {
     // treated as the errno from a failed stat; zero uses the real filesystem.
     std::atomic<int> dfs_root_stat_error_for_testing_{0};
     std::chrono::seconds dfs_root_guard_interval_{5};
+    std::chrono::seconds dfs_health_probe_ttl_{3600};
+    std::chrono::seconds dfs_health_probe_cleanup_interval_{7200};
+    std::chrono::steady_clock::time_point next_dfs_health_probe_cleanup_{};
+    // Legacy probes in the DFS root are scanned only once per master lifetime,
+    // after the first full cleanup interval has elapsed.
+    bool dfs_health_probe_initial_scan_pending_{true};
     bool use_kvcs_{false};
     std::unique_ptr<KvcsCapacityProvider> dfs_kvcs_capacity_provider_;
     std::chrono::seconds dfs_kvcs_capacity_check_interval_{5};

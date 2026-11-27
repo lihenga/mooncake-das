@@ -7,6 +7,7 @@
 #include "storage/distributed/dfs_log_limiter.h"
 #include "storage/distributed/dfs_root_identity.h"
 #include "storage/distributed/dfs_read_probe.h"
+#include "storage/distributed/dfs_probe_gc.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
 #include "storage/distributed/shard_allocator.h"
 #include <algorithm>
@@ -111,8 +112,8 @@ bool SyncDfsRootDirectory(const std::string& root) {
            saved_errno == EOPNOTSUPP;
 }
 
-bool EnsureDfsReadProbeDirectory(const std::string& root,
-                                 std::string_view directory_name) {
+bool EnsureDfsProbeDirectory(const std::string& root,
+                             std::string_view directory_name) {
     const std::string path = root + "/" + std::string(directory_name);
     struct stat st {};
     if (::lstat(path.c_str(), &st) == 0) return S_ISDIR(st.st_mode);
@@ -383,7 +384,7 @@ bool MasterService::InitializeDfsRootGuard(const std::string& root,
          probe_index < kDfsReadProbeDirectoryNames.size(); ++probe_index) {
         const auto directory_name =
             kDfsReadProbeDirectoryNames[probe_index];
-        if (!EnsureDfsReadProbeDirectory(root, directory_name)) return false;
+        if (!EnsureDfsProbeDirectory(root, directory_name)) return false;
         const std::string probe_directory =
             root + "/" + std::string(directory_name);
         const std::string read_probe_path =
@@ -750,7 +751,7 @@ void MasterService::ReconcileDfsRootFiles() {
          probe_index < kDfsReadProbeDirectoryNames.size(); ++probe_index) {
         const auto directory_name =
             kDfsReadProbeDirectoryNames[probe_index];
-        if (!EnsureDfsReadProbeDirectory(root, directory_name)) {
+        if (!EnsureDfsProbeDirectory(root, directory_name)) {
             LOG(ERROR) << "Failed to create DFS read-probe directory "
                        << root << "/" << directory_name;
             continue;
@@ -759,6 +760,25 @@ void MasterService::ReconcileDfsRootFiles() {
             root + "/" + std::string(directory_name);
         reconcile(probe_directory, kDfsReadProbeFileName,
                   BuildDfsReadProbeContents(identity, probe_index));
+    }
+
+    // Run last, on the same worker that checks the identity/read-probe files
+    // (currently DfsEvictionThreadFunc); do not dispatch to a separate worker.
+    // A failed scan must not take down that worker or change DFS health.
+    const auto cleanup_now = std::chrono::steady_clock::now();
+    if (cleanup_now >= next_dfs_health_probe_cleanup_) {
+        try {
+            dfs_probe_gc::CleanupRound(root, dfs_health_probe_ttl_,
+                                      dfs_health_probe_initial_scan_pending_);
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "DFS write-probe cleanup threw, root=" << root
+                         << ", error=" << e.what();
+        } catch (...) {
+            LOG(WARNING) << "DFS write-probe cleanup threw, root=" << root
+                         << ", error=unknown exception";
+        }
+        next_dfs_health_probe_cleanup_ = std::chrono::steady_clock::now() +
+                                         dfs_health_probe_cleanup_interval_;
     }
 }
 

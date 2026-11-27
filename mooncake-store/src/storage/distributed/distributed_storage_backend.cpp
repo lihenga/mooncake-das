@@ -25,6 +25,7 @@
 #include "storage/distributed/immutable_bucket_allocator.h"
 #include "storage/distributed/dfs_root_identity.h"
 #include "storage/distributed/dfs_read_probe.h"
+#include "storage/distributed/dfs_write_probe.h"
 #include "storage/distributed/shard_allocator.h"
 #include "thread_pool.h"
 #include "types.h"
@@ -68,8 +69,6 @@ std::optional<int> ParseShardFileName(std::string_view name) {
     return index;
 }
 
-
-constexpr char kDfsHealthProbeFilePrefix[] = ".mooncake_dfs_health_probe_";
 
 using l4::kBucketFilePrefix;
 using l4::kBucketDataSuffix;
@@ -156,7 +155,8 @@ DistributedStorageBackend::DistributedStorageBackend(
     if (object_storage_adapter_) {
         storage_mode_ = DistributedStorageMode::kObjectStorage;
     }
-    health_probe_path_prefix_ = root_dir_ + "/" + kDfsHealthProbeFilePrefix +
+    health_probe_path_prefix_ = root_dir_ + "/" + kDfsWriteProbeDirectoryName +
+                                "/" + kDfsWriteProbeFilePrefix +
                                 UuidToString(generate_uuid());
 }
 
