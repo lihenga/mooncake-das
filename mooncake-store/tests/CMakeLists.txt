@@ -39,6 +39,14 @@ function(add_ha_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+# Do not link client objects: they would hide a misplaced shared trace helper.
+add_executable(dfs_read_trace_link_test dfs_read_trace_link_test.cpp)
+target_link_libraries(
+  dfs_read_trace_link_test
+  PRIVATE mooncake_store_master cachelib_memory_allocator
+          yalantinglibs::yalantinglibs gtest gtest_main)
+add_test(NAME dfs_read_trace_link_test COMMAND dfs_read_trace_link_test)
+
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
 add_store_test(weight_management_contract_test
                weight_management_contract_test.cpp)
