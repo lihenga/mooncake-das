@@ -1515,8 +1515,7 @@ class RealClient : public PyClient {
     template <bool Grouped>
     std::vector<int> PrefetchSessionKeys(
         const std::vector<std::string> &keys,
-        const std::vector<size_t> *request_ids,
-        std::vector<size_t> *oversized_entries = nullptr);
+        const std::vector<size_t> *request_ids);
     // Called while session_mutex_ is held; detached owners stay in the caller.
     void CollectOrphanedDfsPrefetchBuffers(
         bool prefetch_cache_enabled, SessionRangeReadContext &context,
@@ -1533,7 +1532,7 @@ class RealClient : public PyClient {
         size_t chunk_index, size_t chunk_count, size_t chunk_limit_bytes,
         size_t request_planned_bytes,
         const std::vector<size_t> *request_ids = nullptr,
-        std::vector<size_t> *oversized_entries = nullptr);
+        const std::vector<size_t> *key_indices = nullptr);
     tl::expected<std::string, ErrorCode> StartEmbeddedMaster(
         bool enable_ssd_offload);
 

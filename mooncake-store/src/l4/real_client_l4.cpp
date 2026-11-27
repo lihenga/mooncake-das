@@ -852,59 +852,7 @@ std::vector<std::vector<int>> RealClient::batch_get_session_prefetch_batch(
         keys.insert(keys.end(), requests[i].begin(), requests[i].end());
         request_ids.insert(request_ids.end(), requests[i].size(), i);
     }
-    std::vector<size_t> oversized_entries;
-    auto flat_results =
-        PrefetchSessionKeys<true>(keys, &request_ids, &oversized_entries);
-    // Rescue only allocation failures and groups rejected before allocation
-    // for exceeding the byte limit, never capacity waits or I/O timeouts.
-    if (!oversized_entries.empty() ||
-        std::find(flat_results.begin(), flat_results.end(),
-                  toInt(ErrorCode::NO_AVAILABLE_HANDLE)) !=
-            flat_results.end()) {
-        std::unordered_set<std::string> oversized_keys;
-        for (size_t i : oversized_entries) oversized_keys.insert(keys[i]);
-        const auto rescuable = [&](size_t i) {
-            return flat_results[i] == toInt(ErrorCode::NO_AVAILABLE_HANDLE) ||
-                   oversized_keys.contains(keys[i]);
-        };
-        std::unordered_set<std::string> earlier_keys;
-        std::unordered_map<std::string, int> resolved;
-        size_t begin = 0;
-        for (const auto &request : requests) {
-            std::vector<std::string> retry;
-            for (size_t i = 0; i < request.size(); ++i) {
-                const auto &key = request[i];
-                if (rescuable(begin + i) && earlier_keys.contains(key) &&
-                    !resolved.contains(key)) {
-                    retry.push_back(key);
-                }
-            }
-            if (!retry.empty()) {
-                const std::vector<size_t> retry_request_ids(retry.size(), 0);
-                std::vector<size_t> retry_oversized_entries;
-                const auto retried = PrefetchSessionKeys<true>(
-                    retry, &retry_request_ids, &retry_oversized_entries);
-                std::unordered_set<std::string> retry_oversized_keys;
-                for (size_t i : retry_oversized_entries) {
-                    retry_oversized_keys.insert(retry[i]);
-                }
-                for (size_t i = 0; i < retry.size(); ++i) {
-                    // A smaller later request may still fit this shared key.
-                    if (!retry_oversized_keys.contains(retry[i]) &&
-                        retried[i] != toInt(ErrorCode::NO_AVAILABLE_HANDLE)) {
-                        resolved.emplace(retry[i], retried[i]);
-                    }
-                }
-            }
-            earlier_keys.insert(request.begin(), request.end());
-            begin += request.size();
-        }
-        for (size_t i = 0; i < keys.size(); ++i) {
-            if (rescuable(i) && resolved.contains(keys[i])) {
-                flat_results[i] = resolved.at(keys[i]);
-            }
-        }
-    }
+    const auto flat_results = PrefetchSessionKeys<true>(keys, &request_ids);
     std::vector<std::vector<int>> results;
     size_t offset = 0;
     for (const auto &request : requests) {
@@ -918,8 +866,7 @@ std::vector<std::vector<int>> RealClient::batch_get_session_prefetch_batch(
 template <bool Grouped>
 std::vector<int> RealClient::PrefetchSessionKeys(
     const std::vector<std::string> &keys,
-    const std::vector<size_t> *request_ids,
-    std::vector<size_t> *oversized_entries) {
+    const std::vector<size_t> *request_ids) {
     std::vector<int> results(
         keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     if (!client_) {
@@ -946,6 +893,8 @@ std::vector<int> RealClient::PrefetchSessionKeys(
                 duplicate_of[i] = first_it->second;
                 continue;
             }
+
+            if constexpr (Grouped) duplicate_of[i] = i;
 
             auto session_it = get_sessions_.find(keys[i]);
             if (session_it == get_sessions_.end()) continue;
@@ -1003,7 +952,7 @@ std::vector<int> RealClient::PrefetchSessionKeys(
             } else {
                 execute_session_dfs_range_reads_batch<true>(
                     dfs_entries, results, trace_id, true, 1, 1, 0, 0,
-                    request_ids, oversized_entries);
+                    request_ids, &duplicate_of);
             }
         } else {
             process_session_disk_dfs_reads(dfs_entries, results, trace_id,
@@ -1185,7 +1134,7 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
     uint64_t trace_id, bool prefetch_only, size_t chunk_index,
     size_t chunk_count, size_t chunk_limit_bytes, size_t request_planned_bytes,
     const std::vector<size_t> *request_ids,
-    std::vector<size_t> *oversized_entries) {
+    const std::vector<size_t> *key_indices) {
     const auto timing_start = std::chrono::steady_clock::now();
     const auto chunk_entries = entries;
     const bool trace_enabled = trace_id != 0;
@@ -1410,14 +1359,9 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
             continue;
         }
 
-        size_t group = 0;
-        size_t *planned = &arena_size;
-        Arena *group_arena = nullptr;
-        if constexpr (Grouped) {
-            group = (*request_ids)[entry.original_idx];
-            group_arena = &arenas[group];
-            planned = &group_arena->size;
-        }
+        size_t candidate_size = 0;
+        auto *planned = &arena_size;
+        if constexpr (Grouped) planned = &candidate_size;
         auto &planned_size = *planned;
         size_t aligned_offset = 0;
         // DFS iovecs read descriptor.aligned_size, including trailing padding.
@@ -1447,21 +1391,9 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
             continue;
         }
         if constexpr (Grouped) {
-            const size_t growth =
-                aligned_offset + aligned_object_size - planned_size;
-            if (growth > std::numeric_limits<size_t>::max() - arena_size) {
-                results[entry.original_idx] = toInt(ErrorCode::INVALID_PARAMS);
-                continue;
-            }
-            arena_views.push_back(
-                {{entry_ptr, aligned_offset, aligned_object_size}, group});
-            arena_size += growth;
-            planned_size = aligned_offset + aligned_object_size;
-            // DFS allocateSlices reads exactly source_size, including padding;
-            // arena slot alignment and allocator rounding are not I/O bytes.
-            auto &read_bytes = group_arena->read_bytes;
-            read_bytes += std::min<uint64_t>(
-                source_size, std::numeric_limits<uint64_t>::max() - read_bytes);
+            // Keep unique metadata; request order chooses ownership only after
+            // its complete candidate arena has been allocated successfully.
+            arena_views.push_back({{entry_ptr, 0, aligned_object_size}, 0});
         } else {
             arena_views.push_back(
                 {entry_ptr, aligned_offset, aligned_object_size});
@@ -1473,87 +1405,77 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
     bool prefetch_arena_used = false;
     bool prefetch_arena_alloc_fail = false;
     if constexpr (Grouped) {
-        for (auto &[group, allocation] : arenas) {
-            if (allocation.size == 0) continue;
+        const auto unique_views = std::move(arena_views);
+        arena_views = {};
+        arena_views.reserve(unique_views.size());
+        const size_t absent = unique_views.size();
+        std::vector<size_t> position(results.size(), absent);
+        std::vector<size_t> selected(unique_views.size(), request_ids->size());
+        for (size_t i = 0; i < unique_views.size(); ++i) {
+            position[unique_views[i].entry->original_idx] = i;
+        }
+        for (size_t first = 0; first < request_ids->size();) {
+            const size_t group = (*request_ids)[first];
+            size_t end = first;
+            while (end < request_ids->size() && (*request_ids)[end] == group)
+                ++end;
+            const size_t begin = arena_views.size();
+            Arena allocation;
+            for (size_t i = first; i < end; ++i) {
+                const size_t index = position[(*key_indices)[i]];
+                if (index == absent || selected[index] == first) {
+                    continue;
+                }
+                selected[index] = first;
+                auto view = unique_views[index];
+                size_t offset = 0;
+                if (!AlignUp(allocation.size, dfs_alignment, &offset) ||
+                    view.size > std::numeric_limits<size_t>::max() - offset) {
+                    results[view.entry->original_idx] =
+                        toInt(ErrorCode::INVALID_PARAMS);
+                    continue;
+                }
+                view.offset = offset;
+                view.group = group;
+                arena_views.push_back(view);
+                allocation.size = offset + view.size;
+                // DFS slices include descriptor padding, not arena slot gaps.
+                allocation.read_bytes += std::min<uint64_t>(
+                    view.size, std::numeric_limits<uint64_t>::max() -
+                                   allocation.read_bytes);
+            }
+            first = end;
+            if (arena_views.size() == begin) continue;
+            int error = toInt(ErrorCode::NO_AVAILABLE_HANDLE);
             if (allocation.read_bytes > admission_limit) {
+                error = toInt(ErrorCode::DFS_BATCH_GET_ADMISSION_TIMEOUT);
                 LOG_EVERY_N(WARNING, 64)
                     << "DFS_PREFETCH_ADMISSION_REJECTED "
                     << "reason=request_exceeds_read_admission_limit, group="
                     << group << ", request_bytes=" << allocation.read_bytes
                     << ", max_bytes=" << admission_limit;
+            } else {
+                allocation.buffer =
+                    AllocatePrefetchArenaRegion(allocation.size, dfs_alignment);
+                prefetch_arena_alloc_fail |= allocation.buffer == nullptr;
+            }
+            if (!allocation.buffer) {
+                for (size_t i = begin; i < arena_views.size(); ++i) {
+                    results[arena_views[i].entry->original_idx] = error;
+                }
+                arena_views.resize(begin);
                 continue;
             }
-            auto &arena = allocation.buffer;
-            if (prefetch_only) {
-                // Cached prefetch views retain their unified buffer allocation
-                // until session end and count against the prefetch admission
-                // limit.
-                arena =
-                    AllocatePrefetchArenaRegion(allocation.size, dfs_alignment);
-                prefetch_arena_used |= arena != nullptr;
-                prefetch_arena_alloc_fail |= arena == nullptr;
-            } else {
-                std::optional<BufferHandle> handle;
-                if (file_storage_) {
-                    // Wait briefly for another holder to release; reads never
-                    // wait on their own, so this bounded wait is what keeps a
-                    // transient peak from dropping the read onto pageable
-                    // memory.
-                    handle = file_storage_->AllocatePinnedStagingBuffer(
-                        allocation.size, dfs_alignment,
-                        file_storage_->ReadArenaWait());
-                    pinned_restore_arena_used = handle.has_value();
-                }
-                // Fall back to client_buffer_allocator_ when the unified buffer
-                // refused. That pool is sized by the local_buffer_size argument
-                // of setup(), independent of the unified buffer, so the
-                // fallback is not bounded by the admission budgets and only
-                // fails when that buffer is exhausted too. Writes and prefetch
-                // never take this path: they wait within their own budget or
-                // fail, so they cannot silently exceed the unified buffer.
-                if (!handle && client_buffer_allocator_) {
-                    handle = client_buffer_allocator_->allocate_aligned(
-                        allocation.size, dfs_alignment);
-                }
-                if (handle) {
-                    arena = std::make_shared<BufferHandle>(std::move(*handle));
-                }
+            for (size_t i = begin; i < arena_views.size(); ++i) {
+                const size_t canonical = arena_views[i].entry->original_idx;
+                position[canonical] = absent;
+                results[canonical] = 0;
             }
-            if (arena) {
-                arena_capacity += arena->size();
-            }
-            if (!arena) {
-                // Reached only when the unified buffer and the generic
-                // allocator both failed. The unified buffer already logged its
-                // own refusal with full state, so this only records that the
-                // fallback failed too, which is what makes the read itself
-                // fail.
-                if (!prefetch_only) {
-                    if (client_) {
-                        client_->ObserveUnifiedDfsBufferAllocationFailure(
-                            DfsBufferUsageKind::kRead);
-                    }
-                    LOG(ERROR) << "DFS staging arena allocation failed, size="
-                               << arena_size << ", pinned_restore_available="
-                               << (file_storage_ &&
-                                   file_storage_->HasPinnedRestoreArena())
-                               << ", generic_buffer_fallback_failed=1";
-                }
-            }
+            prefetch_arena_used = true;
+            arena_size += allocation.size;
+            arena_capacity += allocation.buffer->size();
+            arenas.emplace(group, std::move(allocation));
         }
-
-        std::erase_if(arena_views, [&](const ArenaView &view) {
-            const auto &allocation = arenas.at(view.group);
-            if (allocation.buffer) return false;
-            const bool oversized = allocation.read_bytes > admission_limit;
-            results[view.entry->original_idx] =
-                toInt(oversized ? ErrorCode::DFS_BATCH_GET_ADMISSION_TIMEOUT
-                                : ErrorCode::NO_AVAILABLE_HANDLE);
-            if (oversized && oversized_entries) {
-                oversized_entries->push_back(view.entry->original_idx);
-            }
-            return true;
-        });
     } else {
         auto &arena = single_arena;
         if (!arena_views.empty()) {
@@ -1664,6 +1586,10 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
         // An empty batch is a successful no-op unless arena construction had
         // already failed and left a non-zero requested arena size.
         dfs_read_success = arena_size == 0;
+        if constexpr (Grouped) {
+            // Rejected candidates allocate nothing, but remain cache misses.
+            dfs_read_success = entries.empty();
+        }
     }
     auto t_io_done = std::chrono::steady_clock::now();
     if (!disk_batch_keys.empty()) {
@@ -2054,6 +1980,6 @@ RealClient::PlanDfsReadChunks(
 template ErrorCode RealClient::execute_session_dfs_range_reads_batch<false>(
     std::vector<SessionRangeReadRequest *> &, std::vector<int> &, uint64_t,
     bool, size_t, size_t, size_t, size_t, const std::vector<size_t> *,
-    std::vector<size_t> *);
+    const std::vector<size_t> *);
 
 }  // namespace mooncake

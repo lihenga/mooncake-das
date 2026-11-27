@@ -537,9 +537,13 @@ bool PinnedPrefetchMemorySupported(size_t required_bytes) {
 class CompletionReadAdapter : public PosixFsAdapter {
    public:
     std::function<void()> after_read;
+    std::optional<ErrorCode> read_error;
     tl::expected<size_t, ErrorCode> DirectReadAt(int fd, iovec* iov, int iovcnt,
                                                  int64_t offset) override {
-        auto result = PosixFsAdapter::DirectReadAt(fd, iov, iovcnt, offset);
+        auto result =
+            read_error ? tl::expected<size_t, ErrorCode>{tl::make_unexpected(
+                             *read_error)}
+                       : PosixFsAdapter::DirectReadAt(fd, iov, iovcnt, offset);
         if (after_read) after_read();
         return result;
     }
@@ -684,7 +688,8 @@ class RealClientDfsPrefetchTest : public RealClientTest {
     }
 
     void InstallBucketReadHook(std::function<void()> hook,
-                               uint64_t read_timeout_ms = 10000) {
+                               uint64_t read_timeout_ms = 10000,
+                               std::optional<ErrorCode> read_error = {}) {
         FileStorageConfig file_config;
         file_config.storage_backend_type = StorageBackendType::kDistributed;
         file_config.storage_filepath = ssd_path_;
@@ -696,6 +701,7 @@ class RealClientDfsPrefetchTest : public RealClientTest {
         config.batch_timeout_fixed_ms = 0;
         auto adapter = std::make_unique<CompletionReadAdapter>();
         adapter->after_read = std::move(hook);
+        adapter->read_error = read_error;
         auto backend = std::make_shared<DistributedStorageBackend>(
             file_config, config, std::move(adapter),
             py_client_->client_->GetDfsRootIdentity());
@@ -709,8 +715,9 @@ class RealClientDfsPrefetchTest : public RealClientTest {
         const auto snapshot = py_client_->get_sessions_.at(key);
         py_client_->get_sessions_.erase(key);
         py_client_->get_sessions_.emplace(
-            key, QueryResult(std::vector(snapshot.replicas), deadline,
-                             snapshot.object_checksum));
+            key,
+            QueryResult(std::vector(snapshot.replicas), deadline,
+                        snapshot.object_checksum, snapshot.resolved_tenant_id));
     }
 
     void ExpectArenaReleased() {
@@ -1454,6 +1461,215 @@ TEST_F(RealClientLeasePrefetchTest,
         EXPECT_TRUE(py_client_->get_session_prefetch_cache_.empty());
         ExpectArenaReleased();
     }
+}
+
+TEST_F(RealClientLeasePrefetchTest,
+       BatchPrefetchSharedPrefixPrivateSuffixAllocatesCompletePeer) {
+    DfsPrefetchTestEnv dfs_env;
+    ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+    ScopedEnvVar unified("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES", "65536");
+    ScopedEnvVar ratio("MC_STORE_DFS_PREFETCH_CAPACITY_RATIO", "0.125");
+    ScopedEnvVar admission("MOONCAKE_DFS_BATCH_GET_MAX_INFLIGHT_BYTES",
+                           "65536");
+    const std::vector<std::string> keys{"batch_prefix_s", "batch_prefix_a",
+                                        "batch_prefix_b", "batch_prefix_c",
+                                        "batch_prefix_d"};
+    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:18001", keys));
+    ASSERT_NO_FATAL_FAILURE(RequirePrefetchArena());
+    if (IsSkipped()) return;
+    ASSERT_EQ(py_client_->file_storage_->UnifiedPrefetchLimitBytes(), 8192u);
+
+    for (bool reverse : {false, true}) {
+        for (bool duplicate : {false, true}) {
+            SCOPED_TRACE(reverse ? "fitting first" : "oversized first");
+            SCOPED_TRACE(duplicate ? "duplicate keys" : "unique keys");
+            ASSERT_EQ(py_client_->batch_get_session_start(keys),
+                      std::vector<int>(keys.size(), 0));
+            for (const auto& key : keys) {
+                SetSessionDeadline(
+                    key, std::chrono::steady_clock::time_point::max());
+            }
+            std::vector<std::vector<std::string>> requests{
+                {keys[0], keys[1], keys[2]},
+                {keys[0], keys[3]},
+                {keys[0], keys[4]}};
+            const int full = NoAvailableHandle();
+            auto expected = std::vector<std::vector<int>>{
+                {0, full, full}, {0, 0}, {0, full}};
+            if (reverse) {
+                std::reverse(requests.begin(), requests.end());
+                expected = {{0, 0}, {0, full}, {0, full, full}};
+            }
+            if (duplicate) {
+                for (size_t i = 0; i < requests.size(); ++i) {
+                    requests[i].push_back(requests[i].front());
+                    expected[i].push_back(0);
+                }
+            }
+            // The failed 12 KiB group must not strand the shared prefix;
+            // the first fitting peer needs both it and its private suffix.
+            ASSERT_EQ(py_client_->batch_get_session_prefetch_batch(requests),
+                      expected);
+            ASSERT_EQ(py_client_->get_session_prefetch_cache_.size(), 2u);
+            const size_t successful_suffix = reverse ? 4 : 3;
+            const size_t failed_suffix = reverse ? 3 : 4;
+            // Native sessions are keyed by unique key, not request refcounts.
+            ASSERT_EQ(py_client_->batch_get_session_end(
+                          {keys[1], keys[2], keys[failed_suffix]}),
+                      0);
+            for (size_t offset = 0; offset < kDfsPrefetchObjectSize;
+                 offset += 1024) {
+                ExpectRead(keys[0], 0, offset, /*cache_only=*/true);
+                ExpectRead(keys[successful_suffix], successful_suffix, offset,
+                           /*cache_only=*/true);
+            }
+            EXPECT_EQ(py_client_->batch_get_session_end(
+                          {keys[0], keys[successful_suffix]}),
+                      0);
+            EXPECT_TRUE(py_client_->get_session_prefetch_cache_.empty());
+            ExpectArenaReleased();
+        }
+    }
+}
+
+TEST_F(RealClientLeasePrefetchTest,
+       BatchPrefetchSubmittedReadFailureDoesNotRetrySharedKeys) {
+    DfsPrefetchTestEnv dfs_env;
+    ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+    ScopedEnvVar unified("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES", "65536");
+    ScopedEnvVar ratio("MC_STORE_DFS_PREFETCH_CAPACITY_RATIO", "0.125");
+    const std::vector<std::string> keys{
+        "batch_io_s", "batch_io_a", "batch_io_b", "batch_io_c", "batch_io_d"};
+    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:18002", keys));
+    ASSERT_NO_FATAL_FAILURE(RequirePrefetchArena());
+    if (IsSkipped()) return;
+    for (const auto error :
+         {ErrorCode::FILE_READ_FAIL, ErrorCode::NO_AVAILABLE_HANDLE}) {
+        SCOPED_TRACE(toInt(error));
+        ASSERT_EQ(py_client_->batch_get_session_start(keys),
+                  std::vector<int>(keys.size(), 0));
+        for (const auto& key : keys) {
+            SetSessionDeadline(key,
+                               std::chrono::steady_clock::time_point::max());
+        }
+        auto reads = std::make_shared<std::atomic<size_t>>(0);
+        ASSERT_NO_FATAL_FAILURE(InstallBucketReadHook(
+            [reads] { reads->fetch_add(1); }, 10000, error));
+        const int failed = toInt(error);
+        const int full = NoAvailableHandle();
+        EXPECT_EQ(py_client_->batch_get_session_prefetch_batch(
+                      {{keys[0], keys[1], keys[2]},
+                       {keys[0], keys[3]},
+                       {keys[0], keys[4]}}),
+                  (std::vector<std::vector<int>>{
+                      {failed, full, full}, {failed, failed}, {failed, full}}));
+        // These count submitted positional reads, not BatchGet calls. Even
+        // NO_AVAILABLE_HANDLE from I/O must not trigger another rescue pass.
+        EXPECT_EQ(reads->load(), 2u);
+        EXPECT_TRUE(py_client_->get_session_prefetch_cache_.empty());
+        EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+        ExpectArenaReleased();
+    }
+}
+
+TEST_F(RealClientLeasePrefetchTest,
+       BatchPrefetchExpiredSharedKeyDoesNotRetryOrRead) {
+    DfsPrefetchTestEnv dfs_env;
+    ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+    ScopedEnvVar unified("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES", "131072");
+    const std::vector<std::string> keys{"batch_expired_s", "batch_expired_a"};
+    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:18003", keys));
+    ASSERT_NO_FATAL_FAILURE(RequirePrefetchArena());
+    if (IsSkipped()) return;
+    ASSERT_EQ(py_client_->batch_get_session_start(keys),
+              std::vector<int>(keys.size(), 0));
+    SetSessionDeadline(keys[0], std::chrono::steady_clock::now());
+    SetSessionDeadline(keys[1], std::chrono::steady_clock::time_point::max());
+    auto reads = std::make_shared<std::atomic<size_t>>(0);
+    ASSERT_NO_FATAL_FAILURE(
+        InstallBucketReadHook([reads] { reads->fetch_add(1); }));
+    const int expired = toInt(ErrorCode::SESSION_PREFETCH_LEASE_EXPIRED);
+    EXPECT_EQ(py_client_->batch_get_session_prefetch_batch(
+                  {{keys[0], keys[1]}, {keys[0], keys[0]}, {keys[0], keys[1]}}),
+              (std::vector<std::vector<int>>{
+                  {expired, 0}, {expired, expired}, {expired, 0}}));
+    EXPECT_EQ(reads->load(), 1u);
+    EXPECT_EQ(py_client_->get_sessions_.count(keys[0]), 0u);
+    EXPECT_EQ(py_client_->get_session_prefetch_cache_.count(keys[0]), 0u);
+    ExpectRead(keys[1], 1, 1024, /*cache_only=*/true);
+    EXPECT_EQ(reads->load(), 1u);
+    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+    ExpectArenaReleased();
+}
+
+TEST_F(RealClientLeasePrefetchTest,
+       BatchPrefetchCoalescesReadsAndReusesCachedSharedKeys) {
+    DfsPrefetchTestEnv dfs_env;
+    ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+    ScopedEnvVar unified("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES", "131072");
+    ScopedEnvVar metrics_env("MC_STORE_CLIENT_METRIC", "1");
+    const std::vector<std::string> keys{"batch_once_s", "batch_once_a",
+                                        "batch_once_b"};
+    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:18004", keys));
+    ASSERT_NO_FATAL_FAILURE(RequirePrefetchArena());
+    if (IsSkipped()) return;
+    ASSERT_EQ(py_client_->batch_get_session_start(keys),
+              std::vector<int>(keys.size(), 0));
+    for (const auto& key : keys) {
+        SetSessionDeadline(key, std::chrono::steady_clock::time_point::max());
+    }
+    auto reads = std::make_shared<std::atomic<size_t>>(0);
+    ASSERT_NO_FATAL_FAILURE(
+        InstallBucketReadHook([reads] { reads->fetch_add(1); }));
+    auto* metrics = py_client_->client_->GetDfsMetricPtr();
+    ASSERT_NE(metrics, nullptr);
+    const auto read_batches = [metrics] {
+        uint64_t count = 0;
+        for (const auto& bucket :
+             metrics->dfs_read_latency_us.get_bucket_counts()) {
+            count += bucket->value();
+        }
+        return count;
+    };
+    const auto before_batches = read_batches();
+    const auto before_keys = metrics->dfs_read_ops.value();
+    const auto before_bytes = metrics->dfs_read_bytes.value();
+    const std::vector<std::vector<std::string>> requests{
+        {keys[0], keys[1]}, {keys[0], keys[2]}, {keys[0], keys[0]}};
+    const std::vector<std::vector<int>> expected{{0, 0}, {0, 0}, {0, 0}};
+    ASSERT_EQ(py_client_->batch_get_session_prefetch_batch(requests), expected);
+    EXPECT_EQ(reads->load(), 3u);
+    // This histogram observes once per successful Client::BatchGet DFS batch;
+    // positional reads above count unique objects, not batches.
+    EXPECT_EQ(read_batches() - before_batches, 1u);
+    EXPECT_EQ(metrics->dfs_read_ops.value() - before_keys, 3);
+    EXPECT_EQ(metrics->dfs_read_bytes.value() - before_bytes,
+              3 * kDfsPrefetchObjectSize);
+    ASSERT_EQ(py_client_->get_session_prefetch_cache_.size(), 3u);
+    const auto free_before_reuse =
+        py_client_->file_storage_->UnifiedBufferReport().totalFreeSpace;
+    EXPECT_EQ(py_client_->batch_get_session_prefetch_batch(requests), expected);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ExpectRead(keys[i], i, 2048, /*cache_only=*/true);
+    }
+    EXPECT_EQ(reads->load(), 3u);
+    EXPECT_EQ(read_batches() - before_batches, 1u);
+    EXPECT_EQ(py_client_->file_storage_->UnifiedBufferReport().totalFreeSpace,
+              free_before_reuse);
+    // Retain the cached shared prefix while a private suffix becomes a miss.
+    ASSERT_EQ(py_client_->batch_get_session_end({keys[2]}), 0);
+    ASSERT_EQ(py_client_->batch_get_session_start({keys[2]}),
+              std::vector<int>{0});
+    SetSessionDeadline(keys[2], std::chrono::steady_clock::time_point::max());
+    EXPECT_EQ(py_client_->batch_get_session_prefetch_batch(requests), expected);
+    EXPECT_EQ(reads->load(), 4u);
+    EXPECT_EQ(read_batches() - before_batches, 2u);
+    EXPECT_EQ(metrics->dfs_read_ops.value() - before_keys, 4);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ExpectRead(keys[i], i, 1024, /*cache_only=*/true);
+    }
+    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+    ExpectArenaReleased();
 }
 
 TEST_F(RealClientLeasePrefetchTest,
