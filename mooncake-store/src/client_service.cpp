@@ -3854,7 +3854,7 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
     const std::vector<const std::vector<Slice>*>& slice_lists,
     const std::vector<DistributedFSDescriptor>& descriptors,
     std::shared_ptr<DistributedStorageBackend> backend,
-    std::chrono::milliseconds staging_wait) {
+    std::chrono::milliseconds staging_wait, DfsWriteTiming* timing) {
     if (keys.size() != slice_lists.size() ||
         keys.size() != descriptors.size()) {
         return std::vector<ErrorCode>(keys.size(), ErrorCode::INVALID_PARAMS);
@@ -3898,6 +3898,9 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
         if (requests.empty()) return;
         const auto write_started = std::chrono::steady_clock::now();
         auto write_results = backend->BatchWrite(requests);
+        if (timing != nullptr) {
+            timing->io_us += elapsed_us_since(write_started);
+        }
         const double write_duration_seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                           write_started)
@@ -4011,6 +4014,7 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
             bool flushed_for_retry = false;
             bool request_exceeds_limit = false;
             bool stage_timed_out = false;
+            const auto alloc_started = std::chrono::steady_clock::now();
             auto staging_buffer =
                 unified_buffer_allocator_
                     ? unified_buffer_allocator_->allocate_aligned_wait(
@@ -4020,6 +4024,9 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
                                            : std::chrono::milliseconds::zero(),
                           &stage_timed_out, &request_exceeds_limit)
                     : std::nullopt;
+            if (timing != nullptr) {
+                timing->alloc_us += elapsed_us_since(alloc_started);
+            }
             if (!staging_buffer && !requests.empty() && retry_after_flush &&
                 !request_exceeds_limit) {
                 flush_requests();
@@ -4071,6 +4078,9 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
                 staging_offset += slice.size;
             }
             if (dfs_metric) dfs_metric->ObserveWriteStaging(elapsed_us_since(staging_start));
+            if (timing != nullptr) {
+                timing->staging_us += elapsed_us_since(staging_start);
+            }
             if (!staging_succeeded) break;
 
             requests.push_back(
@@ -4092,7 +4102,8 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
 }
 
 void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
-                             bool allow_async) {
+                             bool allow_async, DfsWriteTiming* timing) {
+    const auto total_started = std::chrono::steady_clock::now();
     auto backend = dfs_storage_backend_;
     uint64_t total_dfs_payload_bytes = 0;
     for (const auto& op : ops) {
@@ -4115,11 +4126,17 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
     const bool async_write =
         allow_async && backend &&
         backend->GetAllocatorType() == DfsAllocatorType::BUCKET;
+    if (timing != nullptr) {
+        timing->io_in_background = async_write;
+    }
     if (!async_write) {
         std::vector<size_t> all_indices(ops.size());
         std::iota(all_indices.begin(), all_indices.end(), 0);
         SubmitDfsWriteChunk(ops, all_indices, is_upsert, allow_async, deadline,
-                            nullptr);
+                            nullptr, nullptr, timing);
+        if (timing != nullptr) {
+            timing->total_us += elapsed_us_since(total_started);
+        }
         return;
     }
 
@@ -4192,7 +4209,7 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
         bool staging_exceeds_limit = false;
         SubmitDfsWriteChunk(ops, chunks[chunk_index], is_upsert, allow_async,
                             deadline, &staging_timed_out,
-                            &staging_exceeds_limit);
+                            &staging_exceeds_limit, timing);
         if (staging_exceeds_limit) {
             LOG(WARNING) << "DFS staging request exceeds the unified buffer "
                             "limit; refusing chunk "
@@ -4222,6 +4239,9 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
             }
             break;
         }
+    }
+    if (timing != nullptr) {
+        timing->total_us += elapsed_us_since(total_started);
     }
 }
 
@@ -4853,11 +4873,17 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     StartBatchPut(ops, client_cfg);
     StageWriteBuffersForRemoteReplicas(ops, stager);
 
+    const bool trace_write_timing = dfs_read_trace_enabled();
+    DfsWriteTiming dfs_timing;
+    DfsWriteTiming* dfs_timing_out = trace_write_timing ? &dfs_timing : nullptr;
+
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops,
                     group_by_target || client_cfg.prefer_alloc_in_same_node);
     WaitForTransfers(ops);
-    SubmitDfsWrites(ops);
+    const auto submit_transfer_us = elapsed_us_since(t0);
+    SubmitDfsWrites(ops, /*is_upsert=*/false, /*allow_async=*/true,
+                    dfs_timing_out);
     // Covers missing DFS allocations, staging/enqueue failures and skipped
     // DFS writes. Already computed checksums (including zero) are preserved.
     if (reuse_dfs_staging) ComputeBatchObjectChecksums(ops);
@@ -4866,6 +4892,31 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
                   .count();
     if (metrics_) {
         metrics_->transfer_metric.batch_put_latency_us.observe(us);
+    }
+    if (trace_write_timing) {
+        uint64_t payload_bytes = 0;
+        size_t dfs_ops = 0;
+        for (const auto& op : ops) {
+            if (op.transfer_summary.allocated_dfs_replicas > 0) {
+                ++dfs_ops;
+                for (const auto& slice : op.slices) {
+                    payload_bytes += slice.size;
+                }
+            }
+        }
+        LOG(INFO) << "BatchPut write timing: keys=" << ops.size()
+                  << ", dfs_keys=" << dfs_ops
+                  << ", payload_bytes=" << payload_bytes
+                  << ", mem_transfer_us=" << submit_transfer_us
+                  << " (submit+wait)"
+                  << ", dfs_prep_us=" << dfs_timing.prep_us
+                  << ", dfs_alloc_us=" << dfs_timing.alloc_us
+                  << ", dfs_staging_us=" << dfs_timing.staging_us
+                  << ", dfs_io_us=" << dfs_timing.io_us
+                  << (dfs_timing.io_in_background ? " (crc+enqueue)"
+                                                  : " (batch_write)")
+                  << ", dfs_total_us=" << dfs_timing.total_us
+                  << ", total_us=" << us;
     }
 
     RecordBatchServiceDualWriteMetrics(ops);
@@ -7270,7 +7321,9 @@ void Client::SubmitDfsWriteChunk(
     std::vector<PutOperation>& ops, const std::vector<size_t>& chunk_indices,
     bool is_upsert, bool allow_async,
     std::chrono::steady_clock::time_point deadline,
-    bool* staging_timed_out_out, bool* staging_exceeds_limit_out) {
+    bool* staging_timed_out_out, bool* staging_exceeds_limit_out,
+    DfsWriteTiming* timing) {
+    const auto prep_started = std::chrono::steady_clock::now();
     if (staging_timed_out_out) *staging_timed_out_out = false;
     if (staging_exceeds_limit_out) *staging_exceeds_limit_out = false;
     std::vector<std::string> keys;
@@ -7336,6 +7389,10 @@ void Client::SubmitDfsWriteChunk(
 
     if (keys.empty()) return;
 
+    if (timing != nullptr) {
+        timing->prep_us += elapsed_us_since(prep_started);
+    }
+
     auto backend = dfs_storage_backend_;
     if (!backend) {
         // No backend: fail every affected key here instead of queueing a task
@@ -7374,7 +7431,7 @@ void Client::SubmitDfsWriteChunk(
             return std::min(dfs_write_arena_wait_, left);
         }();
         auto results = WriteDfsReplicas(keys, slice_lists, descriptors, nullptr,
-                                        sync_staging_wait);
+                                        sync_staging_wait, timing);
         for (size_t i = 0; i < results.size(); ++i) {
             auto& op = ops[op_indices[i]];
             if (results[i] == ErrorCode::OK) {
@@ -7431,11 +7488,15 @@ void Client::SubmitDfsWriteChunk(
                             std::chrono::duration_cast<std::chrono::milliseconds>(
                                 deadline - std::chrono::steady_clock::now()));
         if (deadline_expired) staging_allocation_timed_out = true;
+        const auto alloc_started = std::chrono::steady_clock::now();
         context->staging_buffer =
             context->unified_buffer_allocator->allocate_aligned_wait(
                 payload_size, dfs_write_alignment_, DfsBufferUsageKind::kWrite,
                 staging_wait, &staging_allocation_timed_out,
                 &staging_request_exceeds_limit);
+        if (timing != nullptr) {
+            timing->alloc_us += elapsed_us_since(alloc_started);
+        }
         if (!context->staging_buffer) {
             LOG(ERROR) << "DFS_UNIFIED_BUFFER_ALLOCATION_FAILED kind=write "
                           "mode=asynchronous size="
@@ -7494,6 +7555,7 @@ void Client::SubmitDfsWriteChunk(
 
     // No End may run until the foreground CRC is ready, even if DFS I/O
     // finishes before the memory replicas are finalized.
+    const auto foreground_tail_started = std::chrono::steady_clock::now();
     bool checksums_ready = true;
     for (size_t i = 0; i < op_indices.size(); ++i) {
         auto& op = ops[op_indices[i]];
@@ -7592,6 +7654,9 @@ void Client::SubmitDfsWriteChunk(
         auto& op = ops[op_indices[i]];
         op.transfer_summary.RecordSuccess(ReplicaType::DFS);
         op.transfer_summary.dfs_completion_deferred = true;
+    }
+    if (timing != nullptr) {
+        timing->io_us += elapsed_us_since(foreground_tail_started);
     }
 }
 

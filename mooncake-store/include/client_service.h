@@ -4,6 +4,7 @@
 #include <array>
 #include <boost/functional/hash.hpp>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -39,6 +40,27 @@ class DfsBucketClientTest;
 
 class PutOperation;
 class DistributedStorageBackend;
+
+/**
+ * @brief Wall-clock breakdown of one batch DFS write, in microseconds.
+ *
+ * Stages are measured on the calling thread and accumulate across chunks.
+ * `prep_us` covers request validation and assembly, `alloc_us` waits for
+ * unified-buffer space, `staging_us` copies slices into that buffer and
+ * `io_us` is the backend write. For the asynchronous BUCKET path the real
+ * BatchWrite runs in the worker after the call returns, so `io_us` only covers
+ * the CRC pass and the thread-pool handoff and `io_in_background` is set.
+ * `total_us` is measured independently of the stages, so it may exceed their
+ * sum by the untimed bookkeeping between them.
+ */
+struct DfsWriteTiming {
+    uint64_t prep_us = 0;
+    uint64_t alloc_us = 0;
+    uint64_t staging_us = 0;
+    uint64_t io_us = 0;
+    uint64_t total_us = 0;
+    bool io_in_background = false;
+};
 
 std::optional<size_t> GetTransportRegistrationLimit(
     const std::string& protocol);
@@ -1269,14 +1291,16 @@ class Client {
      *        ReplicaType::ALL and would collide with a deferred completion.
      */
     void SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert = false,
-                         bool allow_async = true);
+                         bool allow_async = true,
+                         DfsWriteTiming* timing = nullptr);
     void SubmitDfsWriteChunk(std::vector<PutOperation>& ops,
                              const std::vector<size_t>& op_indices,
                              bool is_upsert, bool allow_async,
                              std::chrono::steady_clock::time_point deadline =
                                  std::chrono::steady_clock::time_point::max(),
                              bool* staging_timed_out = nullptr,
-                             bool* staging_exceeds_limit = nullptr);
+                             bool* staging_exceeds_limit = nullptr,
+                             DfsWriteTiming* timing = nullptr);
     void FinalizeBatchPut(std::vector<PutOperation>& ops,
                           bool allow_memory_only_fallback);
     void StartBatchUpsert(std::vector<PutOperation>& ops,
@@ -1295,7 +1319,8 @@ class Client {
         const std::vector<DistributedFSDescriptor>& descriptors,
         std::shared_ptr<DistributedStorageBackend> backend = nullptr,
         std::chrono::milliseconds staging_wait =
-            std::chrono::seconds(10));
+            std::chrono::seconds(10),
+        DfsWriteTiming* timing = nullptr);
 
     /**
      * @brief Everything one asynchronous DFS write batch needs, owned outright.
