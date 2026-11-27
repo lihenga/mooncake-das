@@ -1102,6 +1102,39 @@ void DistributedStorageBackend::ExecuteReadTasks(
 
     const size_t worker_count = std::min<size_t>(
         static_cast<size_t>(distributed_config_.batch_read_threads), tasks.size());
+
+    // The merge path sorts candidate tasks by file and offset before building
+    // contiguous runs. Claiming them in index order can therefore put the
+    // worker set on neighbouring runs, whose boundary lock units overlap in
+    // the filesystem and serialise otherwise independent reads. Claim tasks
+    // by index stride to separate neighbouring runs while retaining locality.
+    // A stride of one preserves the legacy claim order.
+    const size_t task_count = tasks.size();
+    const size_t stride =
+        distributed_config_.batch_read_merge_enabled
+            ? std::min<size_t>(
+                  static_cast<size_t>(distributed_config_.batch_read_stride),
+                  task_count)
+            : size_t{1};
+    const size_t short_lane_size = task_count / stride;
+    const size_t long_lane_count = task_count % stride;
+    const size_t long_lane_slots =
+        long_lane_count * (short_lane_size + 1);
+    auto claimed_task = [stride, short_lane_size, long_lane_count,
+                         long_lane_slots](size_t slot) {
+        if (stride == 1) return slot;
+        if (slot < long_lane_slots) {
+            const size_t lane = slot / (short_lane_size + 1);
+            const size_t rank = slot % (short_lane_size + 1);
+            return lane + rank * stride;
+        }
+        const size_t short_slot = slot - long_lane_slots;
+        const size_t lane =
+            long_lane_count + short_slot / short_lane_size;
+        const size_t rank = short_slot % short_lane_size;
+        return lane + rank * stride;
+    };
+
     std::atomic<size_t> next_task{0};
     std::mutex completion_mutex;
     std::condition_variable completion_cv;
@@ -1113,11 +1146,12 @@ void DistributedStorageBackend::ExecuteReadTasks(
     };
 
     auto worker_fn = [this, &tasks, &requests, &results, &mark_done,
-                      &next_task]() {
+                      &next_task, &claimed_task]() {
         while (true) {
-            const size_t task_index =
+            const size_t slot =
                 next_task.fetch_add(1, std::memory_order_relaxed);
-            if (task_index >= tasks.size()) break;
+            if (slot >= tasks.size()) break;
+            const size_t task_index = claimed_task(slot);
             try {
                 ExecuteReadTask(tasks[task_index], requests, results);
             } catch (const std::exception& e) {
