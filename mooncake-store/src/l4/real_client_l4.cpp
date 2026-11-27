@@ -880,9 +880,18 @@ std::vector<std::vector<int>> RealClient::batch_get_session_prefetch_batch(
                 }
             }
             if (!retry.empty()) {
-                const auto retried = PrefetchSessionKeys<false>(retry, nullptr);
+                const std::vector<size_t> retry_request_ids(retry.size(), 0);
+                std::vector<size_t> retry_oversized_entries;
+                const auto retried = PrefetchSessionKeys<true>(
+                    retry, &retry_request_ids, &retry_oversized_entries);
+                std::unordered_set<std::string> retry_oversized_keys;
+                for (size_t i : retry_oversized_entries) {
+                    retry_oversized_keys.insert(retry[i]);
+                }
                 for (size_t i = 0; i < retry.size(); ++i) {
-                    if (retried[i] != toInt(ErrorCode::NO_AVAILABLE_HANDLE)) {
+                    // A smaller later request may still fit this shared key.
+                    if (!retry_oversized_keys.contains(retry[i]) &&
+                        retried[i] != toInt(ErrorCode::NO_AVAILABLE_HANDLE)) {
                         resolved.emplace(retry[i], retried[i]);
                     }
                 }
