@@ -591,31 +591,32 @@ std::vector<int> RealClient::probe_dfs_health() {
             file_storage_ && file_storage_->IsDfsBackendReady() ? 1 : 0};
 }
 
-int RealClient::probe_dfs_read() {
+int RealClient::probe_dfs_read(uint64_t timeout_ms) {
     if (!file_storage_) return toInt(ErrorCode::NOT_SUPPORTED);
-    const auto result = file_storage_->ProbeDfsRead();
+    const auto result = file_storage_->ProbeDfsRead(timeout_ms);
     return result ? 0 : toInt(result.error());
 }
 
-int RealClient::probe_dfs_write() {
+int RealClient::probe_dfs_write(uint64_t timeout_ms) {
     if (!file_storage_) return toInt(ErrorCode::NOT_SUPPORTED);
-    const auto result = file_storage_->ProbeDfsWrite();
+    const auto result = file_storage_->ProbeDfsWrite(timeout_ms);
     return result ? 0 : toInt(result.error());
 }
 
-async_simple::coro::Lazy<int> RealClient::probe_dfs_read_rpc() {
+async_simple::coro::Lazy<int> RealClient::probe_dfs_read_rpc(uint64_t timeout_ms) {
     // DFS calls may block indefinitely in the kernel. Keep them off the
     // coro_rpc I/O thread so a stuck read cannot prevent a write RPC from
     // being accepted and dispatched.
-    auto result = co_await coro_io::post([this]() { return probe_dfs_read(); });
+    auto result = co_await coro_io::post(
+        [this, timeout_ms]() { return probe_dfs_read(timeout_ms); });
     co_return result.value();
 }
 
-async_simple::coro::Lazy<int> RealClient::probe_dfs_write_rpc() {
+async_simple::coro::Lazy<int> RealClient::probe_dfs_write_rpc(uint64_t timeout_ms) {
     // Use a separate worker task from read. The backend itself has no shared
     // probe lock, and failed initialization uses a non-blocking try-lock.
-    auto result =
-        co_await coro_io::post([this]() { return probe_dfs_write(); });
+    auto result = co_await coro_io::post(
+        [this, timeout_ms]() { return probe_dfs_write(timeout_ms); });
     co_return result.value();
 }
 

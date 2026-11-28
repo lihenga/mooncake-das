@@ -715,10 +715,10 @@ class PyClient {
 
     // DFS health/policy control. The probe result is
     // [read_error_code, write_error_code, backend_ready].
-    virtual int probe_dfs_read() {
+    virtual int probe_dfs_read(uint64_t /*timeout_ms*/ = 25000) {
         return toInt(ErrorCode::NOT_SUPPORTED);
     }
-    virtual int probe_dfs_write() {
+    virtual int probe_dfs_write(uint64_t /*timeout_ms*/ = 25000) {
         return toInt(ErrorCode::NOT_SUPPORTED);
     }
     virtual std::vector<int> probe_dfs_health() {

@@ -11,7 +11,8 @@ namespace mooncake {
 class PosixFsAdapter : public FileSystemAdapter {
    public:
     tl::expected<size_t, ErrorCode> WriteFile(
-        const std::string& path, std::span<const char> data) override;
+        const std::string& path, std::span<const char> data,
+        FileWriteTimings* timings = nullptr) override;
     tl::expected<size_t, ErrorCode> OverwriteFile(
         const std::string& path, std::span<const char> data) override;
 

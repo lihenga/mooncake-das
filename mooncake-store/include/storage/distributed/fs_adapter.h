@@ -24,6 +24,16 @@ struct FileInfo {
     size_t size;
 };
 
+// Optional path-write phase timings. -1 means the phase was not executed.
+// create_ms measures open/create; write_ms measures the data-write loop.
+// write_total_ms also includes post-create registration/resources and close,
+// excluding the backend's separate fsync and delete calls.
+struct FileWriteTimings {
+    double create_ms = -1;
+    double write_ms = -1;
+    double write_total_ms = -1;
+};
+
 /**
  * @brief Which adapter code path served one positional I/O call.
  *
@@ -107,7 +117,8 @@ class FileSystemAdapter {
     // Adapters that only implement fd-based I/O may leave these unsupported.
 
     virtual tl::expected<size_t, ErrorCode> WriteFile(
-        const std::string& /*path*/, std::span<const char> /*data*/) {
+        const std::string& /*path*/, std::span<const char> /*data*/,
+        FileWriteTimings* /*timings*/ = nullptr) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
 

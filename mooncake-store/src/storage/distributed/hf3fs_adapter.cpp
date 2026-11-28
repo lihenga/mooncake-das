@@ -43,64 +43,86 @@ tl::expected<void, ErrorCode> Hf3fsAdapter::Shutdown() {
 }
 
 tl::expected<size_t, ErrorCode> Hf3fsAdapter::WriteFile(
-    const std::string& path, std::span<const char> data) {
+    const std::string& path, std::span<const char> data,
+    FileWriteTimings* timings) {
+    const auto create_started = timings ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point{};
+    if (timings) *timings = {};
     int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-
-    if (hf3fs_reg_fd(fd, 0) > 0) {
-        close(fd);
-        ::unlink(path.c_str());
-        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    if (timings) {
+        timings->create_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - create_started).count();
     }
+    if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    const auto write_started = timings ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
+    auto result = [&]() -> tl::expected<size_t, ErrorCode> {
+        if (hf3fs_reg_fd(fd, 0) > 0) {
+            close(fd);
+            ::unlink(path.c_str());
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
 
-    auto* resource = resource_manager_->getThreadResource();
-    if (!resource || !resource->initialized) {
+        auto* resource = resource_manager_->getThreadResource();
+        if (!resource || !resource->initialized) {
+            hf3fs_dereg_fd(fd);
+            close(fd);
+            ::unlink(path.c_str());
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+
+        auto& threefs_iov = resource->iov_;
+        auto& ior_write = resource->ior_write_;
+        const char* data_ptr = data.data();
+        size_t length = data.size();
+        size_t total_written = 0;
+        off_t offset = 0;
+
+        const auto data_write_started = timings ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
+        while (total_written < length) {
+            size_t chunk =
+                std::min(length - total_written, resource->config_.iov_size);
+            memcpy(threefs_iov.base, data_ptr + total_written, chunk);
+
+            int ret = hf3fs_prep_io(&ior_write, &threefs_iov, false,
+                                    threefs_iov.base, fd, offset, chunk, nullptr);
+            if (ret < 0) break;
+
+            ret = hf3fs_submit_ios(&ior_write);
+            if (ret < 0) break;
+
+            struct hf3fs_cqe cqe;
+            ret = hf3fs_wait_for_ios(&ior_write, &cqe, 1, 1, nullptr);
+            if (ret < 0 || cqe.result < 0) break;
+
+            size_t bytes_written = cqe.result;
+            total_written += bytes_written;
+            offset += bytes_written;
+            if (bytes_written < chunk) break;
+        }
+
+        if (timings) {
+            timings->write_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - data_write_started).count();
+        }
         hf3fs_dereg_fd(fd);
         close(fd);
-        ::unlink(path.c_str());
-        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-    }
 
-    auto& threefs_iov = resource->iov_;
-    auto& ior_write = resource->ior_write_;
-    const char* data_ptr = data.data();
-    size_t length = data.size();
-    size_t total_written = 0;
-    off_t offset = 0;
-
-    while (total_written < length) {
-        size_t chunk =
-            std::min(length - total_written, resource->config_.iov_size);
-        memcpy(threefs_iov.base, data_ptr + total_written, chunk);
-
-        int ret = hf3fs_prep_io(&ior_write, &threefs_iov, false,
-                                threefs_iov.base, fd, offset, chunk, nullptr);
-        if (ret < 0) break;
-
-        ret = hf3fs_submit_ios(&ior_write);
-        if (ret < 0) break;
-
-        struct hf3fs_cqe cqe;
-        ret = hf3fs_wait_for_ios(&ior_write, &cqe, 1, 1, nullptr);
-        if (ret < 0 || cqe.result < 0) break;
-
-        size_t bytes_written = cqe.result;
-        total_written += bytes_written;
-        offset += bytes_written;
-        if (bytes_written < chunk) break;
-    }
-
-    hf3fs_dereg_fd(fd);
-    close(fd);
-
-    if (total_written != length) {
-        auto unlink_ret = ::unlink(path.c_str());
-        if (unlink_ret != 0) {
-            LOG(WARNING) << "Failed to clean up partial write: " << path;
+        if (total_written != length) {
+            auto unlink_ret = ::unlink(path.c_str());
+            if (unlink_ret != 0) {
+                LOG(WARNING) << "Failed to clean up partial write: " << path;
+            }
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        return total_written;
+    }();
+    if (timings) {
+        timings->write_total_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - write_started).count();
     }
-    return total_written;
+    return result;
 }
 
 tl::expected<size_t, ErrorCode> Hf3fsAdapter::OverwriteFile(

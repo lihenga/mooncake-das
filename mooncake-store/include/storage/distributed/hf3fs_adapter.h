@@ -17,7 +17,8 @@ class Hf3fsAdapter : public FileSystemAdapter {
                                // unique_ptr deleter)
 
     tl::expected<size_t, ErrorCode> WriteFile(
-        const std::string& path, std::span<const char> data) override;
+        const std::string& path, std::span<const char> data,
+        FileWriteTimings* timings = nullptr) override;
     tl::expected<size_t, ErrorCode> OverwriteFile(
         const std::string& path, std::span<const char> data) override;
 

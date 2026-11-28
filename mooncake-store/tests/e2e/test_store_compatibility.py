@@ -29,6 +29,7 @@ class StoreCapabilitiesTest(unittest.TestCase):
             dict.fromkeys(
                 (
                     "dfs_health",
+                    "dfs_health_timeout_ms",
                     "dfs_prefetch",
                     "read_plan",
                     "read_layout",

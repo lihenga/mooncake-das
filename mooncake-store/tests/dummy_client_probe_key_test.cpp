@@ -13,12 +13,15 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <span>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "dummy_client.h"
@@ -42,12 +45,30 @@ static void RegisterRpcHandlers(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::unregister_shm_buffer_internal>(&rc);
     server.register_handler<&RealClient::probeKey_internal>(&rc);
     server.register_handler<&RealClient::batchProbeKey_internal>(&rc);
+    server.register_handler<&RealClient::probe_dfs_read_rpc>(&rc);
+    server.register_handler<&RealClient::probe_dfs_write_rpc>(&rc);
 }
 
 static constexpr size_t kMB = 1024ULL * 1024;
 static constexpr size_t kSegmentSize = 128 * kMB;
 static constexpr size_t kLocalBufSize = 64 * kMB;
 static constexpr size_t kPoolSize = 64 * kMB;
+
+// Exercise the production coroutine RPC wrappers while observing the budgets
+// delivered to the native probe entry points on their worker threads.
+class BudgetRecordingRealClient : public RealClient {
+   public:
+    int probe_dfs_read(uint64_t timeout_ms) override {
+        read_budget.store(timeout_ms);
+        return 17;
+    }
+    int probe_dfs_write(uint64_t timeout_ms) override {
+        write_budget.store(timeout_ms);
+        return 23;
+    }
+    std::atomic<uint64_t> read_budget{0};
+    std::atomic<uint64_t> write_budget{0};
+};
 
 class DummyClientProbeKeyTest : public ::testing::Test {
    protected:
@@ -74,10 +95,10 @@ class DummyClientProbeKeyTest : public ::testing::Test {
     }
 
     // Bring up master + RealClient + RPC server + DummyClient.
-    bool SetupStack() {
+    bool SetupStack(std::shared_ptr<RealClient> real_client = nullptr) {
         if (!master_.Start(InProcMasterConfigBuilder().build())) return false;
 
-        real_client_ = RealClient::create();
+        real_client_ = real_client ? std::move(real_client) : RealClient::create();
         const std::string rdma_devices =
             (FLAGS_protocol == "rdma") ? FLAGS_device_name : "";
         ipc_path_ = "@probe_key_test_" + std::to_string(getpid()) + ".sock";
@@ -131,6 +152,38 @@ TEST_F(DummyClientProbeKeyTest, ProbeKeyOverRpcReportsExistence) {
 
     EXPECT_EQ(dummy_client_->probeKey("probe_rpc_missing_key"), 0)
         << "probeKey should report a missing key as 0, not an error";
+}
+
+TEST_F(DummyClientProbeKeyTest, DfsProbeRpcPreservesNativeErrors) {
+    ASSERT_TRUE(SetupStack());
+    // This stack has no DFS backend. A successful RPC must preserve the exact
+    // native NOT_SUPPORTED result, including for zero and full-width budgets.
+    const int expected = toInt(ErrorCode::NOT_SUPPORTED);
+    EXPECT_EQ(dummy_client_->probe_dfs_read(), expected);
+    EXPECT_EQ(dummy_client_->probe_dfs_write(), expected);
+    for (uint64_t budget : {uint64_t{0}, uint64_t{37},
+                            std::numeric_limits<uint64_t>::max()}) {
+        EXPECT_EQ(dummy_client_->probe_dfs_read(budget), expected);
+        EXPECT_EQ(dummy_client_->probe_dfs_write(budget), expected);
+        EXPECT_EQ(real_client_->probe_dfs_read(budget), expected);
+        EXPECT_EQ(real_client_->probe_dfs_write(budget), expected);
+    }
+}
+
+TEST_F(DummyClientProbeKeyTest, DfsProbeBudgetSurvivesRpcBoundary) {
+    auto recorder = std::make_shared<BudgetRecordingRealClient>();
+    ASSERT_TRUE(SetupStack(recorder));
+    EXPECT_EQ(dummy_client_->probe_dfs_read(), 17);
+    EXPECT_EQ(recorder->read_budget.load(), 25000u);
+    EXPECT_EQ(dummy_client_->probe_dfs_write(), 23);
+    EXPECT_EQ(recorder->write_budget.load(), 25000u);
+    for (uint64_t budget : {uint64_t{37}, uint64_t{0},
+                            std::numeric_limits<uint64_t>::max()}) {
+        EXPECT_EQ(dummy_client_->probe_dfs_read(budget), 17);
+        EXPECT_EQ(recorder->read_budget.load(), budget);
+        EXPECT_EQ(dummy_client_->probe_dfs_write(budget), 23);
+        EXPECT_EQ(recorder->write_budget.load(), budget);
+    }
 }
 
 TEST_F(DummyClientProbeKeyTest, BatchProbeKeyOverRpcReportsExistence) {

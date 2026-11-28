@@ -174,9 +174,6 @@ DistributedStorageBackend::~DistributedStorageBackend() {
             shard->write_fd.store(-1);
         }
     }
-    if (fs_adapter_ && !active_health_probe_path_.empty()) {
-        (void)fs_adapter_->DeleteFile(active_health_probe_path_);
-    }
     // Drop cached bucket handles before the adapter goes away; each handle
     // closes its own fd in its destructor via the adapter pointer it holds.
     {
