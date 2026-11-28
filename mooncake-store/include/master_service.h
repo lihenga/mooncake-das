@@ -1685,7 +1685,8 @@ class MasterService {
     void RestoreRecoveredDfsReplicas(bool rebuild_metadata);
     bool PrepareDfsRootForInitialization(
         const DistributedStorageConfig& dfs_config);
-    bool ValidateDfsRootFilesystem(const std::string& root) const;
+    bool ValidateDfsRootFilesystem(const std::string& root,
+                                   int root_fd = -1) const;
     bool PublishDfsRootIdentity(const std::string& root,
                                 const std::string& identity);
     DfsInitResult InitDfsAllocatorFromEnvironment(
@@ -2282,6 +2283,8 @@ class MasterService {
     // Test-only synchronization point after slow recovery preparation and
     // before the short snapshot commit barrier.
     std::function<void()> dfs_root_recovery_before_commit_hook_;
+    // Test-only boundary after identity root validation, before file creation.
+    std::function<void()> dfs_root_identity_before_publish_hook_;
     // Test-only synchronization point after a batch reservation and before
     // any per-key metadata insertion.
     std::function<void()> dfs_batch_reservation_hook_;

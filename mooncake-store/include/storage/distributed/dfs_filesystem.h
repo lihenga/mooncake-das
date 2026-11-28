@@ -1,7 +1,8 @@
 #pragma once
 
+#include <fcntl.h>
 #include <sys/stat.h>
-#include <sys/sysmacros.h>
+#include <unistd.h>
 
 #include <fstream>
 #include <sstream>
@@ -9,22 +10,27 @@
 
 namespace mooncake {
 
-// Bind mounts of the same filesystem share its device and filesystem type.
-inline std::string ReadDfsFilesystemType(const std::string& root) {
+inline std::string ReadDfsFilesystemType(int root_fd) {
     struct stat st{};
-    if (::stat(root.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) return {};
-    const std::string device = std::to_string(major(st.st_dev)) + ":" +
-                               std::to_string(minor(st.st_dev));
-    std::ifstream mountinfo("/proc/self/mountinfo");
+    if (::fstat(root_fd, &st) != 0 || !S_ISDIR(st.st_mode)) return {};
+    // Identify the opened mount, not whatever the pathname resolves to now.
+    std::ifstream fdinfo("/proc/self/fdinfo/" + std::to_string(root_fd));
     std::string line;
+    std::string mount_id;
+    while (std::getline(fdinfo, line)) {
+        std::istringstream row(line);
+        std::string field;
+        if (row >> field && field == "mnt_id:") {
+            row >> mount_id;
+            break;
+        }
+    }
+    if (mount_id.empty()) return {};
+    std::ifstream mountinfo("/proc/self/mountinfo");
     while (std::getline(mountinfo, line)) {
         std::istringstream row(line);
         std::string field;
-        std::string mounted_device;
-        if (!(row >> field >> field >> mounted_device) ||
-            mounted_device != device) {
-            continue;
-        }
+        if (!(row >> field) || field != mount_id) continue;
         while (row >> field) {
             if (field == "-") {
                 return row >> field ? field : std::string{};
@@ -32,6 +38,14 @@ inline std::string ReadDfsFilesystemType(const std::string& root) {
         }
     }
     return {};
+}
+
+inline std::string ReadDfsFilesystemType(const std::string& root) {
+    const int fd = ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return {};
+    const auto type = ReadDfsFilesystemType(fd);
+    ::close(fd);
+    return type;
 }
 
 }  // namespace mooncake

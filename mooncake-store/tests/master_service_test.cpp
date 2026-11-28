@@ -1,4 +1,5 @@
 #include <cerrno>
+#include <fcntl.h>
 #include <iterator>
 #include "utils.h"
 #include "storage/distributed/distributed_storage_backend.h"
@@ -5595,6 +5596,107 @@ TEST_F(MasterServiceTest, DfsIdentityPublicationChecksFilesystemAndContents) {
                   config->dfs_root_identity);
         EXPECT_FALSE(MasterServiceTestPeer::PublishDfsRootIdentity(
             service, candidate, "conflicting-identity"));
+    }
+    std::filesystem::remove_all(root);
+    std::filesystem::remove_all(candidate);
+}
+
+TEST_F(MasterServiceTest, DfsIdentityPublicationStaysOnOpenedDirectory) {
+    for (const bool initialization : {false, true}) {
+        SCOPED_TRACE(initialization);
+        const auto root = MakeDfsTestRoot("identity_dirfd_service");
+        const auto candidate = MakeDfsTestRoot("identity_dirfd_candidate");
+        const auto saved = candidate + "_saved";
+        ScopedBucketDfsEnv env(root, "1048576", "16");
+        {
+            MasterService service;
+            const auto storage = service.GetStorageConfig();
+            ASSERT_TRUE(storage);
+            ASSERT_FALSE(storage->dfs_root_identity.empty());
+            bool switched = false;
+            MasterServiceTestPeer::SetDfsIdentityBeforePublishHook(
+                service, [&] {
+                    std::filesystem::rename(candidate, saved);
+                    std::filesystem::create_directory(candidate);
+                    switched = true;
+                });
+            if (initialization) {
+                auto config = DistributedStorageConfig::FromEnvironment();
+                config.fsdir = candidate;
+                EXPECT_FALSE(
+                    MasterServiceTestPeer::PrepareDfsRootForInitialization(
+                        service, config));
+            } else {
+                EXPECT_FALSE(MasterServiceTestPeer::PublishDfsRootIdentity(
+                    service, candidate, storage->dfs_root_identity));
+            }
+            MasterServiceTestPeer::SetDfsIdentityBeforePublishHook(service, {});
+            ASSERT_TRUE(switched);
+            EXPECT_TRUE(std::filesystem::is_empty(candidate));
+            std::ifstream identity(saved + "/" + kDfsRootIdentityFileName);
+            EXPECT_EQ(std::string(std::istreambuf_iterator<char>(identity), {}),
+                      storage->dfs_root_identity);
+            // Temporary files must also be removed from the opened directory.
+            EXPECT_EQ(std::distance(std::filesystem::directory_iterator(saved),
+                                    std::filesystem::directory_iterator()),
+                      1);
+        }
+        std::filesystem::remove_all(root);
+        std::filesystem::remove_all(candidate);
+        std::filesystem::remove_all(saved);
+    }
+}
+
+TEST_F(MasterServiceTest, DfsFilesystemTypeUsesOpenedMountAfterSymlinkChange) {
+    const auto root = MakeDfsTestRoot("identity_fd_mount");
+    const auto other =
+        "/dev/shm/mooncake_identity_fd_" + UuidToString(generate_uuid());
+    ASSERT_TRUE(std::filesystem::create_directory(other));
+    const auto link = root + "/root_link";
+    std::filesystem::create_directory_symlink(root, link);
+    const int fd = ::open(link.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    ASSERT_GE(fd, 0);
+    const auto original_type = ReadDfsFilesystemType(fd);
+    const auto other_type = ReadDfsFilesystemType(other);
+    EXPECT_FALSE(original_type.empty());
+    EXPECT_FALSE(other_type.empty());
+    std::filesystem::remove(link);
+    std::filesystem::create_directory_symlink(other, link);
+    EXPECT_EQ(ReadDfsFilesystemType(fd), original_type);
+    EXPECT_EQ(ReadDfsFilesystemType(link), other_type);
+    EXPECT_TRUE(ReadDfsFilesystemType(-1).empty());
+    EXPECT_EQ(::close(fd), 0);
+    std::filesystem::remove_all(root);
+    std::filesystem::remove_all(other);
+}
+
+TEST_F(MasterServiceTest,
+       DfsIdentityConcurrentPublicationDoesNotOverwriteWinner) {
+    const auto root = MakeDfsTestRoot("identity_concurrent_service");
+    const auto candidate = MakeDfsTestRoot("identity_concurrent_candidate");
+    ScopedBucketDfsEnv env(root, "1048576", "16");
+    {
+        MasterService service;
+        std::barrier ready(2);
+        MasterServiceTestPeer::SetDfsIdentityBeforePublishHook(
+            service, [&] { ready.arrive_and_wait(); });
+        bool first = false;
+        bool second = false;
+        std::thread writer([&] {
+            first = MasterServiceTestPeer::PublishDfsRootIdentity(
+                service, candidate, "first-identity");
+        });
+        second = MasterServiceTestPeer::PublishDfsRootIdentity(
+            service, candidate, "second-identity");
+        writer.join();
+        MasterServiceTestPeer::SetDfsIdentityBeforePublishHook(service, {});
+        EXPECT_NE(first, second);
+        std::ifstream identity(candidate + "/" + kDfsRootIdentityFileName);
+        EXPECT_EQ(std::string(std::istreambuf_iterator<char>(identity), {}),
+                  first ? "first-identity" : "second-identity");
+        EXPECT_EQ(std::distance(std::filesystem::directory_iterator(candidate),
+                                std::filesystem::directory_iterator()),
+                  1);
     }
     std::filesystem::remove_all(root);
     std::filesystem::remove_all(candidate);

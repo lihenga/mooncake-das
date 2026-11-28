@@ -24,6 +24,21 @@ namespace mooncake {
 
 namespace {
 
+class DfsIdentityRootFd {
+   public:
+    explicit DfsIdentityRootFd(const std::string& root)
+        : fd_(::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)) {}
+    ~DfsIdentityRootFd() {
+        if (fd_ >= 0) ::close(fd_);
+    }
+    DfsIdentityRootFd(const DfsIdentityRootFd&) = delete;
+    DfsIdentityRootFd& operator=(const DfsIdentityRootFd&) = delete;
+    int get() const { return fd_; }
+
+   private:
+    int fd_;
+};
+
 enum class DfsRootFileStatus {
     kMatch,
     kMissing,
@@ -32,8 +47,10 @@ enum class DfsRootFileStatus {
 };
 
 DfsRootFileStatus ReadExpectedDfsRootFile(const std::string& path,
-                                          std::string_view expected) {
-    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+                                          std::string_view expected,
+                                          int root_fd = AT_FDCWD) {
+    const int fd =
+        ::openat(root_fd, path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) {
         return errno == ENOENT ? DfsRootFileStatus::kMissing
                               : DfsRootFileStatus::kIoError;
@@ -66,10 +83,11 @@ DfsRootFileStatus ReadExpectedDfsRootFile(const std::string& path,
 }
 
 bool ReadDfsRootIdentity(const std::string& marker_path,
-                         const std::string& cluster_id,
-                         std::string& identity, bool& missing) {
+                         const std::string& cluster_id, std::string& identity,
+                         bool& missing, int root_fd) {
     missing = false;
-    const int fd = ::open(marker_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    const int fd = ::openat(root_fd, marker_path.c_str(),
+                            O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) {
         missing = errno == ENOENT;
         return false;
@@ -102,7 +120,10 @@ bool ReadDfsRootIdentity(const std::string& marker_path,
     return true;
 }
 
-bool SyncDfsRootDirectory(const std::string& root) {
+bool SyncDfsRootDirectory(const std::string& root, int root_fd = AT_FDCWD) {
+    if (root_fd != AT_FDCWD) {
+        return ::fsync(root_fd) == 0 || errno == EINVAL || errno == EOPNOTSUPP;
+    }
     const int fd = ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd < 0) {
         return errno == EINVAL || errno == EOPNOTSUPP;
@@ -144,15 +165,15 @@ bool WriteAll(int fd, const std::string& contents) {
 
 bool PublishExpectedDfsRootFile(const std::string& root,
                                 const std::string& path,
-                                const std::string& contents) {
+                                const std::string& contents,
+                                int root_fd = AT_FDCWD) {
     const UUID suffix = generate_uuid();
     const std::string temp_path =
         path + "." + std::to_string(::getpid()) + "." +
         UuidToString(suffix) + ".tmp";
-    const int temp_fd = ::open(temp_path.c_str(),
-                               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC |
-                                   O_NOFOLLOW,
-                               0644);
+    const int temp_fd =
+        ::openat(root_fd, temp_path.c_str(),
+                 O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0644);
     if (temp_fd < 0) {
         static DfsLogLimiter log_limiter;
         if (auto suppressed = log_limiter.ShouldLog()) {
@@ -167,7 +188,7 @@ bool PublishExpectedDfsRootFile(const std::string& root,
     const int close_result = ::close(temp_fd);
     if (!temp_written || close_result != 0) {
         const int saved_errno = errno;
-        ::unlink(temp_path.c_str());
+        ::unlinkat(root_fd, temp_path.c_str(), 0);
         static DfsLogLimiter log_limiter;
         if (auto suppressed = log_limiter.ShouldLog()) {
             LOG(ERROR) << "Failed to write DFS root temp file " << temp_path
@@ -177,10 +198,11 @@ bool PublishExpectedDfsRootFile(const std::string& root,
         return false;
     }
 
-    const int link_result = ::link(temp_path.c_str(), path.c_str());
+    const int link_result =
+        ::linkat(root_fd, temp_path.c_str(), root_fd, path.c_str(), 0);
     const int link_errno = errno;
     if (link_result != 0 && link_errno != EEXIST) {
-        ::unlink(temp_path.c_str());
+        ::unlinkat(root_fd, temp_path.c_str(), 0);
         static DfsLogLimiter log_limiter;
         if (auto suppressed = log_limiter.ShouldLog()) {
             LOG(ERROR) << "Failed to publish DFS root file " << path << ": "
@@ -189,15 +211,15 @@ bool PublishExpectedDfsRootFile(const std::string& root,
         }
         return false;
     }
-    ::unlink(temp_path.c_str());
+    ::unlinkat(root_fd, temp_path.c_str(), 0);
 
     // EEXIST means another writer won the race, not that it published the
     // expected bytes. Re-read in both cases before declaring success.
-    if (ReadExpectedDfsRootFile(path, contents) !=
+    if (ReadExpectedDfsRootFile(path, contents, root_fd) !=
         DfsRootFileStatus::kMatch) {
         return false;
     }
-    if (!SyncDfsRootDirectory(root)) {
+    if (!SyncDfsRootDirectory(root, root_fd)) {
         static DfsLogLimiter log_limiter;
         if (auto suppressed = log_limiter.ShouldLog()) {
             LOG(ERROR) << "Failed to sync DFS root after publishing " << path
@@ -209,27 +231,17 @@ bool PublishExpectedDfsRootFile(const std::string& root,
 }
 
 bool EnsureDfsRootIdentity(const std::string& root,
-                           const std::string& cluster_id,
-                           std::string& identity) {
-    std::error_code ec;
-    if (!std::filesystem::is_directory(root, ec) || ec) {
-        static DfsLogLimiter log_limiter;
-        if (auto suppressed = log_limiter.ShouldLog()) {
-            LOG(ERROR) << "DFS root must already exist as a directory; "
-                          "refusing to create it: "
-                       << root << ", suppressed=" << *suppressed;
-        }
-        return false;
-    }
+                           const std::string& cluster_id, std::string& identity,
+                           int root_fd) {
     if (!IsValidClusterIdComponent(cluster_id)) {
         LOG(ERROR) << "Invalid cluster id for DFS root identity: " << cluster_id;
         return false;
     }
 
-    const std::string marker_path =
-        root + "/" + kDfsRootIdentityFileName;
+    const std::string marker_path = kDfsRootIdentityFileName;
     bool missing = false;
-    if (ReadDfsRootIdentity(marker_path, cluster_id, identity, missing)) {
+    if (ReadDfsRootIdentity(marker_path, cluster_id, identity, missing,
+                            root_fd)) {
         return true;
     }
     if (!missing) {
@@ -261,14 +273,15 @@ bool EnsureDfsRootIdentity(const std::string& root,
         if (candidate.empty()) return false;
     }
 
-    if (!PublishExpectedDfsRootFile(root, marker_path, candidate)) {
+    if (!PublishExpectedDfsRootFile(root, marker_path, candidate, root_fd)) {
         // Concurrent first-time initializers legitimately generate different
         // candidates. The atomic link chooses one; initializers that lose the
         // race adopt the complete, valid winner. Recovery from a cached
         // identity must remain exact and may never adopt a different value.
         if (!restoring_cached_identity &&
-            ReadDfsRootIdentity(marker_path, cluster_id, identity, missing)) {
-            return true;
+            ReadDfsRootIdentity(marker_path, cluster_id, identity, missing,
+                                root_fd)) {
+            return SyncDfsRootDirectory(root, root_fd);
         }
         static DfsLogLimiter log_limiter;
         if (auto suppressed = log_limiter.ShouldLog()) {
@@ -330,12 +343,14 @@ bool ProbeDfsRootWritable(const std::string& root, std::string& error) {
 
 }  // namespace
 
-bool MasterService::ValidateDfsRootFilesystem(const std::string& root) const {
+bool MasterService::ValidateDfsRootFilesystem(const std::string& root,
+                                              int root_fd) const {
     if (DistributedStorageConfig::FromEnvironment().allocator_type !=
         DfsAllocatorType::BUCKET) {
         return true;
     }
-    const auto actual = ReadDfsFilesystemType(root);
+    const auto actual = root_fd >= 0 ? ReadDfsFilesystemType(root_fd)
+                                     : ReadDfsFilesystemType(root);
     const char* configured = std::getenv("MOONCAKE_DFS_ALLOWED_FS_TYPES");
     const std::string allowed = configured ? configured : "storage,kingstorage";
     std::istringstream types(allowed);
@@ -358,9 +373,16 @@ bool MasterService::ValidateDfsRootFilesystem(const std::string& root) const {
 bool MasterService::PublishDfsRootIdentity(const std::string& root,
                                            const std::string& identity) {
     const std::string path = root + "/" + kDfsRootIdentityFileName;
-    // Best-effort checks around the pathname write, without pinning a mount.
-    return ValidateDfsRootFilesystem(root) &&
-           PublishExpectedDfsRootFile(root, path, identity) &&
+    const DfsIdentityRootFd root_fd(root);
+    if (root_fd.get() < 0 || !ValidateDfsRootFilesystem(root, root_fd.get())) {
+        return false;
+    }
+    if (dfs_root_identity_before_publish_hook_) {
+        dfs_root_identity_before_publish_hook_();
+    }
+    // Pin only this identity operation; allocator I/O keeps its existing paths.
+    return PublishExpectedDfsRootFile(root, kDfsRootIdentityFileName, identity,
+                                      root_fd.get()) &&
            ValidateDfsRootFilesystem(root) &&
            ReadExpectedDfsRootFile(path, identity) == DfsRootFileStatus::kMatch;
 }
@@ -1106,16 +1128,25 @@ auto MasterService::GetDfsBucketSnapshot(
 
 bool MasterService::PrepareDfsRootForInitialization(
     const DistributedStorageConfig& dfs_config) {
-    if (!ValidateDfsRootFilesystem(dfs_config.fsdir) ||
-        !EnsureDfsRootIdentity(dfs_config.fsdir, cluster_id_,
-                               dfs_root_identity_) ||
-        !ValidateDfsRootFilesystem(dfs_config.fsdir) ||
-        ReadExpectedDfsRootFile(
-            dfs_config.fsdir + "/" + kDfsRootIdentityFileName,
-            dfs_root_identity_) != DfsRootFileStatus::kMatch) {
-        enable_dfs_ = false;
-        dfs_retry_needed_.store(true, std::memory_order_release);
-        return false;
+    {
+        const DfsIdentityRootFd root_fd(dfs_config.fsdir);
+        const bool root_allowed =
+            root_fd.get() >= 0 &&
+            ValidateDfsRootFilesystem(dfs_config.fsdir, root_fd.get());
+        if (root_allowed && dfs_root_identity_before_publish_hook_) {
+            dfs_root_identity_before_publish_hook_();
+        }
+        if (!root_allowed ||
+            !EnsureDfsRootIdentity(dfs_config.fsdir, cluster_id_,
+                                   dfs_root_identity_, root_fd.get()) ||
+            !ValidateDfsRootFilesystem(dfs_config.fsdir) ||
+            ReadExpectedDfsRootFile(
+                dfs_config.fsdir + "/" + kDfsRootIdentityFileName,
+                dfs_root_identity_) != DfsRootFileStatus::kMatch) {
+            enable_dfs_ = false;
+            dfs_retry_needed_.store(true, std::memory_order_release);
+            return false;
+        }
     }
 
     std::string probe_error;

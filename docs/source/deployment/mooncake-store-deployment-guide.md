@@ -993,16 +993,20 @@ regular shared filesystem.
 For bucket storage, `MOONCAKE_DFS_ALLOWED_FS_TYPES` selects the exact Linux
 filesystem types permitted for root identity publication. It defaults to
 `storage,kingstorage`; a comma-separated override replaces that list. The Master
-checks the configured path's filesystem before and after writing the identity
-and reads the identity back before proceeding. An allowed filesystem can recover
-after its device number changes, using the existing root recovery checks.
+opens the root directory and checks that descriptor's filesystem before creating
+an identity file. Temporary-file creation, publication without replacement,
+cleanup, and directory sync use the same directory descriptor. The configured
+path's filesystem and identity are checked again before proceeding. An allowed
+filesystem can recover after its device number changes, using the existing root
+recovery checks.
 
 A ready Master publishes its identity and bucket epoch through the existing
 heartbeat. Surviving clients adopt the new identity, validate their local shared
 directory, and invalidate old bucket handles through the existing epoch guard.
-Filesystem access continues to use absolute paths. Identity publication checks
-are best effort around the write; they do not make live mount changes atomic
-or check background bucket creation. Existing retry intervals still apply.
+The directory descriptor is held only during the identity operation; other
+filesystem access continues to use absolute paths. This does not make live
+mount changes atomic or check background bucket creation. Existing retry
+intervals still apply.
 
 #### Restarting without recovering old DFS bucket replicas
 
