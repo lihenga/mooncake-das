@@ -5642,6 +5642,8 @@ void Client::SetDfsStorageBackend(
                 });
         }
     }
+    std::atomic_store_explicit(&heartbeat_dfs_backend_, backend,
+                               std::memory_order_release);
     dfs_storage_backend_ = std::move(backend);
     EnsureStorageControlPlaneStarted();
 }
@@ -6898,6 +6900,15 @@ void Client::StorageHeartbeatThreadMain() {
             ping_fail_count = 0;
             last_ping_success_.store(true);
             auto& ping_response = ping_result.value();
+            if (ping_response.dfs_root_binding.has_value()) {
+                if (auto backend = std::atomic_load_explicit(
+                        &heartbeat_dfs_backend_, std::memory_order_acquire)) {
+                    if (!backend->UpdateDfsRootBinding(
+                            *ping_response.dfs_root_binding)) {
+                        LOG(WARNING) << "Rejected DFS root binding from Ping";
+                    }
+                }
+            }
             if (ping_response.client_status == ClientStatus::NEED_REMOUNT &&
                 !remount_segment_future.valid()) {
                 // Ensure at most one remount segment thread is running

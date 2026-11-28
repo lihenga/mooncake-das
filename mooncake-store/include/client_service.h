@@ -1464,6 +1464,8 @@ class Client {
     std::shared_ptr<StorageBackend> storage_backend_;
     std::string master_dfs_root_dir_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;
+    // Registration may race the already-running storage heartbeat.
+    std::shared_ptr<DistributedStorageBackend> heartbeat_dfs_backend_;
     // Preserve existing behavior for non-SGLang callers. SGLang explicitly
     // installs memory-only immediately after setup and before warmup.
     std::atomic<bool> dfs_read_allowed_{true};
