@@ -236,7 +236,7 @@ struct ObjectMetadata {
     std::vector<Replica> PopReplicas() { return MutablePart(0).PopReplicas(); }
 
     size_t EraseReplicas(const std::function<bool(const Replica&)>& pred_fn) {
-        return MutablePart(0).PopReplicas(pred_fn).size();
+        return MutablePart(0).EraseReplicas(pred_fn);
     }
 
     // visit_fn may modify the replica but must not add or pop replicas.

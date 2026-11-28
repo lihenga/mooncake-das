@@ -1017,9 +1017,12 @@ available for new buckets, leaving headroom for other users and metadata. The
 budget includes precreated ready buckets. Capacity and eviction watermarks cover
 only this run's managed buckets; they do not measure total filesystem usage. The
 background sweep returns the space held by old bucket files to the filesystem;
-until it finishes, those files transiently consume storage. Because the sweep
-deletes them, re-enabling recovery over the same directory can no longer restore
-the reclaimed buckets: only buckets written after re-enabling are eligible.
+until it finishes, those files transiently consume storage. While recovery is
+disabled (`MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED=false`), newly sealed buckets
+also skip writing `.meta` files, so if recovery is later enabled on restart, any
+buckets written while recovery was disabled will be treated as orphaned data
+files and deleted; only buckets written with recovery enabled are eligible for
+recovery.
 
 #### Client configuration
 

@@ -20,6 +20,7 @@ namespace {
 constexpr int kMaxBatchReadThreads = 256;
 constexpr int kMaxBatchReadStride = 256;
 constexpr int kMaxBucketCreateConcurrency = 8;
+constexpr int kMaxBucketDeleteConcurrency = 32;
 
 bool ValidateEvictionSettings(const DistributedStorageConfig& config) {
     if (config.eviction_low_watermark < 0.0 ||
@@ -261,6 +262,9 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     config.bucket_create_concurrency = Environ::ReadOr(
         Variables::MOONCAKE_DFS_BUCKET_CREATE_CONCURRENCY,
         config.bucket_create_concurrency);
+    config.bucket_delete_concurrency = Environ::ReadOr(
+        Variables::MOONCAKE_DFS_BUCKET_DELETE_CONCURRENCY,
+        config.bucket_delete_concurrency);
     config.batch_read_threads = Environ::ReadOr(
         Variables::MOONCAKE_DFS_BATCH_READ_THREADS, config.batch_read_threads);
     config.batch_read_stride = Environ::ReadOr(
@@ -310,6 +314,7 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", max_bucket_count=" << max_bucket_count
         << ", ready_bucket_target=" << ready_bucket_target
         << ", bucket_create_concurrency=" << bucket_create_concurrency
+        << ", bucket_delete_concurrency=" << bucket_delete_concurrency
         << ", batch_read_threads=" << batch_read_threads
         << ", batch_read_stride=" << batch_read_stride
         << ", batch_read_merge_enabled=" << batch_read_merge_enabled
@@ -390,6 +395,15 @@ bool DistributedStorageConfig::ValidateForBucketAllocator() const {
                "in [1, "
             << kMaxBucketCreateConcurrency
             << "], bucket_create_concurrency=" << bucket_create_concurrency;
+        return false;
+    }
+    if (bucket_delete_concurrency < 0 ||
+        bucket_delete_concurrency > kMaxBucketDeleteConcurrency) {
+        LOG(ERROR)
+            << "DistributedStorageConfig: bucket_delete_concurrency must be "
+               "in [0, "
+            << kMaxBucketDeleteConcurrency
+            << "], bucket_delete_concurrency=" << bucket_delete_concurrency;
         return false;
     }
     if (batch_read_threads < 1 || batch_read_threads > kMaxBatchReadThreads) {

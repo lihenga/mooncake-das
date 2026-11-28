@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -10,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -267,6 +269,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
         ImmutableBucketAllocator* owner_ = nullptr;
         int64_t bucket_id_ = -1;
         bool invalidation_ = false;
+        bool force_one_ = false;
         // Keeps the exact BucketState captured by PrepareEviction alive. The
         // allocator compares pointer identity before Commit/Abort can act.
         std::shared_ptr<void> bucket_identity_;
@@ -339,6 +342,9 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     tl::expected<EvictedBucket, ErrorCode> CommitEvictionLogical(
         PendingEviction&& pending);
     tl::expected<void, ErrorCode> DeleteEvictedBucket(EvictedBucket&& bucket);
+    tl::expected<void, ErrorCode> EnqueueDeleteEvictedBucket(
+        EvictedBucket&& bucket);
+    bool WaitForAnyAsyncDeleteCompletion(std::chrono::milliseconds timeout);
     void DeferDeletion(EvictedBucket&& bucket,
                        std::chrono::system_clock::time_point not_before);
     size_t RetryFailedEvictions();
@@ -417,7 +423,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     PendingEviction PrepareEvictionInternal(
         bool force_one, double low_utilization_threshold = -1.0);
     PendingEviction PrepareInvalidationInternal(int64_t bucket_id);
-    bool DeleteFailureBacklogFullLocked() const;
+    bool DeleteFailureBacklogFullLocked(bool force_one = false) const;
 
     // Shared implementation of AbortEviction. `demote` distinguishes an
     // explicit master rejection (return the bucket at the warm end so the scan
@@ -451,6 +457,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
         // both files are deleted. An unset deadline awaits the master's
         // verdict.
         bool evicting = false;
+        bool delete_in_flight = false;
         std::optional<std::chrono::system_clock::time_point> delete_after;
         std::chrono::steady_clock::time_point delete_retry_after{};
         uint8_t delete_failures = 0;
@@ -495,7 +502,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
 
     // Marks `bucket` as needing its `.meta` file (re)written. A bucket that is
     // still active is never persisted, so the flag is only set once sealed.
-    static void MarkMetaDirtyLocked(BucketState& bucket);
+    void MarkMetaDirtyLocked(BucketState& bucket) const;
 
     // Seals the currently active bucket - it stops accepting allocations - and
     // marks it for persistence. Requires `mutex_`.
@@ -520,7 +527,10 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     void RequestRefillLocked();
     void RecordBucketCreationFailureLocked(ErrorCode error);
     void BucketCreateWorker();
+    void BucketDeleteWorker();
+    void WaitForPendingAsyncDeletes();
     void StopBucketWorkers();
+    std::mutex& MetadataIoStripe(int64_t bucket_id);
 
     // One-shot background sweep that reclaims the bucket files recorded by the
     // disabled-recovery scan. Their ids are all below `next_bucket_id_`, so no
@@ -538,6 +548,11 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
 
     void TouchLruLocked(int64_t bucket_id, int64_t now_ns);
     void RemoveFromLruLocked(int64_t bucket_id);
+    bool IsLowUtilizationLocked(const BucketState& bucket,
+                                double threshold) const;
+    void TrackLowUtilizationLocked(const BucketState& bucket,
+                                   bool front = false);
+    void RemoveFromLowUtilizationLocked(int64_t bucket_id);
 
     // Applies one reservation to `bucket` and returns the descriptor.
     tl::expected<DistributedFSDescriptor, ErrorCode> ReserveInBucketLocked(
@@ -571,22 +586,32 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     int64_t max_bucket_count_ = 0;
     size_t ready_bucket_target_ = 4;
     size_t bucket_create_concurrency_ = 2;
+    size_t bucket_delete_concurrency_ = 8;
 
     bool eviction_enabled_ = true;
     double eviction_high_watermark_ = 0.9;
     double eviction_low_watermark_ = 0.7;
+    double low_utilization_threshold_ = 0.0;
     std::chrono::seconds eviction_check_interval_{5};
     // With the POSIX write context enabled, client write handles stop updating
     // mtime, so the master refreshes it once when a bucket is sealed.
     bool mtime_refresh_on_seal_ = false;
+    bool bucket_recovery_enabled_ = false;
     mutable std::mutex mutex_;
-    // Serializes `.meta` writes and eviction deletion. Flush and eviction both
-    // revalidate BucketState pointer identity after taking this mutex so a
-    // captured operation cannot recreate or overwrite metadata for a bucket
-    // that has since been removed.
-    std::mutex metadata_io_mutex_;
+    // Serializes `.meta` writes and eviction deletion per bucket stripe while
+    // allowing retirement to take an exclusive root barrier. Flush and eviction
+    // both revalidate BucketState pointer identity after taking the stripe
+    // lock so a captured operation cannot recreate or overwrite metadata for a
+    // bucket that has since been removed.
+    static constexpr size_t kMetadataIoStripeCount = 64;
+    std::shared_mutex metadata_io_root_mutex_;
+    std::array<std::mutex, kMetadataIoStripeCount> metadata_io_stripes_;
     std::deque<int64_t> ready_bucket_ids_;
+    std::deque<EvictedBucket> delete_queue_;
     size_t bucket_creations_in_flight_ = 0;
+    size_t async_deletes_in_flight_ = 0;
+    uint64_t async_delete_bytes_ = 0;
+    uint64_t async_delete_completion_seq_ = 0;
     size_t waiting_allocators_ = 0;
     bool synchronous_creation_in_flight_ = false;
     bool stop_bucket_workers_ = false;
@@ -596,7 +621,9 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     std::chrono::steady_clock::time_point bucket_creation_retry_after_{};
     std::chrono::seconds bucket_creation_retry_delay_{1};
     std::condition_variable bucket_pool_cv_;
+    std::condition_variable delete_cv_;
     std::vector<std::thread> bucket_create_workers_;
+    std::vector<std::thread> bucket_delete_workers_;
     // One-shot sweep of legacy bucket files, spawned only when metadata
     // recovery is disabled. Joined by StopBucketWorkers().
     std::thread legacy_cleanup_worker_;
@@ -606,6 +633,9 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     int64_t next_bucket_id_ = 0;
     int64_t active_bucket_id_ = -1;
     uint64_t next_generation_ = 1;
+    uint64_t total_used_bytes_ = 0;
+    size_t evicting_bucket_count_ = 0;
+    size_t failed_delete_bucket_count_ = 0;
     // Once the high watermark is crossed, keep evicting until usage falls
     // below the low watermark; protected buckets may make that span several
     // prepare/resolve rounds.
@@ -613,6 +643,12 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
 
     std::list<int64_t> lru_list_;
     std::unordered_map<int64_t, std::list<int64_t>::iterator> lru_index_;
+    // Sealed, non-frozen, non-evicting buckets below low_utilization_threshold_.
+    // Scanned from the front; newly sparse and rejected (demoted) buckets join
+    // the back so rejected candidates do not starve other sparse buckets.
+    std::list<int64_t> low_utilization_buckets_;
+    std::unordered_map<int64_t, std::list<int64_t>::iterator>
+        low_utilization_index_;
 
     std::vector<RecoveredReplica> recovered_replicas_;
 
